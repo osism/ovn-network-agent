@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis
+.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -16,6 +16,7 @@ E2E_MULTI_VLAN  := test/e2e/scenarios/multi-vlan.sh
 E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
+E2E_DRAIN       := test/e2e/scenarios/drain-hitless.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
 
@@ -198,3 +199,19 @@ e2e-pf-hairpin:
 # EXIT trap restarts the killed chassis and waits for baseline-green.
 e2e-stale-chassis:
 	$(E2E_STALE)
+
+# Run the graceful-drain vs hard-kill hitless scenario (issue #113)
+# against a lab that is already up and deployed with the drain armed
+# (`E2E_DRAIN_ON_SHUTDOWN=true make e2e-up` — the scenario fail-fasts
+# otherwise). Runs two arms back-to-back: a
+# `kill -TERM` on the priority-30 chassis's agent (proves the drain
+# committed by matching both the `drain: gateway chassis priority
+# lowered` and the `drain: complete` log lines) and a
+# `docker kill -s KILL` control arm. Between the two arms the
+# scenario itself runs `make e2e-down && make e2e-up` so both arms
+# start from identical priority-30/20/10 baseline state. Asserts
+# `graceful_loss <= 1 packet` and `graceful_loss < hardkill_loss`.
+# The scenario's EXIT trap recycles the lab again on success so a
+# developer run leaves the lab baseline-green.
+e2e-drain-hitless:
+	$(E2E_DRAIN)
