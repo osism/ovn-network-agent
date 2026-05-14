@@ -28,8 +28,14 @@ log_level: "info"
 # container restart does not require re-bootstrapping the NB DB.
 cleanup_on_shutdown: false
 
-# Drain is exercised explicitly in scenarios; default to off so a plain
-# `containerlab destroy` returns quickly.
+# Drain is off by default: a plain `containerlab destroy` returns
+# quickly, and pf-hairpin's `docker restart` of the master must not
+# hand mastership away (a drained chassis restores at standby priority
+# and the anti-flap design never hands the election back). The
+# drain-hitless scenario (issue #113) needs the drain, so its lab is
+# deployed with `E2E_DRAIN_ON_SHUTDOWN=true make e2e-up`, which
+# topology.clab.yml forwards as OVN_NETWORK_DRAIN_ON_SHUTDOWN — the
+# agent's env layer beats this file.
 drain_on_shutdown: false
 
 # Reconcile cadence — tighter than the 60s production default so the

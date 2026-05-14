@@ -28,6 +28,14 @@ topology:
       # Forwarded into the gwnode entrypoint so each chassis registers
       # under a stable name.
       OVN_SB_REMOTE: tcp:central:6642
+      # Deploy-time switch for the drain-hitless scenario (issue #113):
+      # `E2E_DRAIN_ON_SHUTDOWN=true make e2e-up` deploys gateways whose
+      # agent drains on SIGTERM. The agent's env layer beats the
+      # `drain_on_shutdown: false` in gwnode-config.yaml, and the flag
+      # stays off for every other scenario — pf-hairpin restarts the
+      # master and must not hand mastership away. Non-gateway nodes
+      # ignore the variable.
+      OVN_NETWORK_DRAIN_ON_SHUTDOWN: ${E2E_DRAIN_ON_SHUTDOWN:=false}
 
   kinds:
     linux:
