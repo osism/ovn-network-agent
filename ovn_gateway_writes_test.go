@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +13,18 @@ import (
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
+
+// captureSlog routes the default logger into a buffer for the duration of the
+// test. No test in this package runs in parallel at the top level, so swapping
+// the process-wide default is safe here.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
 
 // strPtr is a tiny helper for taking the address of a string literal.
 func strPtr(s string) *string { return &s }
@@ -989,6 +1003,74 @@ func TestCleanupStale_SkipsUnmanagedRoutes(t *testing.T) {
 // DrainGateways
 // =============================================================================
 
+func TestSummarizeGatewayChassis(t *testing.T) {
+	rows := func(n int) []NBGatewayChassis {
+		list := make([]NBGatewayChassis, n)
+		for i := range list {
+			list[i] = NBGatewayChassis{
+				Name:        fmt.Sprintf("lrp-%d_host-a", i),
+				ChassisName: "host-a",
+				Priority:    i,
+			}
+		}
+		return list
+	}
+
+	tests := []struct {
+		name      string
+		list      []NBGatewayChassis
+		want      int
+		wantFirst string
+		wantLast  string
+	}{
+		{name: "empty cache renders nothing", list: nil, want: 0},
+		{
+			name:      "short cache renders every row",
+			list:      rows(3),
+			want:      3,
+			wantFirst: "lrp-0_host-a/host-a/0",
+			wantLast:  "lrp-2_host-a/host-a/2",
+		},
+		{
+			name:      "cache at the cap renders every row without a marker",
+			list:      rows(maxLoggedCacheEntries),
+			want:      maxLoggedCacheEntries,
+			wantFirst: "lrp-0_host-a/host-a/0",
+			wantLast:  fmt.Sprintf("lrp-%d_host-a/host-a/%d", maxLoggedCacheEntries-1, maxLoggedCacheEntries-1),
+		},
+		{
+			// The NB monitor is table-wide, so a real deployment fills the
+			// cache with every Gateway_Chassis row. Rendering all of them
+			// produced a log line past journald's per-line limit.
+			name:      "oversized cache is truncated with a remainder marker",
+			list:      rows(maxLoggedCacheEntries + 5),
+			want:      maxLoggedCacheEntries + 1,
+			wantFirst: "lrp-0_host-a/host-a/0",
+			wantLast:  "... (5 more)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := summarizeGatewayChassis(tc.list)
+			if len(got) != tc.want {
+				t.Fatalf("summarizeGatewayChassis(%d rows) returned %d entries, want %d: %v",
+					len(tc.list), len(got), tc.want, got)
+			}
+			if tc.want == 0 {
+				return
+			}
+			if got[0] != tc.wantFirst {
+				t.Errorf("first entry = %q, want %q", got[0], tc.wantFirst)
+			}
+			if last := got[len(got)-1]; last != tc.wantLast {
+				t.Errorf("last entry = %q, want %q", last, tc.wantLast)
+			}
+		})
+	}
+}
+
 func TestDrainGateways_NothingToDrain(t *testing.T) {
 	c, nb, sb := newOVNClientWithFakes(t, "host-a")
 	// Only entries for other chassis or already-drained.
@@ -1121,6 +1203,46 @@ func TestDrainGateways_FallsBackToServerSelectOnCacheMiss(t *testing.T) {
 	}
 	if got, ok := updates[0].Row["priority"].(int); !ok || got != 0 {
 		t.Errorf("drain op must set priority=0, got %#v", updates[0].Row["priority"])
+	}
+}
+
+// TestDrainGateways_EmptyMatchAfterCacheMissLogsServerRows covers the one
+// branch where the "no entries to drain" log has to name what the SERVER
+// returned: the cache missed the local row, the select fallback found it at
+// priority 0, and nothing is left to drain. Dumping only the cache there is
+// useless — the cache cannot hold the local row by construction, so a
+// maintainer could not tell "NB has no row for this chassis" apart from "NB
+// has it, at priority 0".
+func TestDrainGateways_EmptyMatchAfterCacheMissLogsServerRows(t *testing.T) {
+	logs := captureSlog(t)
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	// Cache has only peer entries — no row for host-a (the missed INSERT).
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 20},
+	)
+	// The server does hold the local row, but a previous drain left it at
+	// priority 0, so filterDrainCandidates still yields nothing to drain.
+	nb.setSelectRows("Gateway_Chassis", ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "g1"},
+		"name":         "lrp-a_host-a",
+		"chassis_name": "host-a",
+		"priority":     float64(0),
+	})
+
+	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "drain: no gateway chassis entries to drain on this chassis") {
+		t.Fatalf("expected the empty-match log line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "server_count=1") {
+		t.Errorf("empty-match log must report how many rows the NB select returned, got:\n%s", out)
+	}
+	if !strings.Contains(out, "lrp-a_host-a/host-a/0") {
+		t.Errorf("empty-match log must render the server-side row that the cache lacked, got:\n%s", out)
 	}
 }
 

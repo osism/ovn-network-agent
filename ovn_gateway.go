@@ -695,11 +695,13 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	// Cache may be missing the local row entirely if the Gateway_Chassis
 	// INSERT update was not delivered to this client. Confirm by reading
 	// directly from the NB server before silently skipping the drain.
+	var serverList []NBGatewayChassis
 	if !hasLocalRow {
 		slog.Warn("drain: cache has no Gateway_Chassis row for this chassis, querying NB directly",
 			"local_chassis_name", localChassisName,
 			"cache_count", len(gwChassisList))
-		serverList, err := o.selectLocalGatewayChassis(ctx, localChassisName)
+		var err error
+		serverList, err = o.selectLocalGatewayChassis(ctx, localChassisName)
 		if err != nil {
 			return fmt.Errorf("drain: cache miss + NB select fallback failed: %w", err)
 		}
@@ -711,8 +713,25 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	}
 
 	if len(toDrain) == 0 {
-		slog.Info("drain: no gateway chassis entries to drain on this chassis",
-			"local_chassis_name", localChassisName)
+		// Surface what was actually read so a "no entries" log does not end
+		// the triage trail. Useful when an empty match is caused by a
+		// chassis-name mismatch or a monitor that did not pick up the row
+		// (rather than a genuinely empty NB).
+		attrs := []any{
+			"local_chassis_name", localChassisName,
+			"cache_count", len(gwChassisList),
+			"cache_entries", summarizeGatewayChassis(gwChassisList),
+		}
+		if !hasLocalRow {
+			// The cache dump cannot hold the local row — its absence is what
+			// sent us to the server. Only the select's result separates "NB
+			// has no row for this chassis" from "NB has it, at priority 0"
+			// (a previous drain whose RestoreDrainedGateways never ran).
+			attrs = append(attrs,
+				"server_count", len(serverList),
+				"server_entries", summarizeGatewayChassis(serverList))
+		}
+		slog.Info("drain: no gateway chassis entries to drain on this chassis", attrs...)
 		return nil
 	}
 
@@ -868,6 +887,29 @@ func filterRestoreCandidates(gwChassisList []NBGatewayChassis, localChassisName 
 		}
 	}
 	return toRestore, hasLocalRow
+}
+
+// maxLoggedCacheEntries bounds how many Gateway_Chassis rows a single log
+// line renders. The NB monitor is registered on the whole table, so the cache
+// holds every row in the deployment — thousands in a region with a few
+// hundred routers. A line that long is truncated or dropped by journald and
+// most log shippers, destroying the triage value it was added for.
+const maxLoggedCacheEntries = 20
+
+// summarizeGatewayChassis renders gwChassisList as name/chassis_name/priority
+// strings for a log attribute, truncating after maxLoggedCacheEntries with a
+// "... (N more)" marker. The caller logs the exact total separately, so the
+// truncation costs no diagnostic information.
+func summarizeGatewayChassis(gwChassisList []NBGatewayChassis) []string {
+	shown := min(len(gwChassisList), maxLoggedCacheEntries)
+	seen := make([]string, 0, shown+1)
+	for _, gwc := range gwChassisList[:shown] {
+		seen = append(seen, fmt.Sprintf("%s/%s/%d", gwc.Name, gwc.ChassisName, gwc.Priority))
+	}
+	if remaining := len(gwChassisList) - shown; remaining > 0 {
+		seen = append(seen, fmt.Sprintf("... (%d more)", remaining))
+	}
+	return seen
 }
 
 // filterDrainCandidates returns the Gateway_Chassis rows that must have
