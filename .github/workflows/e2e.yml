@@ -461,3 +461,84 @@ jobs:
       - name: Tear the lab down
         if: always()
         run: make e2e-down
+
+  drain-hitless:
+    name: Graceful drain vs hard kill (hitless)
+    runs-on: ubuntu-latest
+    # Runs after the stale-chassis job on its own runner so a
+    # drain-hitless regression is reported in isolation. This is the
+    # one job that does not fit the other three's 15-minute budget:
+    # the scenario runs `baseline.sh` as a sanity gate, the graceful
+    # arm, a full `make e2e-down && make e2e-up` recycle, `baseline.sh`
+    # again to gate the recycled lab, then the hardkill arm. Counting
+    # this job's own bring-up and teardown that is two lab deploys, two
+    # destroys and two baseline runs — roughly twice the baseline job's
+    # work — plus two ~21 s probes each followed by a failover wait.
+    # 25 minutes keeps the cap a backstop rather than the thing that
+    # ends the run: a `timeout-minutes` cancellation is not a failure,
+    # so the `if: failure()` artifact steps below never run and the
+    # aborted arm leaves no bundle to debug. Per issue #113.
+    needs: stale-chassis
+    timeout-minutes: 25
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+      # Arm the drain for this job only: topology.clab.yml forwards the
+      # variable into the gateway containers as
+      # OVN_NETWORK_DRAIN_ON_SHUTDOWN, where the agent's env layer beats
+      # the `drain_on_shutdown: false` default in gwnode-config.yaml.
+      # Job-level (not step-level) so the scenario's own mid-run
+      # `make e2e-up` recycle deploys the same lab shape. Every other
+      # E2E job keeps the no-drain default — pf-hairpin restarts the
+      # master and must not hand mastership away.
+      E2E_DRAIN_ON_SHUTDOWN: "true"
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+
+      # See the baseline job for the rationale; same modules required.
+      - name: Load required kernel modules
+        run: |
+          set -euo pipefail
+          sudo modprobe openvswitch
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run drain-hitless scenario
+        # Direct the scenario's per-arm captures (ping output, drain
+        # log line, Port_Binding snapshots, summary) into the same
+        # artifact root so collect-artifacts.sh and the uploader both
+        # pick them up. The scenario recycles the lab between arms
+        # itself; this job only does the initial `make e2e-up` and
+        # the final `make e2e-down`.
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/drain-hitless
+        run: ./test/e2e/scenarios/drain-hitless.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-drain-hitless-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
