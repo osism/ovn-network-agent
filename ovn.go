@@ -149,6 +149,12 @@ type OVNState struct {
 	// AllChassisNames is the set of chassis hostnames currently present in
 	// the SB Chassis table. Used for stale chassis cleanup.
 	AllChassisNames map[string]bool
+
+	// Gen is the refreshState pass that published this state. It orders a
+	// snapshot against a pending failover observation, so that a reconcile
+	// only consumes an observation its own snapshot already reflects — see
+	// takeFailoverObservedAt.
+	Gen uint64
 }
 
 // clone returns a deep copy of s in which every reference-typed field is
@@ -255,6 +261,36 @@ type OVNClient struct {
 	// loopDone is closed when refreshLoop exits. Set by Connect() before
 	// starting the loop; nil before Connect() succeeds.
 	loopDone chan struct{}
+
+	// failoverObserved holds the first chassisredirect change observed in the
+	// immediate-refresh path, or nil when no observation is pending. The
+	// takeover reconcile consumes it via takeFailoverObservedAt to record the
+	// failover-announce latency metric. Atomic because it is stamped from
+	// cache event-handler goroutines and consumed by the reconcile loop.
+	failoverObserved atomic.Pointer[failoverObservation]
+
+	// refreshSeq numbers the refreshState passes. It is incremented at the
+	// start of a pass and published as OVNState.Gen once that pass completes,
+	// which is what orders a snapshot against a failover observation.
+	refreshSeq atomic.Uint64
+}
+
+// failoverObservation is a chassisredirect change seen on the immediate-refresh
+// path, awaiting the reconcile that announces the takeover routes.
+type failoverObservation struct {
+	// at is when the change was observed. It stays a time.Time rather than a
+	// Unix nanosecond count so that it keeps its monotonic clock reading:
+	// time.Since then subtracts on the monotonic clock, so an NTP step
+	// between the observation and the announce — likely, since a gateway
+	// reboot both triggers a takeover and steps the clock on startup —
+	// cannot yield a negative or a wildly inflated sample.
+	at time.Time
+
+	// gen is the state generation current when the change was observed. Only
+	// a refreshState pass that started afterwards reads the change out of the
+	// cache, so only a snapshot with a higher Gen reflects it — and only that
+	// snapshot's reconcile may consume the observation.
+	gen uint64
 }
 
 func NewOVNClient(cfg Config, onChange func()) *OVNClient {
@@ -830,6 +866,12 @@ func (nc *natCollection) addSBGatewayNATAddresses(
 // ovn_cache.go). The per-step joins themselves are the pure helpers above; this
 // function only sequences them and publishes the result.
 func (o *OVNClient) refreshState(ctx context.Context) {
+	// Number this pass before the first cache read. An observation stamped
+	// while the reads below are already in flight must not be consumed by the
+	// state this pass publishes: those reads may have passed the changed row
+	// already, so the resulting snapshot need not reflect the change.
+	seq := o.refreshSeq.Add(1)
+
 	// Step 1: chassisredirect port bindings and chassis hostnames.
 	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
 		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
@@ -898,6 +940,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		NATIPToSegment:     nc.IPToSegment,
 		DiscoveredNetworks: discoveredNets,
 		AllChassisNames:    allChassisNames,
+		Gen:                seq,
 	})
 
 	slog.Info("state updated",
@@ -1008,6 +1051,16 @@ func (o *OVNClient) immediateStateRefresh() {
 	if !o.ready.Load() {
 		return // not fully connected yet
 	}
+	// Stamp the first chassisredirect observation of this failover window so
+	// the takeover reconcile can measure the announce latency. The cache has
+	// already applied the change by the time the event handler runs, so any
+	// refreshState pass numbered above refreshSeq reads it. CompareAndSwap
+	// keeps the earliest observation; takeFailoverObservedAt clears the slot
+	// once a reconcile that reflects the change has consumed it.
+	o.failoverObserved.CompareAndSwap(nil, &failoverObservation{
+		at:  time.Now(),
+		gen: o.refreshSeq.Load(),
+	})
 	select {
 	case o.immediateCh <- struct{}{}:
 	default:
@@ -1032,6 +1085,37 @@ func (o *OVNClient) signalDrainWatch() {
 	}
 }
 
+// takeFailoverObservedAt consumes the chassisredirect observation stamped by
+// immediateStateRefresh and returns when the change was seen, or the zero Time
+// when nothing is pending.
+//
+// snapGen is OVNState.Gen of the caller's own snapshot. An observation is only
+// consumed by a snapshot that already reflects it (snapGen > gen). Without that
+// check the observation would go to whichever reconcile ran first, which is not
+// necessarily the one that announces: a debounce cycle refreshes state, arms its
+// reconcile timer, and a chassisredirect change landing inside that window is
+// then consumed — and discarded — by a reconcile still holding the pre-failover
+// snapshot, leaving the genuine takeover reconcile that follows with nothing to
+// measure.
+//
+// A snapshot that does reflect the change consumes the observation whether or
+// not it goes on to announce. That keeps the lifetime bounded to one failover
+// window: the event handler stamps on every chassis, not just the takeover
+// target, so an observation left pending on a standby would otherwise attach
+// itself to some unrelated announce minutes later.
+//
+// Only the reconcile loop consumes, and it is serial, so clearing the slot
+// cannot drop a competing observation — immediateStateRefresh only ever stamps
+// into an empty one.
+func (o *OVNClient) takeFailoverObservedAt(snapGen uint64) time.Time {
+	obs := o.failoverObserved.Load()
+	if obs == nil || snapGen <= obs.gen {
+		return time.Time{}
+	}
+	o.failoverObserved.Store(nil)
+	return obs.at
+}
+
 // =============================================================================
 // SB event handler (implements cache.EventHandler)
 // =============================================================================
@@ -1051,8 +1135,8 @@ func (h *sbEventHandler) OnAdd(table string, m model.Model) {
 }
 
 func (h *sbEventHandler) OnUpdate(table string, old, updated model.Model) {
-	if h.isChassisRedirect(table, updated) {
-		slog.Debug("chassisredirect port updated, immediate refresh")
+	if h.isChassisRedirect(table, updated) && h.chassisRebound(old, updated) {
+		slog.Debug("chassisredirect port rebound, immediate refresh")
 		h.ovn.signalDrainWatch()
 		h.ovn.immediateStateRefresh()
 		return
@@ -1076,6 +1160,41 @@ func (h *sbEventHandler) isChassisRedirect(table string, m model.Model) bool {
 	}
 	pb, ok := m.(*SBPortBinding)
 	return ok && pb.Type == "chassisredirect"
+}
+
+// chassisRebound reports whether a Port_Binding update moved the row to a
+// different chassis, which is what a gateway re-election looks like on the
+// wire.
+//
+// The SB monitor selects whole tables, so OnUpdate fires for every column of a
+// chassisredirect row, not just chassis. refreshState reads only Type and
+// Chassis from such a row, so an update that leaves Chassis alone — northd
+// rewriting nat_addresses because an operator added a FIP, say — changes
+// nothing this agent derives and is not a failover. Those updates take the
+// debounced path: routing them through the immediate path would stamp a
+// failover observation, and the sub-second announce that follows (no
+// re-election to wait for) would land in failover_announce_seconds. FIP churn
+// outnumbers failovers by orders of magnitude, so the histogram would sit in
+// the fast buckets and a p95 alert would stay quiet through a slow takeover.
+//
+// A pair that is not two Port_Binding rows cannot be compared; treat it as a
+// rebinding rather than risk missing a real failover.
+func (h *sbEventHandler) chassisRebound(old, updated model.Model) bool {
+	oldPB, oldOK := old.(*SBPortBinding)
+	newPB, newOK := updated.(*SBPortBinding)
+	if !oldOK || !newOK {
+		return true
+	}
+	return chassisRef(oldPB) != chassisRef(newPB)
+}
+
+// chassisRef returns a Port_Binding's chassis reference, collapsing the unset
+// pointer and the empty string — both mean "bound nowhere" to refreshState.
+func chassisRef(pb *SBPortBinding) string {
+	if pb.Chassis == nil {
+		return ""
+	}
+	return *pb.Chassis
 }
 
 func (h *sbEventHandler) handleChange(table string) {

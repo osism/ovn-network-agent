@@ -146,6 +146,7 @@ func TestOVNStateCloneReallocatesEveryReferenceField(t *testing.T) {
 		NATIPToSegment:     map[string]string{"198.51.100.1": "physnet1"},
 		DiscoveredNetworks: []*net.IPNet{cidr},
 		AllChassisNames:    map[string]bool{"node1": true},
+		Gen:                1,
 	}
 
 	// Every field must be non-zero, or the re-allocation check below would
@@ -857,10 +858,10 @@ func TestSBEventHandlerOnUpdateAndOnDelete(t *testing.T) {
 	c.ready.Store(true)
 	h := &sbEventHandler{ovn: c}
 
-	// chassisredirect update → immediate.
+	// chassisredirect rebinding → immediate.
 	h.OnUpdate("Port_Binding",
-		&SBPortBinding{Type: "chassisredirect"},
-		&SBPortBinding{Type: "chassisredirect"})
+		&SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-a")},
+		&SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-b")})
 	if got := len(c.immediateCh); got != 1 {
 		t.Errorf("OnUpdate(chassisredirect) immediateCh len = %d, want 1", got)
 	}
@@ -884,6 +885,91 @@ func TestSBEventHandlerOnUpdateAndOnDelete(t *testing.T) {
 	h.OnDelete("Chassis", &SBChassis{Name: "ch-a"})
 	if got := len(c.debounceCh); got != 1 {
 		t.Errorf("OnDelete(Chassis) debounceCh len = %d, want 1", got)
+	}
+}
+
+// TestSBEventHandlerOnUpdateIgnoresNonChassisChurn pins the failover-announce
+// histogram against routine chassisredirect churn. The SB monitor selects whole
+// tables, so OnUpdate fires for every column of a cr-port row — northd rewrites
+// nat_addresses whenever an operator adds a FIP to the router. Such an update
+// is not a re-election, and the announce that follows it is sub-second because
+// there is nothing to wait for. FIP churn outnumbers failovers by orders of
+// magnitude, so stamping these would pull the histogram into the fast buckets
+// and leave a p95 alert quiet through a genuinely slow takeover.
+func TestSBEventHandlerOnUpdateIgnoresNonChassisChurn(t *testing.T) {
+	tests := []struct {
+		name          string
+		oldPB, newPB  *SBPortBinding
+		wantImmediate bool
+	}{
+		{
+			name:          "nat_addresses churn on a bound cr-port is not a failover",
+			oldPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-a")},
+			newPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-a"), NatAddresses: []string{"fa:16:3e:11:22:33 198.51.100.60"}},
+			wantImmediate: false,
+		},
+		{
+			name:          "an unbound cr-port staying unbound is not a failover",
+			oldPB:         &SBPortBinding{Type: "chassisredirect"},
+			newPB:         &SBPortBinding{Type: "chassisredirect", NatAddresses: []string{"fa:16:3e:11:22:33 198.51.100.60"}},
+			wantImmediate: false,
+		},
+		{
+			name:          "nil and empty chassis both mean bound nowhere",
+			oldPB:         &SBPortBinding{Type: "chassisredirect"},
+			newPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("")},
+			wantImmediate: false,
+		},
+		{
+			name:          "a re-election onto this chassis is a failover",
+			oldPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-a")},
+			newPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-b")},
+			wantImmediate: true,
+		},
+		{
+			name:          "a cr-port gaining a chassis is a failover",
+			oldPB:         &SBPortBinding{Type: "chassisredirect"},
+			newPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-b")},
+			wantImmediate: true,
+		},
+		{
+			name:          "a cr-port losing its chassis is a failover",
+			oldPB:         &SBPortBinding{Type: "chassisredirect", Chassis: strPtr("ch-a")},
+			newPB:         &SBPortBinding{Type: "chassisredirect"},
+			wantImmediate: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _, _ := newOVNClientWithFakes(t, "host-a")
+			c.ready.Store(true)
+			h := &sbEventHandler{ovn: c}
+
+			h.OnUpdate("Port_Binding", tt.oldPB, tt.newPB)
+
+			if tt.wantImmediate {
+				if got := len(c.immediateCh); got != 1 {
+					t.Errorf("immediateCh len = %d, want 1", got)
+				}
+				if c.failoverObserved.Load() == nil {
+					t.Error("a chassis rebinding must stamp a failover observation")
+				}
+				return
+			}
+
+			if got := len(c.immediateCh); got != 0 {
+				t.Errorf("immediateCh len = %d, want 0: routine churn must not take the failover path", got)
+			}
+			if obs := c.failoverObserved.Load(); obs != nil {
+				t.Errorf("routine churn stamped a failover observation (%v); the "+
+					"sub-second announce that follows would be recorded as failover latency", obs.at)
+			}
+			// The change still reaches the refresh loop, just debounced.
+			if got := len(c.debounceCh); got != 1 {
+				t.Errorf("debounceCh len = %d, want 1: the update must still refresh state", got)
+			}
+		})
 	}
 }
 
@@ -1376,6 +1462,113 @@ func TestImmediateStateRefreshIgnoresNotReady(t *testing.T) {
 	c.immediateStateRefresh()
 	if got := len(c.immediateCh); got != 0 {
 		t.Errorf("immediateCh should remain empty when not ready, got len = %d", got)
+	}
+	if !c.takeFailoverObservedAt(c.refreshSeq.Load() + 1).IsZero() {
+		t.Error("a not-ready immediateStateRefresh must not stamp a failover timestamp")
+	}
+}
+
+// TestImmediateStateRefreshStampsFailoverObservedAt verifies that the
+// immediate-refresh path records the chassisredirect-observed timestamp and
+// that repeated observations keep the earliest one until it is consumed.
+func TestImmediateStateRefreshStampsFailoverObservedAt(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+
+	before := time.Now()
+	c.immediateStateRefresh()
+	first := c.failoverObserved.Load().at
+	if first.Before(before) || first.After(time.Now()) {
+		t.Errorf("failoverObserved.at = %v, want within the call window", first)
+	}
+
+	// A second observation before the first is consumed keeps the earliest.
+	c.immediateStateRefresh()
+	if got := c.failoverObserved.Load().at; !got.Equal(first) {
+		t.Errorf("second observation changed the timestamp: %v != %v", got, first)
+	}
+
+	// A snapshot published after the observation consumes and clears it.
+	snapGen := c.refreshSeq.Add(1)
+	if got := c.takeFailoverObservedAt(snapGen); !got.Equal(first) {
+		t.Errorf("takeFailoverObservedAt = %v, want %v", got, first)
+	}
+	if !c.takeFailoverObservedAt(snapGen).IsZero() {
+		t.Error("takeFailoverObservedAt must return the zero Time once consumed")
+	}
+}
+
+// TestTakeFailoverObservedAtKeepsMonotonicReading pins the clock source of the
+// failover-announce metric. time.Since only subtracts on the monotonic clock
+// when its operand carries a monotonic reading; a timestamp round-tripped
+// through an integer (time.Unix(0, ns)) carries none, so time.Since falls back
+// to the wall clock. A gateway reboot is exactly when a takeover happens and
+// also when chronyd steps the clock, and a backward step would then hand
+// Observe a negative sample — which Prometheus accepts, decreasing the
+// histogram _sum and making rate() see a counter reset.
+func TestTakeFailoverObservedAtKeepsMonotonicReading(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+
+	c.immediateStateRefresh()
+	got := c.takeFailoverObservedAt(c.refreshSeq.Add(1))
+	if got.IsZero() {
+		t.Fatal("takeFailoverObservedAt returned the zero Time, want the stamped observation")
+	}
+	// Round(0) strips the monotonic reading, so a value that still differs
+	// from its stripped form carries one.
+	if got == got.Round(0) {
+		t.Error("takeFailoverObservedAt returned a Time with no monotonic reading: " +
+			"time.Since would fall back to the wall clock and an NTP step would corrupt the sample")
+	}
+}
+
+// TestTakeFailoverObservedAtIgnoresStaleSnapshot covers the reconcile that runs
+// with a snapshot predating the chassisredirect change. The observation must
+// survive it: a debounce cycle refreshes state and arms its reconcile timer,
+// and a chassisredirect change landing inside that 100ms window is otherwise
+// consumed — and discarded — by that older cycle, which announces nothing.
+// The takeover reconcile that follows the immediate refresh would then find the
+// slot empty and record no sample at all for a genuine failover.
+func TestTakeFailoverObservedAtIgnoresStaleSnapshot(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+
+	// A debounce cycle already published state (gen 1), then the
+	// chassisredirect change is observed.
+	staleGen := c.refreshSeq.Add(1)
+	c.immediateStateRefresh()
+
+	// The reconcile armed by that debounce cycle still holds the
+	// pre-failover snapshot, so it must not consume the observation.
+	if got := c.takeFailoverObservedAt(staleGen); !got.IsZero() {
+		t.Errorf("a snapshot predating the change consumed the observation (%v); "+
+			"the takeover reconcile that announces would have nothing to measure", got)
+	}
+
+	// The immediate refresh publishes a snapshot that does reflect the
+	// change; its reconcile is the one that announces, and it consumes.
+	if c.takeFailoverObservedAt(c.refreshSeq.Add(1)).IsZero() {
+		t.Error("the snapshot reflecting the change must consume the observation")
+	}
+}
+
+// TestTakeFailoverObservedAtConsumesWithoutAnnounce pins the bound on an
+// observation's lifetime. The SB event handler stamps on every chassis, not
+// just the takeover target, so a standby that reflects the change must still
+// consume it even though it announces nothing. Holding the observation until
+// some cycle announces would attach it to an unrelated announce minutes later
+// and report that interval as failover latency.
+func TestTakeFailoverObservedAtConsumesWithoutAnnounce(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.ready.Store(true)
+
+	c.immediateStateRefresh()
+	if c.takeFailoverObservedAt(c.refreshSeq.Add(1)).IsZero() {
+		t.Fatal("the snapshot reflecting the change must consume the observation")
+	}
+	if got := c.failoverObserved.Load(); got != nil {
+		t.Errorf("observation still pending after a non-announcing cycle consumed it: %v", got.at)
 	}
 }
 

@@ -111,3 +111,10 @@ linters:
       - path: '_test\.go$'
         linters: [revive]
         text: 'context-as-argument'
+      # staticcheck QF1009 (use time.Time.Equal): the monotonic-clock test
+      # compares a Time against its Round(0) form with == on purpose.
+      # Equal compares instants and would be vacuously true; only struct
+      # equality can see whether the monotonic reading is present.
+      - path: '_test\.go$'
+        linters: [staticcheck]
+        text: 'QF1009'
