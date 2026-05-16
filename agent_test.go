@@ -638,7 +638,13 @@ func TestEnsureRoutesAddsMissingAndRemovesStale(t *testing.T) {
 	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
 	// Desired: 198.51.100.10 (new) and 198.51.100.20 (already in FRR).
-	a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, nil, nil)
+	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, nil, nil)
+	if !res.changed {
+		t.Error("routeSyncResult.changed = false, want true (routes were added and removed)")
+	}
+	if !res.announced {
+		t.Error("routeSyncResult.announced = false, want true (an FRR route was added)")
+	}
 
 	var sawAdd, sawDel, sawRefresh bool
 	for _, c := range rec.calls {
@@ -666,55 +672,55 @@ func TestEnsureRoutesAddsMissingAndRemovesStale(t *testing.T) {
 	}
 }
 
-// TestEnsureRoutesReturnsAnnounceOutcome pins the announce outcome the drain
-// takeover handshake keys on: ensureRoutes returns true when the FIP routes
-// were announced (or nothing needed changing) and false when the FRR add or
-// the BGP soft-refresh failed. PortForwardOnly skips kernel routes so only the
-// FRR/BGP paths — the ones the outcome depends on — are exercised, keeping the
-// test off the real bridge.
-func TestEnsureRoutesReturnsAnnounceOutcome(t *testing.T) {
+// TestEnsureRoutesReportsReadyOutcome pins the route-sync outcome the drain
+// takeover handshake keys on: ensureRoutes reports ready when the FIP routes
+// were announced (or nothing needed changing) and not ready when the FRR add
+// or the BGP soft-refresh failed. PortForwardOnly skips kernel routes so only
+// the FRR/BGP paths — the ones the outcome depends on — are exercised, keeping
+// the test off the real bridge.
+func TestEnsureRoutesReportsReadyOutcome(t *testing.T) {
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	newAgent := func(rec *vtyshRecorder) *Agent {
 		rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 		return &Agent{cfg: Config{PortForwardOnly: true}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 	}
 
-	t.Run("clean add announces", func(t *testing.T) {
+	t.Run("clean add is ready", func(t *testing.T) {
 		rec := newVtyshRecorder()
 		// FRR reports no routes, so the desired IP is added and BGP refreshed;
 		// the recorder returns success for both.
-		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
-			t.Errorf("clean add cycle: announced = false, want true (calls: %v)", rec.calls)
+		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+			t.Errorf("clean add cycle: ready = false, want true (calls: %v)", rec.calls)
 		}
 	})
 
-	t.Run("no-change cycle announces", func(t *testing.T) {
+	t.Run("no-change cycle is ready", func(t *testing.T) {
 		rec := newVtyshRecorder()
 		// FRR already advertises the only desired IP: nothing is added or
-		// removed, so no BGP refresh runs and the cycle still announces.
+		// removed, so no BGP refresh runs and the cycle is still ready.
 		rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
 			frrStaticRoutesJSON("169.254.0.1", "198.51.100.10"), nil)
-		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
-			t.Errorf("no-change cycle: announced = false, want true (calls: %v)", rec.calls)
+		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+			t.Errorf("no-change cycle: ready = false, want true (calls: %v)", rec.calls)
 		}
 	})
 
-	t.Run("FRR add failure does not announce", func(t *testing.T) {
+	t.Run("FRR add failure is not ready", func(t *testing.T) {
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
 			"-c", "ip route 198.51.100.10/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
 			"", errors.New("vtysh add failed"))
-		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
-			t.Errorf("FRR add failure: announced = true, want false")
+		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+			t.Errorf("FRR add failure: ready = true, want false")
 		}
 	})
 
-	t.Run("BGP refresh failure does not announce", func(t *testing.T) {
+	t.Run("BGP refresh failure is not ready", func(t *testing.T) {
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", "clear ip bgp vrf vrf-provider * soft out"},
 			"", errors.New("bgp refresh failed"))
-		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
-			t.Errorf("BGP refresh failure: announced = true, want false")
+		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+			t.Errorf("BGP refresh failure: ready = true, want false")
 		}
 	})
 }
@@ -807,6 +813,51 @@ func TestCheckFRRRouteActivity(t *testing.T) {
 			t.Errorf("gauge with a healthy route = %v, want 0", got)
 		}
 	})
+}
+
+// TestEnsureRoutesKeepsAnnounceSeparateFromRouteAdd verifies that a takeover
+// reconcile with only additions issues the FRR route-add and the BGP
+// soft-refresh as two separate vtysh invocations. Bundling them into one
+// process makes the soft-refresh race the static→BGP redistribution, so the
+// freshly added /32s miss the immediate re-advertise (issue #131 follow-up).
+func TestEnsureRoutesKeepsAnnounceSeparateFromRouteAdd(t *testing.T) {
+	rec := newVtyshRecorder()
+	// FRR has no static routes yet — every desired route is a pure addition.
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		"",
+		nil,
+	)
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
+	a := &Agent{routing: rm}
+
+	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, nil, nil)
+	if !res.announced || !res.changed {
+		t.Fatalf("routeSyncResult = %+v, want changed+announced", res)
+	}
+
+	var addCall, refreshCall, bundled int
+	for _, c := range rec.calls {
+		joined := strings.Join(c, " ")
+		hasAdd := strings.Contains(joined, "ip route 198.51.100.10/32") &&
+			!strings.Contains(joined, "no ip route")
+		hasRefresh := strings.Contains(joined, "clear ip bgp vrf vrf-provider")
+		if hasAdd {
+			addCall++
+		}
+		if hasRefresh {
+			refreshCall++
+		}
+		if hasAdd && hasRefresh {
+			bundled++
+		}
+	}
+	if addCall != 1 || refreshCall != 1 {
+		t.Errorf("expected one route-add and one BGP refresh call, got add=%d refresh=%d (calls: %v)", addCall, refreshCall, rec.calls)
+	}
+	if bundled != 0 {
+		t.Errorf("route-add and BGP refresh must not share a vtysh call: %v", rec.calls)
+	}
 }
 
 // TestRemoveAllRoutesWithStubbedFRRList exercises the FRR-driven removal
@@ -1214,6 +1265,306 @@ func TestReconcileCompletesPromptlyOnCancelledContext(t *testing.T) {
 	// would leave the agent half-initialised on the next tick.
 	if len(a.effectiveFilters) != 1 || a.effectiveFilters[0].String() != "198.51.100.0/24" {
 		t.Errorf("effectiveFilters = %v, want [198.51.100.0/24]", a.effectiveFilters)
+	}
+}
+
+// takeoverAgent builds an Agent whose OVN state has one locally-active
+// router, so a reconcile cycle takes the HasLocalRouters branch and the
+// announce adds the router's FIP /32 to FRR. The RouteManager is in
+// dry-run, so the FRR/kernel helpers are no-ops.
+func takeoverAgent(t *testing.T) (*Agent, *OVNClient) {
+	t.Helper()
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{{
+			RouterName:  "router1",
+			LRPName:     "lrp-abc",
+			LRPMAC:      "aa:aa:aa:aa:aa:aa",
+			LRPNetworks: []string{"198.51.100.0/24"},
+		}},
+		HasLocalRouters:    true,
+		DiscoveredNetworks: []*net.IPNet{cidr},
+	})
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	return a, c
+}
+
+// observeFailoverAt stamps a chassisredirect observation made at `at`, then
+// advances the published state generation the way the immediate refreshState
+// pass that follows the observation does. The reconcile's snapshot therefore
+// reflects the change and is entitled to consume the observation, which is the
+// production sequence: stamp, refresh, announce.
+func observeFailoverAt(t *testing.T, c *OVNClient, at time.Time) {
+	t.Helper()
+	c.failoverObserved.Store(&failoverObservation{at: at, gen: c.refreshSeq.Load()})
+	st := c.state.Snapshot()
+	st.Gen = c.refreshSeq.Add(1)
+	c.state.Replace(st)
+}
+
+// failoverAnnounceSample returns the observation count and the summed
+// observed seconds of the ovn_network_agent_failover_announce_seconds
+// histogram. The sum matters as much as the count: the documented alert reads
+// the observed interval, so a test that only counts samples would pass on a
+// histogram recording the wrong duration.
+func failoverAnnounceSample(t *testing.T, m *metricsRegistry) (uint64, float64) {
+	t.Helper()
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() == "ovn_network_agent_failover_announce_seconds" {
+			h := mf.GetMetric()[0].GetHistogram()
+			return h.GetSampleCount(), h.GetSampleSum()
+		}
+	}
+	t.Fatal("failover_announce_seconds histogram missing from registry")
+	return 0, 0
+}
+
+// TestReconcileRecordsFailoverAnnounceMetric verifies that a takeover
+// reconcile triggered by a chassisredirect change records the
+// failover-announce latency, and consumes the timestamp exactly once.
+func TestReconcileRecordsFailoverAnnounceMetric(t *testing.T) {
+	m := withTestMetrics(t)
+	a, c := takeoverAgent(t)
+
+	// A chassisredirect change was observed ~400ms ago.
+	observeFailoverAt(t, c, time.Now().Add(-400*time.Millisecond))
+
+	a.reconcile(context.Background(), triggerEvent)
+	count, sum := failoverAnnounceSample(t, m)
+	if count != 1 {
+		t.Fatalf("failover_announce_seconds count after takeover = %d, want 1", count)
+	}
+	// The recorded value must be the observed→announce interval (~0.4s plus
+	// the reconcile itself), not merely a sample: the p95 alert in
+	// docs/guides/metrics.md reads the value, not the count. A guard on the
+	// count alone would pass on a histogram recording 0.
+	if sum < 0.4 || sum > 2.0 {
+		t.Errorf("failover_announce_seconds sum = %v, want ~0.4 (the stamped interval)", sum)
+	}
+
+	// The timestamp is consumed: a follow-up reconcile with no new
+	// observation must not record another sample.
+	a.reconcile(context.Background(), triggerEvent)
+	if count, _ := failoverAnnounceSample(t, m); count != 1 {
+		t.Errorf("failover_announce_seconds count after second reconcile = %d, want 1", count)
+	}
+}
+
+// TestReconcileLeavesFailoverStampForTheAnnouncingCycle covers the reconcile
+// that loses the race to the takeover: a failover produces a storm of OVN
+// changes, most of them not chassisredirect, so a debounce cycle is almost
+// always in flight alongside the immediate path. That cycle refreshes state,
+// arms its reconcile timer, and the chassisredirect change lands inside the
+// window — so its reconcile runs on the pre-failover snapshot, announces
+// nothing, and must leave the observation alone. Consuming it there loses the
+// sample for the takeover reconcile that follows and does announce, so a
+// genuine failover records nothing at all.
+func TestReconcileLeavesFailoverStampForTheAnnouncingCycle(t *testing.T) {
+	m := withTestMetrics(t)
+	a, c := takeoverAgent(t)
+
+	// The debounce cycle published the pre-failover snapshot (no local
+	// routers), then the chassisredirect change was observed ~400ms ago.
+	preFailover := c.state.Snapshot()
+	preFailover.LocalRouters = nil
+	preFailover.HasLocalRouters = false
+	preFailover.Gen = c.refreshSeq.Add(1)
+	c.state.Replace(preFailover)
+	c.failoverObserved.Store(&failoverObservation{
+		at:  time.Now().Add(-400 * time.Millisecond),
+		gen: c.refreshSeq.Load(),
+	})
+
+	// The reconcile armed by the debounce cycle: it still holds the stale
+	// snapshot, so it announces nothing and records nothing.
+	a.reconcile(context.Background(), triggerEvent)
+	if count, _ := failoverAnnounceSample(t, m); count != 0 {
+		t.Fatalf("failover_announce_seconds count after the stale cycle = %d, want 0", count)
+	}
+
+	// The immediate refresh publishes the post-failover snapshot; the
+	// reconcile it triggers is the one that announces the takeover routes and
+	// must find the observation still pending.
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	postFailover := c.state.Snapshot()
+	postFailover.LocalRouters = []LocalRouterInfo{{
+		RouterName:  "router1",
+		LRPName:     "lrp-abc",
+		LRPMAC:      "aa:aa:aa:aa:aa:aa",
+		LRPNetworks: []string{"198.51.100.0/24"},
+	}}
+	postFailover.HasLocalRouters = true
+	postFailover.DiscoveredNetworks = []*net.IPNet{cidr}
+	postFailover.Gen = c.refreshSeq.Add(1)
+	c.state.Replace(postFailover)
+
+	a.reconcile(context.Background(), triggerEvent)
+	count, sum := failoverAnnounceSample(t, m)
+	if count != 1 {
+		t.Fatalf("failover_announce_seconds count after the takeover = %d, want 1 — "+
+			"the stale cycle consumed the observation the announcing cycle needed", count)
+	}
+	// The sample must span from the observation, not from the takeover
+	// reconcile: a stamp re-taken later would record a near-zero latency.
+	if sum < 0.4 || sum > 2.0 {
+		t.Errorf("failover_announce_seconds sum = %v, want ~0.4 (the observed→announce interval)", sum)
+	}
+}
+
+// TestReconcileSkipsFailoverMetricOnStartup verifies that the startup
+// reconcile never records a failover-announce sample, even though it adds
+// FRR routes — startup is not a failover.
+func TestReconcileSkipsFailoverMetricOnStartup(t *testing.T) {
+	m := withTestMetrics(t)
+	a, c := takeoverAgent(t)
+	observeFailoverAt(t, c, time.Now())
+
+	a.reconcile(context.Background(), triggerStartup)
+	if count, _ := failoverAnnounceSample(t, m); count != 0 {
+		t.Errorf("failover_announce_seconds count after startup = %d, want 0", count)
+	}
+	// The startup cycle still consumes the timestamp so it cannot leak.
+	if !c.takeFailoverObservedAt(c.GetState().Gen).IsZero() {
+		t.Error("startup reconcile must consume the failover timestamp")
+	}
+}
+
+// TestEnsureRoutesRemovalOnlyIsNotAnnounce verifies that a cycle which only
+// withdraws routes reports changed (so verification still runs) but not
+// announced: withdrawing a /32 attracts no traffic, so it is not a takeover
+// announce and must not feed the failover-latency metric.
+func TestEnsureRoutesRemovalOnlyIsNotAnnounce(t *testing.T) {
+	rec := newVtyshRecorder()
+	// FRR still carries a /32 that is no longer desired.
+	rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "203.0.113.5"), nil)
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
+	a := &Agent{
+		cfg:            Config{},
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	// Disjoint desired set: the stale /32 is withdrawn, nothing is added.
+	res := a.ensureRoutes(nil, nil, nil)
+	if !res.changed {
+		t.Errorf("changed = false, want true — the stale /32 was withdrawn")
+	}
+	if res.announced {
+		t.Errorf("announced = true, want false — a withdrawal is not an announce")
+	}
+}
+
+// TestEnsureRoutesAnnounceReportsOutcomeNotIntent verifies that an announce
+// which failed is not reported as one that happened. The FRR route-add and the
+// BGP soft-refresh both only log their error and let the cycle continue, so
+// deriving announced from the intent to run them — the list of routes to add —
+// claims a successful announce whenever either silently failed.
+//
+// The failure is correlated with the event under measurement: the takeover
+// chassis is under stress precisely because of whatever moved the gateway to
+// it, and an unavailable or restarting vtysh fails both calls. The histogram
+// would then record a fast, healthy failover and keep the p95 alert green
+// while zero FIPs are advertised and every FIP on the router is unreachable
+// from outside — the alert is worth less than none at all.
+func TestEnsureRoutesAnnounceReportsOutcomeNotIntent(t *testing.T) {
+	tests := []struct {
+		name   string
+		failOn string // substring of the vtysh args that must fail
+	}{
+		{"route-add fails", "ip route 198.51.100.7/32"},
+		{"soft-refresh fails", "clear ip bgp"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rm := &RouteManager{
+				cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"},
+				execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+					if strings.Contains(strings.Join(cmd.Args, " "), tc.failOn) {
+						return []byte("vtysh: failed to connect to zebra"), errors.New("exit status 1")
+					}
+					return nil, nil
+				},
+			}
+			// Port-forward-only keeps ensureRoutes off the kernel-route path,
+			// so the cycle under test is exactly the FRR add plus the
+			// soft-refresh on every platform. The empty route listing above
+			// makes the desired /32 missing, so the add is attempted.
+			a := &Agent{
+				cfg:            Config{PortForwardOnly: true},
+				routing:        rm,
+				reconcileCh:    make(chan struct{}, 1),
+				missingChassis: make(map[string]time.Time),
+			}
+
+			res := a.ensureRoutes([]string{"198.51.100.7"}, nil, nil)
+			if !res.changed {
+				t.Error("changed = false, want true — the cycle still touched FRR, so verification must run")
+			}
+			if res.announced {
+				t.Error("announced = true after the announce failed: the failover histogram " +
+					"would record a fast, healthy takeover while nothing is advertised")
+			}
+		})
+	}
+}
+
+// TestReconcileSkipsFailoverMetricWithoutAnnounce verifies that a reconcile
+// which changes routes but announces nothing records no failover sample, even
+// with a chassisredirect observation pending. Only an announce ends a
+// failover, so timing a withdrawal-only cycle would report a bogus latency.
+func TestReconcileSkipsFailoverMetricWithoutAnnounce(t *testing.T) {
+	m := withTestMetrics(t)
+
+	rec := newVtyshRecorder()
+	// The desired /32 (198.51.100.0, from the router's LRP network) is
+	// already in FRR, so nothing is added and the cycle cannot announce.
+	// 198.51.100.77 falls inside the discovered /24 — it is managed, no
+	// longer desired, and therefore withdrawn: changed, but not announced.
+	rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.0", "198.51.100.77"), nil)
+	rm := &RouteManager{
+		cfg:           Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"},
+		execVtyshHook: rec.hook(),
+		execOVSHook:   newOVSRecorder().hook(),
+	}
+
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{{
+			RouterName:  "router1",
+			LRPName:     "lrp-abc",
+			LRPMAC:      "aa:aa:aa:aa:aa:aa",
+			LRPNetworks: []string{"198.51.100.0/24"},
+		}},
+		HasLocalRouters:    true,
+		DiscoveredNetworks: []*net.IPNet{cidr},
+	})
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	observeFailoverAt(t, c, time.Now().Add(-400*time.Millisecond))
+
+	a.reconcile(context.Background(), triggerEvent)
+	if count, _ := failoverAnnounceSample(t, m); count != 0 {
+		t.Errorf("failover_announce_seconds count after a withdrawal-only cycle = %d, want 0", count)
 	}
 }
 
