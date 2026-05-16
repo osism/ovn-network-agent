@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -201,6 +201,15 @@ e2e-baseline:
 # tearing the lab down.
 e2e-failover:
 	$(E2E_FAILOVER)
+
+# Run the HA failover scenario with the strict outage-budget assertion
+# (issue #131): a 0.1s-spaced ping flood from client-1 is captured with
+# tcpdump across the re-election, and the largest reply gap must stay
+# within LOSS_BUDGET seconds (default 2). Mirrors the failover-strict
+# leg of the CI failover job; runs the same failover.sh, only with the
+# strict variant on.
+e2e-failover-strict:
+	LOSS_BUDGET=2 $(E2E_FAILOVER)
 
 # Run the same-chassis hairpin scenario (issue #108) against a lab
 # that is already up. Adds a second FIP backend (ls0-vm2 / 192.0.2.12)

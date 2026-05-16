@@ -33,6 +33,16 @@
 # shutdown via the SIGTERM handler, so re-election needs the process
 # to actually exit.
 #
+# Strict variant (issue #131): when LOSS_BUDGET is set, the scenario
+# additionally measures the data-plane outage. A 0.1s-spaced `ping`
+# flood from CLIENT is captured with `tcpdump` on its eth1 across the
+# re-election; the failover outage is the largest gap between
+# consecutive ICMP echo replies and must stay within LOSS_BUDGET
+# seconds. The pcap is written to ARTIFACTS_DIR for triage. The
+# loss-measurement pattern follows issue #113 (`ping -i 0.1` +
+# `tcpdump`). With LOSS_BUDGET unset the scenario behaves exactly as
+# before.
+#
 # Pre-condition: the lab is up. When SANITY_GATE=1 (default) this
 # scenario runs `baseline.sh` first so a broken green path is reported
 # as a baseline regression instead of being attributed to failover.
@@ -57,6 +67,11 @@
 #   PING_COUNT         packets for the final reachability check (default 5)
 #   PING_TIMEOUT       per-packet wait, passed to ping -W (default 2)
 #   SANITY_GATE        run baseline.sh first when 1 (default 1)
+#   LOSS_BUDGET        when set, run the strict variant and fail if the
+#                      failover outage exceeds this many seconds
+#                      (issue #131; default unset = strict variant off)
+#   PROBE_INTERVAL     ping spacing for the strict-variant flood (default 0.1)
+#   ARTIFACTS_DIR      when set, the strict-variant pcap is saved here
 
 set -euo pipefail
 
@@ -73,6 +88,9 @@ FAILBACK_TIMEOUT="${FAILBACK_TIMEOUT:-60}"
 PING_COUNT="${PING_COUNT:-5}"
 PING_TIMEOUT="${PING_TIMEOUT:-2}"
 SANITY_GATE="${SANITY_GATE:-1}"
+LOSS_BUDGET="${LOSS_BUDGET:-}"
+PROBE_INTERVAL="${PROBE_INTERVAL:-0.1}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
 
 SCENARIOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASELINE="${BASELINE:-${SCENARIOS_DIR}/baseline.sh}"
@@ -201,6 +219,84 @@ probe() {
     docker exec "${CLIENT}" ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" "${FIP}"
 }
 
+# Strict variant: drive the failover while a fine-grained ping flood
+# from CLIENT is captured with tcpdump on its eth1. The failover outage
+# is the largest gap between consecutive ICMP echo replies; the variant
+# fails when that exceeds LOSS_BUDGET seconds. tcpdump runs with -U so
+# the pcap is consistent on disk even if the capture is not stopped
+# cleanly. Returns non-zero on a budget breach so main() can fail the
+# scenario after still confirming the control-plane migration.
+measured_failover() {
+    local pcap="/tmp/failover-strict.pcap"
+    local window=$(( FAILOVER_TIMEOUT + 10 ))
+    # Seconds of flood before the re-election and after recovery. The
+    # capture must cover both, so min_span below is derived from them.
+    local baseline_secs=2 post_secs=3
+
+    log "strict mode: capturing ICMP on ${CLIENT}:eth1, loss budget ${LOSS_BUDGET}s"
+    docker exec -d "${CLIENT}" \
+        timeout "$(( window + 5 ))" tcpdump -i eth1 -n -U -w "${pcap}" icmp
+    sleep 1  # let tcpdump open the capture before traffic starts
+
+    # Steady ping flood spanning the whole failover window: one packet every
+    # PROBE_INTERVAL for `window` seconds. -c bounds it so it self-terminates
+    # even if the pkill below is missed. Derive the count from
+    # PROBE_INTERVAL rather than hardcoding its default reciprocal, so
+    # overriding the knob during triage still bounds the flood to the window
+    # instead of letting the ping outlive the capture.
+    local count
+    count=$(awk -v w="${window}" -v i="${PROBE_INTERVAL}" 'BEGIN { printf "%d", w / i }')
+    docker exec -d "${CLIENT}" \
+        ping -n -i "${PROBE_INTERVAL}" -c "${count}" "${FIP}"
+    sleep "${baseline_secs}"  # baseline traffic before the re-election
+
+    stop_controller_on_master
+    wait_for_recovery
+    sleep "${post_secs}"  # capture a few post-recovery replies
+
+    docker exec "${CLIENT}" pkill -INT tcpdump   >/dev/null 2>&1 || true
+    docker exec "${CLIENT}" pkill -f 'ping -n -i' >/dev/null 2>&1 || true
+    sleep 1  # let tcpdump flush and exit
+
+    if [ -n "${ARTIFACTS_DIR}" ]; then
+        mkdir -p "${ARTIFACTS_DIR}"
+        docker cp "${CLIENT}:${pcap}" "${ARTIFACTS_DIR}/failover-strict.pcap" \
+            >/dev/null 2>&1 || log "could not copy pcap into ${ARTIFACTS_DIR}"
+    fi
+
+    # The largest gap between consecutive echo replies is the outage; the
+    # span from the first to the last reply is how much of the failover the
+    # capture actually witnessed.
+    local stats outage replies span
+    stats=$(docker exec "${CLIENT}" \
+        tcpdump -tt -n -r "${pcap}" 'icmp[icmptype] = icmp-echoreply' 2>/dev/null \
+        | awk '{ n++; if (prev == "") first = $1; else { g = $1 - prev; if (g > max) max = g } prev = $1 }
+               END { printf "%.2f %d %.2f", max + 0, n + 0, (n ? prev - first : 0) }')
+    read -r outage replies span <<<"${stats}"
+    log "captured ${replies} echo replies spanning ${span}s; largest reply gap ${outage}s (budget ${LOSS_BUDGET}s)"
+
+    # The capture must cover the baseline, the re-election and the
+    # post-recovery replies. A reply-count floor cannot express this: the
+    # baseline alone yields baseline_secs/PROBE_INTERVAL replies (~20 at the
+    # defaults), so a flood that died at the failover still clears any small
+    # floor while its largest gap is one probe interval — the budget check
+    # then passes without the re-election ever being observed. A count floor
+    # scaled to the window would be wrong in the other direction: the flood
+    # is killed once wait_for_recovery returns, so it normally runs for far
+    # less than the window it is bounded by.
+    local min_span=$(( baseline_secs + post_secs ))
+    if awk -v s="${span}" -v m="${min_span}" 'BEGIN { exit !(s < m) }'; then
+        log "ERROR: echo replies span only ${span}s, expected >= ${min_span}s — the flood or capture died before the failover completed"
+        return 1
+    fi
+    if awk -v o="${outage}" -v b="${LOSS_BUDGET}" 'BEGIN { exit !(o > b) }'; then
+        log "ERROR: failover outage ${outage}s exceeds the ${LOSS_BUDGET}s budget"
+        return 1
+    fi
+    log "failover outage ${outage}s within the ${LOSS_BUDGET}s budget"
+    return 0
+}
+
 main() {
     sanity_gate
 
@@ -212,9 +308,16 @@ main() {
     fi
 
     trap restore_master EXIT
-    stop_controller_on_master
 
-    wait_for_recovery
+    # The strict variant measures the data-plane outage across the
+    # re-election; the default variant just polls for recovery.
+    local strict_rc=0
+    if [ -n "${LOSS_BUDGET}" ]; then
+        measured_failover || strict_rc=1
+    else
+        stop_controller_on_master
+        wait_for_recovery
+    fi
 
     # Guard against a false pass: a probe that succeeds because OVS on
     # MASTER kept executing stale flows after ovn-controller died is
@@ -228,7 +331,8 @@ main() {
         return 1
     fi
 
-    probe
+    probe || return 1
+    return "${strict_rc}"
 }
 
 main "$@"
