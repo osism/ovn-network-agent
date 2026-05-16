@@ -49,6 +49,15 @@ type Agent struct {
 // chassis grace period to prevent thundering-herd cleanup across agents.
 const maxStaleCleanupJitter = 30 * time.Second
 
+// Reconcile trigger labels. These are the "trigger" metric label and, for
+// triggerStartup, gate the failover-announce metric — so the call sites and
+// the guard must stay in sync by reference rather than by matching literals.
+const (
+	triggerStartup  = "startup"
+	triggerEvent    = "event"
+	triggerPeriodic = "periodic"
+)
+
 // ovnConnectRetryInterval is how long Run waits between failed OVN connect
 // attempts. The agent is a long-running daemon: when its OVN endpoint is
 // unreachable on cold start, the right behaviour is to keep retrying rather
@@ -163,7 +172,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// Initial reconciliation
-	a.reconcile(ctx, "startup")
+	a.reconcile(ctx, triggerStartup)
 
 	// Drain any reconcile signals queued during startup — the initial
 	// reconcile already handled the current state.
@@ -230,11 +239,11 @@ func (a *Agent) Run(ctx context.Context) error {
 
 		case <-a.reconcileCh:
 			slog.Debug("event-triggered reconciliation")
-			a.reconcile(ctx, "event")
+			a.reconcile(ctx, triggerEvent)
 
 		case <-ticker.C:
 			slog.Debug("periodic reconciliation")
-			a.reconcile(ctx, "periodic")
+			a.reconcile(ctx, triggerPeriodic)
 		}
 	}
 }
@@ -257,8 +266,16 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// OVNState (no local routers, no SNAT IPs, no discovered networks)
 	// drives the rest of the cycle through the port-forward-only path.
 	var state OVNState
+	// failoverObservedAt is the time a chassisredirect change was last seen
+	// in the immediate-refresh path. It is consumed against this cycle's own
+	// snapshot: a cycle whose state predates the change leaves the
+	// observation for the reconcile that actually announces the takeover,
+	// and a cycle that does reflect it consumes it either way, so a stale
+	// observation cannot leak into a later, unrelated announce.
+	var failoverObservedAt time.Time
 	if a.ovn != nil {
 		state = a.ovn.GetState()
+		failoverObservedAt = a.ovn.takeFailoverObservedAt(state.Gen)
 	}
 
 	// Compute effective network filters for this cycle.
@@ -291,6 +308,12 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		slog.Debug("desired IP list", "ips", desiredIPs)
 	}
 
+	// The reachability-critical OVN/OVS setup runs before the BGP announce
+	// so a failover takeover reconcile starts attracting traffic as early as
+	// possible. The stability steps (priority lead, veth-leak, route
+	// verification, stale-chassis cleanup) are deferred to after the
+	// announce — see issue #131. The prefix-list stays on the critical path:
+	// it is the BGP outbound filter, so the announce is a no-op without it.
 	switch {
 	case a.cfg.PortForwardOnly:
 		// Port-forward-only mode: no OVN state to act on. OVS flows,
@@ -316,6 +339,8 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		// routers, each pointing at the MAC of its own segment's kernel
 		// interface. When the segment bindings are not (yet) resolved,
 		// fall back to the bridge MAC — the flat single-network value.
+		// Reply traffic needs the NB default route, so this stays on the
+		// reachability-critical path before the announce.
 		macByLRP := make(map[string]string, len(state.LocalRouters))
 		fallbackMAC := ""
 		for _, lr := range state.LocalRouters {
@@ -334,18 +359,13 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 			slog.Error("failed to ensure gateway routing", "error", err)
 		}
 
-		// Ensure the active chassis has a strictly higher priority than
-		// standby peers, preventing reverse failover after drain/restore.
-		if err := a.ovn.EnsureActivePriorityLead(ctx, state.LocalRouters, state.LocalChassisName); err != nil {
-			slog.Error("failed to ensure active priority lead", "error", err)
-		}
-
-		// Reconcile per-network veth leak routes and policy rules.
-		if err := a.routing.ReconcileVethLeakNetworks(a.effectiveFilters); err != nil {
-			slog.Error("failed to reconcile veth leak networks", "error", err)
-		}
-
-		// Reconcile FRR prefix-list entries for discovered networks.
+		// Reconcile FRR prefix-list entries for discovered networks. The
+		// prefix-list is the BGP outbound filter (neighbor ... prefix-list
+		// ... out) and it is what permits the FIP /32s, so the announce
+		// below advertises nothing until it is populated. A standby chassis
+		// empties it via the default: branch, so on a takeover this must run
+		// BEFORE the announce — it is reachability-critical, not a stability
+		// step.
 		if err := a.routing.ReconcileFRRPrefixList(a.effectiveFilters); err != nil {
 			slog.Error("failed to reconcile FRR prefix-list", "error", err)
 		}
@@ -393,26 +413,59 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		ipDev[ip] = a.routing.SegmentDev(target.Segment)
 	}
 
-	// Ensure routes for all desired IPs (FIPs, SNATs, and port forward VIPs).
-	// When no local routers are present but port forwards are configured,
-	// this still installs VIP routes on br-ex and in FRR.
-	announced := false
+	// The BGP announce. Ensure routes for all desired IPs (FIPs, SNATs, and
+	// port forward VIPs). When no local routers are present but port
+	// forwards are configured, this still installs VIP routes on br-ex and
+	// in FRR.
+	var routeSync routeSyncResult
 	if len(desiredIPs) > 0 || state.HasLocalRouters {
-		announced = a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
+		routeSync = a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
 	} else {
 		a.removeAllRoutes("no locally active routers and no port forward VIPs")
+	}
+
+	// Failover-latency metric: time from observing the chassisredirect
+	// change to completing the BGP announce of the takeover routes.
+	// Recorded only on a takeover reconcile (FRR routes were added and BGP
+	// refreshed) and never for the startup cycle. Recorded before the NB
+	// writes below so their latency does not inflate the sample.
+	if routeSync.announced && !failoverObservedAt.IsZero() && trigger != triggerStartup {
+		recordFailoverAnnounce(time.Since(failoverObservedAt))
 	}
 
 	// On a node that owns local routers, stamp the takeover readiness marker on
 	// each managed default route once the announce succeeded. A draining peer
 	// polls NB for this marker before it releases its own FIP routes, so it
 	// must only be written when this node can actually forward (ensureRoutes
-	// returns true only after RefreshBGP succeeded). HasLocalRouters is false in
-	// port-forward-only mode (a.ovn is nil), so this is skipped there.
-	if announced && state.HasLocalRouters {
+	// reports ready only when no route add or BGP refresh failed).
+	// HasLocalRouters is false in port-forward-only mode (a.ovn is nil), so
+	// this is skipped there.
+	if routeSync.ready && state.HasLocalRouters {
 		if err := a.ovn.MarkTakeoverReady(ctx, state.LocalRouters); err != nil {
 			slog.Error("failed to write takeover readiness marker", "error", err)
 		}
+	}
+
+	// Stability steps — deferred to after the announce so the FRR/BGP
+	// announce on a failover takeover is not gated behind them.
+	if state.HasLocalRouters {
+		// Ensure the active chassis has a strictly higher priority than
+		// standby peers, preventing reverse failover after drain/restore.
+		if err := a.ovn.EnsureActivePriorityLead(ctx, state.LocalRouters, state.LocalChassisName); err != nil {
+			slog.Error("failed to ensure active priority lead", "error", err)
+		}
+
+		// Reconcile per-network veth leak routes and policy rules.
+		if err := a.routing.ReconcileVethLeakNetworks(a.effectiveFilters); err != nil {
+			slog.Error("failed to reconcile veth leak networks", "error", err)
+		}
+	}
+
+	// Post-change route verification: re-add any desired route that
+	// disappeared during the mutation. Runs after the announce and only
+	// when routes actually changed, matching the pre-#131 trigger.
+	if routeSync.changed {
+		a.verifyRoutes(desiredIPs, ipDev, skipKernelRoute)
 	}
 
 	// Surface desired routes that are configured in FRR but not actually
@@ -540,20 +593,42 @@ func (a *Agent) desiredRouteDev(ip string, ipDev map[string]string) string {
 	return a.cfg.BridgeDev
 }
 
+// routeSyncResult reports what ensureRoutes changed so the caller can run
+// the post-announce route verification, record the failover-latency metric,
+// and decide whether to write the takeover readiness marker.
+type routeSyncResult struct {
+	// changed is true when FRR routes were added or removed — the trigger
+	// for the post-change route verification.
+	changed bool
+	// announced is true when FRR routes were added AND both the route-add
+	// and the BGP outbound soft-refresh succeeded — i.e. this cycle really
+	// did advertise takeover routes. Both operations only log their errors
+	// and continue, so this must reflect their outcome and not merely the
+	// intent to run them: a takeover chassis whose vtysh is unavailable
+	// (a failure correlated with the event that triggered the failover)
+	// advertises nothing, and reporting that as a fast, healthy announce
+	// would leave the latency histogram green while every FIP is unreachable.
+	announced bool
+	// ready is true unless a kernel-route add, an FRR add, or the BGP
+	// soft-refresh failed. Unlike announced it is also true for a
+	// steady-state cycle with nothing to change. The drain takeover
+	// handshake uses it so a node that attracted BGP traffic it cannot yet
+	// deliver never signals readiness to a draining peer, while a marker
+	// missed in one cycle self-heals on the next.
+	ready bool
+}
+
 // ensureRoutes adds routes for all desired IPs and removes stale ones.
 // ipDev names the kernel interface each IP's route belongs on; kernel routes
 // are reconciled as (IP, device) pairs so a route that sits on the wrong
 // segment interface is replaced. IPs in skipKernelRoute keep their existing
 // kernel route untouched — their VLAN segment did not resolve this cycle, so
 // moving the /32 to the bridge fallback would mis-deliver the traffic.
-// ensureRoutes returns whether this node successfully announced the desired
-// routes: true unless a kernel-route add, an FRR add, or the BGP soft-refresh
-// failed. The drain takeover handshake uses it so a node that attracted BGP
-// traffic it cannot yet deliver never signals readiness to a draining peer. A
-// steady-state cycle with nothing to change returns true, so a marker missed
-// in one cycle self-heals on the next.
-func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) bool {
-	announced := true
+// It returns what changed so the caller can run the post-announce route
+// verification, record the failover-latency metric, and decide whether to
+// write the takeover readiness marker.
+func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) routeSyncResult {
+	kernelOK := true
 	desiredSet := make(map[string]bool, len(desiredIPs))
 	for _, ip := range desiredIPs {
 		desiredSet[ip] = true
@@ -612,7 +687,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 		if needsKernel {
 			if err := a.routing.AddKernelRoute(ip, dev); err != nil {
 				slog.Error("failed to add kernel route", "ip", ip, "dev", dev, "error", err)
-				announced = false
+				kernelOK = false
 			}
 		}
 		if needsFRR {
@@ -621,10 +696,11 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	}
 
 	// Batch-add all missing FRR routes in one vtysh call.
+	addOK := true
 	if len(addFRR) > 0 {
 		if err := a.routing.AddFRRRoutes(addFRR); err != nil {
 			slog.Error("failed to batch-add FRR routes", "count", len(addFRR), "ips", addFRR, "error", err)
-			announced = false
+			addOK = false
 		}
 	}
 
@@ -680,21 +756,25 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	// only re-evaluates outbound policy and re-sends; it never withdraws
 	// a route, so re-announcing the existing set alongside the new ones
 	// is harmless.
+	//
+	// This MUST stay a separate vtysh invocation from AddFRRRoutes above:
+	// bundling the route-add and the soft-refresh into one vtysh process
+	// makes "clear ... soft out" race the static→zebra→BGP redistribution,
+	// so the freshly added /32s miss the immediate re-advertise and only
+	// go out on FRR's slower redistribution timing.
+	refreshOK := true
 	if len(addFRR) > 0 || len(delFRR) > 0 {
 		if err := a.routing.RefreshBGP(); err != nil {
 			slog.Warn("BGP soft-refresh failed, peers may wait for MRAI timer", "error", err)
-			announced = false
+			refreshOK = false
 		}
 	}
 
-	// Safety net: after any route changes, verify that all desired routes
-	// are still present. A BGP soft-refresh re-evaluates outbound policy
-	// and could (in edge cases) interact with FRR in unexpected ways.
-	if len(addFRR) > 0 || len(delFRR) > 0 {
-		a.verifyRoutes(desiredIPs, ipDev, skipKernelRoute)
+	return routeSyncResult{
+		changed:   len(addFRR) > 0 || len(delFRR) > 0,
+		announced: len(addFRR) > 0 && addOK && refreshOK,
+		ready:     kernelOK && addOK && refreshOK,
 	}
-
-	return announced
 }
 
 // removeAllRoutes removes every agent-owned FIP route. Ownership is scoped by
