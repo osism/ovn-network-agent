@@ -86,14 +86,30 @@ jobs:
         run: make e2e-down
 
   failover:
-    name: HA failover (master chassis loss)
+    name: HA failover (${{ matrix.variant }})
     runs-on: ubuntu-latest
     # Runs after the baseline job, but on its own runner so a failover
     # regression is reported in isolation from the baseline path. Same
-    # 15-minute budget — the scenario only adds ~30s of failover wait
-    # on top of the baseline gate.
+    # 15-minute budget — the default leg only adds ~30s of failover
+    # wait on top of the baseline gate, the strict leg the ~40s
+    # ping-flood window of issue #131.
     needs: baseline
     timeout-minutes: 15
+
+    # The strict leg is the same scenario with LOSS_BUDGET set, so it
+    # is a matrix leg rather than a copy of this job. fail-fast is off
+    # so a strict-budget breach still lets the plain re-election leg
+    # report its own result.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: failover
+            variant: "master chassis loss"
+            loss_budget: ""
+          - id: failover-strict
+            variant: "strict ~2s outage budget"
+            loss_budget: "2"
 
     env:
       E2E_TOPOLOGY: test/e2e/topology.clab.yml
@@ -109,6 +125,17 @@ jobs:
         run: make e2e-up
 
       - name: Run failover scenario
+        # LOSS_BUDGET switches failover.sh into the strict variant: a
+        # 0.1s-spaced ping flood from client-1 is captured with tcpdump
+        # across the re-election and the largest reply gap must stay
+        # within the budget (issue #131). Empty selects the default
+        # variant. The pcap is directed into the shared artifact root
+        # so collect-artifacts.sh and the uploader both pick it up.
+        # `runner.temp` is only available at step scope, not the
+        # job-level env block.
+        env:
+          LOSS_BUDGET: ${{ matrix.loss_budget }}
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/${{ matrix.id }}
         run: ./test/e2e/scenarios/failover.sh
 
       - name: Collect failure artifacts
@@ -120,7 +147,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: e2e-artifacts-failover-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-artifacts-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-artifacts
           if-no-files-found: warn
           retention-days: 7

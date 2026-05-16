@@ -234,6 +234,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of six agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, no gateway port is claimed twice, and the lab converges to its config-aware expected state in settle windows. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177), [#179](https://github.com/osism/ovn-network-agent/issues/179) |
 | [Drain-hitless](#drain-hitless) | `e2e-drain-hitless` | A graceful `SIGTERM` drain loses fewer packets than a hard `docker kill` of the same chassis. | [#113](https://github.com/osism/ovn-network-agent/issues/113) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
+| [Failover (strict)](#failover) | `e2e-failover-strict` | The data-plane outage across the re-election stays within a ~2s budget. | [#131](https://github.com/osism/ovn-network-agent/issues/131) |
 | [Hairpin](#hairpin) | `e2e-hairpin` | The `cookie=0x998` hairpin flow reflects FIP-to-FIP traffic on `br-ex`. | [#108](https://github.com/osism/ovn-network-agent/issues/108) |
 | [Multi-VLAN](#multi-vlan) | `e2e-multi-vlan` | Two VLAN provider networks on one node get per-segment kernel interfaces, flows, and BGP-announced FIPs. | [#147](https://github.com/osism/ovn-network-agent/issues/147) |
 | [Port-forward (external client)](#port-forward-external-client) | `e2e-pf-external` | Inbound DNAT preserves the external client's source IP. | [#109](https://github.com/osism/ovn-network-agent/issues/109) |
@@ -303,8 +304,21 @@ mechanism under test — re-election of `cr-lr0-public` after the
 priority-30 chassis's claim goes away — is the same either way.
 :::
 
+`make e2e-failover-strict` invokes the same
+[`failover.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/failover.sh)
+with `LOSS_BUDGET=2`, which switches on the strict variant from
+[#131](https://github.com/osism/ovn-network-agent/issues/131). On top
+of the control-plane migration check, it measures the data-plane
+outage: a `ping -i 0.1` flood from `client-1` is captured with
+`tcpdump` on its `eth1` across the re-election, and the largest gap
+between consecutive ICMP echo replies must stay within `LOSS_BUDGET`
+seconds. The pcap is written to `ARTIFACTS_DIR` for triage. With
+`LOSS_BUDGET` unset the script behaves exactly as the plain failover
+scenario.
+
 **Overrides for triage:** `MASTER`, `FIP`, `FAILOVER_TIMEOUT`,
-`FAILBACK_TIMEOUT`, `SANITY_GATE`.
+`FAILBACK_TIMEOUT`, `SANITY_GATE`; the strict variant adds
+`LOSS_BUDGET` and `PROBE_INTERVAL`.
 
 ### Hairpin
 
@@ -1543,8 +1557,17 @@ composite action:
   on failure (`e2e-artifacts-<run id>-<attempt>`), and always tears the
   lab down.
 - **`failover`** (`needs: baseline`) — same shape as baseline, but
-  executes `test/e2e/scenarios/failover.sh`. On failure the artifact
-  bundle is uploaded as `e2e-artifacts-failover-<run id>-<attempt>`.
+  executes `test/e2e/scenarios/failover.sh`. It runs as a two-leg
+  matrix (`fail-fast: false`, so a breach on one leg still lets the
+  other report):
+  - `failover` — the default variant. On failure the artifact bundle
+    is uploaded as `e2e-artifacts-failover-<run id>-<attempt>`.
+  - `failover-strict` — the same scenario with `LOSS_BUDGET=2`, so it
+    fails on an outage above ~2s. The leg points the scenario's
+    `ARTIFACTS_DIR` at the same artifact root so the
+    `failover-strict/...` pcap is bundled with the lab-state dump. On
+    failure the artifact bundle is uploaded as
+    `e2e-artifacts-failover-strict-<run id>-<attempt>`.
 - **`hairpin`** (`needs: baseline`, runs in parallel with `failover`)
   — same shape, but executes `test/e2e/scenarios/hairpin.sh`. The
   job points the scenario's `ARTIFACTS_DIR` at the same artifact
@@ -1600,8 +1623,9 @@ the budgets in issues
 [#45](https://github.com/osism/ovn-network-agent/issues/45),
 [#105](https://github.com/osism/ovn-network-agent/issues/105),
 [#108](https://github.com/osism/ovn-network-agent/issues/108),
-[#109](https://github.com/osism/ovn-network-agent/issues/109), and
-[#111](https://github.com/osism/ovn-network-agent/issues/111).
+[#109](https://github.com/osism/ovn-network-agent/issues/109),
+[#111](https://github.com/osism/ovn-network-agent/issues/111), and
+[#131](https://github.com/osism/ovn-network-agent/issues/131).
 [`drain-hitless`](https://github.com/osism/ovn-network-agent/issues/113)
 is capped at 25: it deploys the lab twice and runs `baseline.sh` twice
 (sanity gate, then the gate on the recycled lab), so its green path is
@@ -1636,6 +1660,7 @@ writes:
   kernel/<gateway>-ip-route.txt    — `ip route show table all`
   agent/<gateway>.log              — copy of the gateway container's stdout
   ovn-controller/<gateway>.log     — gateway `ovn-controller` log (chassis-registration daemon)
+  failover-strict/failover-strict.pcap — client-1 ICMP capture across the re-election (failover-strict only)
   hairpin/hairpin-flows-before.txt — `cookie=0x998` flows on master:br-ex before adding FIP_B (hairpin only)
   hairpin/hairpin-flows-after.txt  — `cookie=0x998` flows on master:br-ex after adding FIP_B (hairpin only)
   pf-external/pf-backend.log       — per-connection source-IP log from the workload-side HTTP responder (pf-external only)
