@@ -35,6 +35,8 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setLocalnetSegments(2)
 	recordRouteReAdds(1, 2)
 	setConsecutiveReAdds(4)
+	setInactiveRoutes(0)
+	recordFailoverAnnounce(750 * time.Millisecond)
 	setOVNConnectionState("nb", true)
 	recordDrain("completed", time.Second)
 	recordStaleChassisCleanup("success", 2)
@@ -59,6 +61,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_route_readds_total",
 		"ovn_network_agent_consecutive_readds",
 		"ovn_network_agent_inactive_routes",
+		"ovn_network_agent_failover_announce_seconds",
 		"ovn_network_agent_ovn_connection_state",
 		"ovn_network_agent_drain_duration_seconds",
 		"ovn_network_agent_drain_total",
@@ -332,6 +335,31 @@ func TestSetInactiveRoutesSetsGauge(t *testing.T) {
 		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 3 {
 			t.Errorf("inactive_routes = %v, want 3", v)
 		}
+	}
+}
+
+func TestRecordFailoverAnnounceObservesHistogram(t *testing.T) {
+	m := withTestMetrics(t)
+	recordFailoverAnnounce(900 * time.Millisecond)
+	recordFailoverAnnounce(1500 * time.Millisecond)
+
+	got, _ := m.registry.Gather()
+	var found bool
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_failover_announce_seconds" {
+			continue
+		}
+		found = true
+		h := mf.GetMetric()[0].GetHistogram()
+		if c := h.GetSampleCount(); c != 2 {
+			t.Errorf("failover_announce_seconds sample count = %d, want 2", c)
+		}
+		if sum := h.GetSampleSum(); sum < 2.39 || sum > 2.41 {
+			t.Errorf("failover_announce_seconds sample sum = %v, want ~2.4", sum)
+		}
+	}
+	if !found {
+		t.Error("failover_announce_seconds histogram missing from registry")
 	}
 }
 

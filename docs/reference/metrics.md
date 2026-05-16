@@ -35,6 +35,7 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_route_readds_total` | counter (vec) | `plane`={`kernel`,`frr`} | Total routes re-added by post-change verification, labelled by route plane. |
 | `ovn_network_agent_consecutive_readds` | gauge | — | Number of consecutive reconcile cycles that required route re-adds. Sustained non-zero indicates persistent route instability. |
 | `ovn_network_agent_inactive_routes` | gauge | — | Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside. |
+| `ovn_network_agent_failover_announce_seconds` | histogram | — | Time from observing a chassisredirect change to completing the BGP announce of the takeover FIP routes, in seconds. Measured on the takeover reconcile. |
 | `ovn_network_agent_ovn_connection_state` | gauge (vec) | `database`={`nb`,`sb`} | 1 when the named OVN database client is connected, 0 otherwise. |
 | `ovn_network_agent_drain_duration_seconds` | histogram | — | Duration of a gateway drain operation in seconds. |
 | `ovn_network_agent_drain_total` | counter (vec) | `outcome`={`completed`,`timeout`,`error`,`noop`} | Total drain operations, labelled by outcome (completed, timeout, error, noop). |
