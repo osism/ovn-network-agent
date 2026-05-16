@@ -37,6 +37,9 @@ type metricsRegistry struct {
 	consecutiveReAdds prometheus.Gauge
 	inactiveRoutes    prometheus.Gauge
 
+	// Failover metrics
+	failoverAnnounceDuration prometheus.Histogram
+
 	// OVN connection state
 	ovnConnectionState *prometheus.GaugeVec
 
@@ -131,6 +134,13 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside.",
 		}),
 
+		failoverAnnounceDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "failover_announce_seconds",
+			Help:      "Time from observing a chassisredirect change to completing the BGP announce of the takeover FIP routes, in seconds. Measured on the takeover reconcile.",
+			Buckets:   []float64{0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5, 10},
+		}),
+
 		ovnConnectionState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "ovn_connection_state",
@@ -174,6 +184,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.routeReAddsTotal,
 		m.consecutiveReAdds,
 		m.inactiveRoutes,
+		m.failoverAnnounceDuration,
 		m.ovnConnectionState,
 		m.drainDuration,
 		m.drainTotal,
@@ -311,6 +322,15 @@ func setInactiveRoutes(n int) {
 		return
 	}
 	metrics.inactiveRoutes.Set(float64(n))
+}
+
+// recordFailoverAnnounce records the time from observing a chassisredirect
+// change to completing the BGP announce of the takeover FIP routes.
+func recordFailoverAnnounce(d time.Duration) {
+	if metrics == nil {
+		return
+	}
+	metrics.failoverAnnounceDuration.Observe(d.Seconds())
 }
 
 func setOVNConnectionState(database string, connected bool) {
