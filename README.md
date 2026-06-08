@@ -48,7 +48,7 @@ workflow.
 
 ## Quick start
 
-Requires Go 1.25+ (see `go.mod` for the exact minimum). Build the binary,
+Requires Go 1.26+ (see `go.mod` for the exact minimum). Build the binary,
 write a minimal config pointing at your OVN cluster, and run it:
 
 ```bash
