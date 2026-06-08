@@ -40,7 +40,7 @@ configures FRR with a `vrf-provider`. See the
 
 ## Step 1 — Build the binary
 
-Requires Go 1.25+ (see `go.mod` for the exact minimum).
+Requires Go 1.26+ (see `go.mod` for the exact minimum).
 
 ```bash
 # Standard build (linux)

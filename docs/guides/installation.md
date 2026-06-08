@@ -62,7 +62,7 @@ sudo systemctl enable --now ovn-network-agent
 
 ## From source
 
-Requires Go 1.25+ (see `go.mod` for the exact minimum).
+Requires Go 1.26+ (see `go.mod` for the exact minimum).
 
 ```bash
 make build-static

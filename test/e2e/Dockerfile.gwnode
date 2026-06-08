@@ -12,7 +12,7 @@
 # multi-arch publication, use buildx with --platform=linux/amd64,linux/arm64;
 # the Go build stage honours TARGETARCH set by BuildKit.
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 ARG UBUNTU_VERSION=24.04
 
 # ---------------------------------------------------------------------------
