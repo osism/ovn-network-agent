@@ -212,8 +212,14 @@ make e2e-baseline
 
 [`baseline.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/baseline.sh)
 pings the FIP `192.0.2.10` from `clab-ovn-e2e-client-1` and waits up to
-30 s for the agent's reconcile loop to install the routes. The
-scenario's exit code mirrors `ping`'s — any packet loss fails the run.
+`RECONCILE_TIMEOUT` (default 60 s) for the agent's reconcile loop to
+install the routes. The scenario's exit code mirrors `ping`'s — any
+packet loss fails the run. The window was raised from the 30 s
+originally measured on a warm local Docker host because cold CI runners
+regularly need longer for the full data path (OVN BFD/geneve tunnels,
+the `cr-lr0-public` HA election, the agent's FRR FIP routes and BGP
+propagation) to converge — a too-tight window made this gate flaky in
+every scenario that runs it as a sanity pre-check.
 
 **Overrides for triage:** `FIP`, `RECONCILE_TIMEOUT`, `PING_COUNT`,
 `PING_TIMEOUT`.
@@ -280,7 +286,7 @@ The scenario:
    a `vm2` netns + veth on `gateway-3`, so the new FIP has a real
    responder.
 3. Polls `gateway-1` for the new hairpin flow on `br-ex` (default
-   `RECONCILE_TIMEOUT=30s`) and asserts that **both** FIPs carry a
+   `RECONCILE_TIMEOUT=60s`) and asserts that **both** FIPs carry a
    `cookie=0x998` flow with `actions=output:in_port` — matching the
    issue's acceptance criterion of "at least one matching rule per FIP
    on the chassis".
@@ -434,7 +440,7 @@ agent's config:
 2. **Phase 2 (positive).** The scenario rewrites the config with
    `hairpin_masquerade: true`, restarts the gateway again, waits for
    the chassis re-bind and DNAT rule, then polls the same probe for up
-   to `RECONCILE_TIMEOUT` (default 30 s). The probe **must** complete,
+   to `RECONCILE_TIMEOUT` (default 60 s). The probe **must** complete,
    and `nft list table ip ovn-network-agent` on `gateway-1` **must**
    carry a `ct original daddr 198.51.100.50 ... masquerade` rule. Both
    the `phase1-off` and `phase2-on` nft snapshots are written to
