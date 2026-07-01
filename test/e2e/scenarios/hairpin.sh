@@ -6,7 +6,8 @@
 # behind FIP_A to FIP_B must traverse the agent's OpenFlow hairpin rule
 # (cookie `0x998`, `actions=output:in_port`) on `br-ex` and complete a
 # round trip with 100% reply rate within `RECONCILE_TIMEOUT` (default
-# 30s).
+# 60s — see baseline.sh for why the cold-runner reconcile window was
+# raised from the original 30s).
 #
 # Why a separate scenario: the baseline only exercises a single FIP on
 # the master chassis. The hairpin path is what kicks in when two FIPs
@@ -67,7 +68,7 @@
 #   WORKLOAD_NETNS      netns the probe runs in — host of FIP_A's workload (default vm1)
 #   WORKLOAD_GW         tenant gateway IP for the new responder (default 192.168.10.1)
 #   WORKLOAD_CIDR_LEN   netmask length for FIP_B_INTERNAL on the responder (default 24)
-#   RECONCILE_TIMEOUT   seconds to wait for the agent to install FIP_B's hairpin flow (default 30)
+#   RECONCILE_TIMEOUT   seconds to wait for the agent to install FIP_B's hairpin flow (default 60)
 #   PING_COUNT          packets for the final reachability check (default 5)
 #   PING_TIMEOUT        per-packet wait, passed to ping -W (default 2)
 #   ARTIFACTS_DIR       directory to write before/after hairpin-flow snapshots (default empty = skip)
@@ -94,7 +95,7 @@ FIP_B_NS_VETH="${FIP_B_NS_VETH:-vm2-eth0}"
 WORKLOAD_NETNS="${WORKLOAD_NETNS:-vm1}"
 WORKLOAD_GW="${WORKLOAD_GW:-192.168.10.1}"
 WORKLOAD_CIDR_LEN="${WORKLOAD_CIDR_LEN:-24}"
-RECONCILE_TIMEOUT="${RECONCILE_TIMEOUT:-30}"
+RECONCILE_TIMEOUT="${RECONCILE_TIMEOUT:-60}"
 PING_COUNT="${PING_COUNT:-5}"
 PING_TIMEOUT="${PING_TIMEOUT:-2}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"

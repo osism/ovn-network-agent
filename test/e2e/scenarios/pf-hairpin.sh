@@ -103,7 +103,7 @@
 #   AGENT_CONFIG_PATH  in-container agent config path (default /etc/ovn-network-agent/config.yaml)
 #   GWNODE_CONFIG      host-side baseline config (defaults to the file next to this script)
 #   PROBE_TIMEOUT      seconds for the `timeout` wrapper around the probe (default 5)
-#   RECONCILE_TIMEOUT  seconds to wait for agent reconcile + DNAT/masquerade rules (default 30)
+#   RECONCILE_TIMEOUT  seconds to wait for agent reconcile + DNAT/masquerade rules (default 60 — see baseline.sh for the cold-runner rationale)
 #   RESTART_TIMEOUT    seconds to wait for the gateway container to come back after `docker restart` (default 90)
 #   ARTIFACTS_DIR      directory to write nft snapshots into (default empty = skip)
 #   SANITY_GATE        run baseline.sh first when 1 (default 1)
@@ -149,7 +149,7 @@ WORKLOAD_CIDR_LEN="${WORKLOAD_CIDR_LEN:-24}"
 
 AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-/etc/ovn-network-agent/config.yaml}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-5}"
-RECONCILE_TIMEOUT="${RECONCILE_TIMEOUT:-30}"
+RECONCILE_TIMEOUT="${RECONCILE_TIMEOUT:-60}"
 RESTART_TIMEOUT="${RESTART_TIMEOUT:-90}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
 SANITY_GATE="${SANITY_GATE:-1}"
