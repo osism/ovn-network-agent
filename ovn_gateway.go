@@ -61,11 +61,22 @@ func virtualGatewayIP(lrpNetworks []string) (net.IP, error) {
 }
 
 // EnsureGatewayRouting ensures that each locally-active router has a default
-// route and a static MAC binding pointing to the local br-ex interface.
-// This allows OVN to route reply traffic out the external port and into
-// the kernel for further routing via the VRF.
-func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []LocalRouterInfo, bridgeMAC string) error {
+// route and a static MAC binding pointing to the kernel interface of that
+// router's localnet segment (the bridge device for flat segments, the VLAN
+// subinterface for tagged ones). This allows OVN to route reply traffic out
+// the external port and into the kernel for further routing via the VRF.
+//
+// macForLRP maps each router's LRP name to its segment interface MAC. A
+// router whose MAC is unknown (empty or absent) is skipped entirely — route
+// and binding — preserving the "no MAC → no write" contract per router.
+func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []LocalRouterInfo, macForLRP map[string]string) error {
 	for _, lr := range localRouters {
+		mac := macForLRP[lr.LRPName]
+		if mac == "" {
+			slog.Error("no segment interface MAC for router, skipping gateway routing",
+				"router", lr.RouterName, "lrp", lr.LRPName)
+			continue
+		}
 		vgwIP, err := virtualGatewayIP(lr.LRPNetworks)
 		if err != nil {
 			slog.Error("cannot compute virtual gateway IP", "router", lr.RouterName, "error", err)
@@ -77,7 +88,7 @@ func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []Loc
 			slog.Error("failed to ensure default route", "router", lr.RouterName, "vgw", vgwStr, "error", err)
 			continue
 		}
-		if err := o.ensureStaticMACBinding(ctx, lr.LRPName, vgwStr, bridgeMAC); err != nil {
+		if err := o.ensureStaticMACBinding(ctx, lr.LRPName, vgwStr, mac); err != nil {
 			slog.Error("failed to ensure static MAC binding", "router", lr.RouterName, "lrp", lr.LRPName, "error", err)
 		}
 	}

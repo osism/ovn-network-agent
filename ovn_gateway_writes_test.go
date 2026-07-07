@@ -291,7 +291,8 @@ func TestEnsureGatewayRouting_SkipsRouterWithoutIPv4(t *testing.T) {
 		LRPName:     "lrp-v6",
 		LRPNetworks: []string{"fe80::1/64"}, // no IPv4 — virtualGatewayIP must fail
 	}}
-	if err := c.EnsureGatewayRouting(context.Background(), routers, "aa:bb:cc:dd:ee:ff"); err != nil {
+	macs := map[string]string{"lrp-v6": "aa:bb:cc:dd:ee:ff"}
+	if err := c.EnsureGatewayRouting(context.Background(), routers, macs); err != nil {
 		t.Fatalf("EnsureGatewayRouting: %v", err)
 	}
 	if got := nb.recordedTransacts(); len(got) != 0 {
@@ -311,7 +312,11 @@ func TestEnsureGatewayRouting_ProcessesEachRouter(t *testing.T) {
 		{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-1", LRPNetworks: []string{"198.51.100.11/24"}},
 		{RouterName: "router2", RouterUUID: "lr-2", LRPName: "lrp-2", LRPNetworks: []string{"203.0.113.1/24"}},
 	}
-	if err := c.EnsureGatewayRouting(context.Background(), routers, "aa:bb:cc:dd:ee:ff"); err != nil {
+	macs := map[string]string{
+		"lrp-1": "aa:bb:cc:dd:ee:ff",
+		"lrp-2": "aa:bb:cc:dd:ee:ff",
+	}
+	if err := c.EnsureGatewayRouting(context.Background(), routers, macs); err != nil {
 		t.Fatalf("EnsureGatewayRouting: %v", err)
 	}
 
@@ -320,6 +325,140 @@ func TestEnsureGatewayRouting_ProcessesEachRouter(t *testing.T) {
 	tx := nb.recordedTransacts()
 	if len(tx) != 4 {
 		t.Fatalf("expected 4 transacts (2 routers × {route, mac}), got %d: %+v", len(tx), tx)
+	}
+}
+
+// TestEnsureGatewayRouting_UsesPerRouterMAC verifies that each router's
+// static MAC binding is written with that router's own segment interface
+// MAC — two routers on different VLAN segments get two distinct bindings.
+func TestEnsureGatewayRouting_UsesPerRouterMAC(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-1", Name: "router1"},
+		&NBLogicalRouter{UUID: "lr-2", Name: "router2"},
+	)
+
+	routers := []LocalRouterInfo{
+		{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-1", LRPNetworks: []string{"198.51.100.11/24"}},
+		{RouterName: "router2", RouterUUID: "lr-2", LRPName: "lrp-2", LRPNetworks: []string{"203.0.113.11/24"}},
+	}
+	macs := map[string]string{
+		"lrp-1": "aa:bb:cc:dd:ee:65",
+		"lrp-2": "aa:bb:cc:dd:ee:66",
+	}
+	if err := c.EnsureGatewayRouting(context.Background(), routers, macs); err != nil {
+		t.Fatalf("EnsureGatewayRouting: %v", err)
+	}
+
+	// Collect the Static_MAC_Binding inserts across all transacts and check
+	// each LRP got its own MAC. The fake's Create records only table +
+	// UUIDName, so assert per-router write counts via transact shape: each
+	// router produces one route transact (insert+mutate) and one MAC-binding
+	// transact (single insert on Static_MAC_Binding).
+	tx := nb.recordedTransacts()
+	macInserts := 0
+	for _, batch := range tx {
+		for _, op := range batch {
+			if op.Op == ovsdb.OperationInsert && op.Table == "Static_MAC_Binding" {
+				macInserts++
+			}
+		}
+	}
+	if macInserts != 2 {
+		t.Fatalf("expected 2 Static_MAC_Binding inserts (one per router), got %d: %+v", macInserts, tx)
+	}
+}
+
+// TestEnsureGatewayRouting_UpdatesBindingToSegmentMAC drives the per-router
+// MAC through an existing binding: router1's binding carries the old global
+// bridge MAC and must be updated to its segment MAC, while router2's binding
+// already matches its own segment MAC and must be left alone.
+func TestEnsureGatewayRouting_UpdatesBindingToSegmentMAC(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-1", Name: "router1", StaticRoutes: []string{"rt-1"}},
+		&NBLogicalRouter{UUID: "lr-2", Name: "router2", StaticRoutes: []string{"rt-2"}},
+	)
+	// Both default routes already exist and are correct, so the only writes
+	// left are MAC-binding updates.
+	nb.setRows("Logical_Router_Static_Route",
+		&NBLogicalRouterStaticRoute{
+			UUID: "rt-1", IPPrefix: "0.0.0.0/0", Nexthop: "198.51.100.254",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", "ovn-network-agent-chassis": "host-a"},
+		},
+		&NBLogicalRouterStaticRoute{
+			UUID: "rt-2", IPPrefix: "0.0.0.0/0", Nexthop: "203.0.113.254",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", "ovn-network-agent-chassis": "host-a"},
+		},
+	)
+	nb.setRows("Static_MAC_Binding",
+		&NBStaticMACBinding{UUID: "mb-1", LogicalPort: "lrp-1", IP: "198.51.100.254", MAC: "aa:bb:cc:dd:ee:ff"},
+		&NBStaticMACBinding{UUID: "mb-2", LogicalPort: "lrp-2", IP: "203.0.113.254", MAC: "aa:bb:cc:dd:ee:66"},
+	)
+
+	routers := []LocalRouterInfo{
+		{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-1", LRPNetworks: []string{"198.51.100.11/24"}},
+		{RouterName: "router2", RouterUUID: "lr-2", LRPName: "lrp-2", LRPNetworks: []string{"203.0.113.11/24"}},
+	}
+	macs := map[string]string{
+		"lrp-1": "aa:bb:cc:dd:ee:65",
+		"lrp-2": "aa:bb:cc:dd:ee:66",
+	}
+	if err := c.EnsureGatewayRouting(context.Background(), routers, macs); err != nil {
+		t.Fatalf("EnsureGatewayRouting: %v", err)
+	}
+
+	tx := nb.recordedTransacts()
+	if len(tx) != 1 || len(tx[0]) != 1 {
+		t.Fatalf("expected exactly one update transact (router1's binding), got %+v", tx)
+	}
+	op := tx[0][0]
+	if op.Op != ovsdb.OperationUpdate || op.Table != "Static_MAC_Binding" || op.UUID != "mb-1" {
+		t.Fatalf("expected update on mb-1, got %+v", op)
+	}
+	if got := op.Row["mac"]; got != "aa:bb:cc:dd:ee:65" {
+		t.Errorf("updated MAC = %v, want aa:bb:cc:dd:ee:65", got)
+	}
+}
+
+// TestEnsureGatewayRouting_SkipsRouterWithoutMAC pins the per-router
+// "no MAC → no write" contract: a router with an empty (or absent) MAC in
+// macForLRP is skipped entirely — neither default route nor MAC binding —
+// while other routers proceed.
+func TestEnsureGatewayRouting_SkipsRouterWithoutMAC(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-1", Name: "router1"},
+		&NBLogicalRouter{UUID: "lr-2", Name: "router2"},
+	)
+
+	routers := []LocalRouterInfo{
+		{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-1", LRPNetworks: []string{"198.51.100.11/24"}},
+		{RouterName: "router2", RouterUUID: "lr-2", LRPName: "lrp-2", LRPNetworks: []string{"203.0.113.11/24"}},
+	}
+	// lrp-1 has no MAC at all; lrp-2 resolves normally.
+	macs := map[string]string{"lrp-2": "aa:bb:cc:dd:ee:66"}
+	if err := c.EnsureGatewayRouting(context.Background(), routers, macs); err != nil {
+		t.Fatalf("EnsureGatewayRouting: %v", err)
+	}
+
+	// Only router2 writes: one route transact (insert+mutate) and one
+	// MAC-binding transact. Nothing may reference router1.
+	tx := nb.recordedTransacts()
+	if len(tx) != 2 {
+		t.Fatalf("expected 2 transacts (router2 only), got %d: %+v", len(tx), tx)
+	}
+	for _, batch := range tx {
+		for _, op := range batch {
+			if op.Op == ovsdb.OperationMutate && op.Table == "Logical_Router" {
+				if uuid, ok := op.Where[0].Value.(ovsdb.UUID); !ok || uuid.GoUUID != "lr-2" {
+					t.Errorf("route mutate must target lr-2 only, got %+v", op)
+				}
+			}
+		}
 	}
 }
 
