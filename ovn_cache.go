@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
@@ -46,7 +47,7 @@ import (
 // selects exactly these — keeping the common in-sync round-trip cheap — and
 // the matching keyOf* helper must read only the model fields they back.
 var (
-	pbCheckColumns   = []string{"_uuid", "type", "chassis", "nat_addresses"}
+	pbCheckColumns   = []string{"_uuid", "type", "chassis", "nat_addresses", "datapath", "tag", "options"}
 	chCheckColumns   = []string{"_uuid", "hostname"}
 	lrCheckColumns   = []string{"_uuid", "ports", "nat", "static_routes"}
 	lrpCheckColumns  = []string{"_uuid", "mac", "networks"}
@@ -60,7 +61,13 @@ func keyOfSBPortBinding(p SBPortBinding) string {
 	if p.Chassis != nil {
 		chassis = *p.Chassis
 	}
-	return contentKey(p.UUID, p.Type, chassis, sortedJoin(p.NatAddresses))
+	tag := ""
+	if p.Tag != nil {
+		tag = strconv.Itoa(*p.Tag)
+	}
+	// fmt %v renders a map with its keys sorted, so the key stays stable.
+	return contentKey(p.UUID, p.Type, chassis, sortedJoin(p.NatAddresses),
+		p.Datapath, tag, fmt.Sprintf("%v", p.Options))
 }
 
 func keyOfSBChassis(c SBChassis) string {
@@ -250,6 +257,8 @@ func decodeSBPortBinding(row ovsdb.Row) SBPortBinding {
 		Type:         rowString(row, "type"),
 		LogicalPort:  rowString(row, "logical_port"),
 		Chassis:      rowOptString(row, "chassis"),
+		Datapath:     rowUUIDRef(row, "datapath"),
+		Tag:          rowOptInt(row, "tag"),
 		Options:      rowStringMap(row, "options"),
 		ExternalIDs:  rowStringMap(row, "external_ids"),
 		NatAddresses: rowStringSet(row, "nat_addresses"),
@@ -338,6 +347,41 @@ func rowOptString(row ovsdb.Row, col string) *string {
 		if vals := ovsSetToStrings(v); len(vals) > 0 {
 			return &vals[0]
 		}
+	}
+	return nil
+}
+
+// rowUUIDRef returns a strong UUID-reference column flattened to its GoUUID
+// string, or "" when absent. The monitor cache stores such columns as plain
+// strings, so both encodings are accepted.
+func rowUUIDRef(row ovsdb.Row, col string) string {
+	switch v := row[col].(type) {
+	case ovsdb.UUID:
+		return v.GoUUID
+	case string:
+		return v
+	}
+	return ""
+}
+
+// rowOptInt returns an optional integer column as a pointer. OVSDB sends an
+// absent optional as an empty set and a present one as the bare number;
+// JSON-RPC delivers integers as float64, while an in-process fake may pass int.
+func rowOptInt(row ovsdb.Row, col string) *int {
+	v := row[col]
+	if s, ok := v.(ovsdb.OvsSet); ok {
+		if len(s.GoSet) == 0 {
+			return nil
+		}
+		v = s.GoSet[0]
+	}
+	switch n := v.(type) {
+	case int:
+		i := n
+		return &i
+	case float64:
+		i := int(n)
+		return &i
 	}
 	return nil
 }

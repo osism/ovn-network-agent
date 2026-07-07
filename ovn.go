@@ -143,15 +143,34 @@ type ovsdbClient interface {
 	Transact(ctx context.Context, ops ...ovsdb.Operation) ([]ovsdb.OperationResult, error)
 }
 
+// LocalnetSegment describes the localnet segment (provider network) that a
+// locally-active router's external network is attached to. A nil VLANTag
+// means a flat (untagged) network.
+type LocalnetSegment struct {
+	LocalnetPort string // SB localnet Port_Binding logical_port name
+	NetworkName  string // options:network_name of the localnet port (the physnet)
+	VLANTag      *int   // SB Port_Binding tag; nil = flat
+}
+
 // LocalRouterInfo describes a logical router whose gateway is active on this chassis.
 type LocalRouterInfo struct {
-	RouterName  string   // NB Logical_Router name
-	RouterUUID  string   // NB Logical_Router UUID
-	LRPName     string   // NB Logical_Router_Port name (e.g. "lrp-abc123")
-	LRPUUID     string   // NB Logical_Router_Port UUID
-	LRPMAC      string   // NB Logical_Router_Port MAC (e.g. "fa:16:3e:xx:xx:xx")
-	LRPNetworks []string // NB Logical_Router_Port networks (e.g. ["198.51.100.11/24"])
-	CRPort      string   // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
+	RouterName  string           // NB Logical_Router name
+	RouterUUID  string           // NB Logical_Router UUID
+	LRPName     string           // NB Logical_Router_Port name (e.g. "lrp-abc123")
+	LRPUUID     string           // NB Logical_Router_Port UUID
+	LRPMAC      string           // NB Logical_Router_Port MAC (e.g. "fa:16:3e:xx:xx:xx")
+	LRPNetworks []string         // NB Logical_Router_Port networks (e.g. ["198.51.100.11/24"])
+	CRPort      string           // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
+	Segment     *LocalnetSegment // localnet segment of the external network; nil = unresolved
+}
+
+// segmentName returns the localnet port name of a router's segment, or ""
+// (the fallback segment) when the segment is unresolved.
+func segmentName(seg *LocalnetSegment) string {
+	if seg == nil {
+		return ""
+	}
+	return seg.LocalnetPort
 }
 
 type OVNState struct {
@@ -174,6 +193,11 @@ type OVNState struct {
 	// that OVN's L2 lookup delivers the reflected packet to the correct
 	// router port.
 	NATIPToRouterMAC map[string]string
+
+	// NATIPToSegment maps each FIP/SNAT external IP to the localnet port
+	// name of the segment its external network is on. IPs whose segment
+	// is unresolved are absent from the map (the "" fallback segment).
+	NATIPToSegment map[string]string
 
 	// Networks auto-discovered from Logical_Router_Port.Networks of locally-active routers.
 	DiscoveredNetworks []*net.IPNet
@@ -398,6 +422,10 @@ func (o *OVNClient) GetState() OVNState {
 	for k, v := range o.state.NATIPToRouterMAC {
 		natIPToMAC[k] = v
 	}
+	natIPToSegment := make(map[string]string, len(o.state.NATIPToSegment))
+	for k, v := range o.state.NATIPToSegment {
+		natIPToSegment[k] = v
+	}
 	return OVNState{
 		LocalChassisName:   o.state.LocalChassisName,
 		LocalRouters:       localRouters,
@@ -405,6 +433,7 @@ func (o *OVNClient) GetState() OVNState {
 		FIPs:               append([]string{}, o.state.FIPs...),
 		SNATIPs:            append([]string{}, o.state.SNATIPs...),
 		NATIPToRouterMAC:   natIPToMAC,
+		NATIPToSegment:     natIPToSegment,
 		DiscoveredNetworks: discoveredNets,
 		AllChassisNames:    allChassis,
 	}
@@ -466,6 +495,47 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		}
 	}
 
+	// Step 1b: Resolve each local LRP's localnet segment. A gateway LRP's
+	// peer logical switch (the external network) carries a localnet port
+	// whose SB Port_Binding holds the physnet name (options:network_name)
+	// and the optional VLAN tag. Two joins over the Port_Binding table:
+	// localnet rows indexed by datapath, then the switch-side patch rows
+	// (options:peer == LRP name) sharing that datapath. Deliberately no
+	// neutron:device_owner filter: the join must also work for non-Neutron
+	// topologies (e.g. the E2E lab) that set no external_ids.
+	localnetByDatapath := make(map[string]SBPortBinding)
+	for _, pb := range portBindings {
+		if pb.Type == "localnet" {
+			localnetByDatapath[pb.Datapath] = pb
+		}
+	}
+	segmentByLRP := make(map[string]*LocalnetSegment)
+	for _, pb := range portBindings {
+		if pb.Type != "patch" {
+			continue
+		}
+		peer := pb.Options["peer"]
+		if peer == "" {
+			continue
+		}
+		if _, isLocal := localLRPNames[peer]; !isLocal {
+			continue
+		}
+		ln, ok := localnetByDatapath[pb.Datapath]
+		if !ok {
+			continue
+		}
+		seg := &LocalnetSegment{
+			LocalnetPort: ln.LogicalPort,
+			NetworkName:  ln.Options["network_name"],
+		}
+		if ln.Tag != nil {
+			tag := *ln.Tag
+			seg.VLANTag = &tag
+		}
+		segmentByLRP[peer] = seg
+	}
+
 	// Step 2: Build NB Logical_Router_Port name → UUID map.
 	lrps, err := cachedList(ctx, o.nbClient, "Logical_Router_Port",
 		lrpCheckColumns, keyOfNBLogicalRouterPort, decodeNBLogicalRouterPort)
@@ -500,7 +570,10 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 
 	// natUUIDToRouterMAC maps each NAT UUID to the MAC of the router port
 	// that owns it, so hairpin flows can set the correct dl_dst.
+	// natUUIDToSegment records the owning router's localnet segment
+	// alongside, so per-IP state lands on the right patch port/interface.
 	natUUIDToRouterMAC := make(map[string]string)
+	natUUIDToSegment := make(map[string]string)
 	var localRouters []LocalRouterInfo
 	for _, router := range routers {
 		var matchedLRP *NBLogicalRouterPort
@@ -514,6 +587,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		if matchedLRP == nil {
 			continue
 		}
+		segment := segmentByLRP[matchedLRP.Name]
 		localRouters = append(localRouters, LocalRouterInfo{
 			RouterName:  router.Name,
 			RouterUUID:  router.UUID,
@@ -522,10 +596,14 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			LRPMAC:      matchedLRP.MAC,
 			LRPNetworks: matchedLRP.Networks,
 			CRPort:      localLRPNames[matchedLRP.Name],
+			Segment:     segment,
 		})
 		for _, natUUID := range router.Nat {
 			if matchedLRP.MAC != "" {
 				natUUIDToRouterMAC[natUUID] = matchedLRP.MAC
+			}
+			if segment != nil {
+				natUUIDToSegment[natUUID] = segment.LocalnetPort
 			}
 		}
 	}
@@ -557,6 +635,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 
 	var fips, snatIPs []string
 	natIPToRouterMAC := make(map[string]string)
+	natIPToSegment := make(map[string]string)
 	for _, nat := range nats {
 		routerMAC, ok := natUUIDToRouterMAC[nat.UUID]
 		if !ok {
@@ -570,6 +649,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			}
 		}
 		natIPToRouterMAC[ip] = routerMAC
+		if seg, ok := natUUIDToSegment[nat.UUID]; ok {
+			natIPToSegment[ip] = seg
+		}
 		switch nat.Type {
 		case "dnat_and_snat":
 			fips = append(fips, ip)
@@ -611,6 +693,9 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 				if routerMAC != "" {
 					natIPToRouterMAC[ip] = routerMAC
 				}
+				if seg := segmentByLRP[peer]; seg != nil {
+					natIPToSegment[ip] = seg.LocalnetPort
+				}
 			}
 		}
 	}
@@ -622,6 +707,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	o.state.FIPs = fips
 	o.state.SNATIPs = snatIPs
 	o.state.NATIPToRouterMAC = natIPToRouterMAC
+	o.state.NATIPToSegment = natIPToSegment
 	o.state.DiscoveredNetworks = discoveredNets
 	o.state.AllChassisNames = allChassisNames
 	o.state.mu.Unlock()
@@ -637,6 +723,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			"router", lr.RouterName,
 			"lrp", lr.LRPName,
 			"cr_port", lr.CRPort,
+			"segment", segmentName(lr.Segment),
 		)
 	}
 }
