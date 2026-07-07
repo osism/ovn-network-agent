@@ -118,8 +118,8 @@ func TestDryRunOVSFlows(t *testing.T) {
 		dryRun:    true,
 	}
 
-	if err := rm.EnsureOVSFlows(); err != nil {
-		t.Errorf("EnsureOVSFlows() in dry-run should not error, got: %v", err)
+	if err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}}); err != nil {
+		t.Errorf("EnsureSegments() in dry-run should not error, got: %v", err)
 	}
 	if err := rm.RemoveOVSFlows(); err != nil {
 		t.Errorf("RemoveOVSFlows() in dry-run should not error, got: %v", err)

@@ -49,14 +49,21 @@ func (rm *RouteManager) EnsureBridgeIP(ip string) error {
 		slog.Info("[dry-run] would add bridge IP", "ip", ip, "dev", rm.bridgeDev)
 		return nil
 	}
+	return rm.ensureIPOnDev(ip, rm.bridgeDev)
+}
+
+// ensureIPOnDev adds a /32 IP address to the named device if not already
+// present. Shared by the bridge device (EnsureBridgeIP) and the per-VLAN
+// segment interfaces (EnsureSegmentInterface).
+func (rm *RouteManager) ensureIPOnDev(ip, dev string) error {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
 		return fmt.Errorf("invalid IP: %s", ip)
 	}
 
-	link, err := netlink.LinkByName(rm.bridgeDev)
+	link, err := netlink.LinkByName(dev)
 	if err != nil {
-		return fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return fmt.Errorf("find bridge %s: %w", dev, err)
 	}
 
 	addr := &netlink.Addr{
@@ -65,19 +72,19 @@ func (rm *RouteManager) EnsureBridgeIP(ip string) error {
 
 	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
 	if err != nil {
-		return fmt.Errorf("list addrs on %s: %w", rm.bridgeDev, err)
+		return fmt.Errorf("list addrs on %s: %w", dev, err)
 	}
 	for _, a := range addrs {
 		if a.IP.Equal(parsedIP) {
-			slog.Debug("bridge IP already present", "ip", ip, "dev", rm.bridgeDev)
+			slog.Debug("bridge IP already present", "ip", ip, "dev", dev)
 			return nil
 		}
 	}
 
 	if err := netlink.AddrAdd(link, addr); err != nil {
-		return fmt.Errorf("add IP %s/32 to %s: %w", ip, rm.bridgeDev, err)
+		return fmt.Errorf("add IP %s/32 to %s: %w", ip, dev, err)
 	}
-	slog.Info("bridge IP added", "ip", ip, "dev", rm.bridgeDev)
+	slog.Info("bridge IP added", "ip", ip, "dev", dev)
 	return nil
 }
 
@@ -115,11 +122,17 @@ func (rm *RouteManager) EnableProxyARP() error {
 		slog.Info("[dry-run] would enable proxy ARP", "dev", rm.bridgeDev)
 		return nil
 	}
-	path := filepath.Join("/proc/sys/net/ipv4/conf", rm.bridgeDev, "proxy_arp")
+	return rm.enableProxyARPOnDev(rm.bridgeDev)
+}
+
+// enableProxyARPOnDev enables proxy ARP on the named device. Shared by the
+// bridge device and the per-VLAN segment interfaces.
+func (rm *RouteManager) enableProxyARPOnDev(dev string) error {
+	path := filepath.Join("/proc/sys/net/ipv4/conf", dev, "proxy_arp")
 	if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
-		return fmt.Errorf("enable proxy ARP on %s: %w", rm.bridgeDev, err)
+		return fmt.Errorf("enable proxy ARP on %s: %w", dev, err)
 	}
-	slog.Info("proxy ARP enabled", "dev", rm.bridgeDev)
+	slog.Info("proxy ARP enabled", "dev", dev)
 	return nil
 }
 
@@ -130,6 +143,177 @@ func (rm *RouteManager) GetBridgeMAC() (net.HardwareAddr, error) {
 		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
 	}
 	return link.Attrs().HardwareAddr, nil
+}
+
+// =============================================================================
+// Per-VLAN segment interfaces (Linux only)
+// =============================================================================
+
+// segmentLinkAlias marks kernel VLAN links created by the agent, so restart
+// pruning and shutdown teardown can tell them apart from operator-provisioned
+// interfaces (which are adopted for use but never deleted).
+const segmentLinkAlias = "ovn-network-agent"
+
+// ifNameSize is the kernel's usable interface-name length (IFNAMSIZ minus
+// the trailing NUL).
+const ifNameSize = 15
+
+// segmentIfaceName returns the kernel interface name for a VLAN segment on
+// the provider bridge (<bridge>.<tag>), rejecting names that exceed the
+// kernel's IFNAMSIZ limit.
+func segmentIfaceName(bridgeDev string, tag int) (string, error) {
+	name := fmt.Sprintf("%s.%d", bridgeDev, tag)
+	if len(name) > ifNameSize {
+		return "", fmt.Errorf("segment interface name %q exceeds the kernel's %d-character limit", name, ifNameSize)
+	}
+	return name, nil
+}
+
+// EnsureSegmentInterface makes sure a kernel-visible 802.1Q subinterface for
+// the given VLAN tag exists on the provider bridge, is up, carries the bridge
+// IP, and answers proxy ARP — the per-segment equivalent of the flat bridge
+// setup in Agent.Run. An existing interface (agent-created on a previous run,
+// or operator-provisioned) is adopted as-is; freshly created ones are marked
+// with the agent's link alias so pruning and teardown only ever touch links
+// the agent owns. Returns the interface name and its MAC address.
+func (rm *RouteManager) EnsureSegmentInterface(tag int) (string, string, error) {
+	name, err := segmentIfaceName(rm.bridgeDev, tag)
+	if err != nil {
+		return "", "", err
+	}
+
+	parent, err := netlink.LinkByName(rm.bridgeDev)
+	if err != nil {
+		return "", "", fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+	}
+
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		vlan := &netlink.Vlan{
+			LinkAttrs: netlink.LinkAttrs{Name: name, ParentIndex: parent.Attrs().Index},
+			VlanId:    tag,
+		}
+		if err := netlink.LinkAdd(vlan); err != nil {
+			return "", "", fmt.Errorf("create VLAN interface %s: %w", name, err)
+		}
+		link, err = netlink.LinkByName(name)
+		if err != nil {
+			return "", "", fmt.Errorf("find %s after creation: %w", name, err)
+		}
+		if err := netlink.LinkSetAlias(link, segmentLinkAlias); err != nil {
+			slog.Warn("failed to set ownership alias on segment interface", "dev", name, "error", err)
+		}
+		slog.Info("segment VLAN interface created", "dev", name, "tag", tag)
+	} else {
+		// Adopt a pre-existing interface only after confirming it really is
+		// this segment's 802.1Q subinterface. Keying adoption on the name
+		// alone would silently reuse a colliding link — a different VLAN id,
+		// a non-VLAN device, or a subinterface of another bridge — and steer
+		// the segment's routes, bridge IP, and proxy ARP onto the wrong path.
+		if err := verifyAdoptedSegmentLink(link, tag, parent.Attrs().Index); err != nil {
+			return "", "", err
+		}
+		slog.Debug("segment VLAN interface already exists, adopting", "dev", name, "tag", tag)
+	}
+
+	if link.Attrs().Flags&net.FlagUp == 0 {
+		if err := netlink.LinkSetUp(link); err != nil {
+			return "", "", fmt.Errorf("bring up %s: %w", name, err)
+		}
+	}
+	if rm.bridgeIP != "" {
+		if err := rm.ensureIPOnDev(rm.bridgeIP, name); err != nil {
+			return "", "", fmt.Errorf("ensure bridge IP on %s: %w", name, err)
+		}
+	}
+	if err := rm.enableProxyARPOnDev(name); err != nil {
+		return "", "", err
+	}
+	return name, link.Attrs().HardwareAddr.String(), nil
+}
+
+// verifyAdoptedSegmentLink checks that an existing interface
+// EnsureSegmentInterface is about to adopt is genuinely the expected VLAN
+// subinterface: a *netlink.Vlan carrying VLAN id tag on the parent bridge
+// (parentIndex). It returns a descriptive error on any mismatch so the caller
+// refuses the adoption rather than reusing a wrong interface.
+func verifyAdoptedSegmentLink(link netlink.Link, tag, parentIndex int) error {
+	name := link.Attrs().Name
+	vlan, ok := link.(*netlink.Vlan)
+	if !ok {
+		return fmt.Errorf("refusing to adopt %s: existing interface is type %q, not an 802.1Q VLAN subinterface", name, link.Type())
+	}
+	if vlan.VlanId != tag {
+		return fmt.Errorf("refusing to adopt %s: existing interface carries VLAN id %d, want %d", name, vlan.VlanId, tag)
+	}
+	if vlan.Attrs().ParentIndex != parentIndex {
+		return fmt.Errorf("refusing to adopt %s: existing interface has parent index %d, want %d", name, vlan.Attrs().ParentIndex, parentIndex)
+	}
+	return nil
+}
+
+// PruneSegmentInterfaces removes agent-created VLAN interfaces on the
+// provider bridge whose tag is not in keepTags. Links without the agent's
+// ownership alias (operator-provisioned) are never touched.
+func (rm *RouteManager) PruneSegmentInterfaces(keepTags map[int]bool) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would prune stale segment interfaces", "keep", len(keepTags))
+		return nil
+	}
+	vlans, err := rm.agentSegmentLinks()
+	if err != nil {
+		return err
+	}
+	for _, vlan := range vlans {
+		if keepTags[vlan.VlanId] {
+			continue
+		}
+		if err := netlink.LinkDel(vlan); err != nil {
+			slog.Warn("failed to remove stale segment interface", "dev", vlan.Attrs().Name, "error", err)
+			continue
+		}
+		slog.Info("stale segment VLAN interface removed", "dev", vlan.Attrs().Name, "tag", vlan.VlanId)
+	}
+	return nil
+}
+
+// TeardownSegmentInterfaces removes all agent-created VLAN interfaces on the
+// provider bridge. Called on shutdown cleanup.
+func (rm *RouteManager) TeardownSegmentInterfaces() error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would remove agent-created segment interfaces")
+		return nil
+	}
+	return rm.PruneSegmentInterfaces(nil)
+}
+
+// agentSegmentLinks returns the VLAN links on the provider bridge that carry
+// the agent's ownership alias. Adopted (operator-provisioned) links are
+// deliberately excluded so they are never deleted.
+func (rm *RouteManager) agentSegmentLinks() ([]*netlink.Vlan, error) {
+	parent, err := netlink.LinkByName(rm.bridgeDev)
+	if err != nil {
+		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+	}
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list links: %w", err)
+	}
+	var vlans []*netlink.Vlan
+	for _, l := range links {
+		vlan, ok := l.(*netlink.Vlan)
+		if !ok {
+			continue
+		}
+		if vlan.Attrs().ParentIndex != parent.Attrs().Index {
+			continue
+		}
+		if vlan.Attrs().Alias != segmentLinkAlias {
+			continue
+		}
+		vlans = append(vlans, vlan)
+	}
+	return vlans, nil
 }
 
 // =============================================================================

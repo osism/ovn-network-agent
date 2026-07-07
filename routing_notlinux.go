@@ -44,6 +44,26 @@ func (rm *RouteManager) GetBridgeMAC() (net.HardwareAddr, error) {
 	return nil, fmt.Errorf("bridge MAC lookup is only supported on Linux")
 }
 
+func (rm *RouteManager) EnsureSegmentInterface(tag int) (string, string, error) {
+	return "", "", fmt.Errorf("segment interface management is only supported on Linux")
+}
+
+func (rm *RouteManager) PruneSegmentInterfaces(keepTags map[int]bool) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would prune stale segment interfaces", "keep", len(keepTags))
+		return nil
+	}
+	return fmt.Errorf("segment interface management is only supported on Linux")
+}
+
+func (rm *RouteManager) TeardownSegmentInterfaces() error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would remove agent-created segment interfaces")
+		return nil
+	}
+	return fmt.Errorf("segment interface management is only supported on Linux")
+}
+
 func (rm *RouteManager) AddKernelRoute(ip string) error {
 	if rm.dryRun {
 		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", rm.bridgeDev)

@@ -246,16 +246,18 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// Compute effective network filters for this cycle.
 	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
 
-	// hairpinMACMap maps each IP that needs a hairpin flow to the MAC of
-	// the router port that owns it. This includes FIPs, SNAT IPs, and
-	// router gateway IPs (LRP networks). Port-forward VIPs are
-	// intentionally excluded because their DNAT is handled by nftables.
+	// hairpinTargets maps each IP that needs a hairpin flow to the MAC of
+	// the router port that owns it and the localnet segment its external
+	// network is on. This includes FIPs, SNAT IPs, and router gateway IPs
+	// (LRP networks). Port-forward VIPs are intentionally excluded because
+	// their DNAT is handled by nftables.
 	//
 	// The MAC is used as mod_dl_dst in the hairpin flow so that OVN's
-	// L2 lookup delivers the reflected packet to the correct router.
-	hairpinMACMap := make(map[string]string, len(state.NATIPToRouterMAC))
+	// L2 lookup delivers the reflected packet to the correct router; the
+	// segment selects the patch port the flow binds to.
+	hairpinTargets := make(map[string]HairpinTarget, len(state.NATIPToRouterMAC))
 	for ip, mac := range state.NATIPToRouterMAC {
-		hairpinMACMap[ip] = mac
+		hairpinTargets[ip] = HairpinTarget{RouterMAC: mac, Segment: state.NATIPToSegment[ip]}
 	}
 	// Router gateway IPs (LRP networks) are included so that VMs on a
 	// same-chassis router can reach other routers' gateway addresses,
@@ -267,15 +269,38 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 				continue
 			}
 			if lr.LRPMAC != "" {
-				hairpinMACMap[ip.String()] = lr.LRPMAC
+				hairpinTargets[ip.String()] = HairpinTarget{RouterMAC: lr.LRPMAC, Segment: segmentName(lr.Segment)}
 			}
 		}
 	}
 
+	// desiredSegments is the deduplicated set of localnet segments the
+	// locally-active routers need a data plane for. Routers whose segment
+	// is unresolved contribute the "" fallback segment.
+	segmentSet := make(map[string]DesiredSegment)
+	for _, lr := range state.LocalRouters {
+		key := segmentName(lr.Segment)
+		if _, ok := segmentSet[key]; ok {
+			continue
+		}
+		d := DesiredSegment{LocalnetPort: key}
+		if lr.Segment != nil {
+			d.VLANTag = lr.Segment.VLANTag
+		}
+		segmentSet[key] = d
+	}
+	desiredSegments := make([]DesiredSegment, 0, len(segmentSet))
+	for _, d := range segmentSet {
+		desiredSegments = append(desiredSegments, d)
+	}
+	sort.Slice(desiredSegments, func(i, j int) bool {
+		return desiredSegments[i].LocalnetPort < desiredSegments[j].LocalnetPort
+	})
+
 	// hairpinIPs is the flat list of IPs for kernel routes and FRR.
 	// Map keys are already unique; just sort for deterministic ordering.
-	hairpinIPs := make([]string, 0, len(hairpinMACMap))
-	for ip := range hairpinMACMap {
+	hairpinIPs := make([]string, 0, len(hairpinTargets))
+	for ip := range hairpinTargets {
 		hairpinIPs = append(hairpinIPs, ip)
 	}
 	sort.Strings(hairpinIPs)
@@ -309,8 +334,9 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		// reconciliation are all OVN-driven and skipped entirely — only
 		// port forwarding and the VIP routes below are managed.
 	case state.HasLocalRouters:
-		// Ensure OVS MAC-tweak flows are in place (only when active).
-		if err := a.routing.EnsureOVSFlows(); err != nil {
+		// Ensure per-segment OVS MAC-tweak flows and kernel interfaces are
+		// in place (only when active).
+		if err := a.routing.EnsureSegments(desiredSegments); err != nil {
 			slog.Error("failed to ensure OVS flows", "error", err)
 		}
 
@@ -318,12 +344,12 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		// communication. These reflect FIP/SNAT-IP traffic from OVN back
 		// into OVN's external pipeline instead of sending it to the kernel,
 		// fixing the case where two routers share the same gateway chassis.
-		if err := a.routing.ReconcileOVSHairpinFlows(hairpinMACMap); err != nil {
+		if err := a.routing.ReconcileOVSHairpinFlows(hairpinTargets); err != nil {
 			slog.Error("failed to reconcile OVS hairpin flows", "error", err)
 		}
 
 		// Ensure OVN default routes and static MAC bindings for local routers.
-		bridgeMAC := a.routing.cachedBridgeMAC
+		bridgeMAC := a.routing.SegmentMAC("")
 		if bridgeMAC == "" {
 			if mac, err := a.routing.GetBridgeMAC(); err == nil {
 				bridgeMAC = mac.String()
