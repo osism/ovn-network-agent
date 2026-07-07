@@ -395,11 +395,36 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		slog.Error("failed to reconcile port forwarding", "error", err)
 	}
 
+	// ipDev maps each desired IP to the kernel interface its /32 route
+	// belongs on: the owning segment's interface for FIPs, SNAT IPs, and
+	// router gateway IPs. Port-forward VIPs are absent and default to the
+	// bridge device. Computed after EnsureSegments so the bindings are
+	// fresh for this cycle.
+	//
+	// skipKernelRoute holds IPs whose VLAN segment could not be resolved this
+	// cycle. EnsureSegments leaves such a segment without a binding (a
+	// transient discovery failure nulls the whole map, or a per-segment
+	// interface setup failed), so SegmentDev would report the untagged
+	// provider bridge. Reconciling the /32 onto that fallback would atomically
+	// move a VLAN FIP/SNAT route off its subinterface and mis-deliver the
+	// traffic, so those IPs are skipped and their existing route is left in
+	// place until the segment resolves again. Flat segments legitimately route
+	// on the bridge and are never skipped.
+	ipDev := make(map[string]string, len(hairpinTargets))
+	skipKernelRoute := make(map[string]bool)
+	for ip, target := range hairpinTargets {
+		if a.segmentRouteUnresolved(target.Segment, segmentSet) {
+			skipKernelRoute[ip] = true
+			continue
+		}
+		ipDev[ip] = a.routing.SegmentDev(target.Segment)
+	}
+
 	// Ensure routes for all desired IPs (FIPs, SNATs, and port forward VIPs).
 	// When no local routers are present but port forwards are configured,
 	// this still installs VIP routes on br-ex and in FRR.
 	if len(desiredIPs) > 0 || state.HasLocalRouters {
-		a.ensureRoutes(desiredIPs)
+		a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
 	} else {
 		a.removeAllRoutes("no locally active routers and no port forward VIPs")
 	}
@@ -495,30 +520,58 @@ func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
 	return effectiveNetworkFilters(a.cfg.NetworkFilters, discovered)
 }
 
+// segmentRouteUnresolved reports whether an IP on the given localnet segment
+// must keep its existing kernel /32 route this cycle instead of being routed
+// via SegmentDev. It is true only for a VLAN segment (one the desired set
+// tagged) whose per-segment binding did not resolve — the case where SegmentDev
+// would wrongly return the untagged provider bridge and atomically relocate the
+// FIP/SNAT route off its subinterface. Flat segments (bridge is correct),
+// resolved VLAN segments, and unknown segments return false and route normally.
+func (a *Agent) segmentRouteUnresolved(segment string, desired map[string]DesiredSegment) bool {
+	d, ok := desired[segment]
+	return ok && d.VLANTag != nil && !a.routing.SegmentResolved(segment)
+}
+
+// desiredRouteDev returns the kernel interface an IP's /32 route belongs on,
+// defaulting to the provider bridge for IPs without segment information
+// (port-forward VIPs, unresolved segments).
+func (a *Agent) desiredRouteDev(ip string, ipDev map[string]string) string {
+	if dev := ipDev[ip]; dev != "" {
+		return dev
+	}
+	return a.cfg.BridgeDev
+}
+
 // ensureRoutes adds routes for all desired IPs and removes stale ones.
-func (a *Agent) ensureRoutes(desiredIPs []string) {
+// ipDev names the kernel interface each IP's route belongs on; kernel routes
+// are reconciled as (IP, device) pairs so a route that sits on the wrong
+// segment interface is replaced. IPs in skipKernelRoute keep their existing
+// kernel route untouched — their VLAN segment did not resolve this cycle, so
+// moving the /32 to the bridge fallback would mis-deliver the traffic.
+func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) {
 	desiredSet := make(map[string]bool, len(desiredIPs))
 	for _, ip := range desiredIPs {
 		desiredSet[ip] = true
 	}
 
-	// Kernel routes live on the provider bridge (br-ex). In
-	// port-forward-only mode the node need not have br-ex, so only FRR
-	// static routes are managed — the VIP is reachable as a local address
-	// on port_forward_dev, and the FRR route handles BGP announcement.
+	// Kernel routes live on the provider bridge (br-ex) or a per-VLAN
+	// segment interface on it. In port-forward-only mode the node need not
+	// have br-ex, so only FRR static routes are managed — the VIP is
+	// reachable as a local address on port_forward_dev, and the FRR route
+	// handles BGP announcement.
 	manageKernel := !a.cfg.PortForwardOnly
 
 	// Collect current state so we only add what is actually missing.
-	currentKernelSet := make(map[string]bool)
-	var currentKernel []string
+	currentKernelSet := make(map[kernelRouteEntry]bool)
+	var currentKernel []kernelRouteEntry
 	if manageKernel {
 		var err error
-		currentKernel, err = a.routing.ListKernelRoutes()
+		currentKernel, err = a.routing.listKernelRoutes()
 		if err != nil {
 			slog.Error("failed to list kernel routes", "error", err)
 		} else {
-			for _, ip := range currentKernel {
-				currentKernelSet[ip] = true
+			for _, e := range currentKernel {
+				currentKernelSet[e] = true
 			}
 		}
 	}
@@ -533,10 +586,15 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 		}
 	}
 
-	// Collect missing and stale routes, then apply in batches.
+	// Collect missing and stale routes, then apply in batches. A kernel
+	// route on the wrong device counts as missing: AddKernelRoute uses
+	// route replace, which atomically moves the /32 to the right interface
+	// (one route per destination and table), so no separate delete is
+	// needed for the device change.
 	var addFRR []string
 	for _, ip := range desiredIPs {
-		needsKernel := manageKernel && !currentKernelSet[ip]
+		dev := a.desiredRouteDev(ip, ipDev)
+		needsKernel := manageKernel && !skipKernelRoute[ip] && !currentKernelSet[kernelRouteEntry{IP: ip, Dev: dev}]
 		needsFRR := !currentFRRSet[ip]
 
 		if !needsKernel && !needsFRR {
@@ -544,11 +602,11 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 			continue
 		}
 
-		slog.Info("ensuring route", "ip", ip, "needs_kernel", needsKernel, "needs_frr", needsFRR)
+		slog.Info("ensuring route", "ip", ip, "dev", dev, "needs_kernel", needsKernel, "needs_frr", needsFRR)
 
 		if needsKernel {
-			if err := a.routing.AddKernelRoute(ip); err != nil {
-				slog.Error("failed to add kernel route", "ip", ip, "error", err)
+			if err := a.routing.AddKernelRoute(ip, dev); err != nil {
+				slog.Error("failed to add kernel route", "ip", ip, "dev", dev, "error", err)
 			}
 		}
 		if needsFRR {
@@ -563,16 +621,23 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 		}
 	}
 
-	// Collect stale routes for batch removal.
+	// Collect stale routes for batch removal. Entries for still-desired IPs
+	// on the wrong device were already moved by the route replace above and
+	// must not withdraw the FRR announcement.
 	var delFRR []string
+	var removedKernel []kernelRouteEntry
 	removedSet := make(map[string]bool)
-	for _, ip := range currentKernel {
-		if !desiredSet[ip] && a.isManaged(ip) {
-			slog.Info("removing stale route", "ip", ip)
-			// Remove FRR first to stop attracting traffic before tearing down the data plane.
-			delFRR = append(delFRR, ip)
-			removedSet[ip] = true
+	for _, e := range currentKernel {
+		if desiredSet[e.IP] || !a.isManaged(e.IP) {
+			continue
 		}
+		slog.Info("removing stale route", "ip", e.IP, "dev", e.Dev)
+		// Remove FRR first to stop attracting traffic before tearing down the data plane.
+		if !removedSet[e.IP] {
+			delFRR = append(delFRR, e.IP)
+			removedSet[e.IP] = true
+		}
+		removedKernel = append(removedKernel, e)
 	}
 
 	// Collect orphaned FRR routes that have no corresponding kernel route.
@@ -591,11 +656,9 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 	}
 
 	// Remove stale kernel routes (after FRR withdrawal).
-	for _, ip := range currentKernel {
-		if removedSet[ip] {
-			if err := a.routing.DelKernelRoute(ip); err != nil {
-				slog.Error("failed to remove kernel route", "ip", ip, "error", err)
-			}
+	for _, e := range removedKernel {
+		if err := a.routing.DelKernelRoute(e.IP, e.Dev); err != nil {
+			slog.Error("failed to remove kernel route", "ip", e.IP, "dev", e.Dev, "error", err)
 		}
 	}
 
@@ -617,7 +680,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string) {
 	// are still present. A BGP soft-refresh re-evaluates outbound policy
 	// and could (in edge cases) interact with FRR in unexpected ways.
 	if len(addFRR) > 0 || len(delFRR) > 0 {
-		a.verifyRoutes(desiredIPs)
+		a.verifyRoutes(desiredIPs, ipDev, skipKernelRoute)
 	}
 }
 
@@ -647,15 +710,15 @@ func (a *Agent) removeAllRoutes(reason string) {
 	// Remove kernel routes. Skipped in port-forward-only mode, which does
 	// not manage kernel routes on the provider bridge.
 	if !a.cfg.PortForwardOnly {
-		currentKernel, err := a.routing.ListKernelRoutes()
+		currentKernel, err := a.routing.listKernelRoutes()
 		if err != nil {
 			slog.Error("failed to list kernel routes", "error", err)
 		} else {
-			for _, ip := range currentKernel {
-				if a.isManaged(ip) {
-					slog.Info("removing kernel route", "ip", ip, "reason", reason)
-					if err := a.routing.DelKernelRoute(ip); err != nil {
-						slog.Error("failed to remove kernel route", "ip", ip, "error", err)
+			for _, e := range currentKernel {
+				if a.isManaged(e.IP) {
+					slog.Info("removing kernel route", "ip", e.IP, "dev", e.Dev, "reason", reason)
+					if err := a.routing.DelKernelRoute(e.IP, e.Dev); err != nil {
+						slog.Error("failed to remove kernel route", "ip", e.IP, "dev", e.Dev, "error", err)
 					}
 				}
 			}
@@ -678,14 +741,18 @@ func (a *Agent) cleanup() {
 		slog.Error("failed to cleanup FRR prefix-list", "error", err)
 	}
 
-	// OVS flows and the dedicated kernel routing table are OVN-gateway
-	// specific and never created in port-forward-only mode.
+	// OVS flows, the dedicated kernel routing table, and agent-created
+	// segment VLAN interfaces are OVN-gateway specific and never created
+	// in port-forward-only mode.
 	if !a.cfg.PortForwardOnly {
 		if err := a.routing.RemoveOVSFlows(); err != nil {
 			slog.Error("failed to remove OVS flows", "error", err)
 		}
 		if err := a.routing.CleanupRoutingTable(); err != nil {
 			slog.Error("failed to flush routing table", "error", err)
+		}
+		if err := a.routing.TeardownSegmentInterfaces(); err != nil {
+			slog.Error("failed to remove segment interfaces", "error", err)
 		}
 	}
 	// Tear down port forwarding before veth leak (DNAT return route uses veth).
@@ -714,15 +781,19 @@ func (a *Agent) cleanup() {
 // with route re-adds before logging escalates from Warn to Error.
 const consecutiveReAddThreshold = 3
 
-// verifyRoutes checks that all desired IPs still have both a kernel route and
-// an FRR static route after route mutations. Any route that disappeared
-// (e.g. due to a vtysh race or unexpected FRR behaviour) is re-added
-// immediately so that existing connections are not disrupted.
+// verifyRoutes checks that all desired IPs still have both a kernel route
+// (on the right interface) and an FRR static route after route mutations.
+// Any route that disappeared (e.g. due to a vtysh race or unexpected FRR
+// behaviour) is re-added immediately so that existing connections are not
+// disrupted.
 //
 // Returns the number of routes that had to be re-added (0 means all routes
 // were present). The agent tracks consecutive non-zero results and escalates
-// logging to help operators detect persistent route instability.
-func (a *Agent) verifyRoutes(desiredIPs []string) int {
+// logging to help operators detect persistent route instability. IPs in
+// skipKernelRoute are not re-added at the kernel level: their VLAN segment did
+// not resolve this cycle, so their existing route must be left untouched
+// rather than recreated on the bridge fallback.
+func (a *Agent) verifyRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) int {
 	// Re-read current FRR routes.
 	currentFRR, err := a.routing.ListFRRRoutes()
 	if err != nil {
@@ -737,15 +808,15 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 	// Re-read current kernel routes. In port-forward-only mode kernel
 	// routes are not managed (see ensureRoutes), so this is skipped.
 	manageKernel := !a.cfg.PortForwardOnly
-	kernelSet := make(map[string]bool)
+	kernelSet := make(map[kernelRouteEntry]bool)
 	if manageKernel {
-		currentKernel, err := a.routing.ListKernelRoutes()
+		currentKernel, err := a.routing.listKernelRoutes()
 		if err != nil {
 			slog.Error("post-change kernel route verification failed", "error", err)
 			return 0
 		}
-		for _, ip := range currentKernel {
-			kernelSet[ip] = true
+		for _, e := range currentKernel {
+			kernelSet[e] = true
 		}
 	}
 
@@ -759,10 +830,11 @@ func (a *Agent) verifyRoutes(desiredIPs []string) int {
 			slog.Warn("FRR route missing after route change, re-adding", "ip", ip)
 			reAddFRR = append(reAddFRR, ip)
 		}
-		if manageKernel && !kernelSet[ip] {
-			slog.Warn("kernel route missing after route change, re-adding", "ip", ip)
-			if err := a.routing.AddKernelRoute(ip); err != nil {
-				slog.Error("failed to re-add kernel route", "ip", ip, "error", err)
+		dev := a.desiredRouteDev(ip, ipDev)
+		if manageKernel && !skipKernelRoute[ip] && !kernelSet[kernelRouteEntry{IP: ip, Dev: dev}] {
+			slog.Warn("kernel route missing after route change, re-adding", "ip", ip, "dev", dev)
+			if err := a.routing.AddKernelRoute(ip, dev); err != nil {
+				slog.Error("failed to re-add kernel route", "ip", ip, "dev", dev, "error", err)
 			}
 			reAddKernel++
 		}

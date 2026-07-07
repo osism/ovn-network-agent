@@ -65,6 +65,11 @@ type RouteManager struct {
 	// synthetic kernel interfaces without touching netlink.
 	segmentIfaceHook func(tag int) (dev, mac string, err error)
 
+	// listKernelRoutesHook, when non-nil, replaces ListKernelRoutes in the
+	// agent's route reconciliation. Tests set this to inject kernel route
+	// state without touching netlink.
+	listKernelRoutesHook func() ([]kernelRouteEntry, error)
+
 	// execVtyshHook, when non-nil, replaces the real exec.Cmd runner used by
 	// FRR/vtysh helpers. Tests set this to capture commands without executing them.
 	execVtyshHook ovsExecFunc
@@ -104,6 +109,23 @@ func NewRouteManager(cfg Config) *RouteManager {
 		rm.ovsWrapper = strings.Fields(cfg.OVSWrapper)
 	}
 	return rm
+}
+
+// kernelRouteEntry is one agent-managed /32 kernel route: the destination IP
+// and the kernel interface it is bound to (the bridge device or a per-VLAN
+// segment interface).
+type kernelRouteEntry struct {
+	IP  string
+	Dev string
+}
+
+// listKernelRoutes dispatches to the platform ListKernelRoutes, or to the
+// test hook when one is set.
+func (rm *RouteManager) listKernelRoutes() ([]kernelRouteEntry, error) {
+	if rm.listKernelRoutesHook != nil {
+		return rm.listKernelRoutesHook()
+	}
+	return rm.ListKernelRoutes()
 }
 
 // validateIP checks that the given string is a valid IPv4 address.

@@ -64,23 +64,23 @@ func (rm *RouteManager) TeardownSegmentInterfaces() error {
 	return fmt.Errorf("segment interface management is only supported on Linux")
 }
 
-func (rm *RouteManager) AddKernelRoute(ip string) error {
+func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 	if rm.dryRun {
-		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", rm.bridgeDev)
+		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", dev)
 		return nil
 	}
 	return fmt.Errorf("kernel route management is only supported on Linux")
 }
 
-func (rm *RouteManager) DelKernelRoute(ip string) error {
+func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 	if rm.dryRun {
-		slog.Info("[dry-run] would remove kernel route", "ip", ip, "dev", rm.bridgeDev)
+		slog.Info("[dry-run] would remove kernel route", "ip", ip, "dev", dev)
 		return nil
 	}
 	return fmt.Errorf("kernel route management is only supported on Linux")
 }
 
-func (rm *RouteManager) ListKernelRoutes() ([]string, error) {
+func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
 	if rm.dryRun {
 		return nil, nil
 	}
