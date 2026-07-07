@@ -348,17 +348,26 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 			slog.Error("failed to reconcile OVS hairpin flows", "error", err)
 		}
 
-		// Ensure OVN default routes and static MAC bindings for local routers.
-		bridgeMAC := a.routing.SegmentMAC("")
-		if bridgeMAC == "" {
-			if mac, err := a.routing.GetBridgeMAC(); err == nil {
-				bridgeMAC = mac.String()
+		// Ensure OVN default routes and static MAC bindings for local
+		// routers, each pointing at the MAC of its own segment's kernel
+		// interface. When the segment bindings are not (yet) resolved,
+		// fall back to the bridge MAC — the flat single-network value.
+		macByLRP := make(map[string]string, len(state.LocalRouters))
+		fallbackMAC := ""
+		for _, lr := range state.LocalRouters {
+			mac := a.routing.SegmentMAC(segmentName(lr.Segment))
+			if mac == "" {
+				if fallbackMAC == "" {
+					if m, err := a.routing.GetBridgeMAC(); err == nil {
+						fallbackMAC = m.String()
+					}
+				}
+				mac = fallbackMAC
 			}
+			macByLRP[lr.LRPName] = mac
 		}
-		if bridgeMAC != "" {
-			if err := a.ovn.EnsureGatewayRouting(ctx, state.LocalRouters, bridgeMAC); err != nil {
-				slog.Error("failed to ensure gateway routing", "error", err)
-			}
+		if err := a.ovn.EnsureGatewayRouting(ctx, state.LocalRouters, macByLRP); err != nil {
+			slog.Error("failed to ensure gateway routing", "error", err)
 		}
 
 		// Ensure the active chassis has a strictly higher priority than
