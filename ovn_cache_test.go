@@ -263,6 +263,74 @@ func TestDecodeSBPortBindingSetsAndMaps(t *testing.T) {
 	}
 }
 
+// TestKeyOfSBPortBindingIncludesSegmentColumns guards the segment-resolution
+// inputs: a dropped UPDATE to datapath, tag, or options must register as
+// content drift, or a stale cache could silently program the wrong VLAN.
+func TestKeyOfSBPortBindingIncludesSegmentColumns(t *testing.T) {
+	tag101, tag102 := 101, 102
+	base := SBPortBinding{
+		UUID: "pb-1", Type: "localnet", Datapath: "dp-1",
+		Tag:     &tag101,
+		Options: map[string]string{"network_name": "physnet1"},
+	}
+
+	variants := map[string]SBPortBinding{
+		"datapath changed": func() SBPortBinding { v := base; v.Datapath = "dp-2"; return v }(),
+		"tag changed":      func() SBPortBinding { v := base; v.Tag = &tag102; return v }(),
+		"tag cleared":      func() SBPortBinding { v := base; v.Tag = nil; return v }(),
+		"options changed": func() SBPortBinding {
+			v := base
+			v.Options = map[string]string{"network_name": "physnet2"}
+			return v
+		}(),
+	}
+	baseKey := keyOfSBPortBinding(base)
+	for name, v := range variants {
+		if keyOfSBPortBinding(v) == baseKey {
+			t.Errorf("%s: content key did not change", name)
+		}
+	}
+}
+
+// TestDecodeSBPortBindingSegmentColumns round-trips the columns the segment
+// resolution reads from a direct server select: the datapath UUID reference
+// and the optional VLAN tag, including the OVSDB empty-set encoding for an
+// absent tag.
+func TestDecodeSBPortBindingSegmentColumns(t *testing.T) {
+	row := ovsdb.Row{
+		"_uuid":        ovsdb.UUID{GoUUID: "pb-ln"},
+		"type":         "localnet",
+		"logical_port": "seg-vlan",
+		"datapath":     ovsdb.UUID{GoUUID: "dp-1"},
+		// JSON-RPC delivers integers as float64.
+		"tag":     float64(101),
+		"options": ovsdb.OvsMap{GoMap: map[any]any{"network_name": "physnet1"}},
+	}
+	got := decodeSBPortBinding(row)
+	if got.Datapath != "dp-1" {
+		t.Errorf("Datapath = %q, want dp-1", got.Datapath)
+	}
+	if got.Tag == nil || *got.Tag != 101 {
+		t.Errorf("Tag = %v, want 101", got.Tag)
+	}
+
+	// Absent tag arrives as an empty set and must decode to nil.
+	flatRow := ovsdb.Row{
+		"_uuid":    ovsdb.UUID{GoUUID: "pb-flat"},
+		"type":     "localnet",
+		"datapath": ovsdb.UUID{GoUUID: "dp-2"},
+		"tag":      ovsdb.OvsSet{},
+	}
+	if got := decodeSBPortBinding(flatRow); got.Tag != nil {
+		t.Errorf("flat Tag = %v, want nil", *got.Tag)
+	}
+
+	// A row without the columns at all decodes to zero values.
+	if got := decodeSBPortBinding(ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: "pb-x"}}); got.Datapath != "" || got.Tag != nil {
+		t.Errorf("empty row: Datapath=%q Tag=%v, want zero values", got.Datapath, got.Tag)
+	}
+}
+
 func TestRowHelpers(t *testing.T) {
 	t.Run("ovsSetToStrings", func(t *testing.T) {
 		cases := []struct {

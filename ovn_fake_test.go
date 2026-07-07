@@ -163,6 +163,13 @@ func modelToRow(m model.Model) ovsdb.Row {
 			} else {
 				row[tag] = fv.Elem().String()
 			}
+		case fv.Kind() == reflect.Pointer && fv.Type().Elem().Kind() == reflect.Int:
+			// Optional integer (e.g. Port_Binding.tag) — same set encoding.
+			if fv.IsNil() {
+				row[tag] = ovsdb.OvsSet{}
+			} else {
+				row[tag] = int(fv.Elem().Int())
+			}
 		case fv.Kind() == reflect.Slice && fv.Type().Elem().Kind() == reflect.String:
 			set := make([]any, fv.Len())
 			for j := 0; j < fv.Len(); j++ {

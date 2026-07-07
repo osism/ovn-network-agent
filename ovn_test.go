@@ -880,6 +880,133 @@ func TestRefreshStatePopulatesLocalRoutersAndNATs(t *testing.T) {
 	}
 }
 
+// TestRefreshStateResolvesLocalnetSegments verifies the SB-driven segment
+// resolution: each locally-active router is associated with the localnet
+// segment (localnet port + physnet + optional VLAN tag) of its external
+// network, and NAT IPs inherit the owning router's segment. A router whose
+// external switch has no localnet row keeps a nil segment — the trigger for
+// the legacy single-patch-port fallback.
+func TestRefreshStateResolvesLocalnetSegments(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+
+	chA := "ch-a"
+	tag101 := 101
+	sb.setRows("Port_Binding",
+		// Three locally-active routers.
+		&SBPortBinding{UUID: "pb-cr-vlan", LogicalPort: "cr-lrp-vlan", Type: "chassisredirect", Chassis: &chA},
+		&SBPortBinding{UUID: "pb-cr-flat", LogicalPort: "cr-lrp-flat", Type: "chassisredirect", Chassis: &chA},
+		&SBPortBinding{UUID: "pb-cr-none", LogicalPort: "cr-lrp-none", Type: "chassisredirect", Chassis: &chA},
+		// VLAN segment: switch-side patch row + localnet row share dp-vlan.
+		// The patch row also carries a NatAddresses SNAT IP (step 5b) that
+		// must inherit the segment.
+		&SBPortBinding{
+			UUID: "pb-patch-vlan", LogicalPort: "ext-vlan", Type: "patch",
+			Datapath:    "dp-vlan",
+			Options:     map[string]string{"peer": "lrp-vlan"},
+			ExternalIDs: map[string]string{"neutron:device_owner": "network:router_gateway"},
+			NatAddresses: []string{
+				"fa:16:3e:11:22:33 198.51.100.60 is_chassis_resident(\"cr-lrp-vlan\")",
+			},
+		},
+		&SBPortBinding{
+			UUID: "pb-ln-vlan", LogicalPort: "seg-vlan", Type: "localnet",
+			Datapath: "dp-vlan",
+			Tag:      &tag101,
+			Options:  map[string]string{"network_name": "physnet1"},
+		},
+		// Flat segment: localnet row without a tag.
+		&SBPortBinding{
+			UUID: "pb-patch-flat", LogicalPort: "ext-flat", Type: "patch",
+			Datapath: "dp-flat",
+			Options:  map[string]string{"peer": "lrp-flat"},
+		},
+		&SBPortBinding{
+			UUID: "pb-ln-flat", LogicalPort: "seg-flat", Type: "localnet",
+			Datapath: "dp-flat",
+			Options:  map[string]string{"network_name": "physnet1"},
+		},
+		// No localnet row at all for lrp-none's external switch.
+		&SBPortBinding{
+			UUID: "pb-patch-none", LogicalPort: "ext-none", Type: "patch",
+			Datapath: "dp-none",
+			Options:  map[string]string{"peer": "lrp-none"},
+		},
+	)
+
+	nb.setRows("Logical_Router_Port",
+		&NBLogicalRouterPort{UUID: "lrp-uuid-vlan", Name: "lrp-vlan", MAC: "fa:16:3e:aa:aa:01", Networks: []string{"198.51.100.1/24"}},
+		&NBLogicalRouterPort{UUID: "lrp-uuid-flat", Name: "lrp-flat", MAC: "fa:16:3e:aa:aa:02", Networks: []string{"192.0.2.1/24"}},
+		&NBLogicalRouterPort{UUID: "lrp-uuid-none", Name: "lrp-none", MAC: "fa:16:3e:aa:aa:03", Networks: []string{"203.0.113.1/24"}},
+	)
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-vlan", Name: "router-vlan", Ports: []string{"lrp-uuid-vlan"}, Nat: []string{"nat-vlan"}},
+		&NBLogicalRouter{UUID: "lr-flat", Name: "router-flat", Ports: []string{"lrp-uuid-flat"}, Nat: []string{"nat-flat"}},
+		&NBLogicalRouter{UUID: "lr-none", Name: "router-none", Ports: []string{"lrp-uuid-none"}, Nat: []string{"nat-none"}},
+	)
+	nb.setRows("NAT",
+		&NBNAT{UUID: "nat-vlan", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"},
+		&NBNAT{UUID: "nat-flat", Type: "dnat_and_snat", ExternalIP: "192.0.2.50"},
+		&NBNAT{UUID: "nat-none", Type: "dnat_and_snat", ExternalIP: "203.0.113.50"},
+	)
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+	snap := c.GetState()
+
+	if len(snap.LocalRouters) != 3 {
+		t.Fatalf("LocalRouters length = %d, want 3", len(snap.LocalRouters))
+	}
+	segByRouter := map[string]*LocalnetSegment{}
+	for i := range snap.LocalRouters {
+		segByRouter[snap.LocalRouters[i].RouterName] = snap.LocalRouters[i].Segment
+	}
+
+	vlanSeg := segByRouter["router-vlan"]
+	if vlanSeg == nil {
+		t.Fatal("router-vlan has no segment")
+	}
+	if vlanSeg.LocalnetPort != "seg-vlan" || vlanSeg.NetworkName != "physnet1" {
+		t.Errorf("router-vlan segment = %+v, want seg-vlan/physnet1", vlanSeg)
+	}
+	if vlanSeg.VLANTag == nil || *vlanSeg.VLANTag != 101 {
+		t.Errorf("router-vlan VLANTag = %v, want 101", vlanSeg.VLANTag)
+	}
+
+	flatSeg := segByRouter["router-flat"]
+	if flatSeg == nil {
+		t.Fatal("router-flat has no segment")
+	}
+	if flatSeg.LocalnetPort != "seg-flat" || flatSeg.VLANTag != nil {
+		t.Errorf("router-flat segment = %+v, want seg-flat with nil tag", flatSeg)
+	}
+
+	if segByRouter["router-none"] != nil {
+		t.Errorf("router-none segment = %+v, want nil (no localnet row)", segByRouter["router-none"])
+	}
+
+	wantSegments := map[string]string{
+		"198.51.100.50": "seg-vlan",
+		"192.0.2.50":    "seg-flat",
+		"198.51.100.60": "seg-vlan", // SB NatAddresses SNAT IP (step 5b)
+	}
+	for ip, want := range wantSegments {
+		if got := snap.NATIPToSegment[ip]; got != want {
+			t.Errorf("NATIPToSegment[%s] = %q, want %q", ip, got, want)
+		}
+	}
+	if got, ok := snap.NATIPToSegment["203.0.113.50"]; ok {
+		t.Errorf("NATIPToSegment[203.0.113.50] = %q, want absent (unresolved segment)", got)
+	}
+
+	// The snapshot must be a copy, not a reference.
+	snap.NATIPToSegment["198.51.100.50"] = "modified"
+	if c.state.NATIPToSegment["198.51.100.50"] == "modified" {
+		t.Error("GetState should return a copy of NATIPToSegment, not a reference")
+	}
+}
+
 func TestRefreshStateNoLocalRouters(t *testing.T) {
 	c, nb, sb := newOVNClientWithFakes(t, "host-a")
 
