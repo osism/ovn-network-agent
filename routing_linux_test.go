@@ -50,7 +50,7 @@ func TestRemoveBridgeIPWrapsLinkLookupError(t *testing.T) {
 
 func TestAddKernelRouteWrapsLinkLookupError(t *testing.T) {
 	rm := &RouteManager{bridgeDev: nonexistentBridge}
-	err := rm.AddKernelRoute("10.0.0.1")
+	err := rm.AddKernelRoute("10.0.0.1", nonexistentBridge)
 	if err == nil {
 		t.Fatal("AddKernelRoute should error when the bridge device is missing")
 	}
@@ -66,7 +66,7 @@ func TestAddKernelRouteRejectsInvalidIP(t *testing.T) {
 
 func TestDelKernelRouteWrapsLinkLookupError(t *testing.T) {
 	rm := &RouteManager{bridgeDev: nonexistentBridge}
-	err := rm.DelKernelRoute("10.0.0.1")
+	err := rm.DelKernelRoute("10.0.0.1", nonexistentBridge)
 	if err == nil {
 		t.Fatal("DelKernelRoute should error when the bridge device is missing")
 	}

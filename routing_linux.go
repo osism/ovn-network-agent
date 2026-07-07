@@ -320,14 +320,14 @@ func (rm *RouteManager) agentSegmentLinks() ([]*netlink.Vlan, error) {
 // Kernel routes via netlink (Linux only)
 // =============================================================================
 
-func (rm *RouteManager) AddKernelRoute(ip string) error {
+func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 	if rm.dryRun {
-		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", rm.bridgeDev, "table", rm.routeTableID)
+		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", dev, "table", rm.routeTableID)
 		return nil
 	}
-	link, err := netlink.LinkByName(rm.bridgeDev)
+	link, err := netlink.LinkByName(dev)
 	if err != nil {
-		return fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return fmt.Errorf("find bridge %s: %w", dev, err)
 	}
 
 	dst := &net.IPNet{
@@ -348,7 +348,7 @@ func (rm *RouteManager) AddKernelRoute(ip string) error {
 	}
 
 	if err := netlink.RouteReplace(route); err != nil {
-		return fmt.Errorf("add kernel route %s/32 dev %s: %w", ip, rm.bridgeDev, err)
+		return fmt.Errorf("add kernel route %s/32 dev %s: %w", ip, dev, err)
 	}
 
 	// Add ip rule when using a dedicated routing table.
@@ -360,18 +360,18 @@ func (rm *RouteManager) AddKernelRoute(ip string) error {
 		}
 	}
 
-	slog.Info("kernel route ensured", "ip", ip, "dev", rm.bridgeDev, "table", rm.routeTableID)
+	slog.Info("kernel route ensured", "ip", ip, "dev", dev, "table", rm.routeTableID)
 	return nil
 }
 
-func (rm *RouteManager) DelKernelRoute(ip string) error {
+func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 	if rm.dryRun {
-		slog.Info("[dry-run] would remove kernel route", "ip", ip, "dev", rm.bridgeDev)
+		slog.Info("[dry-run] would remove kernel route", "ip", ip, "dev", dev)
 		return nil
 	}
-	link, err := netlink.LinkByName(rm.bridgeDev)
+	link, err := netlink.LinkByName(dev)
 	if err != nil {
-		return fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return fmt.Errorf("find bridge %s: %w", dev, err)
 	}
 
 	dst := &net.IPNet{
@@ -398,51 +398,98 @@ func (rm *RouteManager) DelKernelRoute(ip string) error {
 
 	if err := netlink.RouteDel(route); err != nil {
 		if isNoSuchRoute(err) {
-			slog.Debug("kernel route already absent", "ip", ip, "dev", rm.bridgeDev)
+			slog.Debug("kernel route already absent", "ip", ip, "dev", dev)
 			return nil
 		}
-		return fmt.Errorf("del kernel route %s/32 dev %s: %w", ip, rm.bridgeDev, err)
+		return fmt.Errorf("del kernel route %s/32 dev %s: %w", ip, dev, err)
 	}
 
-	slog.Info("kernel route removed", "ip", ip, "dev", rm.bridgeDev)
+	slog.Info("kernel route removed", "ip", ip, "dev", dev)
 	return nil
 }
 
-// ListKernelRoutes returns all /32 routes on the bridge device.
-// When a dedicated routing table is configured, only routes from that table are returned.
-func (rm *RouteManager) ListKernelRoutes() ([]string, error) {
+// ListKernelRoutes returns all agent-relevant /32 routes as (IP, device)
+// pairs. When a dedicated routing table is configured, the whole table is
+// listed — routes on any interface — so per-segment leftovers survive an
+// agent restart; otherwise routes on the bridge device and its VLAN
+// subinterfaces are listed.
+func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
 	if rm.dryRun {
 		return nil, nil
 	}
-	link, err := netlink.LinkByName(rm.bridgeDev)
-	if err != nil {
-		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
-	}
 
-	var routes []netlink.Route
 	if rm.routeTableID > 0 {
-		filter := &netlink.Route{
-			LinkIndex: link.Attrs().Index,
-			Table:     rm.routeTableID,
+		filter := &netlink.Route{Table: rm.routeTableID}
+		routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
+		if err != nil {
+			return nil, fmt.Errorf("list routes in table %d: %w", rm.routeTableID, err)
 		}
-		routes, err = netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
-	} else {
-		routes, err = netlink.RouteList(link, netlink.FAMILY_V4)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("list routes on %s: %w", rm.bridgeDev, err)
+		devByIndex := make(map[int]string)
+		var entries []kernelRouteEntry
+		for _, r := range routes {
+			if r.Dst == nil {
+				continue
+			}
+			if ones, _ := r.Dst.Mask.Size(); ones != 32 {
+				continue
+			}
+			dev, ok := devByIndex[r.LinkIndex]
+			if !ok {
+				link, err := netlink.LinkByIndex(r.LinkIndex)
+				if err != nil {
+					slog.Warn("cannot resolve link for kernel route, skipping",
+						"ip", r.Dst.IP, "link_index", r.LinkIndex, "error", err)
+					continue
+				}
+				dev = link.Attrs().Name
+				devByIndex[r.LinkIndex] = dev
+			}
+			entries = append(entries, kernelRouteEntry{IP: r.Dst.IP.String(), Dev: dev})
+		}
+		return entries, nil
 	}
 
-	var ips []string
-	for _, r := range routes {
-		if r.Dst != nil {
-			ones, _ := r.Dst.Mask.Size()
-			if ones == 32 {
-				ips = append(ips, r.Dst.IP.String())
+	links, err := rm.segmentCandidateLinks()
+	if err != nil {
+		return nil, err
+	}
+	var entries []kernelRouteEntry
+	for _, link := range links {
+		routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
+		if err != nil {
+			return nil, fmt.Errorf("list routes on %s: %w", link.Attrs().Name, err)
+		}
+		for _, r := range routes {
+			if r.Dst == nil {
+				continue
+			}
+			if ones, _ := r.Dst.Mask.Size(); ones == 32 {
+				entries = append(entries, kernelRouteEntry{IP: r.Dst.IP.String(), Dev: link.Attrs().Name})
 			}
 		}
 	}
-	return ips, nil
+	return entries, nil
+}
+
+// segmentCandidateLinks returns the bridge device plus every VLAN
+// subinterface parented on it — agent-created or operator-provisioned —
+// i.e. all interfaces that may carry agent-managed /32 routes.
+func (rm *RouteManager) segmentCandidateLinks() ([]netlink.Link, error) {
+	parent, err := netlink.LinkByName(rm.bridgeDev)
+	if err != nil {
+		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+	}
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list links: %w", err)
+	}
+	out := []netlink.Link{parent}
+	for _, l := range links {
+		if vlan, ok := l.(*netlink.Vlan); ok && vlan.Attrs().ParentIndex == parent.Attrs().Index {
+			out = append(out, l)
+		}
+	}
+	return out, nil
 }
 
 // =============================================================================

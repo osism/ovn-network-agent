@@ -354,6 +354,19 @@ func (rm *RouteManager) SegmentDev(localnetPort string) string {
 	return rm.bridgeDev
 }
 
+// SegmentResolved reports whether the given localnet segment has its own
+// binding this cycle. It is false when EnsureSegments could not resolve the
+// segment (a transient discovery failure nulls the whole map, or a per-segment
+// interface setup failed), in which case SegmentDev returns the provider-bridge
+// fallback. Callers routing a VLAN segment's /32 use this to leave the existing
+// route in place rather than move it onto the untagged bridge. A segment that
+// deliberately fell back to the single-patch path keeps its own (fallback)
+// binding and so still reports true.
+func (rm *RouteManager) SegmentResolved(localnetPort string) bool {
+	_, ok := rm.segments[localnetPort]
+	return ok
+}
+
 // SegmentMAC returns the MAC of the given localnet segment's kernel
 // interface, or "" when the segment (and the fallback binding) is not yet
 // discovered.

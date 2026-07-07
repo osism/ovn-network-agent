@@ -157,7 +157,7 @@ func TestVerifyRoutesDryRun(t *testing.T) {
 	// lists (nil, nil). This means verifyRoutes sees every desired IP as
 	// missing and attempts re-adds — but those are also dry-run no-ops.
 	// This is by design: we exercise the full code path without side effects.
-	n := a.verifyRoutes([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"})
+	n := a.verifyRoutes([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil)
 	if n != 6 { // 3 FRR + 3 kernel
 		t.Errorf("expected 6 re-adds in dry-run, got %d", n)
 	}
@@ -177,7 +177,7 @@ func TestVerifyRoutesSkipsUnmanagedIPs(t *testing.T) {
 	}
 
 	// IPs outside the managed CIDR should be skipped — zero re-adds.
-	n := a.verifyRoutes([]string{"192.168.1.1", "172.16.0.1"})
+	n := a.verifyRoutes([]string{"192.168.1.1", "172.16.0.1"}, nil, nil)
 	if n != 0 {
 		t.Errorf("expected 0 re-adds for unmanaged IPs, got %d", n)
 	}
@@ -193,10 +193,10 @@ func TestVerifyRoutesEmptyDesired(t *testing.T) {
 	a := &Agent{routing: rm}
 
 	// Empty desired list should be a no-op.
-	if n := a.verifyRoutes(nil); n != 0 {
+	if n := a.verifyRoutes(nil, nil, nil); n != 0 {
 		t.Errorf("expected 0 re-adds for nil desired, got %d", n)
 	}
-	if n := a.verifyRoutes([]string{}); n != 0 {
+	if n := a.verifyRoutes([]string{}, nil, nil); n != 0 {
 		t.Errorf("expected 0 re-adds for empty desired, got %d", n)
 	}
 }
@@ -218,16 +218,197 @@ func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
 	// always reports all routes as missing since list calls return nil).
 	desired := []string{"10.0.0.1"}
 	for i := 1; i <= 5; i++ {
-		a.verifyRoutes(desired)
+		a.verifyRoutes(desired, nil, nil)
 		if a.consecutiveReAdds != i {
 			t.Errorf("after cycle %d: expected consecutiveReAdds=%d, got %d", i, i, a.consecutiveReAdds)
 		}
 	}
 
 	// A cycle with no managed IPs (nothing to re-add) resets the counter.
-	a.verifyRoutes([]string{"192.168.1.1"}) // unmanaged → 0 re-adds
+	a.verifyRoutes([]string{"192.168.1.1"}, nil, nil) // unmanaged → 0 re-adds
 	if a.consecutiveReAdds != 0 {
 		t.Errorf("expected consecutiveReAdds=0 after clean cycle, got %d", a.consecutiveReAdds)
+	}
+}
+
+// TestEnsureRoutesDevMismatchDoesNotWithdrawFRR covers the (IP, Dev) model:
+// a kernel route that sits on the wrong segment interface is re-replaced on
+// the right device, but the IP is still desired — so its FRR announcement
+// must NOT be withdrawn (a withdraw would blackhole the FIP during a segment
+// move).
+func TestEnsureRoutesDevMismatchDoesNotWithdrawFRR(t *testing.T) {
+	rec := newVtyshRecorder()
+	// FRR already has the desired IP.
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+`,
+		nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		// The kernel route exists, but on the bridge device instead of the
+		// segment's VLAN interface.
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "ovnagent-nonexistent-br"}}, nil
+		},
+		execVtyshHook: rec.hook(),
+	}
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+
+	a.ensureRoutes([]string{"198.51.100.10"}, map[string]string{"198.51.100.10": "br-ex.101"}, nil)
+
+	for _, c := range rec.calls {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "no ip route 198.51.100.10/32") {
+			t.Errorf("dev mismatch must not withdraw the FRR route, got: %v", rec.calls)
+		}
+		if strings.Contains(joined, "clear ip bgp") {
+			t.Errorf("dev mismatch must not trigger a BGP refresh, got: %v", rec.calls)
+		}
+	}
+}
+
+// TestEnsureRoutesStaleEntryRemovedWithItsDevice verifies that a kernel
+// route whose IP is no longer desired withdraws the FRR route regardless of
+// which segment interface it sits on.
+func TestEnsureRoutesStaleEntryRemovedWithItsDevice(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		`S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+`,
+		nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: "198.51.100.99", Dev: "br-ex.101"}}, nil
+		},
+		execVtyshHook: rec.hook(),
+	}
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+
+	a.ensureRoutes(nil, nil, nil)
+
+	sawDel := false
+	for _, c := range rec.calls {
+		if strings.Contains(strings.Join(c, " "), "no ip route 198.51.100.99/32") {
+			sawDel = true
+		}
+	}
+	if !sawDel {
+		t.Errorf("expected FRR withdrawal of stale 198.51.100.99, got calls: %v", rec.calls)
+	}
+}
+
+// TestVerifyRoutesDetectsDevMismatch verifies that the post-change check
+// treats a kernel route on the wrong device as missing and re-adds it on the
+// segment's interface.
+func TestVerifyRoutesDetectsDevMismatch(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+`,
+		nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "ovnagent-nonexistent-br"}}, nil
+		},
+		execVtyshHook: rec.hook(),
+	}
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+
+	// The route exists but on the wrong device — one kernel re-add expected
+	// (the AddKernelRoute itself fails on the synthetic bridge, which is
+	// fine: the count is what matters).
+	n := a.verifyRoutes([]string{"198.51.100.10"}, map[string]string{"198.51.100.10": "br-ex.101"}, nil)
+	if n != 1 {
+		t.Errorf("expected 1 re-add for dev mismatch, got %d", n)
+	}
+
+	// With the device matching, no re-adds.
+	n = a.verifyRoutes([]string{"198.51.100.10"}, nil, nil)
+	if n != 0 {
+		t.Errorf("expected 0 re-adds when device matches, got %d", n)
+	}
+}
+
+// TestSegmentRouteUnresolved guards the decision at the heart of the transient
+// segment-resolution fix: only a VLAN segment whose per-segment binding failed
+// to resolve is skipped. A flat segment (bridge is correct), a resolved VLAN
+// segment, and an unknown segment must all route normally — misclassifying any
+// of them would either mis-deliver traffic or needlessly freeze a route.
+func TestSegmentRouteUnresolved(t *testing.T) {
+	tag := 101
+	desired := map[string]DesiredSegment{
+		"seg-101": {LocalnetPort: "seg-101", VLANTag: &tag}, // VLAN segment
+		"":        {LocalnetPort: ""},                       // flat / fallback
+	}
+	rm := &RouteManager{bridgeDev: "br-ex", segments: map[string]*segmentBinding{}}
+	a := &Agent{routing: rm}
+
+	// VLAN segment with no binding this cycle → must be skipped.
+	if !a.segmentRouteUnresolved("seg-101", desired) {
+		t.Error("unresolved VLAN segment must be skipped")
+	}
+	// Flat segment routes on the bridge legitimately → never skipped.
+	if a.segmentRouteUnresolved("", desired) {
+		t.Error("flat segment must not be skipped")
+	}
+	// Unknown segment (not in the desired set) → route normally.
+	if a.segmentRouteUnresolved("seg-999", desired) {
+		t.Error("unknown segment must not be skipped")
+	}
+	// Once the VLAN segment resolves to its own binding → route normally.
+	rm.segments["seg-101"] = &segmentBinding{kernelDev: "br-ex.101", vlanTag: &tag}
+	if a.segmentRouteUnresolved("seg-101", desired) {
+		t.Error("resolved VLAN segment must not be skipped")
+	}
+}
+
+// TestVerifyRoutesLeavesUnresolvedVLANRouteInPlace is a regression guard for
+// the transient failure that would otherwise relocate a VLAN FIP's /32 onto the
+// untagged bridge. The FIP's kernel route sits on its VLAN subinterface
+// (br-ex.101); its segment did not resolve this cycle, so the IP is flagged
+// skip-kernel and ipDev carries no entry for it. verifyRoutes must leave the
+// route untouched — zero re-adds — rather than re-add it on the bridge fallback
+// (the exact move TestVerifyRoutesDetectsDevMismatch shows for an unskipped IP).
+func TestVerifyRoutesLeavesUnresolvedVLANRouteInPlace(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+`,
+		nil,
+	)
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "br-ex.101"}}, nil
+		},
+		execVtyshHook: rec.hook(),
+	}
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+
+	skip := map[string]bool{"198.51.100.10": true}
+	if n := a.verifyRoutes([]string{"198.51.100.10"}, nil, skip); n != 0 {
+		t.Errorf("unresolved VLAN segment must leave the FIP route in place, got %d re-adds", n)
 	}
 }
 
@@ -298,7 +479,7 @@ S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
 	// Desired: 198.51.100.10 (new) and 198.51.100.20 (already in FRR).
-	a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"})
+	a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, nil, nil)
 
 	var sawAdd, sawDel, sawRefresh bool
 	for _, c := range rec.calls {
