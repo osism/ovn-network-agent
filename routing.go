@@ -24,6 +24,7 @@ const (
 // RouteManager handles kernel routes on the provider bridge and FRR static routes.
 type RouteManager struct {
 	bridgeDev    string
+	bridgeIP     string
 	vrfName      string
 	vethNexthop  string
 	routeTableID int
@@ -48,14 +49,21 @@ type RouteManager struct {
 	portForwardCTZone       int
 	portForwards            []PortForwardVIP
 
-	// Cached OVS discovery results (populated on first use).
-	cachedPatchPort string
-	cachedOfport    string
-	cachedBridgeMAC string
+	// segments maps each localnet port name to its resolved OVS/kernel
+	// binding (populated on first use, revalidated every reconcile). The
+	// "" key is the legacy single-patch-port fallback binding used when a
+	// segment cannot be resolved — flat deployments, or an OVN version
+	// that does not set external_ids:ovn-localnet-port on patch ports.
+	segments map[string]*segmentBinding
 
 	// execOVSHook, when non-nil, replaces the real exec.Cmd runner used by
 	// OVS helpers. Tests set this to capture commands without executing them.
 	execOVSHook ovsExecFunc
+
+	// segmentIfaceHook, when non-nil, replaces EnsureSegmentInterface in
+	// refreshSegmentBindings. Tests set this to resolve VLAN segments to
+	// synthetic kernel interfaces without touching netlink.
+	segmentIfaceHook func(tag int) (dev, mac string, err error)
 
 	// execVtyshHook, when non-nil, replaces the real exec.Cmd runner used by
 	// FRR/vtysh helpers. Tests set this to capture commands without executing them.
@@ -74,6 +82,7 @@ func (rm *RouteManager) runVtysh(args ...string) ([]byte, error) {
 func NewRouteManager(cfg Config) *RouteManager {
 	rm := &RouteManager{
 		bridgeDev:               cfg.BridgeDev,
+		bridgeIP:                cfg.BridgeIP,
 		vrfName:                 cfg.VRFName,
 		vethNexthop:             cfg.VethNexthop,
 		routeTableID:            cfg.RouteTableID,

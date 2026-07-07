@@ -5,6 +5,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/vishvananda/netlink"
 )
 
 // nonexistentBridge is a synthetic interface name that is guaranteed not to
@@ -106,6 +108,129 @@ func TestCheckBridgeDeviceDryRunSkips(t *testing.T) {
 	rm := &RouteManager{bridgeDev: nonexistentBridge, dryRun: true}
 	if err := rm.CheckBridgeDevice(); err != nil {
 		t.Errorf("CheckBridgeDevice in dry-run should not error, got: %v", err)
+	}
+}
+
+func TestSegmentIfaceNameLength(t *testing.T) {
+	tests := []struct {
+		name      string
+		bridgeDev string
+		tag       int
+		want      string
+		wantErr   bool
+	}{
+		{"default bridge fits with max tag", "br-ex", 4094, "br-ex.4094", false},
+		{"short bridge and tag", "br-ex", 101, "br-ex.101", false},
+		{"long bridge with 4-digit tag exceeds IFNAMSIZ", "br-provider", 4094, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := segmentIfaceName(tt.bridgeDev, tt.tag)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("segmentIfaceName(%q, %d) should error", tt.bridgeDev, tt.tag)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("segmentIfaceName(%q, %d) error: %v", tt.bridgeDev, tt.tag, err)
+			}
+			if got != tt.want {
+				t.Errorf("segmentIfaceName(%q, %d) = %q, want %q", tt.bridgeDev, tt.tag, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnsureSegmentInterfaceWrapsLinkLookupError(t *testing.T) {
+	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	_, _, err := rm.EnsureSegmentInterface(101)
+	if err == nil {
+		t.Fatal("EnsureSegmentInterface should error when the bridge device is missing")
+	}
+	if !strings.Contains(err.Error(), nonexistentBridge) {
+		t.Errorf("error should mention the bridge name, got: %v", err)
+	}
+}
+
+func TestEnsureSegmentInterfaceRejectsOverlongName(t *testing.T) {
+	rm := &RouteManager{bridgeDev: "br-provider-x"}
+	_, _, err := rm.EnsureSegmentInterface(4094)
+	if err == nil {
+		t.Fatal("EnsureSegmentInterface should reject a name over the kernel limit")
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Errorf("error should mention the length limit, got: %v", err)
+	}
+}
+
+// TestVerifyAdoptedSegmentLink guards the adoption check: an interface named
+// <bridge>.<tag> that already exists is only reused when it is really a VLAN
+// subinterface with the matching tag and parent. A name collision (wrong tag,
+// non-VLAN device, or a subinterface of a different bridge) must be refused so
+// the segment's traffic is not steered onto the wrong interface.
+func TestVerifyAdoptedSegmentLink(t *testing.T) {
+	const parentIndex = 7
+	tests := []struct {
+		name    string
+		link    netlink.Link
+		tag     int
+		wantErr string
+	}{
+		{
+			name: "matching vlan is adopted",
+			link: &netlink.Vlan{LinkAttrs: netlink.LinkAttrs{Name: "br-ex.101", ParentIndex: parentIndex}, VlanId: 101},
+			tag:  101,
+		},
+		{
+			name:    "wrong vlan id refused",
+			link:    &netlink.Vlan{LinkAttrs: netlink.LinkAttrs{Name: "br-ex.101", ParentIndex: parentIndex}, VlanId: 999},
+			tag:     101,
+			wantErr: "VLAN id",
+		},
+		{
+			name:    "wrong parent refused",
+			link:    &netlink.Vlan{LinkAttrs: netlink.LinkAttrs{Name: "br-ex.101", ParentIndex: parentIndex + 1}, VlanId: 101},
+			tag:     101,
+			wantErr: "parent index",
+		},
+		{
+			name:    "non-vlan device refused",
+			link:    &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "br-ex.101", ParentIndex: parentIndex}},
+			tag:     101,
+			wantErr: "not an 802.1Q",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyAdoptedSegmentLink(tt.link, tt.tag, parentIndex)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("verifyAdoptedSegmentLink() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("verifyAdoptedSegmentLink() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("verifyAdoptedSegmentLink() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPruneSegmentInterfacesWrapsLinkLookupError(t *testing.T) {
+	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	if err := rm.PruneSegmentInterfaces(nil); err == nil {
+		t.Fatal("PruneSegmentInterfaces should error when the bridge device is missing")
+	}
+}
+
+func TestTeardownSegmentInterfacesDryRun(t *testing.T) {
+	rm := &RouteManager{bridgeDev: nonexistentBridge, dryRun: true}
+	if err := rm.TeardownSegmentInterfaces(); err != nil {
+		t.Errorf("TeardownSegmentInterfaces in dry-run should not error, got: %v", err)
 	}
 }
 
