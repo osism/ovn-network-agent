@@ -62,21 +62,25 @@ For each locally-active router the agent:
 1. Writes a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static
    MAC binding** into OVN NB — the
    [virtual gateway](gatewayless-networks) makes reply traffic exit the
-   logical router without a real upstream gateway.
+   logical router without a real upstream gateway. The binding carries the
+   MAC of the router's own segment interface (`br-ex` for flat networks,
+   `br-ex.<tag>` for VLAN networks).
 2. Boosts the **active `Gateway_Chassis` priority** to `max(max peer + 1, 2)`
    so a previously-drained peer that returns at priority 1 cannot trigger
    a reverse failover (see [gateway drain](gateway-drain#priority-semantics)).
-3. Installs **OVS MAC-tweak flows** on `br-ex` — rewrites the destination
-   MAC on packets arriving from OVN's patch port so the kernel accepts them.
+3. Installs **OVS MAC-tweak flows** on `br-ex`, one pair per localnet patch
+   port — rewrites the destination MAC on packets arriving from OVN to the
+   MAC of that segment's kernel interface so the kernel accepts them.
 4. Installs **OVS hairpin flows** on `br-ex` — reflects same-chassis
    cross-router traffic back into OVN via `output:in_port` with rewritten
-   MACs.
+   MACs, each flow bound to the patch port of the segment the target FIP's
+   external network is on.
 5. Reconciles **per-network veth-leak routes and policy rules** so the
    provider subnet's reply traffic crosses from the default VRF into
    `vrf-provider` for BGP delivery.
 6. Creates `/32` **kernel routes** (with `ip rule` entries when using a
-   dedicated routing table) on `br-ex` for every FIP, SNAT IP, router LRP
-   gateway IP, and configured port-forward VIP.
+   dedicated routing table) on the segment's kernel interface for every
+   FIP, SNAT IP, router LRP gateway IP, and configured port-forward VIP.
 7. Creates `/32` **FRR static routes** in `vrf-provider` for the same set
    so BGP announces them to the external fabric.
 8. Triggers a **BGP outbound soft-refresh** only when routes are removed
@@ -192,3 +196,18 @@ The agent creates the veth pair and assigns link-local addresses at startup
 are reconciled dynamically — networks are either auto-discovered from OVN
 `Logical_Router_Port.Networks` or taken from the static `network_cidr`
 configuration. On shutdown, all resources are cleaned up.
+
+### VLAN provider networks
+
+The diagram above shows a single flat provider network, where the kernel
+side of the data path lives on the bridge device itself. When a node serves
+**multiple provider networks** as VLAN localnet segments on the same
+physnet, each segment gets its own kernel path: the agent creates an 802.1Q
+subinterface `br-ex.<tag>` per VLAN segment, carrying that segment's bridge
+IP, proxy ARP, and per-IP `/32` routes. Traffic that OVN emits tagged on
+the provider bridge reaches the kernel through the matching subinterface,
+and the per-patch-port MAC-tweak flows rewrite the destination MAC to that
+subinterface's MAC. Flat segments keep the untagged path on `br-ex`
+unchanged. See
+[gatewayless networks](gatewayless-networks#multiple-provider-networks-vlan-segments)
+for the segment discovery and lifecycle details.

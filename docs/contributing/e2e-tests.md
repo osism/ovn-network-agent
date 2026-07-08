@@ -35,6 +35,7 @@ test/e2e/
     baseline.sh             — baseline reachability scenario (issue #45)
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
     hairpin.sh              — same-chassis hairpin scenario, two FIPs on master (issue #108)
+    multi-vlan.sh           — multi-VLAN provider networks, two segments on master (issue #147)
     pf-external.sh          — port-forward / DNAT scenario, source IP preserved (issue #109)
     pf-hairpin.sh           — port-forward hairpin masquerade scenario (issue #110)
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
@@ -195,6 +196,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | [Baseline](#baseline) | `e2e-baseline` | An external client reaches a FIP once the agent reconciles. | [#45](https://github.com/osism/ovn-network-agent/issues/45) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
 | [Hairpin](#hairpin) | `e2e-hairpin` | The `cookie=0x998` hairpin flow reflects FIP-to-FIP traffic on `br-ex`. | [#108](https://github.com/osism/ovn-network-agent/issues/108) |
+| [Multi-VLAN](#multi-vlan) | `e2e-multi-vlan` | Two VLAN provider networks on one node get per-segment kernel interfaces, flows, and BGP-announced FIPs. | [#147](https://github.com/osism/ovn-network-agent/issues/147) |
 | [Port-forward (external client)](#port-forward-external-client) | `e2e-pf-external` | Inbound DNAT preserves the external client's source IP. | [#109](https://github.com/osism/ovn-network-agent/issues/109) |
 | [Port-forward hairpin masquerade](#port-forward-hairpin-masquerade) | `e2e-pf-hairpin` | The `hairpin_masquerade` flag is load-bearing for a co-located FIP. | [#110](https://github.com/osism/ovn-network-agent/issues/110) |
 | [Stale chassis](#stale-chassis) | `e2e-stale-chassis` | Surviving peers garbage-collect the NB rows of a hard-killed chassis. | [#111](https://github.com/osism/ovn-network-agent/issues/111) |
@@ -329,6 +331,45 @@ nothing behind for other scenarios to trip over.
 
 **Overrides for triage:** `FIP_B`, `FIP_B_INTERNAL`, `MASTER`,
 `WORKLOAD_HOST`, `RECONCILE_TIMEOUT`, `SANITY_GATE`.
+
+### Multi-VLAN
+
+```sh
+make e2e-multi-vlan
+```
+
+[`multi-vlan.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/multi-vlan.sh)
+exercises the multi-network data path from issue #147: one gateway node
+serving FIPs from **two VLAN provider networks** on the same physnet,
+alongside the flat baseline network.
+
+The scenario:
+
+1. Runs the baseline first as a sanity gate.
+2. Adds — scenario-locally — two VLAN provider networks on `physnet1`
+   (localnet ports with `tag=101` / `tag=102`, public subnets
+   `198.51.100.0/24` and `203.0.113.0/24`), each with its own router
+   pinned to `gateway-1`, a tenant switch, a netns workload on
+   `gateway-3`, and one FIP (`198.51.100.10`, `203.0.113.10`).
+3. Waits for the agent on `gateway-1` to create the per-segment kernel
+   subinterfaces `br-ex.101` / `br-ex.102`, land each FIP's `/32` route
+   on its own subinterface, install a `cookie=0x999` MAC-tweak flow on
+   each network's localnet patch port, and announce both FIPs as `/32`
+   via BGP (checked on the upstream router).
+4. Probes both VLAN FIPs from `client-1` and finally re-probes the flat
+   baseline FIP `192.0.2.10`, proving the flat and VLAN data paths
+   coexist on the same node.
+
+No underlay change is required: the fabric routes the `/32`s via BGP
+into `vrf-provider`, so the VLAN frames never leave the node. The EXIT
+trap removes the routers, switches, and workloads; the agent itself
+prunes the subinterfaces and per-segment flows on its next reconcile.
+The CI workflow runs this scenario as its own `multi-vlan` job gating
+on `baseline`.
+
+**Overrides for triage:** `MASTER`, `MASTER_UNDERLAY_IP`,
+`WORKLOAD_HOST`, `BASELINE_FIP`, `RECONCILE_TIMEOUT`, `PING_COUNT`,
+`PING_TIMEOUT`, `SANITY_GATE`.
 
 ### Port-forward (external client)
 
