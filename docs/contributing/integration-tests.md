@@ -26,6 +26,7 @@ test/integration/
   scenario_vethleak_test.go                   — SetupVethLeak / ReconcileVethLeakNetworks / TeardownVethLeak (#56)
   scenario_ipv6_test.go                       — IPv6-capable OVS flow plumbing on br-ex (#54; kernel/FRR paths are v4-only today)
   scenario_metrics_test.go                    — Prometheus /metrics scrapes (reconcile counter, drain outcome, stale-chassis, desired-state gauges)
+  scenario_multi_segment_test.go              — multi-VLAN localnet segments: per-segment interfaces/routes/flows, failover isolation, same-segment hairpin, restart re-adoption (#147)
   scenario_failure_injection_test.go          — mid-cycle vtysh/nft/ovs-ofctl failures + self-heal (#88 item 1)
   scenario_route_tables_test.go               — non-overlapping route_table_id / port_forward_table_id / veth_leak_table_id (#88 item 2)
   scenario_cleanup_no_drain_test.go           — RemoveManagedNBEntries with drain_on_shutdown=false (#88 item 3)
@@ -58,6 +59,13 @@ Scenario tests pause `ovn-northd` for the duration of each test (via
 `testenv.PauseOVNNorthd`) so the test driver can write SB Port_Binding rows
 directly without northd garbage-collecting them. `ovn-controller` keeps
 running. `setup.sh` is unchanged from the harness foundation.
+
+The multi-segment scenarios use `testenv.LocalRouterOpts.SegmentOpts` to
+seed the SB rows of a router's localnet segment (external-switch
+`Datapath_Binding`, `localnet` and peer patch `Port_Binding`) and
+`testenv.EnsureSegmentPatchPort` to create the tagged provider-bridge patch
+port (`external_ids:ovn-localnet-port`) that ovn-controller would create in
+a real deployment.
 
 ## Local prerequisites
 
