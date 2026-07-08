@@ -31,6 +31,7 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_desired_ips` | gauge | — | Number of unique IPs the agent currently wants routes for (FIPs, SNATs, port-forward VIPs). |
 | `ovn_network_agent_local_routers` | gauge | — | Number of OVN logical routers whose chassisredirect port is currently active on this chassis. |
 | `ovn_network_agent_effective_networks` | gauge | — | Number of effective network filters (manual config or auto-discovered). |
+| `ovn_network_agent_localnet_segments` | gauge | — | Number of localnet segments (patch ports) currently bound for locally-active routers. |
 | `ovn_network_agent_route_readds_total` | counter (vec) | `plane`={`kernel`,`frr`} | Total routes re-added by post-change verification, labelled by route plane. |
 | `ovn_network_agent_consecutive_readds` | gauge | — | Number of consecutive reconcile cycles that required route re-adds. Sustained non-zero indicates persistent route instability. |
 | `ovn_network_agent_inactive_routes` | gauge | — | Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside. |
