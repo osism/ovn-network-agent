@@ -59,6 +59,68 @@ func AssertNoKernelRoute(t *testing.T, ip string, timeout time.Duration) {
 	}
 }
 
+// AssertKernelRouteOnDev fails the test if no /32 route for ip exists on the
+// named interface within timeout. The multi-segment scenarios use it to pin
+// each FIP's route to its segment's VLAN subinterface rather than just "some
+// interface on the host".
+func AssertKernelRouteOnDev(t *testing.T, ip, dev string, timeout time.Duration) {
+	t.Helper()
+	if net.ParseIP(ip) == nil {
+		t.Fatalf("AssertKernelRouteOnDev: invalid IP %q", ip)
+	}
+	deadline := time.Now().Add(timeout)
+	var lastOut string
+	var lastErr error
+	for {
+		out, err := exec.Command("ip", "-4", "route", "show", ip+"/32", "dev", dev).CombinedOutput()
+		lastOut = strings.TrimSpace(string(out))
+		lastErr = err
+		if err == nil && strings.Contains(string(out), ip) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("kernel route %s/32 on %s not present after %s (last output: %q, err: %v)",
+				ip, dev, timeout, lastOut, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// AssertLinkExists fails the test if the named link does not appear within
+// timeout. Used for the agent-created per-VLAN segment interfaces.
+func AssertLinkExists(t *testing.T, dev string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if _, err := net.InterfaceByName(dev); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("link %s not present after %s (last error: %v)", dev, timeout, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// AssertNoLink fails the test if the named link persists past timeout.
+// Mirrors AssertLinkExists for the negative case (segment pruning, teardown).
+func AssertNoLink(t *testing.T, dev string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := net.InterfaceByName(dev); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("link %s still present after %s", dev, timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // AssertBridgeAddress fails the test if cidr is not present on bridge within
 // timeout. cidr is matched against `ip -j -4 addr show dev <bridge>` as the
 // (local, prefixlen) pair extracted from each addr_info entry, so the caller
@@ -405,6 +467,11 @@ func scrubLocalState(t *testing.T) {
 		_ = exec.Command("ovs-ofctl", "del-flows", DefaultBridgeDev,
 			fmt.Sprintf("cookie=%s/-1", cookie)).Run()
 	}
+
+	// Agent-created per-VLAN segment interfaces on the bridge. Deleting a
+	// link also drops the /32 routes riding on it, so no per-device route
+	// flush is needed here.
+	scrubSegmentLinks(t)
 
 	// Port-forward residue: managed VIPs on loopback1, fwmark ip rules,
 	// the port-forward reply table. Calls into portforward.go.
