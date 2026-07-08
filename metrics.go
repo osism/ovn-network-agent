@@ -30,6 +30,7 @@ type metricsRegistry struct {
 	desiredIPs        prometheus.Gauge
 	localRouters      prometheus.Gauge
 	effectiveNetworks prometheus.Gauge
+	localnetSegments  prometheus.Gauge
 
 	// Route stability metrics
 	routeReAddsTotal  *prometheus.CounterVec
@@ -106,6 +107,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Number of effective network filters (manual config or auto-discovered).",
 		}),
 
+		localnetSegments: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "localnet_segments",
+			Help:      "Number of localnet segments (patch ports) currently bound for locally-active routers.",
+		}),
+
 		routeReAddsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "route_readds_total",
@@ -163,6 +170,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.desiredIPs,
 		m.localRouters,
 		m.effectiveNetworks,
+		m.localnetSegments,
 		m.routeReAddsTotal,
 		m.consecutiveReAdds,
 		m.inactiveRoutes,
@@ -270,6 +278,13 @@ func setDesiredState(desiredIPs, localRouters, effectiveNetworks int) {
 	metrics.desiredIPs.Set(float64(desiredIPs))
 	metrics.localRouters.Set(float64(localRouters))
 	metrics.effectiveNetworks.Set(float64(effectiveNetworks))
+}
+
+func setLocalnetSegments(n int) {
+	if metrics == nil {
+		return
+	}
+	metrics.localnetSegments.Set(float64(n))
 }
 
 func recordRouteReAdds(frr, kernel int) {

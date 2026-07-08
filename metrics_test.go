@@ -32,6 +32,7 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setReconcileInProgress(true)
 	setReconcileInProgress(false)
 	setDesiredState(5, 2, 3)
+	setLocalnetSegments(2)
 	recordRouteReAdds(1, 2)
 	setConsecutiveReAdds(4)
 	setOVNConnectionState("nb", true)
@@ -54,6 +55,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_reconcile_duration_seconds",
 		"ovn_network_agent_desired_ips",
 		"ovn_network_agent_local_routers",
+		"ovn_network_agent_localnet_segments",
 		"ovn_network_agent_route_readds_total",
 		"ovn_network_agent_consecutive_readds",
 		"ovn_network_agent_inactive_routes",
@@ -238,6 +240,25 @@ func TestSetDesiredStateUpdatesGauges(t *testing.T) {
 		}
 		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != want {
 			t.Errorf("%s = %v, want %v", mf.GetName(), v, want)
+		}
+	}
+}
+
+// TestSetLocalnetSegmentsSetsGauge verifies the gauge tracks the current
+// segment count, including the reset back to zero when the last local
+// router (and with it every bound segment) disappears.
+func TestSetLocalnetSegmentsSetsGauge(t *testing.T) {
+	m := withTestMetrics(t)
+	setLocalnetSegments(2)
+	setLocalnetSegments(0)
+
+	got, _ := m.registry.Gather()
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_localnet_segments" {
+			continue
+		}
+		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 0 {
+			t.Errorf("localnet_segments = %v after reset, want 0", v)
 		}
 	}
 }

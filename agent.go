@@ -315,6 +315,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	desiredIPs = uniqueIPs(desiredIPs)
 
 	setDesiredState(len(desiredIPs), len(state.LocalRouters), len(a.effectiveFilters))
+	setLocalnetSegments(len(desiredSegments))
 
 	slog.Info("reconciling",
 		"has_local_routers", state.HasLocalRouters,
