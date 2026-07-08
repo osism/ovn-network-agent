@@ -204,6 +204,68 @@ jobs:
         if: always()
         run: make e2e-down
 
+  multi-vlan:
+    name: Multi-VLAN provider networks (two segments on master)
+    runs-on: ubuntu-latest
+    # Runs in parallel with failover and hairpin (all gate on baseline)
+    # so a multi-segment regression is reported in isolation. Same
+    # 15-minute budget — the scenario adds the cost of one bootstrap,
+    # the baseline gate, plus a ≤60s convergence wait per segment check
+    # and three 5-packet probes.
+    needs: baseline
+    timeout-minutes: 15
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+
+      # See the baseline job for the rationale; same modules required.
+      - name: Load required kernel modules
+        run: |
+          set -euo pipefail
+          sudo modprobe openvswitch
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run multi-VLAN scenario
+        # Direct the scenario's flow/link/route snapshots into the same
+        # artifact root so collect-artifacts.sh and the uploader both
+        # pick them up. `runner.temp` is only available at step scope,
+        # not the job-level env block.
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/multi-vlan
+        run: ./test/e2e/scenarios/multi-vlan.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-multi-vlan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
+
   pf-external:
     name: Port-forward DNAT (external client, source IP preserved)
     runs-on: ubuntu-latest

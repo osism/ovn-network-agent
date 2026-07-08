@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-pf-external e2e-pf-hairpin e2e-stale-chassis
+.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -12,6 +12,7 @@ E2E_BOOTSTRAP   := test/e2e/bootstrap.sh
 E2E_BASELINE    := test/e2e/scenarios/baseline.sh
 E2E_FAILOVER    := test/e2e/scenarios/failover.sh
 E2E_HAIRPIN     := test/e2e/scenarios/hairpin.sh
+E2E_MULTI_VLAN  := test/e2e/scenarios/multi-vlan.sh
 E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
@@ -148,6 +149,19 @@ e2e-failover:
 # `make e2e-baseline` works without tearing the lab down.
 e2e-hairpin:
 	$(E2E_HAIRPIN)
+
+# Run the multi-VLAN provider-network scenario (issue #147) against a
+# lab that is already up. Adds two VLAN provider networks (tags 101/102
+# on physnet1), each with a gatewayless public subnet, a router pinned
+# to gateway-1, and a netns workload behind a FIP. Asserts the agent
+# creates one kernel subinterface per segment (br-ex.101/br-ex.102),
+# routes each FIP /32 over its own segment interface, installs
+# MAC-tweak flows per localnet patch port, and announces both FIPs via
+# BGP — then probes both FIPs plus the flat baseline FIP from client-1.
+# The scenario's own EXIT trap removes the added networks so a
+# subsequent `make e2e-baseline` works without tearing the lab down.
+e2e-multi-vlan:
+	$(E2E_MULTI_VLAN)
 
 # Run the port-forward / DNAT scenario (issue #109) against a lab
 # that is already up. Adds an OVN Load_Balancer for 192.0.2.50:80 →
