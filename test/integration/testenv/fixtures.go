@@ -101,6 +101,12 @@ type RouterRef struct {
 	CRPort      string // "cr-lrp-router1"
 	CRPortUUID  string
 	DatapathID  string // SB Datapath_Binding UUID
+
+	// SegmentDatapathID is the SB Datapath_Binding UUID of the external
+	// switch inserted for LocalRouterOpts.SegmentOpts ("" when no segment
+	// was requested). A second router can attach to the same segment by
+	// passing it as SegmentOpts.DatapathUUID.
+	SegmentDatapathID string
 }
 
 // LocalRouterOpts configures MakeLocalRouter. ChassisUUID defaults to the
@@ -119,6 +125,31 @@ type LocalRouterOpts struct {
 	// into NB Gateway_Chassis. If nil, a single entry is created for the
 	// local hostname at priority DefaultLocalPriority.
 	GatewayChassis []GatewayChassisEntry
+
+	// SegmentOpts, when set, additionally inserts the SB rows describing the
+	// router's external network as a localnet segment: an external-switch
+	// Datapath_Binding, a type=patch Port_Binding peering with the router's
+	// LRP, and a type=localnet Port_Binding carrying the physnet name and
+	// optional VLAN tag. Nil reproduces the legacy fixture (no segment rows),
+	// which exercises the agent's single-patch-port fallback.
+	SegmentOpts *SegmentOpts
+}
+
+// SegmentOpts configures the localnet segment rows inserted by MakeLocalRouter.
+type SegmentOpts struct {
+	// LocalnetPort is the logical_port name of the type=localnet
+	// Port_Binding. Required unless DatapathUUID is set.
+	LocalnetPort string
+	// NetworkName is options:network_name of the localnet port (the
+	// physnet). Defaults to "physnet1".
+	NetworkName string
+	// Tag is the segment's VLAN tag; nil = flat (untagged).
+	Tag *int
+	// DatapathUUID, when set, attaches the router to an existing external
+	// switch (from another router's SegmentDatapathID) instead of inserting
+	// a new Datapath_Binding and localnet row — only the patch row peering
+	// with this router's LRP is added. Used by same-segment scenarios.
+	DatapathUUID string
 }
 
 // GatewayChassisEntry is one row in NB Gateway_Chassis seeded by MakeLocalRouter.
@@ -267,7 +298,7 @@ func MakeLocalRouter(t *testing.T, ctx context.Context, nb, sb client.Client, op
 	pbResults := Transact(t, ctx, sb, []ovsdb.Operation{pbInsertOp})
 	pbUUID := pbResults[0].UUID.GoUUID
 
-	return RouterRef{
+	ref := RouterRef{
 		Name:        opts.Name,
 		RouterUUID:  lrUUID,
 		LRPName:     lrpName,
@@ -278,6 +309,73 @@ func MakeLocalRouter(t *testing.T, ctx context.Context, nb, sb client.Client, op
 		CRPortUUID:  pbUUID,
 		DatapathID:  dpUUID,
 	}
+	if opts.SegmentOpts != nil {
+		ref.SegmentDatapathID = insertSegment(t, ctx, sb, lrpName, *opts.SegmentOpts)
+	}
+	return ref
+}
+
+// insertSegment inserts the SB rows the agent's segment resolution joins on:
+// the external switch's Datapath_Binding, its type=localnet Port_Binding
+// (options:network_name + optional tag), and the type=patch Port_Binding
+// whose options:peer names the router's LRP. Returns the external-switch
+// datapath UUID. When seg.DatapathUUID is set, only the patch row is added.
+func insertSegment(t *testing.T, ctx context.Context, sb client.Client, lrpName string, seg SegmentOpts) string {
+	t.Helper()
+	if seg.DatapathUUID == "" && seg.LocalnetPort == "" {
+		t.Fatal("insertSegment: SegmentOpts.LocalnetPort required")
+	}
+	if seg.NetworkName == "" {
+		seg.NetworkName = "physnet1"
+	}
+
+	dpUUID := seg.DatapathUUID
+	if dpUUID == "" {
+		dpRow := &SBDatapathBinding{
+			UUID:        "extdp_named",
+			TunnelKey:   nextTunnelKey(),
+			ExternalIDs: map[string]string{"name": "ext-" + seg.LocalnetPort},
+		}
+		dpOps, err := sb.Create(dpRow)
+		if err != nil {
+			t.Fatalf("create external datapath op: %v", err)
+		}
+		dpResults := Transact(t, ctx, sb, dpOps)
+		dpUUID = dpResults[0].UUID.GoUUID
+
+		// The localnet Port_Binding is inserted as a raw op: `tag` is an
+		// optional integer column, which OVSDB encodes as a 0/1-element set.
+		lnRow := ovsdb.Row{
+			"datapath":     realUUID(dpUUID),
+			"tunnel_key":   nextTunnelKey(),
+			"logical_port": seg.LocalnetPort,
+			"type":         "localnet",
+			"options":      ovsdb.OvsMap{GoMap: map[any]any{"network_name": seg.NetworkName}},
+		}
+		if seg.Tag != nil {
+			lnRow["tag"] = ovsdb.OvsSet{GoSet: []any{*seg.Tag}}
+		}
+		Transact(t, ctx, sb, []ovsdb.Operation{{
+			Op:    ovsdb.OperationInsert,
+			Table: "Port_Binding",
+			Row:   lnRow,
+		}})
+	}
+
+	// Switch-side patch row peering with the router's gateway LRP — the row
+	// refreshState joins with the localnet row via the shared datapath.
+	Transact(t, ctx, sb, []ovsdb.Operation{{
+		Op:    ovsdb.OperationInsert,
+		Table: "Port_Binding",
+		Row: ovsdb.Row{
+			"datapath":     realUUID(dpUUID),
+			"tunnel_key":   nextTunnelKey(),
+			"logical_port": lrpName + "-attachment",
+			"type":         "patch",
+			"options":      ovsdb.OvsMap{GoMap: map[any]any{"peer": lrpName}},
+		},
+	}})
+	return dpUUID
 }
 
 // AddFIP inserts a dnat_and_snat NAT entry on the given router for externalIP

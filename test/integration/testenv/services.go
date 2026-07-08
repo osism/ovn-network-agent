@@ -42,6 +42,60 @@ func EnsureBridgePatchPort(t *testing.T) {
 	addPort("br-int", testenvPatchOnBrInt, testenvPatchOnBrEx)
 }
 
+// EnsureSegmentPatchPort creates a patch-port pair between br-ex and br-int
+// whose br-ex Port row carries external_ids:ovn-localnet-port=<localnetPort>,
+// mirroring what ovn-controller stamps on the provider-bridge patch port of
+// each localnet network. The agent's per-segment discovery maps the localnet
+// port name to this patch port. Idempotent; the ports are removed at test
+// cleanup so leftover tagged ports cannot skew single-network scenarios'
+// first-patch-port fallback.
+func EnsureSegmentPatchPort(t *testing.T, localnetPort string) {
+	t.Helper()
+
+	brexPort := "patch-" + localnetPort + "-to-br-int"
+	brintPort := "patch-br-int-to-" + localnetPort
+
+	addPort := func(bridge, port, peer string) {
+		out, err := exec.Command("ovs-vsctl",
+			"--may-exist", "add-port", bridge, port, "--",
+			"set", "Interface", port, "type=patch", "options:peer="+peer,
+		).CombinedOutput()
+		if err != nil {
+			t.Fatalf("create patch port %s on %s: %v (output: %s)",
+				port, bridge, err, strings.TrimSpace(string(out)))
+		}
+	}
+	addPort(DefaultBridgeDev, brexPort, brintPort)
+	addPort("br-int", brintPort, brexPort)
+
+	if out, err := exec.Command("ovs-vsctl", "set", "Port", brexPort,
+		"external_ids:ovn-localnet-port="+localnetPort).CombinedOutput(); err != nil {
+		t.Fatalf("set ovn-localnet-port on %s: %v (output: %s)",
+			brexPort, err, strings.TrimSpace(string(out)))
+	}
+
+	t.Cleanup(func() {
+		_ = exec.Command("ovs-vsctl", "--if-exists", "del-port", DefaultBridgeDev, brexPort).Run()
+		_ = exec.Command("ovs-vsctl", "--if-exists", "del-port", "br-int", brintPort).Run()
+	})
+}
+
+// SegmentPatchOfport returns the OpenFlow port number of the br-ex patch port
+// created by EnsureSegmentPatchPort for the given localnet port name.
+func SegmentPatchOfport(t *testing.T, localnetPort string) string {
+	t.Helper()
+	port := "patch-" + localnetPort + "-to-br-int"
+	out, err := exec.Command("ovs-vsctl", "get", "Interface", port, "ofport").CombinedOutput()
+	if err != nil {
+		t.Fatalf("get ofport for %s: %v (output: %s)", port, err, strings.TrimSpace(string(out)))
+	}
+	ofport := strings.TrimSpace(string(out))
+	if ofport == "" || ofport == "-1" {
+		t.Fatalf("invalid ofport %q for %s", ofport, port)
+	}
+	return ofport
+}
+
 // PauseOVNNorthd suspends the ovn-northd processing loop for the duration of
 // the test, registering a Cleanup that resumes it.
 //

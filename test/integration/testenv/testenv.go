@@ -37,6 +37,7 @@
 package testenv
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -159,6 +160,42 @@ func Teardown(t *testing.T) {
 	// startScenario / ResetOVNState still rely on this safety net to keep
 	// the next run from inheriting an enslaved veth pair.
 	scrubVethLeakState(t)
+
+	// Agent-created per-VLAN segment interfaces on the bridge. A SIGKILL'd
+	// agent skips TeardownSegmentInterfaces, so without this scrub the next
+	// scenario would inherit stale VLAN links (and the routes riding on them).
+	scrubSegmentLinks(t)
+}
+
+// segmentLinkAlias mirrors the ownership marker the agent sets on VLAN links
+// it creates on the provider bridge (segmentLinkAlias in routing_linux.go).
+const segmentLinkAlias = "ovn-network-agent"
+
+// scrubSegmentLinks deletes VLAN links parented on the bridge that carry the
+// agent's ownership alias. Operator-provisioned links (no alias) are left
+// alone — the same contract the agent's own pruning honours.
+func scrubSegmentLinks(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("ip", "-j", "link", "show", "type", "vlan").CombinedOutput()
+	if err != nil {
+		return
+	}
+	var links []struct {
+		Ifname  string `json:"ifname"`
+		Link    string `json:"link"`
+		Ifalias string `json:"ifalias"`
+	}
+	if json.Unmarshal(out, &links) != nil {
+		return
+	}
+	for _, l := range links {
+		if l.Link != DefaultBridgeDev || l.Ifalias != segmentLinkAlias {
+			continue
+		}
+		if err := exec.Command("ip", "link", "del", l.Ifname).Run(); err != nil {
+			t.Logf("teardown: failed to delete segment link %s: %v", l.Ifname, err)
+		}
+	}
 }
 
 // frrStaticRoutes returns the /32 static routes currently present in the
