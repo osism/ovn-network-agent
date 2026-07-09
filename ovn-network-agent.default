@@ -128,3 +128,30 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # that affects ALL sockets — only enable when needed.
 # Accepts "1" / "true" to enable.
 #OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT=false
+
+# =============================================================================
+# BFD failover detection
+# =============================================================================
+# The check is read-only and on by default; the manage options are independent
+# opt-ins that write OVS/FRR state.
+
+# Estimate the BFD detection time every reconcile, export it as
+# ovn_network_agent_bfd_detect_seconds and warn above BFD_CHECK_MAX_DETECT.
+# Accepts "0" / "false" to disable.
+#OVN_NETWORK_BFD_CHECK_ENABLED=true
+
+# Warn when the estimated BFD detection time exceeds this duration.
+#OVN_NETWORK_BFD_CHECK_MAX_DETECT=1s
+
+# Manage bfd:min_rx / bfd:min_tx on local OVN Geneve tunnel interfaces.
+# Accepts "1" / "true" to enable.
+#OVN_NETWORK_OVN_BFD_MANAGE=false
+#OVN_NETWORK_OVN_BFD_MIN_RX_MS=150
+#OVN_NETWORK_OVN_BFD_MIN_TX_MS=150
+
+# Enable BFD on the VRF's already-configured FRR BGP neighbors.
+# Accepts "1" / "true" to enable. The fabric side must enable BFD too.
+#OVN_NETWORK_FRR_BFD_MANAGE=false
+#OVN_NETWORK_FRR_BFD_MIN_RX_MS=150
+#OVN_NETWORK_FRR_BFD_MIN_TX_MS=150
+#OVN_NETWORK_FRR_BFD_MULTIPLIER=3

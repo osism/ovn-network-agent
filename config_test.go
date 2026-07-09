@@ -326,6 +326,28 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.VethLeakRulePriority != 2000 {
 		t.Errorf("VethLeakRulePriority = %d, want 2000", cfg.VethLeakRulePriority)
 	}
+	// BFD: the check is on by default, both manage flags are off.
+	if !cfg.BFDCheckEnabled {
+		t.Error("BFDCheckEnabled should be true by default")
+	}
+	if cfg.BFDCheckMaxDetect != time.Second {
+		t.Errorf("BFDCheckMaxDetect = %v, want %v", cfg.BFDCheckMaxDetect, time.Second)
+	}
+	if cfg.OVNBFDManage {
+		t.Error("OVNBFDManage should be false by default")
+	}
+	if cfg.FRRBFDManage {
+		t.Error("FRRBFDManage should be false by default")
+	}
+	if cfg.OVNBFDMinRxMs != 150 || cfg.OVNBFDMinTxMs != 150 {
+		t.Errorf("OVN BFD timers = %d/%d, want 150/150", cfg.OVNBFDMinRxMs, cfg.OVNBFDMinTxMs)
+	}
+	if cfg.FRRBFDMinRxMs != 150 || cfg.FRRBFDMinTxMs != 150 {
+		t.Errorf("FRR BFD timers = %d/%d, want 150/150", cfg.FRRBFDMinRxMs, cfg.FRRBFDMinTxMs)
+	}
+	if cfg.FRRBFDMultiplier != 3 {
+		t.Errorf("FRRBFDMultiplier = %d, want 3", cfg.FRRBFDMultiplier)
+	}
 }
 
 func TestLoadConfigVethLeakEnabledByDefault(t *testing.T) {
@@ -1848,4 +1870,229 @@ func TestLoadConfigRejectsIncompleteOVN(t *testing.T) {
 			t.Error("expected error when only ovn-nb-remote is set")
 		}
 	})
+}
+
+// =============================================================================
+// BFD failover detection options
+// =============================================================================
+
+func TestLoadConfigBFDCLIFlags(t *testing.T) {
+	cfg, err := loadConfig(fullModeArgs(
+		"--bfd-check-enabled=false",
+		"--bfd-check-max-detect", "500ms",
+		"--ovn-bfd-manage",
+		"--ovn-bfd-min-rx-ms", "100",
+		"--ovn-bfd-min-tx-ms", "120",
+		"--frr-bfd-manage",
+		"--frr-bfd-min-rx-ms", "200",
+		"--frr-bfd-min-tx-ms", "250",
+		"--frr-bfd-multiplier", "5",
+	))
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.BFDCheckEnabled {
+		t.Error("BFDCheckEnabled should be false")
+	}
+	if cfg.BFDCheckMaxDetect != 500*time.Millisecond {
+		t.Errorf("BFDCheckMaxDetect = %v, want 500ms", cfg.BFDCheckMaxDetect)
+	}
+	if !cfg.OVNBFDManage || !cfg.FRRBFDManage {
+		t.Error("both manage flags should be true")
+	}
+	if cfg.OVNBFDMinRxMs != 100 || cfg.OVNBFDMinTxMs != 120 {
+		t.Errorf("OVN BFD timers = %d/%d, want 100/120", cfg.OVNBFDMinRxMs, cfg.OVNBFDMinTxMs)
+	}
+	if cfg.FRRBFDMinRxMs != 200 || cfg.FRRBFDMinTxMs != 250 {
+		t.Errorf("FRR BFD timers = %d/%d, want 200/250", cfg.FRRBFDMinRxMs, cfg.FRRBFDMinTxMs)
+	}
+	if cfg.FRRBFDMultiplier != 5 {
+		t.Errorf("FRRBFDMultiplier = %d, want 5", cfg.FRRBFDMultiplier)
+	}
+}
+
+// The manage flags are independent: enabling one must not enable the other.
+func TestLoadConfigBFDManageFlagsIndependent(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantOVN bool
+		wantFRR bool
+	}{
+		{"both off by default", nil, false, false},
+		{"only OVN", []string{"--ovn-bfd-manage"}, true, false},
+		{"only FRR", []string{"--frr-bfd-manage"}, false, true},
+		{"both", []string{"--ovn-bfd-manage", "--frr-bfd-manage"}, true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadConfig(fullModeArgs(tt.args...))
+			if err != nil {
+				t.Fatalf("loadConfig() error: %v", err)
+			}
+			if cfg.OVNBFDManage != tt.wantOVN {
+				t.Errorf("OVNBFDManage = %v, want %v", cfg.OVNBFDManage, tt.wantOVN)
+			}
+			if cfg.FRRBFDManage != tt.wantFRR {
+				t.Errorf("FRRBFDManage = %v, want %v", cfg.FRRBFDManage, tt.wantFRR)
+			}
+		})
+	}
+}
+
+func TestApplyEnvConfigBFD(t *testing.T) {
+	cfg := Config{BFDCheckEnabled: true, BFDCheckMaxDetect: time.Second}
+	t.Setenv("OVN_NETWORK_BFD_CHECK_ENABLED", "false")
+	t.Setenv("OVN_NETWORK_BFD_CHECK_MAX_DETECT", "750ms")
+	t.Setenv("OVN_NETWORK_OVN_BFD_MANAGE", "true")
+	t.Setenv("OVN_NETWORK_OVN_BFD_MIN_RX_MS", "100")
+	t.Setenv("OVN_NETWORK_OVN_BFD_MIN_TX_MS", "110")
+	t.Setenv("OVN_NETWORK_FRR_BFD_MANAGE", "1")
+	t.Setenv("OVN_NETWORK_FRR_BFD_MIN_RX_MS", "200")
+	t.Setenv("OVN_NETWORK_FRR_BFD_MIN_TX_MS", "210")
+	t.Setenv("OVN_NETWORK_FRR_BFD_MULTIPLIER", "4")
+	applyEnvConfig(&cfg)
+
+	if cfg.BFDCheckEnabled {
+		t.Error("BFDCheckEnabled should be false")
+	}
+	if cfg.BFDCheckMaxDetect != 750*time.Millisecond {
+		t.Errorf("BFDCheckMaxDetect = %v, want 750ms", cfg.BFDCheckMaxDetect)
+	}
+	if !cfg.OVNBFDManage || !cfg.FRRBFDManage {
+		t.Error("both manage flags should be true")
+	}
+	if cfg.OVNBFDMinRxMs != 100 || cfg.OVNBFDMinTxMs != 110 {
+		t.Errorf("OVN BFD timers = %d/%d, want 100/110", cfg.OVNBFDMinRxMs, cfg.OVNBFDMinTxMs)
+	}
+	if cfg.FRRBFDMinRxMs != 200 || cfg.FRRBFDMinTxMs != 210 {
+		t.Errorf("FRR BFD timers = %d/%d, want 200/210", cfg.FRRBFDMinRxMs, cfg.FRRBFDMinTxMs)
+	}
+	if cfg.FRRBFDMultiplier != 4 {
+		t.Errorf("FRRBFDMultiplier = %d, want 4", cfg.FRRBFDMultiplier)
+	}
+}
+
+// Malformed env values must be ignored, leaving the prior value intact —
+// a typo must not silently reconfigure the BFD timers.
+func TestApplyEnvConfigBFDInvalidValues(t *testing.T) {
+	cfg := Config{BFDCheckEnabled: true, BFDCheckMaxDetect: time.Second, OVNBFDMinRxMs: 150, FRRBFDMultiplier: 3}
+	t.Setenv("OVN_NETWORK_BFD_CHECK_ENABLED", "yes-please") // not "0"/"false"
+	t.Setenv("OVN_NETWORK_BFD_CHECK_MAX_DETECT", "soon")
+	t.Setenv("OVN_NETWORK_OVN_BFD_MANAGE", "maybe") // not "1"/"true"
+	t.Setenv("OVN_NETWORK_OVN_BFD_MIN_RX_MS", "fast")
+	t.Setenv("OVN_NETWORK_FRR_BFD_MULTIPLIER", "many")
+	applyEnvConfig(&cfg)
+
+	if !cfg.BFDCheckEnabled {
+		t.Error("BFDCheckEnabled should stay true for an unrecognised value")
+	}
+	if cfg.BFDCheckMaxDetect != time.Second {
+		t.Errorf("BFDCheckMaxDetect = %v, want 1s (invalid value ignored)", cfg.BFDCheckMaxDetect)
+	}
+	if cfg.OVNBFDManage {
+		t.Error("OVNBFDManage should stay false for an unrecognised value")
+	}
+	if cfg.OVNBFDMinRxMs != 150 {
+		t.Errorf("OVNBFDMinRxMs = %d, want 150 (invalid value ignored)", cfg.OVNBFDMinRxMs)
+	}
+	if cfg.FRRBFDMultiplier != 3 {
+		t.Errorf("FRRBFDMultiplier = %d, want 3 (invalid value ignored)", cfg.FRRBFDMultiplier)
+	}
+}
+
+func TestApplyFileConfigBFD(t *testing.T) {
+	cfg := Config{BFDCheckEnabled: true, BFDCheckMaxDetect: time.Second, OVNBFDMinRxMs: 150, FRRBFDMultiplier: 3}
+	checkEnabled := false
+	ovnManage := true
+	frrManage := true
+	minRx := 100
+	mult := 5
+	fc := configFile{
+		BFDCheckEnabled:   &checkEnabled,
+		BFDCheckMaxDetect: "450ms",
+		OVNBFDManage:      &ovnManage,
+		OVNBFDMinRxMs:     &minRx,
+		FRRBFDManage:      &frrManage,
+		FRRBFDMultiplier:  &mult,
+	}
+	applyFileConfig(&cfg, &fc)
+
+	if cfg.BFDCheckEnabled {
+		t.Error("BFDCheckEnabled should be false")
+	}
+	if cfg.BFDCheckMaxDetect != 450*time.Millisecond {
+		t.Errorf("BFDCheckMaxDetect = %v, want 450ms", cfg.BFDCheckMaxDetect)
+	}
+	if !cfg.OVNBFDManage || !cfg.FRRBFDManage {
+		t.Error("both manage flags should be true")
+	}
+	if cfg.OVNBFDMinRxMs != 100 {
+		t.Errorf("OVNBFDMinRxMs = %d, want 100", cfg.OVNBFDMinRxMs)
+	}
+	if cfg.FRRBFDMultiplier != 5 {
+		t.Errorf("FRRBFDMultiplier = %d, want 5", cfg.FRRBFDMultiplier)
+	}
+	// Unset pointers must not clobber the existing values.
+	if cfg.OVNBFDMinTxMs != 0 {
+		t.Errorf("OVNBFDMinTxMs = %d, want 0 (untouched)", cfg.OVNBFDMinTxMs)
+	}
+}
+
+func TestApplyFileConfigBFDInvalidDuration(t *testing.T) {
+	cfg := Config{BFDCheckMaxDetect: time.Second}
+	applyFileConfig(&cfg, &configFile{BFDCheckMaxDetect: "not-a-duration"})
+	if cfg.BFDCheckMaxDetect != time.Second {
+		t.Errorf("BFDCheckMaxDetect = %v, want 1s (invalid value ignored)", cfg.BFDCheckMaxDetect)
+	}
+}
+
+// BFD validation is gated on each feature's enable flag: out-of-range values
+// for a disabled feature must not prevent the agent from starting.
+func TestValidateConfigBFD(t *testing.T) {
+	base := func() Config {
+		return Config{
+			VethNexthop:       "169.254.0.1",
+			VRFName:           "vrf-provider",
+			BFDCheckEnabled:   true,
+			BFDCheckMaxDetect: time.Second,
+			OVNBFDMinRxMs:     150,
+			OVNBFDMinTxMs:     150,
+			FRRBFDMinRxMs:     150,
+			FRRBFDMinTxMs:     150,
+			FRRBFDMultiplier:  3,
+		}
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{"defaults are valid", func(*Config) {}, false},
+		{"check enabled with zero max detect", func(c *Config) { c.BFDCheckMaxDetect = 0 }, true},
+		{"check enabled with negative max detect", func(c *Config) { c.BFDCheckMaxDetect = -time.Second }, true},
+		{"check disabled tolerates zero max detect", func(c *Config) {
+			c.BFDCheckEnabled = false
+			c.BFDCheckMaxDetect = 0
+		}, false},
+		{"ovn manage with zero min_rx", func(c *Config) { c.OVNBFDManage = true; c.OVNBFDMinRxMs = 0 }, true},
+		{"ovn manage with oversized min_tx", func(c *Config) { c.OVNBFDManage = true; c.OVNBFDMinTxMs = 60001 }, true},
+		{"ovn manage disabled tolerates zero min_rx", func(c *Config) { c.OVNBFDMinRxMs = 0 }, false},
+		{"frr manage with too-small min_rx", func(c *Config) { c.FRRBFDManage = true; c.FRRBFDMinRxMs = 9 }, true},
+		{"frr manage with too-small min_tx", func(c *Config) { c.FRRBFDManage = true; c.FRRBFDMinTxMs = 0 }, true},
+		{"frr manage with multiplier 1", func(c *Config) { c.FRRBFDManage = true; c.FRRBFDMultiplier = 1 }, true},
+		{"frr manage with multiplier 256", func(c *Config) { c.FRRBFDManage = true; c.FRRBFDMultiplier = 256 }, true},
+		{"frr manage disabled tolerates multiplier 1", func(c *Config) { c.FRRBFDMultiplier = 1 }, false},
+		{"both manage enabled with valid values", func(c *Config) { c.OVNBFDManage = true; c.FRRBFDManage = true }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base()
+			tt.mutate(&cfg)
+			err := validateConfig(&cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
 }

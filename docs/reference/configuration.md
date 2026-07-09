@@ -48,6 +48,15 @@ regenerate this page with `go generate ./...`.
 | `--port-forward-table-id` | `OVN_NETWORK_PORT_FORWARD_TABLE_ID` | `port_forward_table_id` | `201` | Routing table ID for DNAT return traffic (1-252) |
 | `--port-forward-l3mdev-accept` | `OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT` | `port_forward_l3mdev_accept` | `false` | Set udp/tcp_l3mdev_accept=1 for cross-VRF same-host DNAT backends |
 | `--port-forward-ct-zone` | `OVN_NETWORK_PORT_FORWARD_CT_ZONE` | `port_forward_ct_zone` | `64000` | Conntrack zone for DNAT flows (must not collide with OVN zones, 1-65535) |
+| `--bfd-check-enabled` | `OVN_NETWORK_BFD_CHECK_ENABLED` | `bfd_check_enabled` | `true` | Estimate the BFD failure-detection time every reconcile and export it as a metric |
+| `--bfd-check-max-detect` | `OVN_NETWORK_BFD_CHECK_MAX_DETECT` | `bfd_check_max_detect` | `1s` | Warn when the estimated BFD detection time exceeds this duration (e.g. 1s) |
+| `--ovn-bfd-manage` | `OVN_NETWORK_OVN_BFD_MANAGE` | `ovn_bfd_manage` | `false` | Manage bfd:min_rx/bfd:min_tx on local OVN Geneve tunnel interfaces |
+| `--ovn-bfd-min-rx-ms` | `OVN_NETWORK_OVN_BFD_MIN_RX_MS` | `ovn_bfd_min_rx_ms` | `150` | Desired OVS bfd:min_rx for Geneve tunnels in milliseconds (1-60000) |
+| `--ovn-bfd-min-tx-ms` | `OVN_NETWORK_OVN_BFD_MIN_TX_MS` | `ovn_bfd_min_tx_ms` | `150` | Desired OVS bfd:min_tx for Geneve tunnels in milliseconds (1-60000) |
+| `--frr-bfd-manage` | `OVN_NETWORK_FRR_BFD_MANAGE` | `frr_bfd_manage` | `false` | Enable BFD on the VRF's already-configured FRR BGP neighbors |
+| `--frr-bfd-min-rx-ms` | `OVN_NETWORK_FRR_BFD_MIN_RX_MS` | `frr_bfd_min_rx_ms` | `150` | Desired FRR BFD receive-interval in milliseconds (10-60000) |
+| `--frr-bfd-min-tx-ms` | `OVN_NETWORK_FRR_BFD_MIN_TX_MS` | `frr_bfd_min_tx_ms` | `150` | Desired FRR BFD transmit-interval in milliseconds (10-60000) |
+| `--frr-bfd-multiplier` | `OVN_NETWORK_FRR_BFD_MULTIPLIER` | `frr_bfd_multiplier` | `3` | Desired FRR BFD detect-multiplier (2-255) |
 
 Additional YAML-only keys:
 

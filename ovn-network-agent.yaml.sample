@@ -245,3 +245,36 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 #       - proto: tcp
 #         port: 443
 #         dest_addr: "10.0.0.100"
+
+# =============================================================================
+# BFD failover detection
+# =============================================================================
+# Ungraceful failover (node crash, partition, ovn-controller crash) is
+# dominated by OVN's BFD-based detection of the dead gateway chassis. The
+# check below is read-only and on by default; the two manage options are
+# independent opt-ins that write OVS/FRR state. See
+# https://osism.github.io/ovn-network-agent/explanation/bfd-failover-detection
+
+# Estimate the BFD detection time every reconcile, export it as
+# ovn_network_agent_bfd_detect_seconds{layer="ovn"|"frr"} and warn when it
+# exceeds bfd_check_max_detect. Reads OVS and FRR state only.
+#bfd_check_enabled: true
+
+# Warn when the estimated detection time exceeds this duration.
+#bfd_check_max_detect: 1s
+
+# Manage bfd:min_rx / bfd:min_tx on the local OVN Geneve tunnel interfaces.
+# ovn-controller sets only bfd:enable=true. Verify against the deployed OVN
+# version that operator-set timer keys are preserved before relying on this.
+# With 150/150 ms and OVS' detect multiplier of 3 the floor drops to ~450 ms.
+#ovn_bfd_manage: false
+#ovn_bfd_min_rx_ms: 150
+#ovn_bfd_min_tx_ms: 150
+
+# Enable BFD on the VRF's already-configured BGP neighbors (the agent never
+# configures peering itself) using a "ovn-network-agent" bfd profile. Closes
+# the stale /32 gap on a full node crash. The fabric side must enable BFD too.
+#frr_bfd_manage: false
+#frr_bfd_min_rx_ms: 150
+#frr_bfd_min_tx_ms: 150
+#frr_bfd_multiplier: 3
