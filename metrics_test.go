@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -39,6 +40,8 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	recordDrain("completed", time.Second)
 	recordStaleChassisCleanup("success", 2)
 	setMissingChassis(1)
+	setBFDDetectSeconds("ovn", 3)
+	recordBFDCheckError("ovn")
 }
 
 func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
@@ -64,6 +67,8 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_drain_total",
 		"ovn_network_agent_stale_chassis_cleanup_total",
 		"ovn_network_agent_missing_chassis",
+		"ovn_network_agent_bfd_detect_seconds",
+		"ovn_network_agent_bfd_check_errors_total",
 	}
 	gotNames := make(map[string]bool, len(got))
 	for _, mf := range got {
@@ -410,5 +415,108 @@ func TestStartMetricsServerErrorsOnInvalidAddr(t *testing.T) {
 	defer cancel()
 	if err := startMetricsServer(ctx, "127.0.0.1:not-a-port", newMetricsRegistry()); err == nil {
 		t.Fatal("expected error for invalid addr, got nil")
+	}
+}
+
+// bfdDetectValue returns the gauge value for one layer of
+// ovn_network_agent_bfd_detect_seconds, and whether the series exists.
+func bfdDetectValue(t *testing.T, m *metricsRegistry, layer string) (float64, bool) {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error: %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_bfd_detect_seconds" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "layer" && lp.GetValue() == layer {
+					return metric.GetGauge().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// bfdCheckErrorCount returns the counter value for one layer of
+// ovn_network_agent_bfd_check_errors_total.
+func bfdCheckErrorCount(t *testing.T, m *metricsRegistry, layer string) float64 {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error: %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_bfd_check_errors_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "layer" && lp.GetValue() == layer {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("layer %q missing from bfd_check_errors_total", layer)
+	return 0
+}
+
+// A layer whose state cannot be read has an unknown detection time, not a
+// zero-second one. Counting the read failures is what lets an operator tell the
+// two apart, because NaN satisfies no comparison an alert can express.
+func TestRecordBFDCheckErrorCountsPerLayer(t *testing.T) {
+	m := withTestMetrics(t)
+
+	for _, layer := range []string{"ovn", "frr"} {
+		if v := bfdCheckErrorCount(t, m, layer); v != 0 {
+			t.Errorf("layer %q = %v on a fresh registry, want 0", layer, v)
+		}
+	}
+
+	recordBFDCheckError("ovn")
+	recordBFDCheckError("ovn")
+
+	if v := bfdCheckErrorCount(t, m, "ovn"); v != 2 {
+		t.Errorf("layer ovn = %v, want 2", v)
+	}
+	if v := bfdCheckErrorCount(t, m, "frr"); v != 0 {
+		t.Errorf("layer frr = %v after two ovn errors, want 0", v)
+	}
+}
+
+func TestSetBFDDetectSeconds(t *testing.T) {
+	m := withTestMetrics(t)
+
+	// Both layers are bootstrapped as NaN so they appear on the first scrape
+	// without claiming the instantaneous — i.e. perfect — detection time that a
+	// zero would assert before anything has been measured.
+	for _, layer := range []string{"ovn", "frr"} {
+		v, ok := bfdDetectValue(t, m, layer)
+		if !ok {
+			t.Fatalf("layer %q missing from a fresh registry", layer)
+		}
+		if !math.IsNaN(v) {
+			t.Errorf("layer %q = %v on a fresh registry, want NaN", layer, v)
+		}
+	}
+
+	setBFDDetectSeconds("ovn", 3)
+	setBFDDetectSeconds("frr", 0.45)
+
+	if v, _ := bfdDetectValue(t, m, "ovn"); v != 3 {
+		t.Errorf("layer ovn = %v, want 3", v)
+	}
+	if v, _ := bfdDetectValue(t, m, "frr"); v != 0.45 {
+		t.Errorf("layer frr = %v, want 0.45", v)
+	}
+
+	// Setting one layer must not disturb the other.
+	setBFDDetectSeconds("ovn", 0.45)
+	if v, _ := bfdDetectValue(t, m, "frr"); v != 0.45 {
+		t.Errorf("layer frr = %v after updating ovn, want 0.45", v)
 	}
 }

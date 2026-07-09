@@ -164,6 +164,20 @@ type Config struct {
 	PortForwardL3mdevAccept bool             // set udp/tcp_l3mdev_accept=1 for cross-VRF same-host backends (default: false)
 	PortForwardCTZone       int              // conntrack zone for DNAT flows; must not collide with OVN zones (default: 64000)
 	PortForwards            []PortForwardVIP // VIP forwarding rules from config
+
+	// BFD failover detection. The check is read-only visibility; the two
+	// manage flags are independent opt-ins that write OVS/FRR state.
+	BFDCheckEnabled   bool          // estimate and export the BFD detection floor every reconcile
+	BFDCheckMaxDetect time.Duration // warn when the estimate exceeds this
+
+	OVNBFDManage  bool // set bfd:min_rx/bfd:min_tx on local Geneve tunnel interfaces
+	OVNBFDMinRxMs int  // desired OVS bfd:min_rx in milliseconds
+	OVNBFDMinTxMs int  // desired OVS bfd:min_tx in milliseconds
+
+	FRRBFDManage     bool // enable BFD on the VRF's already-configured BGP neighbors
+	FRRBFDMinRxMs    int  // desired FRR BFD receive-interval in milliseconds
+	FRRBFDMinTxMs    int  // desired FRR BFD transmit-interval in milliseconds
+	FRRBFDMultiplier int  // desired FRR BFD detect-multiplier
 }
 
 // configFile is the YAML representation of the config file.
@@ -202,6 +216,18 @@ type configFile struct {
 	PortForwardL3mdevAccept *bool            `yaml:"port_forward_l3mdev_accept"`
 	PortForwardCTZone       *int             `yaml:"port_forward_ct_zone"`
 	PortForwards            []PortForwardVIP `yaml:"port_forwards"`
+
+	BFDCheckEnabled   *bool  `yaml:"bfd_check_enabled"`
+	BFDCheckMaxDetect string `yaml:"bfd_check_max_detect"`
+
+	OVNBFDManage  *bool `yaml:"ovn_bfd_manage"`
+	OVNBFDMinRxMs *int  `yaml:"ovn_bfd_min_rx_ms"`
+	OVNBFDMinTxMs *int  `yaml:"ovn_bfd_min_tx_ms"`
+
+	FRRBFDManage     *bool `yaml:"frr_bfd_manage"`
+	FRRBFDMinRxMs    *int  `yaml:"frr_bfd_min_rx_ms"`
+	FRRBFDMinTxMs    *int  `yaml:"frr_bfd_min_tx_ms"`
+	FRRBFDMultiplier *int  `yaml:"frr_bfd_multiplier"`
 }
 
 // loadConfig builds the configuration with the following priority
@@ -243,6 +269,16 @@ func loadConfig(args []string) (Config, error) {
 		fPortForwardTableID      = fs.Int("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)")
 		fPortForwardL3mdevAccept = fs.Bool("port-forward-l3mdev-accept", false, "Set udp/tcp_l3mdev_accept=1 for cross-VRF same-host DNAT backends")
 		fPortForwardCTZone       = fs.Int("port-forward-ct-zone", 64000, "Conntrack zone for DNAT flows (must not collide with OVN zones, 1-65535)")
+
+		fBFDCheckEnabled   = fs.Bool("bfd-check-enabled", true, "Estimate the BFD failure-detection time every reconcile and export it as a metric")
+		fBFDCheckMaxDetect = fs.String("bfd-check-max-detect", "", "Warn when the estimated BFD detection time exceeds this duration (e.g. 1s)")
+		fOVNBFDManage      = fs.Bool("ovn-bfd-manage", false, "Manage bfd:min_rx/bfd:min_tx on local OVN Geneve tunnel interfaces")
+		fOVNBFDMinRxMs     = fs.Int("ovn-bfd-min-rx-ms", 150, "Desired OVS bfd:min_rx for Geneve tunnels in milliseconds (1-60000)")
+		fOVNBFDMinTxMs     = fs.Int("ovn-bfd-min-tx-ms", 150, "Desired OVS bfd:min_tx for Geneve tunnels in milliseconds (1-60000)")
+		fFRRBFDManage      = fs.Bool("frr-bfd-manage", false, "Enable BFD on the VRF's already-configured FRR BGP neighbors")
+		fFRRBFDMinRxMs     = fs.Int("frr-bfd-min-rx-ms", 150, "Desired FRR BFD receive-interval in milliseconds (10-60000)")
+		fFRRBFDMinTxMs     = fs.Int("frr-bfd-min-tx-ms", 150, "Desired FRR BFD transmit-interval in milliseconds (10-60000)")
+		fFRRBFDMultiplier  = fs.Int("frr-bfd-multiplier", 3, "Desired FRR BFD detect-multiplier (2-255)")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -273,6 +309,13 @@ func loadConfig(args []string) (Config, error) {
 		PortForwardDev:          "loopback1",
 		PortForwardTableID:      201,
 		PortForwardCTZone:       64000,
+		BFDCheckEnabled:         true,
+		BFDCheckMaxDetect:       1 * time.Second,
+		OVNBFDMinRxMs:           150,
+		OVNBFDMinTxMs:           150,
+		FRRBFDMinRxMs:           150,
+		FRRBFDMinTxMs:           150,
+		FRRBFDMultiplier:        3,
 	}
 
 	// Layer 1: config file
@@ -356,6 +399,28 @@ func loadConfig(args []string) (Config, error) {
 			cfg.PortForwardL3mdevAccept = *fPortForwardL3mdevAccept
 		case "port-forward-ct-zone":
 			cfg.PortForwardCTZone = *fPortForwardCTZone
+		case "bfd-check-enabled":
+			cfg.BFDCheckEnabled = *fBFDCheckEnabled
+		case "bfd-check-max-detect":
+			if d, err := time.ParseDuration(*fBFDCheckMaxDetect); err == nil {
+				cfg.BFDCheckMaxDetect = d
+			} else {
+				slog.Warn("ignoring invalid bfd-check-max-detect flag value", "value", *fBFDCheckMaxDetect, "error", err)
+			}
+		case "ovn-bfd-manage":
+			cfg.OVNBFDManage = *fOVNBFDManage
+		case "ovn-bfd-min-rx-ms":
+			cfg.OVNBFDMinRxMs = *fOVNBFDMinRxMs
+		case "ovn-bfd-min-tx-ms":
+			cfg.OVNBFDMinTxMs = *fOVNBFDMinTxMs
+		case "frr-bfd-manage":
+			cfg.FRRBFDManage = *fFRRBFDManage
+		case "frr-bfd-min-rx-ms":
+			cfg.FRRBFDMinRxMs = *fFRRBFDMinRxMs
+		case "frr-bfd-min-tx-ms":
+			cfg.FRRBFDMinTxMs = *fFRRBFDMinTxMs
+		case "frr-bfd-multiplier":
+			cfg.FRRBFDMultiplier = *fFRRBFDMultiplier
 		}
 	})
 
@@ -570,6 +635,33 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
+	// BFD validation. Each block is gated on its own enable flag so that
+	// values left at an out-of-range setting for a disabled feature do not
+	// prevent the agent from starting.
+	if cfg.BFDCheckEnabled && cfg.BFDCheckMaxDetect <= 0 {
+		return fmt.Errorf("bfd-check-enabled requires a positive bfd-check-max-detect")
+	}
+	if cfg.OVNBFDManage {
+		if cfg.OVNBFDMinRxMs < 1 || cfg.OVNBFDMinRxMs > 60000 {
+			return fmt.Errorf("invalid ovn-bfd-min-rx-ms: %d (must be 1-60000)", cfg.OVNBFDMinRxMs)
+		}
+		if cfg.OVNBFDMinTxMs < 1 || cfg.OVNBFDMinTxMs > 60000 {
+			return fmt.Errorf("invalid ovn-bfd-min-tx-ms: %d (must be 1-60000)", cfg.OVNBFDMinTxMs)
+		}
+	}
+	if cfg.FRRBFDManage {
+		// FRR rejects intervals below 10 ms and multipliers outside 2-255.
+		if cfg.FRRBFDMinRxMs < 10 || cfg.FRRBFDMinRxMs > 60000 {
+			return fmt.Errorf("invalid frr-bfd-min-rx-ms: %d (must be 10-60000)", cfg.FRRBFDMinRxMs)
+		}
+		if cfg.FRRBFDMinTxMs < 10 || cfg.FRRBFDMinTxMs > 60000 {
+			return fmt.Errorf("invalid frr-bfd-min-tx-ms: %d (must be 10-60000)", cfg.FRRBFDMinTxMs)
+		}
+		if cfg.FRRBFDMultiplier < 2 || cfg.FRRBFDMultiplier > 255 {
+			return fmt.Errorf("invalid frr-bfd-multiplier: %d (must be 2-255)", cfg.FRRBFDMultiplier)
+		}
+	}
+
 	return nil
 }
 
@@ -716,6 +808,37 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if len(fc.PortForwards) > 0 {
 		cfg.PortForwards = fc.PortForwards
 	}
+	if fc.BFDCheckEnabled != nil {
+		cfg.BFDCheckEnabled = *fc.BFDCheckEnabled
+	}
+	if fc.BFDCheckMaxDetect != "" {
+		if d, err := time.ParseDuration(fc.BFDCheckMaxDetect); err == nil {
+			cfg.BFDCheckMaxDetect = d
+		} else {
+			slog.Warn("ignoring invalid bfd_check_max_detect in config file", "value", fc.BFDCheckMaxDetect, "error", err)
+		}
+	}
+	if fc.OVNBFDManage != nil {
+		cfg.OVNBFDManage = *fc.OVNBFDManage
+	}
+	if fc.OVNBFDMinRxMs != nil {
+		cfg.OVNBFDMinRxMs = *fc.OVNBFDMinRxMs
+	}
+	if fc.OVNBFDMinTxMs != nil {
+		cfg.OVNBFDMinTxMs = *fc.OVNBFDMinTxMs
+	}
+	if fc.FRRBFDManage != nil {
+		cfg.FRRBFDManage = *fc.FRRBFDManage
+	}
+	if fc.FRRBFDMinRxMs != nil {
+		cfg.FRRBFDMinRxMs = *fc.FRRBFDMinRxMs
+	}
+	if fc.FRRBFDMinTxMs != nil {
+		cfg.FRRBFDMinTxMs = *fc.FRRBFDMinTxMs
+	}
+	if fc.FRRBFDMultiplier != nil {
+		cfg.FRRBFDMultiplier = *fc.FRRBFDMultiplier
+	}
 }
 
 func applyEnvConfig(cfg *Config) {
@@ -830,6 +953,52 @@ func applyEnvConfig(cfg *Config) {
 		var zone int
 		if _, err := fmt.Sscanf(v, "%d", &zone); err == nil {
 			cfg.PortForwardCTZone = zone
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_BFD_CHECK_ENABLED"); v == "0" || v == "false" {
+		cfg.BFDCheckEnabled = false
+	}
+	if v := os.Getenv("OVN_NETWORK_BFD_CHECK_MAX_DETECT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.BFDCheckMaxDetect = d
+		} else {
+			slog.Warn("ignoring invalid OVN_NETWORK_BFD_CHECK_MAX_DETECT env var", "value", v, "error", err)
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_OVN_BFD_MANAGE"); v == "1" || v == "true" {
+		cfg.OVNBFDManage = true
+	}
+	if v := os.Getenv("OVN_NETWORK_OVN_BFD_MIN_RX_MS"); v != "" {
+		var ms int
+		if _, err := fmt.Sscanf(v, "%d", &ms); err == nil {
+			cfg.OVNBFDMinRxMs = ms
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_OVN_BFD_MIN_TX_MS"); v != "" {
+		var ms int
+		if _, err := fmt.Sscanf(v, "%d", &ms); err == nil {
+			cfg.OVNBFDMinTxMs = ms
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_FRR_BFD_MANAGE"); v == "1" || v == "true" {
+		cfg.FRRBFDManage = true
+	}
+	if v := os.Getenv("OVN_NETWORK_FRR_BFD_MIN_RX_MS"); v != "" {
+		var ms int
+		if _, err := fmt.Sscanf(v, "%d", &ms); err == nil {
+			cfg.FRRBFDMinRxMs = ms
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_FRR_BFD_MIN_TX_MS"); v != "" {
+		var ms int
+		if _, err := fmt.Sscanf(v, "%d", &ms); err == nil {
+			cfg.FRRBFDMinTxMs = ms
+		}
+	}
+	if v := os.Getenv("OVN_NETWORK_FRR_BFD_MULTIPLIER"); v != "" {
+		var mult int
+		if _, err := fmt.Sscanf(v, "%d", &mult); err == nil {
+			cfg.FRRBFDMultiplier = mult
 		}
 	}
 }

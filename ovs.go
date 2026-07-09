@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -57,21 +59,47 @@ func MACTweakFlow(cookie, ofport, mac string, ipv6 bool) string {
 		cookie, proto, ofport, mac)
 }
 
+// ovsCommandTimeout bounds a single OVS invocation. Reconciliation runs on the
+// agent's only loop goroutine, so an ovs-vsctl that never returns — a wedged
+// ovsdb-server, a hung wrapper container — would stop route programming and
+// keep the SIGTERM handler from ever draining the gateways off this node.
+const ovsCommandTimeout = 30 * time.Second
+
+// ovsInternalTimeout is passed to every ovs-vsctl and ovs-ofctl as --timeout so
+// the OVS command bounds itself.
+//
+// Killing the command's process group only reaches processes on this host. With
+// the documented `docker exec openvswitch_vswitchd` wrapper the real ovs-vsctl
+// runs in another container, where no signal from the agent reaches it: on a
+// wedged ovsdb-server it keeps retrying its connection forever while the agent
+// forks a fresh one every reconcile. It expires before ovsCommandTimeout so the
+// command reports its own timeout rather than being killed.
+const ovsInternalTimeout = ovsCommandTimeout - 5*time.Second
+
 // ovsCmd builds an exec.Cmd for an OVS command, prepending the configured
 // wrapper (e.g. "docker exec openvswitch_vswitchd") if set.
-func (rm *RouteManager) ovsCmd(binary string, args ...string) *exec.Cmd {
+func (rm *RouteManager) ovsCmd(ctx context.Context, binary string, args ...string) *exec.Cmd {
 	if len(rm.ovsWrapper) > 0 {
 		fullArgs := append(rm.ovsWrapper[1:], binary)
 		fullArgs = append(fullArgs, args...)
-		return exec.Command(rm.ovsWrapper[0], fullArgs...)
+		return exec.CommandContext(ctx, rm.ovsWrapper[0], fullArgs...)
 	}
-	return exec.Command(binary, args...)
+	return exec.CommandContext(ctx, binary, args...)
 }
 
-// runOVS builds and runs an OVS command. When execOVSHook is set (tests) the
-// command is dispatched through it instead of being executed.
+// runOVS builds and runs an OVS command under ovsCommandTimeout, doubly bounded:
+// the context kills the command's process group here, and --timeout stops the
+// ovs-vsctl or ovs-ofctl itself wherever an ovs_wrapper started it. When
+// execOVSHook is set (tests) the command is dispatched through it instead of
+// being executed.
 func (rm *RouteManager) runOVS(binary string, args ...string) ([]byte, error) {
-	cmd := rm.ovsCmd(binary, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), ovsCommandTimeout)
+	defer cancel()
+	// Both binaries take --timeout as a common option before the command verb.
+	args = append([]string{fmt.Sprintf("--timeout=%d", int(ovsInternalTimeout.Seconds()))}, args...)
+	cmd := rm.ovsCmd(ctx, binary, args...)
+	cmd.WaitDelay = commandWaitDelay
+	killProcessGroup(cmd)
 	if rm.execOVSHook != nil {
 		return rm.execOVSHook(cmd)
 	}
@@ -527,6 +555,60 @@ func (rm *RouteManager) addOVSFlow(flow string) error {
 	out, err := rm.runOVS("ovs-ofctl", "add-flow", rm.bridgeDev, flow)
 	if err != nil {
 		return fmt.Errorf("ovs-ofctl add-flow %s %q: %w (output: %s)", rm.bridgeDev, flow, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// findGeneveInterfaces returns the raw `ovs-vsctl find` JSON describing the
+// local OVN Geneve tunnel interfaces and their BFD configuration. See bfd.go
+// for the parser and the detection-time estimate built on top of it.
+func (rm *RouteManager) findGeneveInterfaces() ([]byte, error) {
+	out, err := rm.runOVS("ovs-vsctl", "--format=json", "--columns=name,bfd", "find", "Interface", "type=geneve")
+	if err != nil {
+		return nil, fmt.Errorf("ovs-vsctl find geneve interfaces: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
+}
+
+// setInterfaceBFDTimers sets the operator-managed BFD timer keys on the given
+// OVS interfaces. bfd:enable is deliberately left alone — ovn-controller owns
+// it.
+//
+// All interfaces are written by one ovs-vsctl invocation, joined by `--`.
+// ovsCommandTimeout bounds a single invocation, not a reconcile: a chassis whose
+// tunnels are all drifted would otherwise fork one bounded command per remote
+// chassis, and a wedged ovsdb-server could hold the agent's only loop goroutine
+// for hours — no route programming, no stale-chassis cleanup, and no SIGTERM
+// drain — behind what looks like a 30 s bound.
+//
+// --if-exists: ovn-controller creates and destroys Geneve tunnels as chassis
+// join and leave the cluster, so a tunnel enumerated moments ago may already be
+// gone by the time it is written. It makes that clause a no-op instead of
+// failing the transaction and leaving every other tunnel untuned.
+func (rm *RouteManager) setInterfaceBFDTimers(names []string, minRxMs, minTxMs int) error {
+	args := make([]string, 0, len(names)*7)
+	for _, name := range names {
+		// The name comes from the Interface table, unvalidated. `--` is
+		// ovs-vsctl's own clause separator and a leading `-` starts an option,
+		// so such a name re-partitions the command line: the transaction fails
+		// and one poisoned row leaves every tunnel in the batch untuned.
+		// ovn-controller's `ovn-<hash>` names pass, so the guard costs nothing.
+		if strings.HasPrefix(name, "-") || !isValidIdentifier(name) {
+			slog.Warn("skipping Geneve interface with an unexpected name", "interface", name)
+			continue
+		}
+		if len(args) > 0 {
+			args = append(args, "--")
+		}
+		args = append(args, "--if-exists", "set", "Interface", name,
+			fmt.Sprintf("bfd:min_rx=%d", minRxMs), fmt.Sprintf("bfd:min_tx=%d", minTxMs))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	out, err := rm.runOVS("ovs-vsctl", args...)
+	if err != nil {
+		return fmt.Errorf("set BFD timers on %d interfaces: %w (output: %s)", len(names), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

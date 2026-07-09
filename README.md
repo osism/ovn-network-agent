@@ -30,6 +30,7 @@ Full documentation is published at
   - [Gatewayless provider networks](https://osism.github.io/ovn-network-agent/explanation/gatewayless-networks)
   - [Port forwarding (DNAT)](https://osism.github.io/ovn-network-agent/explanation/port-forwarding)
   - [Gateway drain mode](https://osism.github.io/ovn-network-agent/explanation/gateway-drain)
+  - [BFD failover detection](https://osism.github.io/ovn-network-agent/explanation/bfd-failover-detection)
 - Contributing:
   - [Integration tests](https://osism.github.io/ovn-network-agent/contributing/integration-tests)
   - [Containerlab E2E harness](https://osism.github.io/ovn-network-agent/contributing/e2e-tests)

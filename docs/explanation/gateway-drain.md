@@ -9,7 +9,9 @@ two things happen nearly simultaneously:
    node, so the external fabric stops sending traffic here within seconds.
 2. **OVN BFD failover** — OVN detects that the gateway chassis is gone and
    migrates chassisredirect ports to standby chassis. This relies on BFD
-   timeouts (typically 3×1s = 3 seconds) or periodic probing.
+   timeouts (typically 3×1s = 3 seconds) or periodic probing. See
+   [BFD failover detection](./bfd-failover-detection) for measuring and
+   lowering this floor.
 
 The problem is the **gap between these two events**. During the window where
 BGP has already withdrawn routes but OVN has not yet completed failover,

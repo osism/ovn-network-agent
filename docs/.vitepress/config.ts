@@ -53,6 +53,7 @@ export default defineConfig({
           { text: 'Gatewayless provider networks', link: '/explanation/gatewayless-networks' },
           { text: 'Port forwarding (DNAT)', link: '/explanation/port-forwarding' },
           { text: 'Gateway drain mode', link: '/explanation/gateway-drain' },
+          { text: 'BFD failover detection', link: '/explanation/bfd-failover-detection' },
         ],
       },
       {

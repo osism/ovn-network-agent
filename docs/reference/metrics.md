@@ -40,6 +40,8 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_drain_total` | counter (vec) | `outcome`={`completed`,`timeout`,`error`,`noop`} | Total drain operations, labelled by outcome (completed, timeout, error, noop). |
 | `ovn_network_agent_stale_chassis_cleanup_total` | counter (vec) | `outcome`={`success`,`error`} | Total stale chassis cleanup events, labelled by outcome (success, error). |
 | `ovn_network_agent_missing_chassis` | gauge | — | Number of chassis currently tracked as missing from the SB Chassis table. |
+| `ovn_network_agent_bfd_detect_seconds` | gauge (vec) | `layer`={`ovn`,`frr`} | Estimated BFD failure-detection time in seconds per layer (worst case across local OVN Geneve tunnels / FRR BFD peers in the VRF). This is the floor for ungraceful gateway failover. +Inf = nothing bounds the detection: the layer runs no BFD session, or a BGP neighbor in the VRF runs none. NaN = the layer could not be read; see bfd_check_errors_total. |
+| `ovn_network_agent_bfd_check_errors_total` | counter (vec) | `layer`={`ovn`,`frr`} | Total failures to read a layer's BFD state (ovs-vsctl or vtysh). While this rises, bfd_detect_seconds for that layer is NaN. |
 
 ## Suggested alerts
 

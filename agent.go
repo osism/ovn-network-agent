@@ -443,6 +443,11 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// advertised via BGP — ensureRoutes alone cannot detect this.
 	a.checkFRRRouteActivity(desiredIPs)
 
+	// Surface (and optionally lower) the BFD failure-detection floor that
+	// bounds ungraceful failover. Runs after route programming so it never
+	// delays the failover hot path.
+	a.reconcileBFD()
+
 	// Check for stale chassis entries from dead nodes (runs on every agent).
 	// This runs after gateway routing reconciliation so that a surviving agent
 	// creates its own routes before removing entries from dead chassis.
