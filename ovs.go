@@ -569,3 +569,46 @@ func (rm *RouteManager) findGeneveInterfaces() ([]byte, error) {
 	}
 	return out, nil
 }
+
+// setInterfaceBFDTimers sets the operator-managed BFD timer keys on the given
+// OVS interfaces. bfd:enable is deliberately left alone — ovn-controller owns
+// it.
+//
+// All interfaces are written by one ovs-vsctl invocation, joined by `--`.
+// ovsCommandTimeout bounds a single invocation, not a reconcile: a chassis whose
+// tunnels are all drifted would otherwise fork one bounded command per remote
+// chassis, and a wedged ovsdb-server could hold the agent's only loop goroutine
+// for hours — no route programming, no stale-chassis cleanup, and no SIGTERM
+// drain — behind what looks like a 30 s bound.
+//
+// --if-exists: ovn-controller creates and destroys Geneve tunnels as chassis
+// join and leave the cluster, so a tunnel enumerated moments ago may already be
+// gone by the time it is written. It makes that clause a no-op instead of
+// failing the transaction and leaving every other tunnel untuned.
+func (rm *RouteManager) setInterfaceBFDTimers(names []string, minRxMs, minTxMs int) error {
+	args := make([]string, 0, len(names)*7)
+	for _, name := range names {
+		// The name comes from the Interface table, unvalidated. `--` is
+		// ovs-vsctl's own clause separator and a leading `-` starts an option,
+		// so such a name re-partitions the command line: the transaction fails
+		// and one poisoned row leaves every tunnel in the batch untuned.
+		// ovn-controller's `ovn-<hash>` names pass, so the guard costs nothing.
+		if strings.HasPrefix(name, "-") || !isValidIdentifier(name) {
+			slog.Warn("skipping Geneve interface with an unexpected name", "interface", name)
+			continue
+		}
+		if len(args) > 0 {
+			args = append(args, "--")
+		}
+		args = append(args, "--if-exists", "set", "Interface", name,
+			fmt.Sprintf("bfd:min_rx=%d", minRxMs), fmt.Sprintf("bfd:min_tx=%d", minTxMs))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	out, err := rm.runOVS("ovs-vsctl", args...)
+	if err != nil {
+		return fmt.Errorf("set BFD timers on %d interfaces: %w (output: %s)", len(names), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

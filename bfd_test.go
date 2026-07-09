@@ -538,3 +538,253 @@ func TestReconcileBFDClearsTheEstimateWhenMeasurementStops(t *testing.T) {
 		t.Errorf("bfd_detect_seconds{layer=frr} = %v, want +Inf — a stale estimate must not survive a vanished session", v)
 	}
 }
+
+// =============================================================================
+// OVN tunnel BFD timer management (ovn_bfd_manage)
+// =============================================================================
+
+// setTimerCommands returns the recorded `ovs-vsctl set Interface … bfd:…` calls.
+func setTimerCommands(calls [][]string) []string {
+	var found []string
+	for _, c := range calls {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "set Interface") && strings.Contains(joined, "bfd:min_rx") {
+			found = append(found, joined)
+		}
+	}
+	return found
+}
+
+func TestEnsureOVNBFDTimers(t *testing.T) {
+	t.Run("a drifted tunnel is written, and the caller's slice is left alone", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{{Name: "genev_sys_6081", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3}}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		want := "ovs-vsctl --if-exists set Interface genev_sys_6081 bfd:min_rx=150 bfd:min_tx=150"
+		if got := setTimerCommands(rec.calls); len(got) != 1 || got[0] != want {
+			t.Fatalf("commands = %v, want exactly [%q]", got, want)
+		}
+
+		// A successful write is not proof that OVS kept the value: ovn-controller
+		// may reclaim the bfd column. Only a fresh read knows the effective
+		// timers, so the slice must still hold what OVSDB reported.
+		if tunnels[0].MinRxMs != 1000 || tunnels[0].MinTxMs != 100 {
+			t.Errorf("tunnel = %+v, want the timers OVS reported, not the ones written", tunnels[0])
+		}
+	})
+
+	t.Run("a tunnel already at the desired timers is not written", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{{Name: "genev_sys_6081", Enabled: true, MinRxMs: 150, MinTxMs: 150, Mult: 3}}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		if got := setTimerCommands(rec.calls); len(got) != 0 {
+			t.Errorf("commands = %v, want none", got)
+		}
+	})
+
+	// ovsCommandTimeout bounds one ovs-vsctl invocation, not one reconcile. A
+	// per-tunnel loop over a cluster's worth of drifted tunnels therefore has no
+	// bound at all: a wedged ovsdb-server would hold the agent's only loop
+	// goroutine for 30 s per remote chassis, blocking route programming and the
+	// SIGTERM drain for hours. Every drifted tunnel goes into one transaction,
+	// and --if-exists keeps a tunnel ovn-controller destroyed since the
+	// enumeration from failing it.
+	t.Run("every drifted tunnel is written by a single ovs-vsctl invocation", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{
+			{Name: "gone", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3},
+			{Name: "survivor", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3},
+		}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		if len(rec.calls) != 1 {
+			t.Fatalf("issued %d ovs-vsctl calls, want exactly one: %v", len(rec.calls), rec.calls)
+		}
+		want := "ovs-vsctl --if-exists set Interface gone bfd:min_rx=150 bfd:min_tx=150 " +
+			"-- --if-exists set Interface survivor bfd:min_rx=150 bfd:min_tx=150"
+		if got := strings.Join(rec.calls[0], " "); got != want {
+			t.Errorf("command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("only the drifted tunnel is written", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{
+			{Name: "correct", Enabled: true, MinRxMs: 150, MinTxMs: 150, Mult: 3},
+			{Name: "drifted", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3},
+		}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		got := setTimerCommands(rec.calls)
+		if len(got) != 1 || !strings.Contains(got[0], "Interface drifted") {
+			t.Errorf("commands = %v, want only the drifted tunnel written", got)
+		}
+	})
+
+	t.Run("a disabled tunnel is still pre-staged", func(t *testing.T) {
+		// ovn-controller flips bfd:enable when a gateway lands here; having
+		// the timers already set means the session starts out fast.
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{{Name: "idle", Enabled: false, MinRxMs: 1000, MinTxMs: 100, Mult: 3}}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		if got := setTimerCommands(rec.calls); len(got) != 1 {
+			t.Errorf("commands = %v, want the idle tunnel pre-staged", got)
+		}
+	})
+
+	// `--` is ovs-vsctl's own clause separator: an Interface row named `--`, or
+	// anything starting with `-`, re-partitions the command line and fails the
+	// transaction, leaving every tunnel in the batch untuned.
+	t.Run("an interface whose name would re-partition the command line is skipped", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{
+			{Name: "--", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3},
+			{Name: "genev_sys_6081", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3},
+		}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		want := "ovs-vsctl --if-exists set Interface genev_sys_6081 bfd:min_rx=150 bfd:min_tx=150"
+		if got := setTimerCommands(rec.calls); len(got) != 1 || got[0] != want {
+			t.Fatalf("commands = %v, want exactly [%q] — the poisoned row must not disable the whole batch", got, want)
+		}
+	})
+
+	t.Run("nothing is issued when every name is unusable", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{{Name: "-x", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3}}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		if len(rec.calls) != 0 {
+			t.Errorf("issued %v, want no ovs-vsctl invocation at all", rec.calls)
+		}
+	})
+
+	t.Run("exec error is propagated", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rec.on(strings.Fields("ovs-vsctl --if-exists set Interface genev_sys_6081 bfd:min_rx=150 bfd:min_tx=150"),
+			"ovs-vsctl: unix socket error", errors.New("exit status 1"))
+		rm := &RouteManager{execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{{Name: "genev_sys_6081", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3}}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err == nil {
+			t.Fatal("EnsureOVNBFDTimers() = nil error, want the exec failure")
+		}
+	})
+
+	t.Run("dry-run writes nothing", func(t *testing.T) {
+		rec := newOVSRecorder()
+		rm := &RouteManager{dryRun: true, execOVSHook: rec.hook()}
+		tunnels := []bfdTunnel{{Name: "genev_sys_6081", Enabled: true, MinRxMs: 1000, MinTxMs: 100, Mult: 3}}
+
+		if err := rm.EnsureOVNBFDTimers(tunnels, 150, 150); err != nil {
+			t.Fatalf("EnsureOVNBFDTimers() error: %v", err)
+		}
+		if len(rec.calls) != 0 {
+			t.Errorf("dry-run issued %v, want no commands", rec.calls)
+		}
+	})
+}
+
+// The exported estimate must describe the timers OVS holds, not the ones the
+// agent asked for — otherwise the check that exists to prove ovn_bfd_manage
+// took effect is structurally incapable of observing that it did not.
+func TestReconcileBFDOVNManageEstimatesFromOVSDBNotFromIntent(t *testing.T) {
+	m := withTestMetrics(t)
+	a, ovsRec, vtyshRec := bfdTestAgent(t, Config{
+		BFDCheckEnabled: true, BFDCheckMaxDetect: time.Second,
+		OVNBFDManage: true, OVNBFDMinRxMs: 150, OVNBFDMinTxMs: 150,
+	})
+
+	a.reconcileBFD()
+
+	if got := setTimerCommands(ovsRec.calls); len(got) != 1 {
+		t.Fatalf("OVS timer commands = %v, want exactly one", got)
+	}
+	// OVS still reported the untuned timers this cycle, so 3 s is the floor
+	// that was actually in force.
+	if v, _ := bfdDetectValue(t, m, "ovn"); v != 3 {
+		t.Errorf("bfd_detect_seconds{layer=ovn} = %v, want 3 — the estimate must follow OVSDB, not the write", v)
+	}
+	// FRR must stay untouched: the manage flags are independent.
+	if got := mutatingCommands(vtyshRec.calls); len(got) > 0 {
+		t.Errorf("ovn_bfd_manage modified FRR state: %v", got)
+	}
+
+	// Once OVS reports the timers that were written, the next reconcile finds
+	// nothing drifted, writes nothing, and the estimate follows.
+	ovsRec.on(strings.Fields("ovs-vsctl --format=json --columns=name,bfd find Interface type=geneve"),
+		geneveFindTunedTimers, nil)
+	before := len(setTimerCommands(ovsRec.calls))
+	a.reconcileBFD()
+	if got := setTimerCommands(ovsRec.calls); len(got) != before {
+		t.Errorf("second reconcile issued %d timer commands, want 0", len(got)-before)
+	}
+	if v, _ := bfdDetectValue(t, m, "ovn"); v != 0.45 {
+		t.Errorf("bfd_detect_seconds{layer=ovn} = %v, want 0.45 once OVS reports the tuned timers", v)
+	}
+}
+
+// An OVN version that reclaims the bfd column reverts the timers after every
+// write. The metric must keep reporting the real 3 s floor rather than the
+// 450 ms the agent keeps asking for.
+func TestReconcileBFDOVNManageReportsRevertedTimers(t *testing.T) {
+	m := withTestMetrics(t)
+	a, ovsRec, _ := bfdTestAgent(t, Config{
+		BFDCheckEnabled: true, BFDCheckMaxDetect: time.Second,
+		OVNBFDManage: true, OVNBFDMinRxMs: 150, OVNBFDMinTxMs: 150,
+	})
+
+	// The recorder keeps answering the find with the OVS defaults: whatever the
+	// agent writes, ovn-controller puts them back.
+	a.reconcileBFD()
+	a.reconcileBFD()
+
+	if got := setTimerCommands(ovsRec.calls); len(got) != 2 {
+		t.Errorf("OVS timer commands = %v, want one per reconcile", got)
+	}
+	if v, _ := bfdDetectValue(t, m, "ovn"); v != 3 {
+		t.Errorf("bfd_detect_seconds{layer=ovn} = %v, want 3 — a reverted write must stay visible", v)
+	}
+}
+
+// The manager runs even when the check is off — the two are independent.
+func TestReconcileBFDOVNManageWithoutCheck(t *testing.T) {
+	m := withTestMetrics(t)
+	a, ovsRec, _ := bfdTestAgent(t, Config{
+		BFDCheckEnabled: false,
+		OVNBFDManage:    true, OVNBFDMinRxMs: 150, OVNBFDMinTxMs: 150,
+	})
+
+	a.reconcileBFD()
+
+	if got := setTimerCommands(ovsRec.calls); len(got) != 1 {
+		t.Errorf("OVS timer commands = %v, want exactly one", got)
+	}
+	if v, _ := bfdDetectValue(t, m, "ovn"); !math.IsNaN(v) {
+		t.Errorf("bfd_detect_seconds{layer=ovn} = %v, want NaN — the check is disabled", v)
+	}
+}

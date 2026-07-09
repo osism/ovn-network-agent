@@ -181,6 +181,43 @@ func (rm *RouteManager) GeneveTunnels() ([]bfdTunnel, error) {
 	return parseGeneveTunnels(out)
 }
 
+// EnsureOVNBFDTimers sets bfd:min_rx and bfd:min_tx on the Geneve tunnel
+// interfaces whose timers differ from the desired values. A reconcile that finds
+// nothing drifted issues no OVS command at all, and one that finds N drifted
+// tunnels issues exactly one — see setInterfaceBFDTimers for why the count
+// matters.
+//
+// tunnels is read, never updated: what the agent writes is not necessarily what
+// OVS keeps, so the effective timers are the ones the next reconcile reads back
+// from the bfd column.
+//
+// bfd:enable is never touched: ovn-controller owns it. Whether ovn-controller
+// preserves operator-set timer keys depends on the deployed OVN version — if
+// it reverts them, the next reconcile re-applies them. See
+// docs/explanation/bfd-failover-detection.md.
+func (rm *RouteManager) EnsureOVNBFDTimers(tunnels []bfdTunnel, minRxMs, minTxMs int) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would set BFD timers on Geneve tunnels",
+			"tunnels", len(tunnels), "min_rx_ms", minRxMs, "min_tx_ms", minTxMs)
+		return nil
+	}
+	var drifted []string
+	for _, t := range tunnels {
+		if t.MinRxMs != minRxMs || t.MinTxMs != minTxMs {
+			drifted = append(drifted, t.Name)
+		}
+	}
+	if len(drifted) == 0 {
+		return nil
+	}
+	if err := rm.setInterfaceBFDTimers(drifted, minRxMs, minTxMs); err != nil {
+		return err
+	}
+	slog.Info("BFD timers set on Geneve tunnels",
+		"tunnels", len(drifted), "min_rx_ms", minRxMs, "min_tx_ms", minTxMs)
+	return nil
+}
+
 // worstTunnelDetectTime returns the longest detection time across the tunnels
 // that actually run a BFD session, and the tunnel it belongs to. Tunnels
 // without bfd:enable=true contribute nothing.
@@ -308,16 +345,31 @@ func (a *Agent) reconcileBFD() {
 }
 
 func (a *Agent) reconcileOVNBFD() {
-	if !a.cfg.BFDCheckEnabled {
+	if !a.cfg.BFDCheckEnabled && !a.cfg.OVNBFDManage {
 		return
 	}
 	tunnels, err := a.routing.GeneveTunnels()
 	if err != nil {
 		slog.Warn("failed to enumerate Geneve tunnels for the BFD check", "error", err)
-		reportBFDUnknown("ovn")
+		if a.cfg.BFDCheckEnabled {
+			reportBFDUnknown("ovn")
+		}
 		return
 	}
 
+	if a.cfg.OVNBFDManage {
+		if err := a.routing.EnsureOVNBFDTimers(tunnels, a.cfg.OVNBFDMinRxMs, a.cfg.OVNBFDMinTxMs); err != nil {
+			slog.Warn("failed to set BFD timers on Geneve tunnels", "error", err)
+		}
+	}
+
+	if !a.cfg.BFDCheckEnabled {
+		return
+	}
+	// The estimate comes from the bfd column as OVSDB reported it above, never
+	// from the values just written: an ovn-controller that reclaims the column
+	// would otherwise be invisible to the very check meant to prove that
+	// ovn_bfd_manage took effect.
 	worst, tunnel := worstTunnelDetectTime(tunnels)
 	if worst == 0 {
 		// No tunnel runs a BFD session, so nothing bounds how long OVN takes to
