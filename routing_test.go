@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // vtyshRecorder captures calls to RouteManager.runVtysh for assertion. It
@@ -33,6 +34,44 @@ func (r *vtyshRecorder) hook() ovsExecFunc {
 			return resp.out, resp.err
 		}
 		return nil, nil
+	}
+}
+
+// A vtysh blocked on FRR's configuration lock is killed when the context
+// expires, but Wait keeps blocking on the output pipe until every process
+// holding it exits. Without WaitDelay the timeout bounds nothing.
+func TestRunVtyshBoundsWaitOnTheOutputPipe(t *testing.T) {
+	var waitDelay time.Duration
+	rm := &RouteManager{execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+		waitDelay = cmd.WaitDelay
+		return nil, nil
+	}}
+
+	if _, err := rm.runVtysh("-c", "show running-config"); err != nil {
+		t.Fatalf("runVtysh() error: %v", err)
+	}
+	if waitDelay != commandWaitDelay {
+		t.Errorf("WaitDelay = %v, want %v — the command timeout bounds nothing without it", waitDelay, commandWaitDelay)
+	}
+}
+
+// vtysh forks a child per FRR daemon. Killing vtysh alone leaves them behind,
+// each still holding the vty socket the next reconcile needs.
+func TestRunVtyshKillsTheWholeProcessGroup(t *testing.T) {
+	var captured *exec.Cmd
+	rm := &RouteManager{execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+		captured = cmd
+		return nil, nil
+	}}
+
+	if _, err := rm.runVtysh("-c", "show running-config"); err != nil {
+		t.Fatalf("runVtysh() error: %v", err)
+	}
+	if captured.SysProcAttr == nil || !captured.SysProcAttr.Setpgid {
+		t.Error("SysProcAttr.Setpgid is not set — the command shares the agent's process group, so it cannot be signalled as a group")
+	}
+	if captured.Cancel == nil {
+		t.Error("Cancel is not overridden — the default kills the direct child only, orphaning whatever it forked")
 	}
 }
 

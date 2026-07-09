@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ovsRecorder captures calls to RouteManager.runOVS for assertion. It returns
@@ -32,11 +33,25 @@ func (r *ovsRecorder) on(args []string, out string, err error) {
 	r.responses[strings.Join(args, " ")] = ovsResponse{out: []byte(out), err: err}
 }
 
+// stripOVSTimeout removes the self-bounding --timeout flag runOVS injects into
+// every OVS argv, so the fixtures and assertions below name the command the
+// agent means to run. TestRunOVSBoundsTheOVSCommandItself covers the flag.
+func stripOVSTimeout(args []string) []string {
+	stripped := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, "--timeout=") {
+			continue
+		}
+		stripped = append(stripped, a)
+	}
+	return stripped
+}
+
 func (r *ovsRecorder) hook() ovsExecFunc {
 	return func(cmd *exec.Cmd) ([]byte, error) {
-		args := append([]string{}, cmd.Args...)
+		args := stripOVSTimeout(cmd.Args)
 		r.calls = append(r.calls, args)
-		if resp, ok := r.responses[strings.Join(cmd.Args, " ")]; ok {
+		if resp, ok := r.responses[strings.Join(args, " ")]; ok {
 			return resp.out, resp.err
 		}
 		return nil, nil
@@ -154,7 +169,7 @@ func TestOVSCmdWrapperPrepended(t *testing.T) {
 		ovsWrapper: []string{"docker", "exec", "openvswitch_vswitchd"},
 	}
 
-	cmd := rm.ovsCmd("ovs-ofctl", "add-flow", "br-ex", "flow")
+	cmd := rm.ovsCmd(t.Context(), "ovs-ofctl", "add-flow", "br-ex", "flow")
 	want := []string{"docker", "exec", "openvswitch_vswitchd", "ovs-ofctl", "add-flow", "br-ex", "flow"}
 	if !reflect.DeepEqual(cmd.Args, want) {
 		t.Errorf("ovsCmd args = %v, want %v", cmd.Args, want)
@@ -164,7 +179,7 @@ func TestOVSCmdWrapperPrepended(t *testing.T) {
 func TestOVSCmdNoWrapper(t *testing.T) {
 	rm := &RouteManager{bridgeDev: "br-ex"}
 
-	cmd := rm.ovsCmd("ovs-ofctl", "add-flow", "br-ex", "flow")
+	cmd := rm.ovsCmd(t.Context(), "ovs-ofctl", "add-flow", "br-ex", "flow")
 	want := []string{"ovs-ofctl", "add-flow", "br-ex", "flow"}
 	if !reflect.DeepEqual(cmd.Args, want) {
 		t.Errorf("ovsCmd args = %v, want %v", cmd.Args, want)
@@ -864,12 +879,73 @@ func TestGetOFPortRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+// exec.CommandContext kills only the direct child on timeout. An ovs_wrapper
+// that leaves a hung grandchild holding the output pipe would keep Wait — and
+// with it the reconcile goroutine — blocked forever unless WaitDelay is set.
+func TestRunOVSBoundsWaitOnTheOutputPipe(t *testing.T) {
+	var waitDelay time.Duration
+	rm := &RouteManager{execOVSHook: func(cmd *exec.Cmd) ([]byte, error) {
+		waitDelay = cmd.WaitDelay
+		return nil, nil
+	}}
+
+	if _, err := rm.runOVS("ovs-vsctl", "show"); err != nil {
+		t.Fatalf("runOVS() error: %v", err)
+	}
+	if waitDelay != commandWaitDelay {
+		t.Errorf("WaitDelay = %v, want %v — the command timeout bounds nothing without it", waitDelay, commandWaitDelay)
+	}
+}
+
+// An ovs_wrapper such as `nsenter -t 1 -n` or `sudo` forks the ovs-vsctl that
+// blocks. Killing the direct child alone leaves it running, holding its OVSDB
+// connection, and the next reconcile forks another one.
+func TestRunOVSKillsTheWholeProcessGroup(t *testing.T) {
+	var captured *exec.Cmd
+	rm := &RouteManager{execOVSHook: func(cmd *exec.Cmd) ([]byte, error) {
+		captured = cmd
+		return nil, nil
+	}}
+
+	if _, err := rm.runOVS("ovs-vsctl", "show"); err != nil {
+		t.Fatalf("runOVS() error: %v", err)
+	}
+	if captured.SysProcAttr == nil || !captured.SysProcAttr.Setpgid {
+		t.Error("SysProcAttr.Setpgid is not set — the command shares the agent's process group, so it cannot be signalled as a group")
+	}
+	if captured.Cancel == nil {
+		t.Error("Cancel is not overridden — the default kills the direct child only, orphaning whatever it forked")
+	}
+}
+
+// No signal the agent sends reaches an ovs-vsctl an ovs_wrapper started in
+// another container, so the OVS command must bound itself.
+func TestRunOVSBoundsTheOVSCommandItself(t *testing.T) {
+	var args []string
+	rm := &RouteManager{execOVSHook: func(cmd *exec.Cmd) ([]byte, error) {
+		args = append([]string{}, cmd.Args...)
+		return nil, nil
+	}}
+
+	if _, err := rm.runOVS("ovs-ofctl", "del-flows", "br-ex"); err != nil {
+		t.Fatalf("runOVS() error: %v", err)
+	}
+	want := []string{"ovs-ofctl", "--timeout=25", "del-flows", "br-ex"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %v, want %v", args, want)
+	}
+	if ovsInternalTimeout >= ovsCommandTimeout {
+		t.Errorf("ovsInternalTimeout = %v, want less than ovsCommandTimeout (%v) so the command reports its own timeout",
+			ovsInternalTimeout, ovsCommandTimeout)
+	}
+}
+
 func TestRunOVSWithoutHookCallsCombinedOutput(t *testing.T) {
 	// Sanity check that runOVS without a hook does run a real command.
 	// /usr/bin/true (or "true" on PATH) is a portable success exit; on macOS
 	// and Linux build agents this should always be present.
 	rm := &RouteManager{}
-	cmd := rm.ovsCmd("true")
+	cmd := rm.ovsCmd(t.Context(), "true")
 	if cmd.Args[0] != "true" {
 		t.Skipf("unexpected command shape: %v", cmd.Args)
 	}

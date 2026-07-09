@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // ovsExecFunc is the signature of an exec.Cmd runner. Tests inject a stub via
@@ -75,13 +81,74 @@ type RouteManager struct {
 	execVtyshHook ovsExecFunc
 }
 
-// runVtysh executes a vtysh command, dispatching through execVtyshHook when set.
+// vtyshCommandTimeout bounds a single vtysh invocation. vtysh blocks on FRR's
+// configuration lock, which a concurrent frr-reload or a bgpd that stopped
+// reading its vty socket can hold indefinitely. Reconciliation runs on the
+// agent's only loop goroutine, so an unbounded wait there stops route
+// programming and keeps the SIGTERM handler from ever draining the gateways.
+const vtyshCommandTimeout = 10 * time.Second
+
+// commandWaitDelay bounds how long Wait may keep blocking after a command's
+// context has expired and the command's process group has been killed.
+//
+// Wait first drains the output pipe, which reaches EOF only once every process
+// holding the write end has exited. killProcessGroup below reaps the whole tree
+// on this host, but a wrapper that runs the real command elsewhere — the
+// documented `docker exec openvswitch_vswitchd` starts it in another container —
+// leaves it holding the pipe. Without a WaitDelay the timeouts above would bound
+// nothing at all.
+const commandWaitDelay = 5 * time.Second
+
+// killProcessGroup makes a command's timeout reach the processes it forked.
+//
+// exec.CommandContext's default cancel is Process.Kill, which signals the direct
+// child only. Both runners fork through something that in turn forks the process
+// that blocks: vtysh spawns per-daemon children, and ovs_wrapper is free-form —
+// `nsenter -t 1 -n`, `ip netns exec`, `sudo` and `chroot` all leave the hung
+// grandchild running. That grandchild is precisely the command the timeout
+// exists to escape, and a reconcile that leaves one behind every cycle
+// accumulates them without bound. Giving the child its own process group and
+// signalling the group reaps the whole tree.
+func killProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			// The whole group is gone: the command finished as the deadline
+			// fired. os/exec answers that race by reporting the command's own
+			// result, which the default Process.Kill cancel would also do.
+			return os.ErrProcessDone
+		}
+		return err
+	}
+}
+
+// runVtysh executes a vtysh command under vtyshCommandTimeout, dispatching
+// through execVtyshHook when set.
+//
+// Only stdout is returned. vtysh writes its own diagnostics — a daemon it could
+// not reach, a vty socket that went away — to stderr, and every caller below
+// parses the result as structured data: running-config stanzas keyed on
+// indentation, and JSON. A merged stream would let one stderr line truncate a
+// stanza or make a JSON document unrecognisable, which the callers cannot tell
+// apart from FRR reporting nothing. On failure stderr goes into the error, where
+// it is a diagnostic rather than input.
 func (rm *RouteManager) runVtysh(args ...string) ([]byte, error) {
-	cmd := exec.Command("vtysh", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), vtyshCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "vtysh", args...)
+	cmd.WaitDelay = commandWaitDelay
+	killProcessGroup(cmd)
 	if rm.execVtyshHook != nil {
 		return rm.execVtyshHook(cmd)
 	}
-	return cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return out, fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	}
+	return out, nil
 }
 
 func NewRouteManager(cfg Config) *RouteManager {
