@@ -47,6 +47,24 @@ type RouteManager struct {
 	// FRR prefix-list management
 	frrPrefixList string
 
+	// frrBFDProfileApplied records that the agent's bfd profile has been
+	// written to FRR in this process. The profile carries the BFD timers, and
+	// FRR's running configuration omits a profile value that matches bfdd's
+	// default, so the configured timers cannot be compared against it for drift.
+	// Writing the profile once per start is what applies a changed timer
+	// configuration. Whether FRR still *has* the profile is a separate question
+	// that EnsureFRRBFD does read back — see frrBFDProfileConfigured.
+	// Only the single reconcile goroutine touches this.
+	frrBFDProfileApplied bool
+
+	// frrBFDAttached holds the BGP neighbors this process has already attached
+	// to the agent's bfd profile with a vtysh command FRR accepted. A neighbor
+	// that is in here and still absent from the running configuration's profile
+	// lines can never be rendered — attaching it again every reconcile would
+	// reinstall its BGP session forever. Only the single reconcile goroutine
+	// touches this.
+	frrBFDAttached map[string]bool
+
 	// Port forwarding (DNAT) settings
 	portForwardEnabled      bool
 	portForwardDev          string

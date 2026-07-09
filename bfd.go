@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -244,6 +246,7 @@ func worstTunnelDetectTime(tunnels []bfdTunnel) (time.Duration, string) {
 // "unknown" and is never compared.
 type frrBFDPeer struct {
 	Peer                   string `json:"peer"`
+	Interface              string `json:"interface"`
 	VRF                    string `json:"vrf"`
 	ReceiveInterval        int    `json:"receive-interval"`
 	TransmitInterval       int    `json:"transmit-interval"`
@@ -299,6 +302,337 @@ func (rm *RouteManager) ListFRRBFDPeers() ([]frrBFDPeer, error) {
 		return nil, fmt.Errorf("parse vtysh bfd peers json: %w", err)
 	}
 	return peers, nil
+}
+
+// frrBFDProfileName is the bfd profile the agent owns. Neighbors are attached
+// to it by name so its timers can be retuned in one place.
+const frrBFDProfileName = "ovn-network-agent"
+
+// isValidBGPNeighbor guards the neighbor identifier before it is interpolated
+// into a vtysh command. FRR identifies a neighbor by IP address, or by
+// interface name for unnumbered peering.
+func isValidBGPNeighbor(addr string) bool {
+	if net.ParseIP(addr) != nil {
+		return true
+	}
+	return isValidIdentifier(addr)
+}
+
+// VRFBGPNeighbors returns the addresses of the VRF's configured BGP neighbors,
+// sorted. A VRF with no BGP instance makes vtysh print a "% …" notice, or
+// nothing at all, instead of JSON, which yields no neighbors rather than an
+// error. Output that is neither is an error: reading it as "no neighbors" would
+// silently disable BFD management on a VRF that has peering.
+//
+// Only the object keys are read. Whether a neighbor already carries the agent's
+// bfd profile is decided from the running configuration instead — see
+// parseFRRBGPInstance.
+//
+// Safety: vrfName is validated by isValidIdentifier in config validation, and
+// every neighbor key is validated by isValidBGPNeighbor before use.
+func (rm *RouteManager) VRFBGPNeighbors() ([]string, error) {
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show bgp vrf %s neighbors json", rm.vrfName))
+	if err != nil {
+		return nil, fmt.Errorf("vtysh show bgp neighbors: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" || strings.HasPrefix(trimmed, "%") {
+		slog.Debug("vtysh returned no BGP neighbor JSON", "vrf", rm.vrfName, "output", trimmed)
+		return nil, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return nil, fmt.Errorf("parse vtysh bgp neighbors json: %w", err)
+	}
+
+	var neighbors []string
+	for addr := range raw {
+		if !isValidBGPNeighbor(addr) {
+			slog.Warn("skipping BGP neighbor with an unexpected identifier", "neighbor", addr, "vrf", rm.vrfName)
+			continue
+		}
+		neighbors = append(neighbors, addr)
+	}
+	// Walk the neighbors in a stable order so the emitted command sequence does
+	// not depend on Go's map iteration order.
+	sort.Strings(neighbors)
+	return neighbors, nil
+}
+
+// frrBGPInstance is the VRF's `router bgp` stanza as it stands in FRR's running
+// configuration.
+type frrBGPInstance struct {
+	// AS is the number the stanza is keyed on. 0 means the VRF has no BGP
+	// instance: `router bgp <as> vrf <vrf>` is a create-or-enter command, and
+	// the agent's contract is to add the bfd knob to peering an operator
+	// declared — never to instantiate a BGP instance itself.
+	//
+	// A neighbor's reported localAs is not a substitute: `neighbor <addr>
+	// local-as <asn>` overrides it per session — a routine pattern for AS
+	// migration — and entering `router bgp` with the wrong AS makes FRR reject
+	// the block and run the remaining commands in the wrong CLI node.
+	AS int64
+	// Profiled holds the neighbors the stanza already attaches to the agent's
+	// bfd profile.
+	Profiled map[string]bool
+}
+
+// parseFRRBGPInstance extracts the VRF's `router bgp` stanza from an FRR running
+// configuration. An AS written in asdot notation (`1.10`) does not parse and
+// yields AS 0, so the agent declines to configure rather than emit a command FRR
+// would reject.
+//
+// The stanza's own neighbor lines are the authority on which neighbors carry the
+// agent's profile. `show bgp … neighbors json` reports that a neighbor has BFD,
+// but a neighbor can have BFD and no profile — an operator's plain `neighbor
+// <addr> bfd`, or a vtysh the command timeout killed between the two commands
+// that attach it. Such a neighbor runs at bgpd's session defaults, and treating
+// it as configured would leave it there forever. The key an attached profile is
+// reported under has also changed across FRR releases, whereas `neighbor <addr>
+// bfd profile <name>` is the line the agent writes and FRR renders back verbatim.
+func parseFRRBGPInstance(runningConfig, vrf string) frrBGPInstance {
+	instance := frrBGPInstance{Profiled: make(map[string]bool)}
+	const header = "router bgp "
+	vrfSuffix := " vrf " + vrf
+	profileSuffix := " bfd profile " + frrBFDProfileName
+
+	inStanza := false
+	for _, raw := range strings.Split(runningConfig, "\n") {
+		line := strings.TrimSpace(raw)
+		// The stanza body is indented; `exit`, `!` and the next `router bgp` all
+		// start at column 0.
+		if inStanza && (line == "" || raw != line) {
+			if addr, ok := strings.CutPrefix(line, "neighbor "); ok {
+				if addr, ok := strings.CutSuffix(addr, profileSuffix); ok {
+					instance.Profiled[addr] = true
+				}
+			}
+			continue
+		}
+		inStanza = false
+		if !strings.HasPrefix(line, header) || !strings.HasSuffix(line, vrfSuffix) {
+			continue
+		}
+		as, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(line, header), vrfSuffix), 10, 64)
+		if err != nil || as <= 0 {
+			continue
+		}
+		instance.AS = as
+		inStanza = true
+	}
+	return instance
+}
+
+// frrBFDProfileConfigured reports whether the agent's bfd profile still exists
+// in FRR's running configuration.
+//
+// FRR holds the profile only in its running state. A `systemctl reload frr` or
+// an frr-reload.py run reapplies frr.conf, which carries the agent's `neighbor
+// <addr> bfd profile <name>` lines once an operator has written them to memory,
+// but not the profile stanza the agent never persisted. The neighbors then
+// reference a profile that no longer exists, bfdd silently falls back to its own
+// defaults, and every neighbor still reports BFD — so nothing else notices.
+func frrBFDProfileConfigured(runningConfig string) bool {
+	want := "profile " + frrBFDProfileName
+	for _, line := range strings.Split(runningConfig, "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// frrRunningConfig returns FRR's running configuration.
+func (rm *RouteManager) frrRunningConfig() (string, error) {
+	output, err := rm.runVtysh("-c", "show running-config")
+	if err != nil {
+		return "", fmt.Errorf("vtysh show running-config: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return string(output), nil
+}
+
+// applyFRRBFDProfile writes the agent's bfd profile, which carries the timers
+// every attached neighbor then uses.
+func (rm *RouteManager) applyFRRBFDProfile(minRxMs, minTxMs, multiplier int) error {
+	output, err := rm.runVtysh(
+		"-c", "conf t",
+		"-c", "bfd",
+		"-c", fmt.Sprintf("profile %s", frrBFDProfileName),
+		"-c", fmt.Sprintf("receive-interval %d", minRxMs),
+		"-c", fmt.Sprintf("transmit-interval %d", minTxMs),
+		"-c", fmt.Sprintf("detect-multiplier %d", multiplier),
+		"-c", "exit",
+		"-c", "exit",
+		"-c", "end")
+	if err != nil {
+		return fmt.Errorf("vtysh write bfd profile: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// attachFRRBFDNeighbor enables BFD on one BGP neighbor and points it at the
+// agent's profile.
+//
+// One vtysh invocation per neighbor, not one batch for all of them: vtysh stops
+// at the first command FRR rejects, so a single neighbor bgpd refuses to
+// configure — a dynamic peer from `bgp listen range`, which `show bgp …
+// neighbors json` reports but no `neighbor <addr>` line configures — would keep
+// every neighbor sorted after it from ever getting BFD, and leave the agent
+// unable to tell which of them had already been attached. A neighbor is attached
+// once per process, so the extra invocations are paid on the first reconcile.
+//
+// Safety: addr is validated by isValidBGPNeighbor before it reaches here.
+func (rm *RouteManager) attachFRRBFDNeighbor(as int64, addr string) error {
+	output, err := rm.runVtysh(
+		"-c", "conf t",
+		"-c", fmt.Sprintf("router bgp %d vrf %s", as, rm.vrfName),
+		"-c", fmt.Sprintf("neighbor %s bfd", addr),
+		"-c", fmt.Sprintf("neighbor %s bfd profile %s", addr, frrBFDProfileName),
+		"-c", "end")
+	if err != nil {
+		return fmt.Errorf("vtysh enable BFD on neighbor %s: %w (output: %s)", addr, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// EnsureFRRBFD enables BFD on the VRF's already-configured BGP neighbors,
+// attaching each to the agent's bfd profile, which carries the timers. Only
+// neighbors the running configuration does not already attach to that profile
+// are configured, so once the fleet has settled a reconcile issues no vtysh
+// configuration at all. That matters: every `conf t` takes FRR's configuration
+// lock, and re-issuing `neighbor <addr> bfd` can reinstall the session —
+// bouncing the very fabric BFD session this feature exists to keep up.
+//
+// Nothing guarantees that a neighbor `show bgp … neighbors json` reports can be
+// rendered back as `neighbor <addr> bfd profile <name>`: a peer-group member
+// whose BFD FRR writes under the group never appears attached, however often it
+// is configured. Such a neighbor would keep the set non-empty forever, so each
+// neighbor is attached at most once per process — frrBFDAttached remembers the
+// attempt, and a neighbor still unattached on the next reconcile is reported and
+// left alone rather than reconfigured every 60 s for the life of the node.
+//
+// The profile is written on the first reconcile of the process and whenever
+// FRR's running configuration no longer carries it. The first case applies a
+// changed timer configuration, which the agent only ever reads at startup; the
+// second restores a profile an frr-reload dropped out from under the neighbors
+// still pointing at it.
+//
+// The running configuration is read once per call and answers all three
+// questions — profile present, instance AS, neighbors already attached — from
+// one snapshot. `router bgp <as> vrf <vrf>` is still create-or-enter, so an
+// operator who deletes the instance between that read and the write below has a
+// window in which the agent recreates it; one read makes the window as small as
+// two separate vtysh processes allow.
+//
+// This closes the "stale /32 from the dead node" gap: without BFD the fabric
+// keeps the crashed node's routes until the BGP hold timer expires. The fabric
+// side must enable BFD too — see docs/explanation/bfd-failover-detection.md.
+func (rm *RouteManager) EnsureFRRBFD(minRxMs, minTxMs, multiplier int) error {
+	if rm.dryRun {
+		slog.Info("[dry-run] would enable BFD on the VRF's BGP neighbors",
+			"vrf", rm.vrfName, "min_rx_ms", minRxMs, "min_tx_ms", minTxMs, "multiplier", multiplier)
+		return nil
+	}
+
+	neighbors, err := rm.VRFBGPNeighbors()
+	if err != nil {
+		return err
+	}
+	if len(neighbors) == 0 {
+		return nil // no BGP peering in this VRF — nothing to attach a profile to
+	}
+
+	runningConfig, err := rm.frrRunningConfig()
+	if err != nil {
+		return err
+	}
+	instance := parseFRRBGPInstance(runningConfig, rm.vrfName)
+
+	var needing, unrendered []string
+	for _, addr := range neighbors {
+		switch {
+		case instance.Profiled[addr]:
+			// An operator who removed the line gets it back on the next cycle.
+			delete(rm.frrBFDAttached, addr)
+		case rm.frrBFDAttached[addr]:
+			unrendered = append(unrendered, addr)
+		default:
+			needing = append(needing, addr)
+		}
+	}
+	if len(unrendered) > 0 {
+		slog.Warn("BGP neighbors took the bfd profile but FRR does not render it back; not attaching them again",
+			"vrf", rm.vrfName, "neighbors", strings.Join(unrendered, " "))
+	}
+	if len(needing) > 0 && instance.AS == 0 {
+		return fmt.Errorf("cannot configure BFD: no router bgp instance for vrf %s", rm.vrfName)
+	}
+
+	if !rm.frrBFDProfileApplied || !frrBFDProfileConfigured(runningConfig) {
+		if err := rm.applyFRRBFDProfile(minRxMs, minTxMs, multiplier); err != nil {
+			return err
+		}
+		rm.frrBFDProfileApplied = true
+	}
+	if len(needing) == 0 {
+		return nil
+	}
+	if rm.frrBFDAttached == nil {
+		rm.frrBFDAttached = make(map[string]bool, len(needing))
+	}
+
+	var failed []string
+	for _, addr := range needing {
+		if err := rm.attachFRRBFDNeighbor(instance.AS, addr); err != nil {
+			// A neighbor FRR rejects installs nothing, so retrying it costs one
+			// vtysh invocation and bounces no session. Only a neighbor the
+			// command succeeded on is remembered, so a vtysh the configuration
+			// lock defeated is tried again.
+			slog.Warn("failed to enable BFD on a BGP neighbor", "vrf", rm.vrfName, "neighbor", addr, "error", err)
+			failed = append(failed, addr)
+			continue
+		}
+		rm.frrBFDAttached[addr] = true
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("enable BFD on bgp neighbors %s of vrf %s", strings.Join(failed, " "), rm.vrfName)
+	}
+	slog.Info("BFD profile applied to the VRF's BGP neighbors",
+		"vrf", rm.vrfName, "attached", len(needing), "min_rx_ms", minRxMs, "min_tx_ms", minTxMs, "multiplier", multiplier)
+	return nil
+}
+
+// neighborsWithoutBFD returns the VRF's BGP neighbors that run no BFD session
+// at all.
+//
+// `show bfd peers json` lists the sessions that exist, so a neighbor that was
+// never attached to a profile is simply absent and contributes nothing to
+// worstPeerDetectTime. Three fast sessions and one missing one would report the
+// fast estimate, while the missing neighbor still withdraws a crashed node's
+// /32s only when the BGP hold timer expires — 180 s by default. That is the
+// half-took-effect state frr_bfd_manage can leave behind, and precisely the one
+// the check exists to catch.
+//
+// An unnumbered neighbor is named by its interface, which bfdd reports as
+// `interface` next to the link-local `peer` address, so both identify a session.
+func neighborsWithoutBFD(neighbors []string, peers []frrBFDPeer, vrf string) []string {
+	sessions := make(map[string]bool, 2*len(peers))
+	for _, p := range peers {
+		if !p.inVRF(vrf) {
+			continue
+		}
+		sessions[p.Peer] = true
+		if p.Interface != "" {
+			sessions[p.Interface] = true
+		}
+	}
+	var missing []string
+	for _, n := range neighbors {
+		if !sessions[n] {
+			missing = append(missing, n)
+		}
+	}
+	return missing
 }
 
 // worstPeerDetectTime returns the longest detection time across the BFD
@@ -387,6 +721,16 @@ func (a *Agent) reconcileOVNBFD() {
 }
 
 func (a *Agent) reconcileFRRBFD() {
+	if !a.cfg.BFDCheckEnabled && !a.cfg.FRRBFDManage {
+		return
+	}
+
+	if a.cfg.FRRBFDManage {
+		if err := a.routing.EnsureFRRBFD(a.cfg.FRRBFDMinRxMs, a.cfg.FRRBFDMinTxMs, a.cfg.FRRBFDMultiplier); err != nil {
+			slog.Warn("failed to enable BFD on the VRF's BGP neighbors", "error", err)
+		}
+	}
+
 	if !a.cfg.BFDCheckEnabled {
 		return
 	}
@@ -394,6 +738,22 @@ func (a *Agent) reconcileFRRBFD() {
 	if err != nil {
 		slog.Warn("failed to list FRR BFD peers for the BFD check", "error", err)
 		reportBFDUnknown("frr")
+		return
+	}
+	neighbors, err := a.routing.VRFBGPNeighbors()
+	if err != nil {
+		slog.Warn("failed to list the VRF's BGP neighbors for the BFD check", "error", err)
+		reportBFDUnknown("frr")
+		return
+	}
+
+	if missing := neighborsWithoutBFD(neighbors, peers, a.cfg.VRFName); len(missing) > 0 {
+		// One neighbor without a session is enough: the fabric withdraws this
+		// node's /32s over every session, and the slowest one bounds the
+		// failover. The other sessions' timers say nothing about that neighbor.
+		setBFDDetectSeconds("frr", math.Inf(1))
+		slog.Warn("BGP neighbors run no BFD session; their route withdrawal is bounded only by the BGP hold timer",
+			"layer", "frr", "vrf", a.cfg.VRFName, "neighbors", strings.Join(missing, " "))
 		return
 	}
 
