@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"time"
@@ -47,6 +48,10 @@ type metricsRegistry struct {
 	// Stale chassis cleanup
 	staleChassisCleanupTotal *prometheus.CounterVec
 	missingChassis           prometheus.Gauge
+
+	// BFD detection
+	bfdDetectSeconds    *prometheus.GaugeVec
+	bfdCheckErrorsTotal *prometheus.CounterVec
 }
 
 // metrics is the process-wide registry. It is non-nil after initMetrics()
@@ -161,6 +166,18 @@ func newMetricsRegistry() *metricsRegistry {
 			Name:      "missing_chassis",
 			Help:      "Number of chassis currently tracked as missing from the SB Chassis table.",
 		}),
+
+		bfdDetectSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "bfd_detect_seconds",
+			Help:      "Estimated BFD failure-detection time in seconds per layer (worst case across local OVN Geneve tunnels / FRR BFD peers in the VRF). This is the floor for ungraceful gateway failover. +Inf = nothing bounds the detection: the layer runs no BFD session, or a BGP neighbor in the VRF runs none. NaN = the layer could not be read; see bfd_check_errors_total.",
+		}, []string{"layer"}),
+
+		bfdCheckErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "bfd_check_errors_total",
+			Help:      "Total failures to read a layer's BFD state (ovs-vsctl or vtysh). While this rises, bfd_detect_seconds for that layer is NaN.",
+		}, []string{"layer"}),
 	}
 
 	reg.MustRegister(
@@ -179,6 +196,8 @@ func newMetricsRegistry() *metricsRegistry {
 		m.drainTotal,
 		m.staleChassisCleanupTotal,
 		m.missingChassis,
+		m.bfdDetectSeconds,
+		m.bfdCheckErrorsTotal,
 	)
 
 	// Initialise label series so they appear in /metrics with a zero value
@@ -197,6 +216,12 @@ func newMetricsRegistry() *metricsRegistry {
 	m.staleChassisCleanupTotal.WithLabelValues("error").Add(0)
 	m.ovnConnectionState.WithLabelValues("nb").Set(0)
 	m.ovnConnectionState.WithLabelValues("sb").Set(0)
+	m.bfdCheckErrorsTotal.WithLabelValues("ovn").Add(0)
+	m.bfdCheckErrorsTotal.WithLabelValues("frr").Add(0)
+	// Nothing has been measured yet. Zero would be indistinguishable from an
+	// instantaneous detection time — the healthiest reading the gauge can take.
+	m.bfdDetectSeconds.WithLabelValues("ovn").Set(math.NaN())
+	m.bfdDetectSeconds.WithLabelValues("frr").Set(math.NaN())
 
 	return m
 }
@@ -347,4 +372,18 @@ func setMissingChassis(n int) {
 		return
 	}
 	metrics.missingChassis.Set(float64(n))
+}
+
+func setBFDDetectSeconds(layer string, seconds float64) {
+	if metrics == nil {
+		return
+	}
+	metrics.bfdDetectSeconds.WithLabelValues(layer).Set(seconds)
+}
+
+func recordBFDCheckError(layer string) {
+	if metrics == nil {
+		return
+	}
+	metrics.bfdCheckErrorsTotal.WithLabelValues(layer).Inc()
 }
