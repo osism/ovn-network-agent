@@ -37,6 +37,7 @@ ovn-network-agent --drain-settle-delay 5s                   # longer settle hold
 
 ```bash
 OVN_NETWORK_DRAIN_ON_SHUTDOWN=false                         # disable drain
+OVN_NETWORK_DRAIN_ON_SHUTDOWN=true                          # enable drain (over a config file that disables it)
 OVN_NETWORK_DRAIN_TIMEOUT=120s                              # increase timeout
 OVN_NETWORK_DRAIN_SETTLE_DELAY=5s                           # longer settle hold
 ```
