@@ -108,6 +108,14 @@ const minActivePriority = 2
 // even the fallback path drains faster.
 const drainRecheckInterval = 1 * time.Second
 
+// takeoverReadyMarkerKey is the external_ids key the takeover node stamps on a
+// router's managed default route once it has successfully announced the FIP
+// routes (FRR routes installed and RefreshBGP succeeded). Its value is the
+// takeover chassis name. A leaving node's drain waits for this marker to name
+// the takeover chassis before it releases its own routes, so external traffic
+// is never withdrawn before the takeover node can forward it.
+const takeoverReadyMarkerKey = "ovn-network-agent-advertised"
+
 // EnsureActivePriorityLead ensures that for each locally-active router the
 // local Gateway_Chassis entry has a strictly higher priority than all peers
 // in the same HA group, and at least minActivePriority. The minimum
@@ -359,6 +367,86 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 	}
 
 	slog.Info("default route created", "router", lr.RouterName, "vgw", vgwIP, "output_port", lr.LRPName)
+	return nil
+}
+
+// MarkTakeoverReady stamps external_ids[takeoverReadyMarkerKey] with the local
+// chassis name on each local router's managed default route, signalling a
+// draining peer that this chassis has taken over and can forward external
+// traffic. It is the writer half of the drain takeover handshake and a natural
+// extension of the chassis tag ensureDefaultRoute already maintains.
+//
+// The caller MUST only invoke it after the FRR routes are in place and
+// RefreshBGP has succeeded — writing the marker earlier would release the
+// leaving node before this chassis can actually forward. The write is
+// idempotent: a marker that already names this chassis is left untouched, so a
+// steady-state reconcile issues no transaction.
+//
+// The NB reads go through the cache-consistency guard so a stale monitor cache
+// cannot hide the managed route and silently skip the write.
+func (o *OVNClient) MarkTakeoverReady(ctx context.Context, localRouters []LocalRouterInfo) error {
+	if len(localRouters) == 0 {
+		return nil
+	}
+
+	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
+		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	if err != nil {
+		return fmt.Errorf("list static routes: %w", err)
+	}
+	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
+		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
+	if err != nil {
+		return fmt.Errorf("list routers: %w", err)
+	}
+
+	localRouterUUIDs := make(map[string]bool, len(localRouters))
+	for _, lr := range localRouters {
+		localRouterUUIDs[lr.RouterUUID] = true
+	}
+
+	// Only mark routes owned by a router active on this chassis.
+	routeOwnedLocally := make(map[string]bool)
+	for _, router := range routers {
+		if !localRouterUUIDs[router.UUID] {
+			continue
+		}
+		for _, ruuid := range router.StaticRoutes {
+			routeOwnedLocally[ruuid] = true
+		}
+	}
+
+	localChassis := o.state.LocalChassisName
+	marker := localChassis
+
+	var allOps []ovsdb.Operation
+	for i := range routes {
+		route := routes[i]
+		if !routeOwnedLocally[route.UUID] || route.IPPrefix != "0.0.0.0/0" {
+			continue
+		}
+		if route.ExternalIDs == nil || route.ExternalIDs["ovn-network-agent"] != "managed" {
+			continue
+		}
+		if route.ExternalIDs[takeoverReadyMarkerKey] == localChassis {
+			continue // already advertised by this chassis — idempotent no-op
+		}
+		route.ExternalIDs[takeoverReadyMarkerKey] = marker
+		ops, err := o.nbClient.Where(&route).Update(&route, &route.ExternalIDs)
+		if err != nil {
+			slog.Error("failed to build takeover marker update", "route", route.UUID, "error", err)
+			continue
+		}
+		allOps = append(allOps, ops...)
+	}
+
+	if len(allOps) == 0 {
+		return nil
+	}
+	if err := o.transactOps(ctx, allOps); err != nil {
+		return fmt.Errorf("write takeover readiness marker: %w", err)
+	}
+	slog.Info("drain: takeover readiness marker written", "chassis", localChassis, "marker", marker)
 	return nil
 }
 

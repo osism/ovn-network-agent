@@ -433,10 +433,23 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// Ensure routes for all desired IPs (FIPs, SNATs, and port forward VIPs).
 	// When no local routers are present but port forwards are configured,
 	// this still installs VIP routes on br-ex and in FRR.
+	announced := false
 	if len(desiredIPs) > 0 || state.HasLocalRouters {
-		a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
+		announced = a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
 	} else {
 		a.removeAllRoutes("no locally active routers and no port forward VIPs")
+	}
+
+	// On a node that owns local routers, stamp the takeover readiness marker on
+	// each managed default route once the announce succeeded. A draining peer
+	// polls NB for this marker before it releases its own FIP routes, so it
+	// must only be written when this node can actually forward (ensureRoutes
+	// returns true only after RefreshBGP succeeded). HasLocalRouters is false in
+	// port-forward-only mode (a.ovn is nil), so this is skipped there.
+	if announced && state.HasLocalRouters {
+		if err := a.ovn.MarkTakeoverReady(ctx, state.LocalRouters); err != nil {
+			slog.Error("failed to write takeover readiness marker", "error", err)
+		}
 	}
 
 	// Surface desired routes that are configured in FRR but not actually
@@ -558,7 +571,14 @@ func (a *Agent) desiredRouteDev(ip string, ipDev map[string]string) string {
 // segment interface is replaced. IPs in skipKernelRoute keep their existing
 // kernel route untouched — their VLAN segment did not resolve this cycle, so
 // moving the /32 to the bridge fallback would mis-deliver the traffic.
-func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) {
+// ensureRoutes returns whether this node successfully announced the desired
+// routes: true unless a kernel-route add, an FRR add, or the BGP soft-refresh
+// failed. The drain takeover handshake uses it so a node that attracted BGP
+// traffic it cannot yet deliver never signals readiness to a draining peer. A
+// steady-state cycle with nothing to change returns true, so a marker missed
+// in one cycle self-heals on the next.
+func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) bool {
+	announced := true
 	desiredSet := make(map[string]bool, len(desiredIPs))
 	for _, ip := range desiredIPs {
 		desiredSet[ip] = true
@@ -617,6 +637,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 		if needsKernel {
 			if err := a.routing.AddKernelRoute(ip, dev); err != nil {
 				slog.Error("failed to add kernel route", "ip", ip, "dev", dev, "error", err)
+				announced = false
 			}
 		}
 		if needsFRR {
@@ -628,6 +649,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	if len(addFRR) > 0 {
 		if err := a.routing.AddFRRRoutes(addFRR); err != nil {
 			slog.Error("failed to batch-add FRR routes", "count", len(addFRR), "ips", addFRR, "error", err)
+			announced = false
 		}
 	}
 
@@ -683,6 +705,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	if len(addFRR) > 0 || len(delFRR) > 0 {
 		if err := a.routing.RefreshBGP(); err != nil {
 			slog.Warn("BGP soft-refresh failed, peers may wait for MRAI timer", "error", err)
+			announced = false
 		}
 	}
 
@@ -692,6 +715,8 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	if len(addFRR) > 0 || len(delFRR) > 0 {
 		a.verifyRoutes(desiredIPs, ipDev, skipKernelRoute)
 	}
+
+	return announced
 }
 
 // removeAllRoutes removes all managed FIP routes.

@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
 
 func TestUniqueIPs(t *testing.T) {
@@ -439,6 +441,103 @@ func TestReconcileNoLocalRoutersInvokesRemoveAllRoutes(t *testing.T) {
 	}
 }
 
+// TestReconcileWritesMarkerAfterSuccessfulAnnounce drives a dry-run reconcile
+// with one local router active on this chassis and its managed default route
+// carrying a peer's readiness marker. The announce succeeds (dry-run FRR/BGP
+// never fail), so reconcile must stamp the local chassis into the marker so a
+// draining peer learns this node has taken over. The nonexistent bridge makes
+// GetBridgeMAC fail, so EnsureGatewayRouting writes nothing and the marker
+// update is the only NB write.
+func TestReconcileWritesMarkerAfterSuccessfulAnnounce(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.LocalRouters = []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1"}}
+	c.state.HasLocalRouters = true
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:     "sr1",
+		IPPrefix: "0.0.0.0/0",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-b",
+			takeoverReadyMarkerKey:      "host-b",
+		},
+	})
+
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	a.reconcile(context.Background(), "test")
+
+	if !hasMarkerUpdate(nb.writeTransacts(), "host-a") {
+		t.Fatalf("reconcile did not stamp the takeover marker for host-a; writes: %v", nb.writeTransacts())
+	}
+}
+
+// TestReconcileSkipsMarkerWithoutLocalRouters proves the HasLocalRouters gate:
+// with no locally-active routers the node is not a takeover candidate, so even
+// though NB holds a managed default route, reconcile must not stamp a marker.
+func TestReconcileSkipsMarkerWithoutLocalRouters(t *testing.T) {
+	rm := &RouteManager{
+		bridgeDev:   "ovnagent-nonexistent-br",
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		dryRun:      true,
+	}
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	// HasLocalRouters defaults to false.
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:     "sr1",
+		IPPrefix: "0.0.0.0/0",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-b",
+			takeoverReadyMarkerKey:      "host-b",
+		},
+	})
+
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	a.reconcile(context.Background(), "test")
+
+	if hasMarkerUpdate(nb.writeTransacts(), "host-a") {
+		t.Fatalf("reconcile wrote a takeover marker with no local routers; writes: %v", nb.writeTransacts())
+	}
+}
+
+// hasMarkerUpdate reports whether any recorded write updates a
+// Logical_Router_Static_Route external_ids with a takeover readiness marker
+// naming chassis.
+func hasMarkerUpdate(writes [][]ovsdb.Operation, chassis string) bool {
+	for _, batch := range writes {
+		for _, op := range batch {
+			if op.Op != ovsdb.OperationUpdate || op.Table != "Logical_Router_Static_Route" {
+				continue
+			}
+			ext, ok := op.Row["external_ids"].(map[string]string)
+			if ok && ext[takeoverReadyMarkerKey] == chassis {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // TestRemoveAllRoutesDryRun exercises removeAllRoutes end-to-end. In dry-run
 // mode List* helpers return (nil, nil) so the function walks every branch
 // (FRR list, kernel list, BGP refresh skipped because no routes to remove).
@@ -505,6 +604,64 @@ S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 	if !sawRefresh {
 		t.Errorf("expected BGP refresh after deletes, got calls: %v", rec.calls)
 	}
+}
+
+// TestEnsureRoutesReturnsAnnounceOutcome pins the announce outcome the drain
+// takeover handshake keys on: ensureRoutes returns true when the FIP routes
+// were announced (or nothing needed changing) and false when the FRR add or
+// the BGP soft-refresh failed. PortForwardOnly skips kernel routes so only the
+// FRR/BGP paths — the ones the outcome depends on — are exercised, keeping the
+// test off the real bridge.
+func TestEnsureRoutesReturnsAnnounceOutcome(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	newAgent := func(rec *vtyshRecorder) *Agent {
+		rm := &RouteManager{
+			bridgeDev:     "ovnagent-nonexistent-br",
+			vrfName:       "vrf-provider",
+			vethNexthop:   "169.254.0.1",
+			execVtyshHook: rec.hook(),
+		}
+		return &Agent{cfg: Config{PortForwardOnly: true}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
+	}
+
+	t.Run("clean add announces", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		// FRR reports no routes, so the desired IP is added and BGP refreshed;
+		// the recorder returns success for both.
+		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
+			t.Errorf("clean add cycle: announced = false, want true (calls: %v)", rec.calls)
+		}
+	})
+
+	t.Run("no-change cycle announces", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		// FRR already advertises the only desired IP: nothing is added or
+		// removed, so no BGP refresh runs and the cycle still announces.
+		rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
+			"S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01\n", nil)
+		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
+			t.Errorf("no-change cycle: announced = false, want true (calls: %v)", rec.calls)
+		}
+	})
+
+	t.Run("FRR add failure does not announce", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
+			"-c", "ip route 198.51.100.10/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
+			"", errors.New("vtysh add failed"))
+		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
+			t.Errorf("FRR add failure: announced = true, want false")
+		}
+	})
+
+	t.Run("BGP refresh failure does not announce", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", "clear ip bgp vrf vrf-provider * soft out"},
+			"", errors.New("bgp refresh failed"))
+		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
+			t.Errorf("BGP refresh failure: announced = true, want false")
+		}
+	})
 }
 
 // TestRemoveAllRoutesWithStubbedFRRList exercises the FRR-driven removal
