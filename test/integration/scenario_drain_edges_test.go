@@ -162,6 +162,19 @@ func TestScenario_DrainKeepsRoutesWhenCleanupDisabled(t *testing.T) {
 	testenv.AssertNftChainExists(t, testenv.DefaultNftTable, "prerouting_dnat", 15*time.Second)
 	testenv.AssertVIPOnLoopback(t, pfVIP, 15*time.Second)
 
+	// Capture the agent's managed default route so the drain helper can stamp a
+	// peer readiness marker on it once the CR port has migrated (the #129
+	// takeover handshake), releasing the leaving node's settle on the marker
+	// instead of at drain_timeout — which is what keeps this test fast.
+	managedRoute := testenv.EventuallyValue(t, func() (testenv.NBLogicalRouterStaticRoute, bool) {
+		return testenv.FindStaticRoute(t, ctx, nb, router.RouterUUID, "0.0.0.0/0")
+	}, 15*time.Second, 100*time.Millisecond, "agent must create its managed default route before drain")
+	markerExtIDs := map[string]string{}
+	for k, v := range managedRoute.ExternalIDs {
+		markerExtIDs[k] = v
+	}
+	markerExtIDs["ovn-network-agent-advertised"] = "drainkeep-peer"
+
 	// Pre-stage a peer chassis so ovn-controller does not complain when
 	// the rebind goroutine moves the Port_Binding mid-drain.
 	peerUUID := testenv.MakeChassis(t, ctx, sb, "drainkeep-peer")
@@ -205,6 +218,25 @@ func TestScenario_DrainKeepsRoutesWhenCleanupDisabled(t *testing.T) {
 					if _, opErr := sb.Transact(ctx, ops...); opErr != nil {
 						select {
 						case errCh <- opErr:
+						default:
+						}
+						return
+					}
+					// The takeover node has "arrived": stamp the readiness
+					// marker on the managed default route so the leaving node's
+					// handshake releases on the marker, not at drain_timeout.
+					mark := &testenv.NBLogicalRouterStaticRoute{UUID: managedRoute.UUID, ExternalIDs: markerExtIDs}
+					mops, mErr := nb.Where(mark).Update(mark, &mark.ExternalIDs)
+					if mErr != nil {
+						select {
+						case errCh <- mErr:
+						default:
+						}
+						return
+					}
+					if _, mErr := nb.Transact(ctx, mops...); mErr != nil {
+						select {
+						case errCh <- mErr:
 						default:
 						}
 					}
@@ -255,6 +287,107 @@ func TestScenario_DrainKeepsRoutesWhenCleanupDisabled(t *testing.T) {
 	if !strings.Contains(logs, "shutting down, keeping routes in place") {
 		t.Errorf("expected keep-routes log line not found; last logs:\n%s", a.LogTail(40))
 	}
+}
+
+// TestScenario_DrainSettleTimeoutFallback (#129):
+//
+// With the takeover handshake active but no peer ever writing the readiness
+// marker, the leaving node's settle must fall back cleanly at drain_timeout:
+// the ports migrate (the rebind goroutine unblocks the migration wait), the
+// marker never names a takeover chassis, so awaitTakeoverReady logs the
+// timeout fallback, proceeds to cleanup, and the LRP /32 kernel route is gone
+// afterwards. This is the safe path for a takeover that never signals (e.g. a
+// mixed-version fleet where the peer runs a pre-handshake agent).
+func TestScenario_DrainSettleTimeoutFallback(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "drainfallback",
+		LRPNetworks: []string{"198.51.100.11/24"},
+		GatewayChassis: []testenv.GatewayChassisEntry{
+			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+		},
+	})
+
+	cfg := testenv.Defaults()
+	on := true
+	cfg.DrainOnShutdown = &on
+	// Short drain_timeout so the marker-wait fallback fires quickly; no peer
+	// ever stamps the readiness marker in this scenario.
+	cfg.DrainTimeout = "3s"
+	cfg.ReconcileInterval = "2s"
+	a := readyAgent(t, cfg)
+
+	testenv.AssertKernelRoute(t, "198.51.100.11", 15*time.Second)
+
+	// Pre-stage a peer chassis and rebind the CR port once priority hits 0 so
+	// the migration wait completes; deliberately do NOT write the readiness
+	// marker, forcing the handshake to fall back at drain_timeout.
+	peerUUID := testenv.MakeChassis(t, ctx, sb, "drainfallback-peer")
+	gcName := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
+
+	errCh := make(chan error, 1)
+	pctx, pcancel := context.WithCancel(ctx)
+	defer pcancel()
+	go func() {
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-pctx.Done():
+				return
+			case <-tick.C:
+				var entries []testenv.NBGatewayChassis
+				if err := nb.List(ctx, &entries); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				for _, gc := range entries {
+					if gc.Name != gcName || gc.Priority != 0 {
+						continue
+					}
+					rebind := &testenv.SBPortBinding{UUID: router.CRPortUUID, Chassis: &peerUUID}
+					ops, opErr := sb.Where(rebind).Update(rebind, &rebind.Chassis)
+					if opErr != nil {
+						select {
+						case errCh <- opErr:
+						default:
+						}
+						return
+					}
+					if _, opErr := sb.Transact(ctx, ops...); opErr != nil {
+						select {
+						case errCh <- opErr:
+						default:
+						}
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	if err := a.Stop(15 * time.Second); err != nil {
+		t.Fatalf("agent stop: %v", err)
+	}
+	pcancel()
+	select {
+	case err := <-errCh:
+		t.Fatalf("drain helper goroutine error: %v", err)
+	default:
+	}
+
+	logs := a.LogTail(100000)
+	if !strings.Contains(logs, "takeover readiness marker not observed before timeout") {
+		t.Errorf("expected the marker-timeout fallback log line; last logs:\n%s", a.LogTail(40))
+	}
+
+	// Cleanup still ran despite the fallback: the LRP /32 kernel route is gone.
+	testenv.AssertNoKernelRoute(t, "198.51.100.11", 5*time.Second)
 }
 
 // TestScenario_DrainStuckNBWrite (#59 scenario 4, optional):
