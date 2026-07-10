@@ -128,11 +128,13 @@ type Config struct {
 	DrainOnShutdown   bool
 	DrainTimeout      time.Duration
 
-	// DrainSettleDelay is how long to keep advertising FIP routes after
-	// the drain confirms all chassisredirect ports have migrated away,
-	// before cleanup withdraws them. The hold gives the takeover chassis
-	// time to finish OVN programming and BGP advertisement so external
-	// traffic is not blackholed. 0 = no hold.
+	// DrainSettleDelay is the safety margin held after the takeover chassis
+	// signals readiness (via the NB readiness marker) — or, when no marker can
+	// be expected, after the drain confirms the chassisredirect ports have
+	// migrated away — before cleanup withdraws the FIP routes. The marker wait
+	// itself is event-driven and bounded by drain_timeout, so this is only the
+	// final margin, not the whole hold. 0 disables the readiness wait and the
+	// margin entirely (cleanup runs as soon as the ports migrate).
 	DrainSettleDelay time.Duration
 
 	FRRPrefixList string // FRR prefix-list name to manage dynamically (e.g. ANNOUNCED-NETWORKS)
@@ -228,7 +230,7 @@ func loadConfig(args []string) (Config, error) {
 		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
 		fDrainOnShutdown   = fs.Bool("drain-on-shutdown", true, "Drain HA gateways before shutdown by lowering Gateway_Chassis priority")
 		fDrainTimeout      = fs.String("drain-timeout", "", "Max time to wait for gateway drain (e.g. 60s)")
-		fDrainSettleDelay  = fs.String("drain-settle-delay", "", "Hold time after gateway drain before cleanup so the takeover chassis can finish coming up (e.g. 3s)")
+		fDrainSettleDelay  = fs.String("drain-settle-delay", "", "Safety margin held after the takeover chassis signals readiness, before cleanup (e.g. 500ms; 0 disables the hold)")
 
 		fFRRPrefixList        = fs.String("frr-prefix-list", "", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)")
 		fStaleGrace           = fs.String("stale-chassis-grace-period", "", "Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable)")
@@ -264,7 +266,7 @@ func loadConfig(args []string) (Config, error) {
 		CleanupOnShutdown:       true,
 		DrainOnShutdown:         true,
 		DrainTimeout:            60 * time.Second,
-		DrainSettleDelay:        3 * time.Second,
+		DrainSettleDelay:        500 * time.Millisecond,
 		FRRPrefixList:           "ANNOUNCED-NETWORKS",
 		StaleChassisGracePeriod: 5 * time.Minute,
 		VethLeakEnabled:         true,

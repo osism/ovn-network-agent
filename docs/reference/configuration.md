@@ -36,7 +36,7 @@ regenerate this page with `go generate ./...`.
 | `--cleanup-on-shutdown` | `OVN_NETWORK_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown (SIGINT/SIGTERM) |
 | `--drain-on-shutdown` | `OVN_NETWORK_DRAIN_ON_SHUTDOWN` | `drain_on_shutdown` | `true` | Drain HA gateways before shutdown by lowering Gateway_Chassis priority |
 | `--drain-timeout` | `OVN_NETWORK_DRAIN_TIMEOUT` | `drain_timeout` | `60s` | Max time to wait for gateway drain (e.g. 60s) |
-| `--drain-settle-delay` | `OVN_NETWORK_DRAIN_SETTLE_DELAY` | `drain_settle_delay` | `3s` | Hold time after gateway drain before cleanup so the takeover chassis can finish coming up (e.g. 3s) |
+| `--drain-settle-delay` | `OVN_NETWORK_DRAIN_SETTLE_DELAY` | `drain_settle_delay` | `500ms` | Safety margin held after the takeover chassis signals readiness, before cleanup (e.g. 500ms; 0 disables the hold) |
 | `--frr-prefix-list` | `OVN_NETWORK_FRR_PREFIX_LIST` | `frr_prefix_list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS) |
 | `--stale-chassis-grace-period` | `OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD` | `stale_chassis_grace_period` | `5m` | Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable) |
 | `--veth-leak-enabled` | `OVN_NETWORK_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable veth VRF route leaking |
