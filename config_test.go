@@ -992,8 +992,8 @@ func TestLoadConfigDrainSettleDelayDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
 	}
-	if cfg.DrainSettleDelay != 3*time.Second {
-		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 3*time.Second)
+	if cfg.DrainSettleDelay != 500*time.Millisecond {
+		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 500*time.Millisecond)
 	}
 }
 

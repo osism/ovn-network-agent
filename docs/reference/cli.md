@@ -30,7 +30,7 @@ regenerate it with `go generate ./...`.
 | `--cleanup-on-shutdown` | `true` | Remove all managed routes on shutdown (SIGINT/SIGTERM) |
 | `--drain-on-shutdown` | `true` | Drain HA gateways before shutdown by lowering Gateway_Chassis priority |
 | `--drain-timeout` | `60s` | Max time to wait for gateway drain (e.g. 60s) |
-| `--drain-settle-delay` | `3s` | Hold time after gateway drain before cleanup so the takeover chassis can finish coming up (e.g. 3s) |
+| `--drain-settle-delay` | `500ms` | Safety margin held after the takeover chassis signals readiness, before cleanup (e.g. 500ms; 0 disables the hold) |
 | `--frr-prefix-list` | `ANNOUNCED-NETWORKS` | FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS) |
 | `--stale-chassis-grace-period` | `5m` | Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable) |
 | `--veth-leak-enabled` | `true` | Enable veth VRF route leaking |

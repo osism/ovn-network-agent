@@ -94,13 +94,14 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # gateways have not yet migrated.
 # drain_timeout: "60s"
 
-# Hold time after the drain before cleanup (default: 3s)
-# Once the chassisredirect ports have migrated away, the agent keeps
-# advertising its FIP routes for this long so the takeover chassis can
-# finish OVN programming and BGP advertisement before the routes are
-# withdrawn. This extends total shutdown by up to drain_settle_delay,
-# bounded by drain_timeout. Set to 0 to disable the hold.
-# drain_settle_delay: "3s"
+# Safety margin held after the takeover chassis signals readiness (default: 500ms)
+# Once the chassisredirect ports have migrated away, the agent waits for the
+# takeover chassis to stamp its readiness marker on the managed default route
+# (bounded by drain_timeout), then keeps advertising its FIP routes for this
+# additional margin before cleanup withdraws them. Set to 0 to disable the
+# readiness wait and the margin entirely (cleanup runs as soon as the ports
+# migrate).
+# drain_settle_delay: "500ms"
 
 # FRR prefix-list to manage dynamically (default: ANNOUNCED-NETWORKS)
 # When set, the agent adds/removes "permit <network> ge 32 le 32" entries
