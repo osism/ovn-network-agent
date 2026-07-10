@@ -101,6 +101,13 @@ func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []Loc
 // tiebreak flapping) when a peer restarts.
 const minActivePriority = 2
 
+// drainRecheckInterval is the safety re-poll cadence of the drain migration
+// wait. The wait is primarily event-driven — a chassisredirect Port_Binding
+// change wakes it through drainWatchCh — so this ticker only bounds the worst
+// case if an event is ever missed. It is shorter than the old fixed 2s poll so
+// even the fallback path drains faster.
+const drainRecheckInterval = 1 * time.Second
+
 // EnsureActivePriorityLead ensures that for each locally-active router the
 // local Gateway_Chassis entry has a strictly higher priority than all peers
 // in the same HA group, and at least minActivePriority. The minimum
@@ -665,9 +672,11 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 
 // DrainGateways sets the Gateway_Chassis priority to 0 for this chassis on
 // all locally-active router ports, causing OVN to migrate chassisredirect
-// ports to standby chassis (which have priority >= 1). It then polls the
-// SB Port_Binding table until all gateways have moved away or the context
-// deadline is exceeded.
+// ports to standby chassis (which have priority >= 1). It then waits until
+// all gateways have moved away or the context deadline is exceeded. The wait
+// is event-driven: chassisredirect Port_Binding changes delivered by the SB
+// monitor wake it through drainWatchCh, with a short ticker as a safety
+// re-poll (see drainRecheckInterval).
 //
 // Once the ports have migrated, it holds for cfg.DrainSettleDelay before
 // returning (see settleAfterDrain) so the caller does not withdraw this
@@ -757,8 +766,12 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		}
 	}
 
-	// Step 3: Poll SB until no chassisredirect ports remain on this chassis.
-	ticker := time.NewTicker(2 * time.Second)
+	// Step 3: Wait until no chassisredirect ports remain on this chassis. The
+	// wait is event-driven: the SB monitor is still connected during drain, so
+	// each chassisredirect Port_Binding change signals drainWatchCh and the
+	// wait re-checks countLocalCRPorts immediately. The ticker is only a safety
+	// re-poll in case an event is ever missed.
+	ticker := time.NewTicker(drainRecheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -777,6 +790,9 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		case <-ctx.Done():
 			slog.Warn("drain: timeout exceeded, proceeding with shutdown", "remaining_gateways", remaining)
 			return nil
+		case <-o.drainWatchCh:
+			// A chassisredirect Port_Binding changed — re-check without waiting
+			// for the safety re-poll tick.
 		case <-ticker.C:
 		}
 	}
