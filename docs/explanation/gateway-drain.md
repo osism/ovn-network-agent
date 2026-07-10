@@ -28,9 +28,15 @@ agent:
    database for all locally-active router ports. Since standby chassis have
    priority >= 1, `ovn-northd` immediately begins migrating chassisredirect
    ports to standby chassis.
-2. **Polls the SB `Port_Binding` table** until all chassisredirect ports
-   have moved away from this chassis (or the drain timeout expires).
-3. **Proceeds with normal cleanup** — by this point OVN has already
+2. **Waits for the chassisredirect ports to move away** from this chassis.
+   The SB monitor is still connected during the drain, so the wait is
+   event-driven: each chassisredirect `Port_Binding` change wakes it
+   immediately, with a short safety re-poll and an overall bound of the
+   drain timeout.
+3. **Runs the takeover handshake** — it waits for the takeover chassis to
+   signal that it can forward (see [The takeover
+   handshake](#the-takeover-handshake)) before proceeding.
+4. **Proceeds with normal cleanup** — by this point OVN has already
    migrated traffic to another chassis, so the BGP withdrawal and route
    cleanup cause zero disruption.
 
@@ -70,13 +76,14 @@ already moved. The result is a hitless shutdown.
                           │
                           ▼
   ┌───────────────────────────────────────────────────────┐
-  │  2. SETTLE (hold for drain_settle_delay)              │
+  │  2. HANDSHAKE (await takeover, then hold margin)      │
   │                                                       │
-  │  Keep advertising FIP /32 routes and OVS flows so     │
-  │  this node still forwards external traffic            │
-  │  (hairpinned to the new gateway chassis) while the    │
-  │  takeover chassis finishes OVN programming, reconcile │
-  │  and BGP advertisement. Skipped if nothing migrated.  │
+  │  Wait until the takeover chassis stamps its           │
+  │  readiness marker on the managed default route,       │
+  │  then hold the drain_settle_delay safety margin.      │
+  │  Keeps advertising FIP /32 routes and OVS flows       │
+  │  meanwhile; bounded by drain_timeout, skipped         │
+  │  when nothing migrated.                               │
   └───────────────────────┬───────────────────────────────┘
                           │
                           ▼
@@ -127,9 +134,9 @@ already moved. The result is a hitless shutdown.
                  Normal reconciliation loop
 ```
 
-## The takeover race and the settle delay
+## The takeover handshake
 
-Draining the priority and polling until the chassisredirect port has
+Draining the priority and waiting until the chassisredirect port has
 migrated away makes the **OVN-internal** failover hitless. But "the port
 moved" is not the same as "the takeover chassis can forward external
 traffic". The leaving node advertises each FIP as a BGP `/32`; so does the
@@ -146,27 +153,44 @@ If step 1 wins, external traffic has no working path until step 2
 finishes — observed as roughly 5 s of packet loss on a continuous ping
 through a FIP.
 
-Two mechanisms close this race:
+Rather than paper over this race with a fixed sleep, the agents close it
+with an explicit two-sided handshake plus a BGP nudge:
 
-- **Post-drain settle delay** (`drain_settle_delay`, default 3 s). After
-  the poll loop confirms the ports have migrated, the leaving node holds
-  before cleanup. During the hold it still advertises its FIP routes and
-  keeps its OVS flows, so it continues forwarding external traffic —
-  hairpinned to the new gateway chassis over the tunnel — while the
-  takeover node comes up. The hold is bounded by `drain_timeout`, so total
-  graceful shutdown never exceeds that budget, and it is skipped when there
-  was nothing to drain.
+- **Readiness marker (the handshake).** At the end of a successful
+  failover reconcile — after it has installed its FIP routes **and** the
+  BGP soft-refresh below has succeeded — the takeover node stamps
+  `external_ids["ovn-network-agent-advertised"]="<chassis>"`
+  onto the router's managed default route in NB (a natural extension of
+  the chassis tag the agent already maintains there). The write is
+  idempotent and only happens once the node can actually forward, so it is
+  a truthful "ready" signal, not a timer.
+- **Awaiting the marker on the leaving node.** Instead of sleeping a fixed
+  settle delay, the leaving node polls NB at ~250 ms (through the
+  cache-consistency guard, so a stale cache cannot stall or short-circuit
+  it) until every managed default route it used to own carries a marker
+  naming a *different* chassis. Only then does it hold a small
+  `drain_settle_delay` safety margin and proceed to cleanup. While it
+  waits and holds, it keeps advertising its FIP routes and OVS flows, so it
+  continues forwarding external traffic — hairpinned to the new gateway
+  chassis over the tunnel — until the takeover node is provably up. The
+  whole handshake is bounded by `drain_timeout`: a takeover that never
+  signals (for example a peer running an older agent that does not write
+  the marker) falls back cleanly at the deadline and cleanup still runs.
+  Setting `drain_settle_delay` to `0` disables the wait and the margin
+  entirely, and a drain with no agent-managed default route degrades to
+  holding only the margin.
 - **BGP soft-refresh on the takeover node.** When the takeover node adds
   FIP `/32`s to FRR, the agent immediately issues `clear ip bgp … soft out`
   instead of waiting for FRR's normal redistribution timing. The soft
   refresh only re-evaluates outbound policy and re-sends routes — it never
   withdraws anything — so it shortens the takeover node's "ready" time
   (and also speeds up ungraceful failovers) at the cost of a small extra
-  UPDATE burst.
+  UPDATE burst. Because the readiness marker is written only after this
+  refresh succeeds, observing the marker means BGP has already been nudged.
 
 A portion of the remaining gap is OVN-intrinsic (`ovn-northd` /
 `ovn-controller` reprogramming) and cannot be closed from the agent; the
-settle delay only has to cover the takeover node's reconcile and BGP
+handshake only has to cover the takeover node's reconcile and BGP
 advertisement.
 
 ## Priority semantics
