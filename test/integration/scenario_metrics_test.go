@@ -104,6 +104,19 @@ func TestScenario_MetricsDrainOutcomeCompleted(t *testing.T) {
 		func(v float64, present bool) bool { return present && v == 0 },
 		5*time.Second)
 
+	// Capture the agent's managed default route so the rebind goroutine can
+	// stamp the peer readiness marker on it once the CR port has migrated (the
+	// #129 takeover handshake). Without it the leaving node blocks in
+	// awaitTakeoverReady until drain_timeout and Stop kills the agent.
+	managedRoute := testenv.EventuallyValue(t, func() (testenv.NBLogicalRouterStaticRoute, bool) {
+		return testenv.FindStaticRoute(t, ctx, nb, router.RouterUUID, "0.0.0.0/0")
+	}, 15*time.Second, 100*time.Millisecond, "agent must create its managed default route before drain")
+	markerExtIDs := map[string]string{}
+	for k, v := range managedRoute.ExternalIDs {
+		markerExtIDs[k] = v
+	}
+	markerExtIDs["ovn-network-agent-advertised"] = "metdrain-peer"
+
 	// Rebind goroutine: same shape as TestScenario_DrainOnShutdown — once
 	// the local Gateway_Chassis priority is lowered to 0, simulate
 	// ovn-northd by rebinding the CR Port_Binding to a peer so the drain
@@ -146,6 +159,25 @@ func TestScenario_MetricsDrainOutcomeCompleted(t *testing.T) {
 					if _, opErr := sb.Transact(ctx, ops...); opErr != nil {
 						select {
 						case errCh <- opErr:
+						default:
+						}
+						return
+					}
+					// The takeover node has "arrived": stamp the readiness marker on
+					// the managed default route so the leaving node's handshake releases
+					// on the marker instead of blocking until drain_timeout.
+					mark := &testenv.NBLogicalRouterStaticRoute{UUID: managedRoute.UUID, ExternalIDs: markerExtIDs}
+					mops, mErr := nb.Where(mark).Update(mark, &mark.ExternalIDs)
+					if mErr != nil {
+						select {
+						case errCh <- mErr:
+						default:
+						}
+						return
+					}
+					if _, mErr := nb.Transact(ctx, mops...); mErr != nil {
+						select {
+						case errCh <- mErr:
 						default:
 						}
 					}

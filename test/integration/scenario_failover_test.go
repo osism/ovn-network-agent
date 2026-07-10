@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -262,19 +263,36 @@ func TestScenario_DrainOnShutdown(t *testing.T) {
 	cfg := testenv.Defaults()
 	on := true
 	cfg.DrainOnShutdown = &on
+	// A generous drain_timeout so a Stop that finishes well under it proves the
+	// handshake — the readiness marker, not the deadline — ended the drain.
+	cfg.DrainTimeout = "30s"
 	cfg.ReconcileInterval = "2s"
 	a := readyAgent(t, cfg)
 
 	// Wait for at least the LRP-network /32 route to land before draining.
 	testenv.AssertKernelRoute(t, "198.51.100.11", 15*time.Second)
 
+	// Wait for the agent to create its managed default route, then capture its
+	// external_ids so the drain helper can stamp a peer's readiness marker on
+	// it mid-drain (simulating the takeover node completing its announce).
+	managedRoute := testenv.EventuallyValue(t, func() (testenv.NBLogicalRouterStaticRoute, bool) {
+		return testenv.FindStaticRoute(t, ctx, nb, router.RouterUUID, "0.0.0.0/0")
+	}, 15*time.Second, 100*time.Millisecond, "agent must create its managed default route before drain")
+	markerExtIDs := map[string]string{}
+	for k, v := range managedRoute.ExternalIDs {
+		markerExtIDs[k] = v
+	}
+	markerExtIDs["ovn-network-agent-advertised"] = "drain-peer"
+
 	// Pre-stage a peer chassis so ovn-controller does not complain when we
 	// rebind the Port_Binding mid-drain.
 	peerUUID := testenv.MakeChassis(t, ctx, sb, "drain-peer")
 	gcName := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
 
-	// Goroutine: poll NB for priority==0, record its timestamp, then
-	// rebind the CR port_binding to the peer so countLocalCRPorts returns 0.
+	// Goroutine: poll NB for priority==0, record its timestamp, rebind the CR
+	// port_binding to the peer so countLocalCRPorts returns 0, then stamp the
+	// takeover readiness marker on the managed default route so the leaving
+	// node's handshake releases on the marker instead of the drain timeout.
 	// We do not call t.Fatalf from this goroutine — testing.T methods are
 	// only safe on the test's own goroutine. Errors are surfaced via errCh.
 	var (
@@ -321,6 +339,22 @@ func TestScenario_DrainOnShutdown(t *testing.T) {
 						case errCh <- opErr:
 						default:
 						}
+						return
+					}
+					mark := &testenv.NBLogicalRouterStaticRoute{UUID: managedRoute.UUID, ExternalIDs: markerExtIDs}
+					mops, mErr := nb.Where(mark).Update(mark, &mark.ExternalIDs)
+					if mErr != nil {
+						select {
+						case errCh <- mErr:
+						default:
+						}
+						return
+					}
+					if _, mErr := nb.Transact(ctx, mops...); mErr != nil {
+						select {
+						case errCh <- mErr:
+						default:
+						}
 					}
 					return
 				}
@@ -328,14 +362,25 @@ func TestScenario_DrainOnShutdown(t *testing.T) {
 		}
 	}()
 
+	stopStart := time.Now()
 	if err := a.Stop(45 * time.Second); err != nil {
 		t.Fatalf("agent stop: %v", err)
 	}
+	stopElapsed := time.Since(stopStart)
 	pcancel()
 	select {
 	case err := <-errCh:
 		t.Fatalf("drain helper goroutine error: %v", err)
 	default:
+	}
+
+	// The settle ended on the marker, not on a timer: Stop finished well under
+	// the 30s drain_timeout, and the handshake logged the marker observation.
+	if stopElapsed > 15*time.Second {
+		t.Errorf("Stop took %s; expected a marker-driven drain well under the 30s drain_timeout", stopElapsed)
+	}
+	if logs := a.LogTail(100000); !strings.Contains(logs, "drain: takeover readiness marker observed") {
+		t.Errorf("expected the readiness-marker log line (marker-driven settle); last logs:\n%s", a.LogTail(40))
 	}
 
 	// Capture the moment the kernel route finally disappeared.

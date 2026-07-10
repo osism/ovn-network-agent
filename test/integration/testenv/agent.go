@@ -48,6 +48,7 @@ type AgentConfig struct {
 	ReconcileInterval       string `yaml:"reconcile_interval,omitempty"`
 	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period,omitempty"`
 	DrainTimeout            string `yaml:"drain_timeout,omitempty"`
+	DrainSettleDelay        string `yaml:"drain_settle_delay,omitempty"`
 
 	// MetricsListen is the address the agent's Prometheus /metrics endpoint
 	// binds to. Empty disables the endpoint (the agent's default). Scenario
@@ -385,6 +386,7 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	put("reconcile_interval", cfg.ReconcileInterval)
 	put("stale_chassis_grace_period", cfg.StaleChassisGracePeriod)
 	put("drain_timeout", cfg.DrainTimeout)
+	put("drain_settle_delay", cfg.DrainSettleDelay)
 	put("metrics_listen", cfg.MetricsListen)
 	putBool("dry_run", cfg.DryRun)
 	putBool("cleanup_on_shutdown", cfg.CleanupOnShutdown)
