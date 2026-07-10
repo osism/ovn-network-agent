@@ -934,7 +934,7 @@ assert_hitless() {
     fi
     if ! (( graceful < hardkill )); then
         log "ASSERTION FAILED: graceful_loss (${graceful}) is not strictly less than hardkill_loss (${hardkill})"
-        log "    a non-negative delta is required for the hitless comparison to be meaningful"
+        log "    a positive delta is required for the hitless comparison to be meaningful"
         return 1
     fi
     log "ASSERT OK: graceful outage ~${graceful_ms} ms <= ${GRACEFUL_MAX_OUTAGE_MS} ms AND graceful_loss=${graceful} < hardkill_loss=${hardkill}"
