@@ -3,8 +3,8 @@
 # E2E harness.
 #
 # Goal (issue #113): when the active gateway agent receives SIGTERM
-# with `drain_on_shutdown=true`, `DrainGateways`
-# (ovn_gateway.go:589) sets the local `Gateway_Chassis` priorities to
+# with `drain_on_shutdown=true`, `DrainGateways` (see ovn_gateway.go)
+# sets the local `Gateway_Chassis` priorities to
 # 0 and blocks until OVN's `cr-lr0-public` Port_Binding has migrated
 # to the standby chassis BEFORE the agent exits. The graceful path
 # should produce near-zero packet loss for `client-1 → FIP` traffic,
@@ -75,17 +75,59 @@
 # Probe: `ping -i 0.1 -c 200` from `client-1` to the FIP (20 s probe
 # window). 100 ms inter-packet spacing is already finer than OVN's
 # BFD detection multiplier (3×1 s on the lab geneve tunnels) and gives
-# integer loss counts directly from `ping`'s summary line — no
-# tshark/tcpdump post-processing needed. The kill is delivered after
-# the probe has been running for `PROBE_PRELUDE` seconds so the
-# transition lands inside the captured window.
+# integer loss counts directly from `ping`'s summary line — the loss
+# count never depends on the packet capture. The kill is delivered
+# after the probe has been running for `PROBE_PRELUDE` seconds so the
+# transition lands inside the captured window. Every lost packet is
+# one `PROBE_INTERVAL` in which the FIP did not answer, so
+# `loss × PROBE_INTERVAL` is the data-plane outage the arm measured.
+#
+# Alongside the probe each arm records a once-per-second transition
+# timeline pairing the SB `cr-lr0-public` Port_Binding chassis with
+# the BGP nexthop `upstream` currently routes the FIP /32 to. It is
+# the "BGP/SB Port_Binding transition timeline" the issue's artifact
+# bundle asks for, and it is also what dates the migration for the RTO
+# check below — so it runs on every invocation, not only when
+# ARTIFACTS_DIR is set. Only when ARTIFACTS_DIR is set does an arm
+# additionally record, best-effort, a `tcpdump` capture of the probe on
+# `client-1`'s eth1, rendered to text so the ICMP sequence gap can be
+# lined up against the kill timestamp. That capture can never fail an
+# arm: the assertion below reads ping's summary.
 #
 # Assertion (issue #113 acceptance criteria):
-#   graceful_loss <= 1 AND graceful_loss < hardkill_loss
+#   graceful outage <= GRACEFUL_MAX_OUTAGE_MS AND graceful_loss < hardkill_loss
 #
 # The first half is the "hitless" claim; the second is the delta
 # that makes the comparison meaningful (a no-op script that returned
-# `0 < 0` would trivially fail).
+# `0 < 0` would trivially fail). Issue #113 stated "at most one lost
+# packet" (a 100 ms budget at the default spacing), but that number
+# was written before any measurement existed. The first run on the CI
+# runner class (run 29086884545) measured 200 ms: the two lost packets
+# sat 96–200 ms after the priority-0 write, inside OVN's
+# northd/ovn-controller flow-reprogramming window that follows the
+# Port_Binding migration — while BGP make-before-break held (upstream
+# carried both nexthops until gateway-1 withdrew). The default budget
+# is therefore 500 ms: enough headroom over the observed OVN
+# propagation floor to pass consistently (AC 1), while staying well
+# under the hard-kill control's measured 2800 ms so a broken drain
+# path still trips the assertion. The scenario keeps the duration
+# primary and derives the packet ceiling from `PROBE_INTERVAL`, so
+# overriding the spacing cannot silently move the budget.
+#
+# Nothing in the agent bounds that reprogramming window.
+# `DrainGateways` returns as soon as SB reports no chassisredirect
+# port left on this chassis and agent.go exits right after; the agent
+# is PID 1, so its exit tears down the container netns, FRR, and the
+# `gateway-1 ↔ upstream` veth. Between `cr-lr0-public` migrating to
+# gateway-2 and the gateways' flows converging on the new owner,
+# packets still land on a chassis that no longer owns the port.
+# GRACEFUL_MAX_OUTAGE_MS is the budget this scenario holds that
+# window to; it is not a delay the agent implements.
+#
+# Both arms must additionally end with `cr-lr0-public` migrated off
+# the master within FAILOVER_TIMEOUT of the kill — the same RTO #105
+# asserts for this lab, dated from the transition timeline (see
+# `wait_for_failover`) — and with `client-1 → FIP` answering again.
 #
 # Pre-condition: lab is up, deployed with the drain armed:
 # `E2E_DRAIN_ON_SHUTDOWN=true make e2e-up` (require_drain_enabled
@@ -102,9 +144,11 @@
 # keeps a `make e2e-drain-hitless` run on a developer machine
 # leaving the lab in a known-good state, and matches the
 # stale-chassis/failover convention of "lab is usable after the
-# scenario returns". CI additionally runs `make e2e-down` at the
-# job's `if: always()` step so a fatal interpreter error inside the
-# trap is still cleaned up.
+# scenario returns". CI sets RECYCLE_ON_EXIT=0 — its job-level
+# `make e2e-down` step (`if: always()`) tears the lab down anyway,
+# so paying for a third `containerlab deploy` would only eat into
+# the job's time budget and would destroy the perturbed lab
+# state collect-artifacts.sh wants to dump on failure.
 #
 # Environment overrides:
 #   LAB              container-name prefix (default ovn-e2e)
@@ -113,24 +157,28 @@
 #   FIP              target FIP (default 192.0.2.10, the priority-30 chassis FIP)
 #   CLIENT           probe source container (default clab-${LAB}-client-1)
 #   CENTRAL          OVN central container (default clab-${LAB}-central)
+#   UPSTREAM         upstream BGP router container (default clab-${LAB}-upstream)
 #   LR_PUBLIC_PORT   LR external port name (default lr0-public)
 #   PROBE_INTERVAL   ping -i value (default 0.1)
 #   PROBE_COUNT      ping -c value (default 200)
 #   PROBE_PRELUDE    seconds to let the probe run before the kill (default 3)
-#   FAILOVER_TIMEOUT seconds to wait for the SB Port_Binding to migrate (default 60 — matches the agent's drain_timeout)
-#   GRACEFUL_MAX_LOSS allowed packet loss on the graceful arm (default 5).
-#                    Issue #113 suggested ≤1 packet; in the containerlab
-#                    lab the transition window between gateway-1's FRR
-#                    BGP session closing on container exit and upstream
-#                    converging on gateway-2's advertisement reliably
-#                    drops ~3 packets at the 100 ms probe interval. The
-#                    hitless gain (hardkill loss >> graceful loss) stays
-#                    the meaningful invariant; the tighter ≤1 threshold
-#                    only holds on faster (real-hardware) labs.
+#   FAILOVER_TIMEOUT seconds after the kill for the port to migrate AND
+#                    reachability to return (default 30 — the RTO #105 asserts)
+#   GRACEFUL_MAX_OUTAGE_MS data-plane outage budget for the graceful arm
+#                    (default 500 — calibrated to the ~200 ms OVN
+#                    flow-reprogramming floor measured on the CI runner class,
+#                    see the assertion block comment above; issue #113's
+#                    original "at most one lost packet" predates that
+#                    measurement). The packet ceiling GRACEFUL_MAX_LOSS is
+#                    derived from it and PROBE_INTERVAL. Raise it only to
+#                    triage a lab whose reconvergence is slower than the
+#                    budget; the hitless gain (graceful_loss < hardkill_loss)
+#                    is asserted either way.
 #   ARTIFACTS_DIR    directory to write the per-arm artifacts into (default empty = skip)
 #   SANITY_GATE      run baseline.sh first when 1 (default 1)
 #   SKIP_RECYCLE     skip `make e2e-down && make e2e-up` between arms / on teardown when 1 (default 0)
 #                    Intended for local debugging only — the second arm will misbehave without a fresh lab.
+#   RECYCLE_ON_EXIT  recycle the lab from the EXIT trap when 1 (default 1; CI sets 0)
 
 set -euo pipefail
 
@@ -140,16 +188,31 @@ MASTER_NODE="${MASTER_NODE:-clab-${LAB}-${MASTER}}"
 FIP="${FIP:-192.0.2.10}"
 CLIENT="${CLIENT:-clab-${LAB}-client-1}"
 CENTRAL="${CENTRAL:-clab-${LAB}-central}"
+UPSTREAM="${UPSTREAM:-clab-${LAB}-upstream}"
 LR_PUBLIC_PORT="${LR_PUBLIC_PORT:-lr0-public}"
 CR_PORT="cr-${LR_PUBLIC_PORT}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-0.1}"
 PROBE_COUNT="${PROBE_COUNT:-200}"
 PROBE_PRELUDE="${PROBE_PRELUDE:-3}"
-FAILOVER_TIMEOUT="${FAILOVER_TIMEOUT:-60}"
-GRACEFUL_MAX_LOSS="${GRACEFUL_MAX_LOSS:-5}"
+FAILOVER_TIMEOUT="${FAILOVER_TIMEOUT:-30}"
+GRACEFUL_MAX_OUTAGE_MS="${GRACEFUL_MAX_OUTAGE_MS:-500}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
 SANITY_GATE="${SANITY_GATE:-1}"
 SKIP_RECYCLE="${SKIP_RECYCLE:-0}"
+RECYCLE_ON_EXIT="${RECYCLE_ON_EXIT:-1}"
+
+# Packet-loss ceiling for the graceful arm, derived so it can never drift
+# from the outage budget it is meant to express: at -i 0.1 a `<= 1 packet`
+# rule is a 100 ms budget, but at the 0.2 s unprivileged iputils floor the
+# same rule would silently buy the agent 200 ms.
+#
+# ceil() and not floor(): an outage of D ms sampled every i ms costs at most
+# ceil(D/i) packets, so ceil is the bound that never fails an arm which
+# stayed inside the budget. The flip side is that a coarser PROBE_INTERVAL
+# cannot resolve a finer budget — which is why the defaults probe at the
+# finest interval iputils allows.
+GRACEFUL_MAX_LOSS="$(awk -v ms="${GRACEFUL_MAX_OUTAGE_MS}" -v i="${PROBE_INTERVAL}" \
+    'BEGIN { n = ms / (i * 1000); print (n == int(n) ? n : int(n) + 1) }')"
 
 SCENARIOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCENARIOS_DIR}/../../.." && pwd)"
@@ -160,10 +223,23 @@ BASELINE="${BASELINE:-${SCENARIOS_DIR}/baseline.sh}"
 # does not pay a needless `make e2e-up` cost.
 LAB_PERTURBED=0
 
+# Path of a file holding the PID of the background transition-timeline
+# sampler for the arm that is currently running; empty content when no
+# sampler is active. Set by main().
+#
+# A file and not a variable for the same reason main() hoists LAB_PERTURBED:
+# the arms run as `loss=$(arm_graceful)` command substitutions, so a PID
+# assigned by start_timeline inside that subshell would never propagate back
+# to wait_for_failover or to the EXIT trap — both of which have to reach the
+# sampler.
+TIMELINE_PID_FILE=""
+
 log() { printf '[drain-hitless] %s\n' "$*" >&2; }
 
 # Write `content` to `path` under ARTIFACTS_DIR when it is set; quietly
-# no-op otherwise. Same pattern as stale-chassis.sh.
+# no-op otherwise. Same pattern as stale-chassis.sh: `path` is a flat
+# file name, because the CI job already points ARTIFACTS_DIR at the
+# scenario's own `drain-hitless/` sub-bundle.
 #
 # The no-op path still drains stdin. Most call sites pipe into this
 # function, and returning without reading closes the read end while the
@@ -177,17 +253,46 @@ write_artifact() {
         cat >/dev/null
         return 0
     fi
-    mkdir -p "$(dirname "${ARTIFACTS_DIR}/${path}")"
+    mkdir -p "${ARTIFACTS_DIR}"
     cat >"${ARTIFACTS_DIR}/${path}"
 }
 
 sbctl() { docker exec "${CENTRAL}" ovn-sbctl "$@"; }
 
+# The BGP nexthop(s) `upstream` currently routes the FIP /32 to,
+# comma-joined. The per-gateway underlay /30s make this a proxy for
+# "which gateway is advertising the FIP right now": 100.64.N.2 is
+# gateway-N (see bootstrap.sh), and a transient two-nexthop reading is
+# both gateways advertising mid-transition. Prints the empty string
+# while no route is installed — exactly the window the timeline exists
+# to show.
+#
+# Only the nexthop lines (`* 100.64.1.2, via eth1, weight 1`) are of
+# interest: the `Known via "bgp"` header line also carries a `via`
+# token, so the field before it has to look like an IPv4 address.
+upstream_fip_nexthop() {
+    docker exec "${UPSTREAM}" vtysh -c "show ip route ${FIP}/32" 2>/dev/null \
+        | tr -d '\r' \
+        | awk '
+            {
+                for (i = 2; i <= NF; i++) {
+                    if ($i != "via") continue
+                    nh = $(i-1)
+                    gsub(/,/, "", nh)
+                    if (nh ~ /^[0-9]+(\.[0-9]+){3}$/) {
+                        hops = (hops == "" ? nh : hops "," nh)
+                    }
+                }
+            }
+            END { if (hops != "") print hops }' \
+        || true
+}
+
 # Flip the container's Docker restart policy to "no" so the agent's
 # exit (graceful or hard) leaves the container down instead of being
 # re-launched immediately by Docker. Idempotent; best-effort — a
 # failure here would only manifest as the same flapping the fix is
-# trying to prevent, which then surfaces as a wait_for_remaster
+# trying to prevent, which then surfaces as a wait_for_failover
 # timeout. The policy is reset by the next `make e2e-up` recycle so
 # we do not need to undo it explicitly.
 disable_container_restart() {
@@ -246,25 +351,113 @@ require_drain_enabled() {
     return 1
 }
 
-# Wait until cr-lr0-public migrates away from ${MASTER}, or until
-# FAILOVER_TIMEOUT seconds elapse. Returns the chassis name on stdout
-# either way; the caller decides whether the post-failover binding is
-# acceptable. Polled the same way failover.sh polls (sleep 2s between
-# samples — finer than BFD detection but coarse enough not to flood
-# central).
-wait_for_remaster() {
-    local deadline who
-    deadline=$(( $(date +%s) + FAILOVER_TIMEOUT ))
-    while (( $(date +%s) < deadline )); do
-        who="$(current_master)"
-        if [ -n "${who}" ] && [ "${who}" != "${MASTER}" ]; then
-            printf '%s' "${who}"
-            return 0
-        fi
-        sleep 2
+# Run baseline.sh against the freshly recycled lab. Unlike sanity_gate
+# this is NOT optional: `make e2e-up` returns as soon as bootstrap has
+# seeded NB, and the agents still need a reconcile cycle before
+# `client-1 → FIP` answers. A probe started inside that window would
+# charge the reconcile drops to the arm and inflate its loss count.
+lab_ready_gate() {
+    if [ ! -x "${BASELINE}" ]; then
+        log "ERROR: baseline script not executable at ${BASELINE} — cannot gate the recycled lab"
+        return 1
+    fi
+    log "waiting for the recycled lab to reach baseline-green before the next arm"
+    "${BASELINE}"
+}
+
+# First transition-timeline row at or after ${kill_ts} that shows
+# cr-lr0-public bound to a chassis which is neither `<none>` nor ${MASTER}
+# — i.e. the sample in which the migration became visible. Prints
+# `<epoch> <chassis>`; prints nothing when the timeline never recorded one.
+#
+# Rows whose first field is not an epoch are skipped: the sampler folds its
+# stderr into the same file, so a transient `docker exec` error must not be
+# mistaken for a chassis reading. Rows older than the kill are skipped so a
+# lab that was already misconfigured (cr-lr0-public not on ${MASTER} before
+# the kill) cannot date a "migration" to before the kill and pass with a
+# negative delta.
+first_migration_row() {
+    local timeline="$1" kill_ts="$2"
+    awk -v master="${MASTER}" -v kill_ts="${kill_ts}" '
+        $1 !~ /^[0-9]+$/ { next }
+        $1 < kill_ts { next }
+        NF >= 3 && $3 != "<none>" && $3 != master { print $1, $3; exit }
+    ' "${timeline}"
+}
+
+# Assert both failover signals returned within FAILOVER_TIMEOUT seconds of
+# the kill — the same RTO issue #105 asserts for this lab:
+#
+#   1. cr-lr0-public is bound to a chassis other than ${MASTER}. This is
+#      the false-pass guard failover.sh also applies: a low-loss reading is
+#      meaningless if the lab never re-elected (OVS on the dead master can
+#      keep executing stale flows for a while).
+#   2. `client-1 → FIP` answers again, i.e. the data plane is actually
+#      restored through the NEW master.
+#
+# Signal 1 is DATED from the transition timeline rather than sampled here.
+# By the time an arm calls this function the probe has long drained: the
+# kill fires PROBE_PRELUDE seconds into a probe that runs
+# PROBE_COUNT × PROBE_INTERVAL seconds, so at the defaults we regain control
+# ~17s after the kill. A sample taken then can only ever observe the end
+# state, never the instant it was reached — which is what would make every
+# FAILOVER_TIMEOUT below the probe's tail pass unconditionally. The timeline
+# samples current_master once per second from before the kill until at least
+# kill_ts + FAILOVER_TIMEOUT, so the first row naming another chassis dates
+# the migration to within the sampler's 1s resolution.
+#
+# Signal 2 is only polled, not dated. The probe already measured how long
+# the data plane was down (loss × PROBE_INTERVAL) but it cannot see past its
+# own end: a hardkill arm that never recovered ends the probe having lost
+# every packet after the kill, ~17s of outage, which would slip under a 30s
+# budget. What remains unknown is therefore whether the FIP came back at
+# all, and that is what this poll answers, bounded by the same deadline.
+#
+# Prints the new chassis name on stdout; returns non-zero when either signal
+# missed the budget.
+wait_for_failover() {
+    local kill_ts="$1" timeline="$2"
+    local deadline row="" migrated_ts who delta
+    deadline=$(( kill_ts + FAILOVER_TIMEOUT ))
+
+    while :; do
+        row="$(first_migration_row "${timeline}" "${kill_ts}")"
+        [ -n "${row}" ] && break
+        (( $(date +%s) < deadline )) || break
+        sleep 1
     done
-    printf '%s' "${who:-}"
-    return 1
+
+    # The sampler buffers its last lines until it exits; stop it and read the
+    # flushed file once more so a migration that landed just before the
+    # deadline is not reported as one that never happened.
+    stop_timeline
+    if [ -z "${row}" ]; then
+        row="$(first_migration_row "${timeline}" "${kill_ts}")"
+    fi
+    if [ -z "${row}" ]; then
+        log "${CR_PORT} never migrated away from ${MASTER} within ${FAILOVER_TIMEOUT}s of the kill"
+        log "last transition sample: $(tail -n 1 "${timeline}")"
+        return 1
+    fi
+
+    migrated_ts="${row%% *}"
+    who="${row##* }"
+    delta=$(( migrated_ts - kill_ts ))
+    if (( delta > FAILOVER_TIMEOUT )); then
+        log "${CR_PORT} migrated to ${who} ${delta}s after the kill, over the ${FAILOVER_TIMEOUT}s budget"
+        return 1
+    fi
+
+    while ! docker exec "${CLIENT}" ping -c 1 -W 1 "${FIP}" >/dev/null 2>&1; do
+        if ! (( $(date +%s) < deadline )); then
+            log "${CLIENT} → ${FIP} did not answer again within ${FAILOVER_TIMEOUT}s of the kill (${CR_PORT} is on ${who})"
+            return 1
+        fi
+        sleep 1
+    done
+
+    log "${CR_PORT} migrated to ${who} ${delta}s after the kill (budget ${FAILOVER_TIMEOUT}s)"
+    printf '%s' "${who}"
 }
 
 # Parse `N packets transmitted, M received` out of a ping summary block
@@ -300,10 +493,118 @@ parse_ping_loss() {
     ' "${file}"
 }
 
+# Wall-clock seconds the probe occupies, plus slack for ping's startup
+# and its summary block. Bounds the packet capture so it does not outlive
+# its arm.
+probe_window_seconds() {
+    awk -v c="${PROBE_COUNT}" -v i="${PROBE_INTERVAL}" 'BEGIN { printf "%d", c * i + 10 }'
+}
+
+# Wall-clock seconds the transition timeline samples for. It must outlive
+# both the probe and the kill-anchored FAILOVER_TIMEOUT budget: the timeline
+# is what dates the migration, and a budget the sampler stopped short of
+# could never be observed as exceeded.
+timeline_window_seconds() {
+    awk -v probe="$(probe_window_seconds)" -v prelude="${PROBE_PRELUDE}" \
+        -v rto="${FAILOVER_TIMEOUT}" \
+        'BEGIN { t = prelude + rto + 5; printf "%d", (t > probe ? t : probe) }'
+}
+
+# Milliseconds of data-plane outage a loss count stands for at the current
+# probe spacing. The probe is the only clock here: every lost packet is one
+# PROBE_INTERVAL in which the FIP did not answer.
+outage_ms() {
+    awk -v loss="$1" -v i="${PROBE_INTERVAL}" 'BEGIN { printf "%d", loss * i * 1000 }'
+}
+
+# Capture the probe on client-1's eth1 for the length of the arm. The
+# capture is triage evidence only — the loss assertion reads ping's own
+# summary — so every step here is best-effort and never fails an arm.
+start_capture() {
+    local arm="$1" window="$2"
+    if [ -z "${ARTIFACTS_DIR}" ]; then
+        return 0
+    fi
+    if ! docker exec -d "${CLIENT}" timeout "${window}" \
+        tcpdump -i eth1 -n -U -w "/tmp/drain-hitless-${arm}.pcap" \
+        "icmp and host ${FIP}" >/dev/null 2>&1; then
+        log "[${arm}] WARN: could not start tcpdump on ${CLIENT} (continuing without a capture)"
+        return 0
+    fi
+    # Give tcpdump a moment to attach so the first probe packet is not
+    # missed and mis-read as a lost one during triage.
+    sleep 1
+}
+
+# Render the capture to text. `-tt` prints absolute epoch timestamps so
+# the ICMP sequence gap can be lined up against the kill timestamp the
+# arm records; `-nn` keeps addresses numeric.
+stop_capture() {
+    local arm="$1"
+    if [ -z "${ARTIFACTS_DIR}" ]; then
+        return 0
+    fi
+    docker exec "${CLIENT}" pkill -f 'tcpdump -i eth1' >/dev/null 2>&1 || true
+    if ! docker exec "${CLIENT}" \
+        tcpdump -nn -tt -r "/tmp/drain-hitless-${arm}.pcap" 2>/dev/null \
+        | write_artifact "${arm}-icmp-seq.txt"; then
+        log "[${arm}] WARN: no capture to render (tcpdump unavailable or pcap missing)"
+    fi
+}
+
+# Sample the control-plane transition once per second into ${path}: which
+# chassis anchors cr-lr0-public in SB, and which BGP nexthop `upstream`
+# routes the FIP /32 to.
+#
+# This does two jobs. It is the "BGP/SB Port_Binding transition timeline"
+# the issue's artifact bundle asks for — it shows where in the transition
+# the lost packets sat — and it is the record wait_for_failover dates the
+# migration from. The second job is why it is not gated on ARTIFACTS_DIR
+# like the packet capture is: a local `make e2e-drain-hitless` must hold the
+# agent to the same RTO the CI job does.
+start_timeline() {
+    local arm="$1" path="$2" window
+    window="$(timeline_window_seconds)"
+    log "[${arm}] sampling the transition timeline for ${window}s"
+    (
+        local deadline who nexthop
+        deadline=$(( $(date +%s) + window ))
+        printf '# epoch utc sb_chassis(%s) upstream_bgp_nexthop(%s)\n' "${CR_PORT}" "${FIP}"
+        while (( $(date +%s) < deadline )); do
+            who="$(current_master)"
+            nexthop="$(upstream_fip_nexthop)"
+            printf '%s %s %s %s\n' "$(date +%s)" "$(date -u +%H:%M:%S)" \
+                "${who:-<none>}" "${nexthop:-<none>}"
+            sleep 1
+        done
+    ) >"${path}" 2>&1 &
+    printf '%s' "$!" >"${TIMELINE_PID_FILE}"
+}
+
+# Stop the sampler, if one is running. Idempotent, and safe to call from a
+# shell that is not the sampler's parent: `wait` on a non-child is an error
+# the sampler's own exit makes moot, since every timeline line is flushed as
+# it is printed.
+stop_timeline() {
+    local pid
+    pid="$(cat "${TIMELINE_PID_FILE}" 2>/dev/null || true)"
+    if [ -n "${pid}" ]; then
+        kill "${pid}" >/dev/null 2>&1 || true
+        wait "${pid}" 2>/dev/null || true
+        : >"${TIMELINE_PID_FILE}"
+    fi
+}
+
 # Run the probe in the foreground for the full PROBE_COUNT, with the
 # kill delivered asynchronously after PROBE_PRELUDE seconds. The probe
 # generator runs `ping -i ${PROBE_INTERVAL} -c ${PROBE_COUNT}` inside
-# ${CLIENT}. The kill_cmd is invoked by a backgrounded `(sleep …; …)`.
+# ${CLIENT}. The kill_cmd is invoked by a backgrounded `(sleep …; …)`,
+# which stamps ${kill_ts_file} with the epoch second it fired so the
+# caller can measure the RTO from the kill rather than from probe end.
+#
+# The transition timeline is started here but deliberately NOT stopped:
+# wait_for_failover reads it after the probe has drained and stops the
+# sampler itself, so the timeline spans the whole kill-anchored budget.
 #
 # The function captures stdout+stderr to ${probe_out} and returns the
 # loss count on stdout (via parse_ping_loss). Returns non-zero if the
@@ -315,7 +616,12 @@ parse_ping_loss() {
 run_probe_and_kill() {
     local arm_label="$1"
     local probe_out="$2"
-    local -a kill_cmd=("${@:3}")
+    local kill_ts_file="$3"
+    local timeline="$4"
+    local -a kill_cmd=("${@:5}")
+
+    start_capture "${arm_label}" "$(probe_window_seconds)"
+    start_timeline "${arm_label}" "${timeline}"
 
     log "[${arm_label}] starting probe: ping -i ${PROBE_INTERVAL} -c ${PROBE_COUNT} ${FIP} from ${CLIENT}"
     # The probe is run in the background so the kill scheduler can run
@@ -336,6 +642,7 @@ run_probe_and_kill() {
     # genuine errors still surface.
     (
         sleep "${PROBE_PRELUDE}"
+        date +%s >"${kill_ts_file}"
         log "[${arm_label}] firing kill: ${kill_cmd[*]}"
         "${kill_cmd[@]}" >/dev/null \
             || log "[${arm_label}] kill command returned non-zero (continuing)"
@@ -348,6 +655,8 @@ run_probe_and_kill() {
     # subsequent parse step, not by `wait`'s exit code.
     wait "${probe_pid}" || true
     wait "${killer_pid}" || true
+
+    stop_capture "${arm_label}"
 
     local loss
     if ! loss=$(parse_ping_loss "${probe_out}"); then
@@ -379,7 +688,16 @@ recycle_lab() {
 # `if: always()` step runs `make e2e-down` after the scenario regardless.
 teardown() {
     local exit_code=$?
+    # An arm that failed before wait_for_failover leaves the sampler alive;
+    # it would keep `docker exec`ing into a lab this trap is about to
+    # recycle. Idempotent when the sampler already stopped.
+    stop_timeline
+    rm -f "${TIMELINE_PID_FILE}"
     if [ "${LAB_PERTURBED}" = "0" ]; then
+        return "${exit_code}"
+    fi
+    if [ "${RECYCLE_ON_EXIT}" != "1" ]; then
+        log "teardown: RECYCLE_ON_EXIT=${RECYCLE_ON_EXIT} — leaving the perturbed lab for the caller to tear down"
         return "${exit_code}"
     fi
     log "teardown: lab was perturbed by an arm — recycling so the lab is left baseline-green"
@@ -398,22 +716,73 @@ snapshot_port_binding() {
         printf '# cr-lr0-public Port_Binding at %s\n\n' "${label}"
         sbctl find Port_Binding logical_port="${CR_PORT}" 2>&1 || true
         printf '\n# resolved chassis name: %s\n' "$(current_master)"
-    } | write_artifact "drain-hitless/${label}.txt"
+        printf '# upstream BGP nexthop for %s: %s\n' \
+            "${FIP}" "$(upstream_fip_nexthop)"
+    } | write_artifact "${label}.txt"
 }
 
 # Capture the drain log lines from the killed gateway's `docker logs`.
 # The container has already exited by the time we read this, so logs
-# are the only available signal. Returns the matched lines on stdout
-# (one per chassis entry that was drained); returns non-zero if no
-# line matched.
+# are the only available signal.
+#
+# `drain: gateway chassis priority lowered` is emitted inside the
+# op-building loop of `DrainGateways` (ovn_gateway.go), BEFORE the ops
+# are handed to `transactOps` — it proves the drain path was entered,
+# not that the priority-0 update ever reached the NB DB. When the
+# transaction fails, `DrainGateways` returns an error, agent.go logs
+# `drain failed` and the agent exits anyway: no priority was lowered
+# and the gateway dies exactly like a hard kill. Accepting the
+# `lowered` line alone would bundle an artifact that affirms a drain
+# that never happened, sending a maintainer after OVN's migration path
+# while the real cause sits ungrepped in the logs.
+#
+# `drain: complete` is the only line emitted after the transaction
+# committed AND the SB poll observed the port migrate off this chassis,
+# so require it. `drain: timeout exceeded` means the agent gave up and
+# exited with the port still bound here — the drain did not deliver the
+# migration the graceful arm measures.
+#
+# Every matched line — failures included — goes to stdout so the
+# artifact bundle names the real cause. Returns non-zero unless the log
+# proves a committed, migrated drain.
 capture_drain_log() {
-    local out
-    out=$(docker logs "${MASTER_NODE}" 2>&1 \
-        | grep -E 'msg="drain: gateway chassis priority lowered"' || true)
-    if [ -z "${out}" ]; then
+    local logs lowered completed failed
+    logs="$(docker logs "${MASTER_NODE}" 2>&1 || true)"
+    lowered="$(printf '%s\n' "${logs}" \
+        | grep -E 'msg="drain: gateway chassis priority lowered"' || true)"
+    completed="$(printf '%s\n' "${logs}" \
+        | grep -E 'msg="drain: complete' || true)"
+    failed="$(printf '%s\n' "${logs}" \
+        | grep -E 'msg="drain failed"|msg="drain: timeout exceeded' || true)"
+
+    if [ -n "${lowered}" ]; then
+        printf '%s\n' "${lowered}"
+    fi
+    if [ -n "${failed}" ]; then
+        printf '%s\n' "${failed}"
+    fi
+    if [ -n "${completed}" ]; then
+        printf '%s\n' "${completed}"
+    fi
+
+    if [ -z "${lowered}" ] || [ -z "${completed}" ] || [ -n "${failed}" ]; then
         return 1
     fi
-    printf '%s\n' "${out}"
+}
+
+# Read the epoch second the kill fired, as stamped by the killer
+# subshell just before it fired. A missing stamp means the subshell
+# died before reaching `date`, which should never happen; fall back to
+# "now" (a laxer RTO budget) and say so loudly rather than aborting an
+# arm whose measurement is already in hand.
+read_kill_ts() {
+    local file="$1" ts
+    ts="$(cat "${file}" 2>/dev/null || true)"
+    if [ -z "${ts}" ]; then
+        log "WARN: kill timestamp was never stamped; measuring the RTO from now"
+        ts="$(date +%s)"
+    fi
+    printf '%s' "${ts}"
 }
 
 # Run the graceful arm. Returns the measured loss count on stdout;
@@ -434,42 +803,58 @@ arm_graceful() {
     # bringing gateway-1 back and triggering RestoreDrainedGateways.
     disable_container_restart "${MASTER_NODE}"
 
-    local probe_out loss
+    local probe_out kill_ts_file timeline loss kill_ts
     probe_out="$(mktemp)"
-    if ! loss=$(run_probe_and_kill "graceful" "${probe_out}" \
+    kill_ts_file="$(mktemp)"
+    timeline="$(mktemp)"
+    if ! loss=$(run_probe_and_kill "graceful" "${probe_out}" "${kill_ts_file}" "${timeline}" \
         docker exec "${MASTER_NODE}" kill -TERM 1); then
-        cat "${probe_out}" | write_artifact "drain-hitless/graceful-ping.txt"
-        rm -f "${probe_out}"
+        stop_timeline
+        write_artifact "graceful-ping.txt" <"${probe_out}"
+        write_artifact "graceful-transition-timeline.txt" <"${timeline}"
+        rm -f "${probe_out}" "${kill_ts_file}" "${timeline}"
         return 1
     fi
-    cat "${probe_out}" | write_artifact "drain-hitless/graceful-ping.txt"
-    rm -f "${probe_out}"
+    write_artifact "graceful-ping.txt" <"${probe_out}"
+    kill_ts="$(read_kill_ts "${kill_ts_file}")"
+    rm -f "${probe_out}" "${kill_ts_file}"
 
     snapshot_port_binding "graceful-port-binding-after"
 
-    # Re-election must have happened — otherwise a 0-loss reading is
-    # meaningless (the lab never failed over). Use the same guard
-    # failover.sh applies.
-    local after
-    if ! after=$(wait_for_remaster); then
-        log "graceful arm: ERROR — ${CR_PORT} did not migrate away from ${MASTER} within ${FAILOVER_TIMEOUT}s"
+    # Re-election must have happened inside #105's RTO and the data plane
+    # must be back — otherwise a 0-loss reading is meaningless (the lab
+    # never failed over). Same guard failover.sh applies. wait_for_failover
+    # stops the timeline sampler, so the artifact is complete afterwards.
+    local after rc=0
+    after="$(wait_for_failover "${kill_ts}" "${timeline}")" || rc=$?
+    write_artifact "graceful-transition-timeline.txt" <"${timeline}"
+    rm -f "${timeline}"
+    if (( rc != 0 )); then
+        log "graceful arm: ERROR — the SIGTERM did not produce a failover inside the ${FAILOVER_TIMEOUT}s budget"
         return 1
     fi
-    log "graceful arm: ${CR_PORT} migrated ${MASTER} -> ${after}"
+    log "graceful arm: ${CR_PORT} migrated ${MASTER} -> ${after}, ${FIP} reachable again"
 
-    # Acceptance: prove DrainGateways actually ran. Without this log
-    # line, a 0-loss reading could be explained by the agent racing
-    # the kernel teardown rather than by the drain code path.
-    local drain_log
-    if ! drain_log=$(capture_drain_log); then
-        log "graceful arm: ERROR — no 'drain: gateway chassis priority lowered' line in ${MASTER_NODE} logs"
+    # Acceptance: prove DrainGateways actually committed the priority
+    # update and saw the port migrate. Without that, a 0-loss reading
+    # could be explained by the agent racing the kernel teardown rather
+    # than by the drain code path.
+    local drain_log drain_rc=0
+    drain_log="$(capture_drain_log)" || drain_rc=$?
+    if [ -n "${drain_log}" ]; then
+        printf '%s\n' "${drain_log}" | write_artifact "graceful-drain-log.txt"
+    else
+        printf '# no drain log lines found\n' | write_artifact "graceful-drain-log.txt"
+    fi
+    if (( drain_rc != 0 )); then
+        log "graceful arm: ERROR — ${MASTER_NODE} logs do not show a drain that committed and migrated"
+        log "graceful arm:        want both 'drain: gateway chassis priority lowered' and 'drain: complete', and neither 'drain failed' nor 'drain: timeout exceeded'"
         log "graceful arm:        was the lab deployed with E2E_DRAIN_ON_SHUTDOWN=true make e2e-up?"
-        printf '# no drain log line found\n' | write_artifact "drain-hitless/graceful-drain-log.txt"
+        printf '%s\n' "${drain_log:-<no drain lines at all>}" | sed 's/^/    /' >&2
         return 1
     fi
     log "graceful arm: drain code path confirmed:"
     printf '%s\n' "${drain_log}" | sed 's/^/    /' >&2
-    printf '%s\n' "${drain_log}" | write_artifact "drain-hitless/graceful-drain-log.txt"
 
     log "graceful arm: measured packet loss = ${loss}"
     printf '%s' "${loss}"
@@ -492,25 +877,33 @@ arm_hardkill() {
     # while we are still measuring the failover.
     disable_container_restart "${MASTER_NODE}"
 
-    local probe_out loss
+    local probe_out kill_ts_file timeline loss kill_ts
     probe_out="$(mktemp)"
-    if ! loss=$(run_probe_and_kill "hardkill" "${probe_out}" \
+    kill_ts_file="$(mktemp)"
+    timeline="$(mktemp)"
+    if ! loss=$(run_probe_and_kill "hardkill" "${probe_out}" "${kill_ts_file}" "${timeline}" \
         docker kill -s KILL "${MASTER_NODE}"); then
-        cat "${probe_out}" | write_artifact "drain-hitless/hardkill-ping.txt"
-        rm -f "${probe_out}"
+        stop_timeline
+        write_artifact "hardkill-ping.txt" <"${probe_out}"
+        write_artifact "hardkill-transition-timeline.txt" <"${timeline}"
+        rm -f "${probe_out}" "${kill_ts_file}" "${timeline}"
         return 1
     fi
-    cat "${probe_out}" | write_artifact "drain-hitless/hardkill-ping.txt"
-    rm -f "${probe_out}"
+    write_artifact "hardkill-ping.txt" <"${probe_out}"
+    kill_ts="$(read_kill_ts "${kill_ts_file}")"
+    rm -f "${probe_out}" "${kill_ts_file}"
 
     snapshot_port_binding "hardkill-port-binding-after"
 
-    local after
-    if ! after=$(wait_for_remaster); then
-        log "hardkill arm: ERROR — ${CR_PORT} did not migrate away from ${MASTER} within ${FAILOVER_TIMEOUT}s"
+    local after rc=0
+    after="$(wait_for_failover "${kill_ts}" "${timeline}")" || rc=$?
+    write_artifact "hardkill-transition-timeline.txt" <"${timeline}"
+    rm -f "${timeline}"
+    if (( rc != 0 )); then
+        log "hardkill arm: ERROR — the SIGKILL did not produce a failover inside the ${FAILOVER_TIMEOUT}s budget"
         return 1
     fi
-    log "hardkill arm: ${CR_PORT} migrated ${MASTER} -> ${after}"
+    log "hardkill arm: ${CR_PORT} migrated ${MASTER} -> ${after}, ${FIP} reachable again"
 
     log "hardkill arm: measured packet loss = ${loss}"
     printf '%s' "${loss}"
@@ -519,15 +912,24 @@ arm_hardkill() {
 assert_hitless() {
     local graceful="$1"
     local hardkill="$2"
+    local graceful_ms hardkill_ms
+    graceful_ms="$(outage_ms "${graceful}")"
+    hardkill_ms="$(outage_ms "${hardkill}")"
     {
         printf '# drain-hitless summary\n'
+        printf 'probe_interval=%s\n' "${PROBE_INTERVAL}"
         printf 'graceful_loss=%s\n'  "${graceful}"
+        printf 'graceful_outage_ms=%s\n' "${graceful_ms}"
         printf 'hardkill_loss=%s\n'  "${hardkill}"
+        printf 'hardkill_outage_ms=%s\n' "${hardkill_ms}"
+        printf 'graceful_max_outage_ms=%s\n' "${GRACEFUL_MAX_OUTAGE_MS}"
         printf 'graceful_max_loss=%s\n' "${GRACEFUL_MAX_LOSS}"
-    } | write_artifact "drain-hitless/summary.txt"
+        printf 'hitless_gain_packets=%s\n' "$(( hardkill - graceful ))"
+    } | write_artifact "summary.txt"
 
     if ! (( graceful <= GRACEFUL_MAX_LOSS )); then
-        log "ASSERTION FAILED: graceful_loss (${graceful}) > GRACEFUL_MAX_LOSS (${GRACEFUL_MAX_LOSS})"
+        log "ASSERTION FAILED: the graceful arm lost ${graceful} packets (~${graceful_ms} ms of outage), over the ${GRACEFUL_MAX_OUTAGE_MS} ms budget"
+        log "    at -i ${PROBE_INTERVAL} that budget allows at most ${GRACEFUL_MAX_LOSS} lost packet(s)"
         return 1
     fi
     if ! (( graceful < hardkill )); then
@@ -535,13 +937,14 @@ assert_hitless() {
         log "    a non-negative delta is required for the hitless comparison to be meaningful"
         return 1
     fi
-    log "ASSERT OK: graceful_loss=${graceful} <= ${GRACEFUL_MAX_LOSS} AND graceful_loss < hardkill_loss=${hardkill}"
+    log "ASSERT OK: graceful outage ~${graceful_ms} ms <= ${GRACEFUL_MAX_OUTAGE_MS} ms AND graceful_loss=${graceful} < hardkill_loss=${hardkill}"
 }
 
 main() {
     sanity_gate
     require_drain_enabled
 
+    TIMELINE_PID_FILE="$(mktemp)"
     trap teardown EXIT
 
     local graceful_loss hardkill_loss
@@ -568,6 +971,7 @@ main() {
     # yet, so reset the perturbation flag until the hardkill arm
     # flips it again.
     LAB_PERTURBED=0
+    lab_ready_gate
 
     log "===== hardkill arm (control) ====="
     LAB_PERTURBED=1
