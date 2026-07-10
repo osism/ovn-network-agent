@@ -1281,6 +1281,92 @@ func TestDrainGateways_FallbackReturnsErrorOnTransactFailure(t *testing.T) {
 	}
 }
 
+// TestMarkTakeoverReady_WritesAndIsIdempotent covers the marker writer: a
+// managed default route carrying a peer's marker is restamped for the local
+// chassis in exactly one update that preserves the other external_ids, the
+// re-run is a no-op once the marker already names this chassis, and a router
+// with no managed default route is left untouched.
+func TestMarkTakeoverReady_WritesAndIsIdempotent(t *testing.T) {
+	t.Run("writes and preserves other keys, then idempotent", func(t *testing.T) {
+		c, nb, _ := newOVNClientWithFakes(t, "host-a")
+		nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+		nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+			UUID:     "sr1",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-b",
+				takeoverReadyMarkerKey:      "host-b",
+			},
+		})
+		localRouters := []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1"}}
+
+		if err := c.MarkTakeoverReady(context.Background(), localRouters); err != nil {
+			t.Fatalf("MarkTakeoverReady: %v", err)
+		}
+
+		writes := nb.writeTransacts()
+		if len(writes) != 1 {
+			t.Fatalf("expected exactly one write transaction, got %d", len(writes))
+		}
+		var updates []ovsdb.Operation
+		for _, op := range writes[0] {
+			if op.Op == ovsdb.OperationUpdate && op.Table == "Logical_Router_Static_Route" {
+				updates = append(updates, op)
+			}
+		}
+		if len(updates) != 1 {
+			t.Fatalf("expected one static-route update, got %d", len(updates))
+		}
+		ext, ok := updates[0].Row["external_ids"].(map[string]string)
+		if !ok {
+			t.Fatalf("update external_ids has type %T, want map[string]string", updates[0].Row["external_ids"])
+		}
+		if got := ext[takeoverReadyMarkerKey]; got != "host-a" {
+			t.Errorf("advertised marker = %q, want host-a", got)
+		}
+		if ext["ovn-network-agent"] != "managed" || ext["ovn-network-agent-chassis"] != "host-b" {
+			t.Errorf("marker write dropped existing external_ids: %v", ext)
+		}
+
+		// Re-run: the marker already names host-a, so no new write is issued.
+		if err := c.MarkTakeoverReady(context.Background(), localRouters); err != nil {
+			t.Fatalf("MarkTakeoverReady (rerun): %v", err)
+		}
+		if got := len(nb.writeTransacts()); got != 1 {
+			t.Errorf("rerun issued a redundant write: total write transactions = %d, want 1", got)
+		}
+	})
+
+	t.Run("no managed default route means no write", func(t *testing.T) {
+		c, nb, _ := newOVNClientWithFakes(t, "host-a")
+		nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+		// A default route that is NOT agent-managed (e.g. Neutron-configured).
+		nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+			UUID:        "sr1",
+			IPPrefix:    "0.0.0.0/0",
+			ExternalIDs: map[string]string{},
+		})
+
+		if err := c.MarkTakeoverReady(context.Background(), []LocalRouterInfo{{RouterUUID: "lr1"}}); err != nil {
+			t.Fatalf("MarkTakeoverReady: %v", err)
+		}
+		if got := len(nb.writeTransacts()); got != 0 {
+			t.Errorf("marker written for a non-managed default route: %d write transactions, want 0", got)
+		}
+	})
+
+	t.Run("empty local routers is a no-op", func(t *testing.T) {
+		c, nb, _ := newOVNClientWithFakes(t, "host-a")
+		if err := c.MarkTakeoverReady(context.Background(), nil); err != nil {
+			t.Fatalf("MarkTakeoverReady(nil): %v", err)
+		}
+		if got := len(nb.recordedTransacts()); got != 0 {
+			t.Errorf("empty local routers issued %d transactions, want 0", got)
+		}
+	})
+}
+
 // TestDrainGateways_EventSignalWakesMigrationWait verifies that a
 // chassisredirect Port_Binding change ends the drain migration wait through
 // drainWatchCh, without waiting for the safety re-poll tick. The settle delay
