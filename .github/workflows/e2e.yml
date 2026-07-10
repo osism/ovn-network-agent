@@ -2,15 +2,14 @@ name: E2E
 
 # The containerlab harness boots three OVN+OVS+FRR gateway containers
 # plus a central node and clients, and even on the green path eats
-# ~10 min of runner time. We still run it on every push to `main` and
-# on `workflow_dispatch`, but also on pull requests so authors can
-# debug topology-level regressions on the same runners CI uses — the
-# GHA environment differs enough from local Docker hosts (kernel,
-# resource limits, image caches) that lab-up failures often only
-# reproduce here.
+# ~10 min of runner time. It runs on pull requests so authors can debug
+# topology-level regressions on the same runners CI uses — the GHA
+# environment differs enough from local Docker hosts (kernel, resource
+# limits, image caches) that lab-up failures often only reproduce here —
+# and on `workflow_dispatch` for manual reruns. It deliberately does not
+# run on push to `main`: the merged commit already passed E2E on its PR,
+# so re-running this ~10 min suite post-merge only burns runner time.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
