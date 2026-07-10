@@ -547,6 +547,40 @@ func TestIsChassisRedirect(t *testing.T) {
 	}
 }
 
+// TestSBEventHandlerChassisRedirectSignalsDrainWatch verifies that the SB
+// event handler wakes a drain wait on chassisredirect Port_Binding changes:
+// OnAdd/OnUpdate/OnDelete each enqueue a coalesced drainWatchCh signal when
+// the client is ready, a non-chassisredirect model does not, and nothing is
+// enqueued before the client is ready.
+func TestSBEventHandlerChassisRedirectSignalsDrainWatch(t *testing.T) {
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	h := &sbEventHandler{ovn: c}
+	cr := &SBPortBinding{Type: "chassisredirect", LogicalPort: "cr-lrp-abc"}
+
+	// Not ready: no signal is queued even for a chassisredirect change.
+	c.ready.Store(false)
+	h.OnUpdate("Port_Binding", cr, cr)
+	if got := len(c.drainWatchCh); got != 0 {
+		t.Fatalf("drainWatchCh len before ready = %d, want 0", got)
+	}
+
+	// Ready: each event handler enqueues at most one coalesced signal.
+	c.ready.Store(true)
+	h.OnAdd("Port_Binding", cr)
+	h.OnUpdate("Port_Binding", cr, cr)
+	h.OnDelete("Port_Binding", cr)
+	if got := len(c.drainWatchCh); got != 1 {
+		t.Fatalf("drainWatchCh len after chassisredirect events = %d, want 1 (coalesced)", got)
+	}
+
+	// Consume the signal; a non-chassisredirect change must not re-arm it.
+	<-c.drainWatchCh
+	h.OnUpdate("Port_Binding", &SBPortBinding{Type: "patch"}, &SBPortBinding{Type: "patch"})
+	if got := len(c.drainWatchCh); got != 0 {
+		t.Fatalf("drainWatchCh len after non-chassisredirect change = %d, want 0", got)
+	}
+}
+
 // TestDrainSignalsEmptiesBothChannels verifies that drainSignals consumes a
 // pending signal on each channel without blocking when they are empty.
 func TestDrainSignalsEmptiesBothChannels(t *testing.T) {

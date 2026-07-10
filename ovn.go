@@ -231,6 +231,14 @@ type OVNClient struct {
 	debounceCh  chan struct{}
 	immediateCh chan struct{}
 
+	// drainWatchCh receives signals from the SB event handler on
+	// chassisredirect Port_Binding changes. Unlike debounceCh/immediateCh it
+	// does not feed the refresh loop; DrainGateways consumes it so the drain
+	// wait re-checks countLocalCRPorts the moment a port migrates, instead of
+	// waiting for the fixed safety re-poll. Buffered with capacity 1 so a
+	// storm of events coalesces into at most one queued wake-up.
+	drainWatchCh chan struct{}
+
 	// loopDone is closed when refreshLoop exits. Set by Connect() before
 	// starting the loop; nil before Connect() succeeds.
 	loopDone chan struct{}
@@ -238,11 +246,12 @@ type OVNClient struct {
 
 func NewOVNClient(cfg Config, onChange func()) *OVNClient {
 	return &OVNClient{
-		cfg:         cfg,
-		state:       &OVNState{},
-		onChange:    onChange,
-		debounceCh:  make(chan struct{}, 1),
-		immediateCh: make(chan struct{}, 1),
+		cfg:          cfg,
+		state:        &OVNState{},
+		onChange:     onChange,
+		debounceCh:   make(chan struct{}, 1),
+		immediateCh:  make(chan struct{}, 1),
+		drainWatchCh: make(chan struct{}, 1),
 	}
 }
 
@@ -827,6 +836,23 @@ func (o *OVNClient) immediateStateRefresh() {
 	}
 }
 
+// signalDrainWatch wakes a DrainGateways poll waiting for chassisredirect
+// ports to migrate away. It is fired from the SB event handler on every
+// chassisredirect Port_Binding change so the drain re-checks countLocalCRPorts
+// the moment OVN rebinds a port, instead of waiting for the fixed safety
+// re-poll. Concurrent calls coalesce: at most one wake-up is queued. Outside a
+// drain nothing reads the channel, so the queued signal is simply harmless.
+func (o *OVNClient) signalDrainWatch() {
+	if !o.ready.Load() {
+		return // not fully connected yet
+	}
+	select {
+	case o.drainWatchCh <- struct{}{}:
+	default:
+		// already queued
+	}
+}
+
 // =============================================================================
 // SB event handler (implements cache.EventHandler)
 // =============================================================================
@@ -838,6 +864,7 @@ type sbEventHandler struct {
 func (h *sbEventHandler) OnAdd(table string, m model.Model) {
 	if h.isChassisRedirect(table, m) {
 		slog.Debug("chassisredirect port added, immediate refresh")
+		h.ovn.signalDrainWatch()
 		h.ovn.immediateStateRefresh()
 		return
 	}
@@ -847,6 +874,7 @@ func (h *sbEventHandler) OnAdd(table string, m model.Model) {
 func (h *sbEventHandler) OnUpdate(table string, old, new model.Model) {
 	if h.isChassisRedirect(table, new) {
 		slog.Debug("chassisredirect port updated, immediate refresh")
+		h.ovn.signalDrainWatch()
 		h.ovn.immediateStateRefresh()
 		return
 	}
@@ -856,6 +884,7 @@ func (h *sbEventHandler) OnUpdate(table string, old, new model.Model) {
 func (h *sbEventHandler) OnDelete(table string, m model.Model) {
 	if h.isChassisRedirect(table, m) {
 		slog.Debug("chassisredirect port deleted, immediate refresh")
+		h.ovn.signalDrainWatch()
 		h.ovn.immediateStateRefresh()
 		return
 	}

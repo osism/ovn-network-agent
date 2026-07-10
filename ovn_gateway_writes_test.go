@@ -1281,6 +1281,45 @@ func TestDrainGateways_FallbackReturnsErrorOnTransactFailure(t *testing.T) {
 	}
 }
 
+// TestDrainGateways_EventSignalWakesMigrationWait verifies that a
+// chassisredirect Port_Binding change ends the drain migration wait through
+// drainWatchCh, without waiting for the safety re-poll tick. The settle delay
+// is 0 so only the wait itself is measured; the CR port is unbound and the
+// wake fired ~50ms in, far under the 1s drainRecheckInterval — so a prompt
+// return proves the event, not the ticker, ended the wait.
+func TestDrainGateways_EventSignalWakesMigrationWait(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 0
+	c.ready.Store(true)
+
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 5},
+	)
+	// SB initially shows a chassisredirect port bound to host-a → first poll
+	// returns 1, so the drain enters the wait.
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	sb.setRows("Port_Binding",
+		&SBPortBinding{UUID: "pb1", Type: "chassisredirect", Chassis: strPtr("ch-a")},
+	)
+
+	// After the drain has entered the wait, unbind the port and wake it via a
+	// chassisredirect signal. 50ms is well under drainRecheckInterval (1s), so
+	// a prompt return can only come from the event, not the safety re-poll.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		sb.setRows("Port_Binding")
+		c.signalDrainWatch()
+	}()
+
+	start := time.Now()
+	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Errorf("drain returned after %v; expected the event to wake it well under the %v re-poll", elapsed, drainRecheckInterval)
+	}
+}
+
 // TestDrainGateways_SettleDelayHoldsBeforeReturn verifies that once the SB
 // shows all chassisredirect ports migrated away, DrainGateways holds for
 // cfg.DrainSettleDelay before returning so the caller does not withdraw BGP
