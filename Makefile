@@ -209,8 +209,10 @@ e2e-stale-chassis:
 # lowered` and the `drain: complete` log lines) and a
 # `docker kill -s KILL` control arm. Between the two arms the
 # scenario itself runs `make e2e-down && make e2e-up` so both arms
-# start from identical priority-30/20/10 baseline state. Asserts
-# `graceful_loss <= 1 packet` and `graceful_loss < hardkill_loss`.
+# start from identical priority-30/20/10 baseline state. Asserts the
+# graceful outage stays within GRACEFUL_MAX_OUTAGE_MS (default 500 ms,
+# calibrated to the measured CI floor — see the scenario header) and
+# `graceful_loss < hardkill_loss`.
 # The scenario's EXIT trap recycles the lab again on success so a
 # developer run leaves the lab baseline-green.
 e2e-drain-hitless:
