@@ -1406,10 +1406,130 @@ func TestDrainGateways_EventSignalWakesMigrationWait(t *testing.T) {
 	}
 }
 
-// TestDrainGateways_SettleDelayHoldsBeforeReturn verifies that once the SB
-// shows all chassisredirect ports migrated away, DrainGateways holds for
-// cfg.DrainSettleDelay before returning so the caller does not withdraw BGP
-// routes before the takeover chassis is ready.
+// TestAwaitTakeoverReady_ReturnsOnMarker verifies the reader half of the
+// handshake: with a managed default route whose marker still names the local
+// chassis, awaitTakeoverReady waits until the takeover chassis stamps its own
+// name, then returns after only the small safety margin — well before a long
+// drain deadline.
+func TestAwaitTakeoverReady_ReturnsOnMarker(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 50 * time.Millisecond
+	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:        "sr1",
+		IPPrefix:    "0.0.0.0/0",
+		ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-a"},
+	})
+
+	// Shortly after the wait starts, the takeover chassis stamps its name.
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+			UUID:        "sr1",
+			IPPrefix:    "0.0.0.0/0",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-b"},
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	c.awaitTakeoverReady(ctx, "host-a")
+	elapsed := time.Since(start)
+	if elapsed < c.cfg.DrainSettleDelay {
+		t.Errorf("returned after %v, want at least the %v safety margin", elapsed, c.cfg.DrainSettleDelay)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("blocked %v; expected a prompt return on the marker, not the ctx deadline", elapsed)
+	}
+}
+
+// TestAwaitTakeoverReady_TimeoutFallbackWhenMarkerNeverAppears verifies the
+// clean fallback: when the marker never names a takeover chassis, the wait
+// ends at the drain deadline and logs the fallback so cleanup still runs.
+func TestAwaitTakeoverReady_TimeoutFallbackWhenMarkerNeverAppears(t *testing.T) {
+	buf := captureSlog(t)
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 50 * time.Millisecond
+	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:        "sr1",
+		IPPrefix:    "0.0.0.0/0",
+		ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-a"},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	c.awaitTakeoverReady(ctx, "host-a")
+	elapsed := time.Since(start)
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("returned after %v, expected it to wait for the ~300ms deadline", elapsed)
+	}
+	if !strings.Contains(buf.String(), "takeover readiness marker not observed before timeout") {
+		t.Errorf("expected timeout-fallback log line, got:\n%s", buf.String())
+	}
+}
+
+// TestAwaitTakeoverReady_DisabledWhenSettleZero pins the "0 = no hold" escape
+// hatch: a zero settle delay disables the whole handshake, so the wait returns
+// immediately and reads nothing from NB.
+func TestAwaitTakeoverReady_DisabledWhenSettleZero(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 0
+	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:        "sr1",
+		IPPrefix:    "0.0.0.0/0",
+		ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-a"},
+	})
+
+	start := time.Now()
+	c.awaitTakeoverReady(context.Background(), "host-a")
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("settle delay 0 must disable the handshake, but it blocked %v", elapsed)
+	}
+	if got := len(nb.recordedTransacts()); got != 0 {
+		t.Errorf("handshake disabled but read/wrote %d transactions, want 0", got)
+	}
+}
+
+// TestAwaitTakeoverReady_NoManagedRouteHoldsMarginOnly covers the degraded
+// path: when a local router has no agent-managed default route, no marker can
+// ever appear, so the wait falls back to holding only the safety margin
+// instead of polling to the deadline.
+func TestAwaitTakeoverReady_NoManagedRouteHoldsMarginOnly(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 60 * time.Millisecond
+	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
+	// Default route present but NOT agent-managed → excluded from the wait set.
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID: "sr1", IPPrefix: "0.0.0.0/0", ExternalIDs: map[string]string{},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	c.awaitTakeoverReady(ctx, "host-a")
+	elapsed := time.Since(start)
+	if elapsed < c.cfg.DrainSettleDelay {
+		t.Errorf("returned after %v, want at least the %v margin", elapsed, c.cfg.DrainSettleDelay)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("no managed route must hold only the margin, not poll to the deadline; blocked %v", elapsed)
+	}
+}
+
+// TestDrainGateways_SettleDelayHoldsBeforeReturn verifies the empty-wait-set
+// path of the takeover handshake: once the SB shows all chassisredirect ports
+// migrated away and there is no managed default route to watch (the test state
+// has no local routers), DrainGateways holds for cfg.DrainSettleDelay before
+// returning so the caller does not withdraw BGP routes before the takeover
+// chassis is ready.
 func TestDrainGateways_SettleDelayHoldsBeforeReturn(t *testing.T) {
 	c, nb, sb := newOVNClientWithFakes(t, "host-a")
 	c.cfg.DrainSettleDelay = 80 * time.Millisecond
@@ -1433,10 +1553,11 @@ func TestDrainGateways_SettleDelayHoldsBeforeReturn(t *testing.T) {
 	}
 }
 
-// TestDrainGateways_SettleDelaySkippedWhenNothingToDrain ensures the settle
-// hold only applies after an actual migration: when there is nothing to
-// drain (non-HA / single-chassis / already drained) the function still
-// returns immediately even with a long settle delay configured.
+// TestDrainGateways_SettleDelaySkippedWhenNothingToDrain ensures the handshake
+// (and its margin) only run after an actual migration: when there is nothing
+// to drain (non-HA / single-chassis / already drained) DrainGateways takes the
+// no-op fast path and returns immediately even with a long settle delay
+// configured.
 func TestDrainGateways_SettleDelaySkippedWhenNothingToDrain(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	c.cfg.DrainSettleDelay = 30 * time.Second
