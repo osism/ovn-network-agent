@@ -637,7 +637,7 @@ make e2e-drain-hitless
 
 [`drain-hitless.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/drain-hitless.sh)
 compares the agent's graceful-drain code path
-([`DrainGateways`](https://github.com/osism/ovn-network-agent/blob/main/ovn_gateway.go#L589))
+([`DrainGateways`](https://github.com/osism/ovn-network-agent/blob/main/ovn_gateway.go))
 against the hard-kill case (#105's mechanic, reused here as the
 control arm) and asserts the graceful path stays hitless. The
 graceful arm sends `docker exec … kill -TERM 1` on `gateway-1`
@@ -677,18 +677,50 @@ multiplier of 3×1 s); the kill is delivered `PROBE_PRELUDE` seconds
 into the probe so the transition lands inside the captured window.
 The loss count comes straight from `ping`'s
 `N packets transmitted, M received` summary, so the scenario stays
-single-file bash without tshark post-processing. After each arm the
-scenario waits up to `FAILOVER_TIMEOUT` (default 30 s) for
-`cr-lr0-public` to migrate away from `gateway-1` — a 0-loss reading
-without migration would only indicate the kill never fired.
+single-file bash without tshark post-processing.
 
-The graceful arm additionally requires the
-`drain: gateway chassis priority lowered` log line in
-`gateway-1`'s `docker logs`. Without it a low-loss reading could be
-explained by the agent racing the kernel teardown rather than by
-the drain code path running; this acceptance criterion guards
-against a future change that lets the agent exit before
-`DrainGateways` completes.
+Each arm then has `FAILOVER_TIMEOUT` seconds **from the moment the
+kill fired** (default 30 s — the same RTO
+[#105](https://github.com/osism/ovn-network-agent/issues/105) asserts
+for this lab) to satisfy both failover signals: `cr-lr0-public` must
+have migrated away from `gateway-1`, and `client-1 → FIP` must answer
+again. The migration check is the false-pass guard — a 0-loss reading
+without it would only indicate the kill never fired, since OVS on the
+dead master can keep executing stale flows for a while.
+
+The migration is *dated* from the transition timeline rather than
+sampled once the probe is over. The kill lands `PROBE_PRELUDE` seconds
+into a 20 s probe, so the scenario does not regain control until ~17 s
+after the kill; a sample taken then can only show the end state, never
+the instant it was reached, and every `FAILOVER_TIMEOUT` shorter than
+the probe's tail would pass unconditionally. Reachability is polled
+rather than dated: the probe already measured how long the data plane
+was down (`loss × PROBE_INTERVAL`) but it cannot see past its own end,
+so what the poll adds is whether the FIP came back at all.
+
+Each arm records a once-per-second transition timeline pairing the SB
+`cr-lr0-public` chassis with the BGP nexthop `upstream` routes the FIP
+`/32` to. Because the RTO check reads it, the timeline is recorded on
+every run — a local `make e2e-drain-hitless` holds the agent to the
+same budget the CI job does. When `ARTIFACTS_DIR` is set each arm
+additionally records, best-effort, a `tcpdump` capture of the probe on
+`client-1`'s `eth1` (rendered to text with absolute timestamps, so the
+ICMP sequence gap can be lined up against the kill). The capture can
+never fail an arm: the loss count never depends on it.
+
+The graceful arm additionally requires two log lines in `gateway-1`'s
+`docker logs`: `drain: gateway chassis priority lowered` **and**
+`drain: complete`. The first is emitted while `DrainGateways` is still
+building the OVSDB operations, so on its own it survives a transaction
+that never commits — the gateway then dies exactly like a hard kill
+while the log still claims the drain ran. Only `drain: complete` is
+emitted after the priority-0 update landed and the SB poll saw the port
+migrate away. A `drain failed` or `drain: timeout exceeded` line fails
+the arm outright and is bundled into `graceful-drain-log.txt` so the
+artifact names the real cause. Without these checks a low-loss reading
+could be explained by the agent racing the kernel teardown rather than
+by the drain code path running; the criterion guards against a future
+change that lets the agent exit before `DrainGateways` completes.
 
 Between the two arms the scenario itself runs
 `make e2e-down && make e2e-up` so both arms start from the same
@@ -696,25 +728,48 @@ priority-30/20/10 baseline. The recycle is mandatory: after the
 graceful arm `gateway-1` has been drained to priority 0 and exited;
 `docker start`ing it would re-attach with `RestoreDrainedGateways`
 setting priority back to 1, not the 30 the bootstrap seeds, and the
-hardkill arm would no longer be comparable. The same EXIT trap
-recycles the lab once more after the hardkill arm so a developer
-run leaves the lab baseline-green. CI handles its own teardown
-through the workflow's `make e2e-down` step with `if: always()`.
+hardkill arm would no longer be comparable. The recycled lab is then
+gated on `baseline.sh` before the hardkill arm starts — `make e2e-up`
+returns once bootstrap has seeded NB, but the agents still need a
+reconcile cycle before the FIP answers, and a probe started inside
+that window would charge the reconcile drops to the control arm.
 
-The graceful-arm threshold (`GRACEFUL_MAX_LOSS`, default 5) is
-higher than the ≤1 packet the issue suggests because in the
-containerlab lab the transition window between `gateway-1`'s FRR
-BGP session closing on container exit and `upstream` converging on
-`gateway-2`'s advertisement reliably drops ~3 packets at the
-100 ms probe interval. The meaningful invariant is the **delta**
-between the two arms (hardkill loss strictly greater than graceful
-loss); the tighter ≤1 ceiling only holds on faster real-hardware
-labs. Tighten with `GRACEFUL_MAX_LOSS=1` once the lab is on
-hardware that meets it.
+The same EXIT trap recycles the lab once more after the hardkill arm
+so a developer run leaves the lab baseline-green. CI sets
+`RECYCLE_ON_EXIT=0` instead: its `make e2e-down` step already runs
+with `if: always()`, so a third `containerlab deploy` would only eat
+into the job's time budget and, on the failure path, destroy the
+lab state the artifact collector is about to dump.
 
-**Overrides for triage:** `MASTER`, `FIP`, `PROBE_INTERVAL`,
-`PROBE_COUNT`, `PROBE_PRELUDE`, `FAILOVER_TIMEOUT`,
-`GRACEFUL_MAX_LOSS`, `SKIP_RECYCLE`, `SANITY_GATE`.
+The assertion: the graceful arm's outage at most
+`GRACEFUL_MAX_OUTAGE_MS` (default **500 ms**), and `graceful_loss`
+strictly less than `hardkill_loss`. The second half is what makes the
+comparison meaningful — both arms hit the same lab and the same FIP,
+so the delta between them *is* the hitless gain.
+
+Issue #113 phrased its ceiling as "at most one lost packet" (100 ms at
+the default probe spacing), but that number predates any measurement.
+The first run on the CI runner class measured a 200 ms outage: the two
+lost packets sat 96–200 ms after the priority-0 write, inside OVN's
+northd/ovn-controller flow-reprogramming window that follows the
+Port_Binding migration, while BGP make-before-break held (`upstream`
+carried both nexthops until `gateway-1` withdrew). Nothing in the
+agent bounds that window: `DrainGateways` returns as soon as SB
+reports the chassisredirect port gone, and the agent (PID 1) exits
+right after. The 500 ms default gives headroom over that measured
+floor so the job passes consistently, while staying well under the
+hard-kill control's measured 2800 ms — a broken drain path still trips
+the assertion. The scenario keeps the duration primary and derives the
+packet ceiling from `PROBE_INTERVAL` so overriding the spacing cannot
+silently move the budget — at the 0.2 s unprivileged `iputils` floor,
+a packet ceiling would otherwise silently double. Raise
+`GRACEFUL_MAX_OUTAGE_MS` only to triage a lab whose reconvergence is
+slower; the delta is asserted either way.
+
+**Overrides for triage:** `MASTER`, `FIP`, `UPSTREAM`,
+`PROBE_INTERVAL`, `PROBE_COUNT`, `PROBE_PRELUDE`, `FAILOVER_TIMEOUT`,
+`GRACEFUL_MAX_OUTAGE_MS`, `SKIP_RECYCLE`, `RECYCLE_ON_EXIT`,
+`SANITY_GATE`.
 
 ### Manual setup for triage
 
@@ -808,11 +863,14 @@ is reported in isolation:
   the [Drain-hitless](#drain-hitless) section for why the flag is not
   in the shared `gwnode-config.yaml`). The job points the
   scenario's `ARTIFACTS_DIR` at the same artifact root so the
-  per-arm ping output, the drain log capture, the Port_Binding
-  before/after snapshots and the loss-summary file are bundled with
-  the lab-state dump. The scenario recycles the lab itself between
-  the two arms via `make e2e-down && make e2e-up`. On failure the
-  artifact bundle is uploaded as
+  per-arm ping output, the ICMP sequence dump, the BGP/SB transition
+  timeline, the drain log capture, the Port_Binding before/after
+  snapshots and the loss-summary file are bundled with the lab-state
+  dump. The scenario recycles the lab itself between the two arms via
+  `make e2e-down && make e2e-up`; the job sets `RECYCLE_ON_EXIT=0` so
+  the scenario's EXIT trap does not rebuild the lab a third time (and
+  does not destroy the failed lab before the collect step runs). On
+  failure the artifact bundle is uploaded as
   `e2e-artifacts-drain-hitless-<run id>-<attempt>`.
 
 Every job except `drain-hitless` is capped at 15 minutes — matching
@@ -822,9 +880,12 @@ the budgets in issues
 [#108](https://github.com/osism/ovn-network-agent/issues/108),
 [#109](https://github.com/osism/ovn-network-agent/issues/109), and
 [#111](https://github.com/osism/ovn-network-agent/issues/111).
-`drain-hitless` ([#113](https://github.com/osism/ovn-network-agent/issues/113))
-is capped at 25 minutes because it deploys and destroys the lab twice
-— once for each arm — and runs the baseline gate before both.
+[`drain-hitless`](https://github.com/osism/ovn-network-agent/issues/113)
+is capped at 25: it deploys the lab twice and runs `baseline.sh` twice
+(sanity gate, then the gate on the recycled lab), so its green path is
+roughly twice the baseline job's. The cap is a backstop — a
+`timeout-minutes` cancellation is not a failure, so it skips the
+`if: failure()` artifact steps and leaves nothing to triage.
 
 ### Triaging a failed run
 
@@ -853,13 +914,17 @@ writes:
   stale-chassis/nb-after-kill.txt  — NB rows still tagged for the killed chassis after the cleanup deadline (stale-chassis only)
   stale-chassis/peer-cleanup.log   — surviving peer's `stale chassis route removed` line (stale-chassis only)
   drain-hitless/graceful-ping.txt                — ping output from the SIGTERM/graceful arm (drain-hitless only)
-  drain-hitless/graceful-drain-log.txt           — `drain: gateway chassis priority lowered` log line from gateway-1 (drain-hitless only)
+  drain-hitless/graceful-icmp-seq.txt            — tcpdump of the probe on client-1 eth1, epoch-stamped (drain-hitless only)
+  drain-hitless/graceful-transition-timeline.txt — per-second SB chassis + upstream BGP nexthop across the drain (drain-hitless only)
+  drain-hitless/graceful-drain-log.txt           — `drain: gateway chassis priority lowered` + the terminal `drain:` line (`complete`, `failed` or `timeout exceeded`) from gateway-1 (drain-hitless only)
   drain-hitless/graceful-port-binding-before.txt — cr-lr0-public Port_Binding snapshot before the graceful kill (drain-hitless only)
   drain-hitless/graceful-port-binding-after.txt  — cr-lr0-public Port_Binding snapshot after the graceful kill (drain-hitless only)
   drain-hitless/hardkill-ping.txt                — ping output from the SIGKILL/control arm (drain-hitless only)
+  drain-hitless/hardkill-icmp-seq.txt            — tcpdump of the probe on client-1 eth1, epoch-stamped (drain-hitless only)
+  drain-hitless/hardkill-transition-timeline.txt — per-second SB chassis + upstream BGP nexthop across the hard kill (drain-hitless only)
   drain-hitless/hardkill-port-binding-before.txt — cr-lr0-public Port_Binding snapshot before the hard kill (drain-hitless only)
   drain-hitless/hardkill-port-binding-after.txt  — cr-lr0-public Port_Binding snapshot after the hard kill (drain-hitless only)
-  drain-hitless/summary.txt                      — recorded loss counts and the configured threshold (drain-hitless only)
+  drain-hitless/summary.txt                      — both loss counts, the configured threshold, and the hitless gain (drain-hitless only)
 ```
 
 You can reproduce the same dump on a local lab with:
