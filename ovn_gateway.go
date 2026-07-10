@@ -116,6 +116,12 @@ const drainRecheckInterval = 1 * time.Second
 // is never withdrawn before the takeover node can forward it.
 const takeoverReadyMarkerKey = "ovn-network-agent-advertised"
 
+// takeoverMarkerPollInterval is the cadence at which awaitTakeoverReady
+// re-reads NB for the takeover node's readiness marker. It is short so a fast
+// takeover releases the leaving node quickly; the poll is bounded by the drain
+// context (drain_timeout).
+const takeoverMarkerPollInterval = 250 * time.Millisecond
+
 // EnsureActivePriorityLead ensures that for each locally-active router the
 // local Gateway_Chassis entry has a strictly higher priority than all peers
 // in the same HA group, and at least minActivePriority. The minimum
@@ -389,31 +395,9 @@ func (o *OVNClient) MarkTakeoverReady(ctx context.Context, localRouters []LocalR
 		return nil
 	}
 
-	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
-		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	routes, err := o.localManagedDefaultRoutes(ctx, localRouters)
 	if err != nil {
-		return fmt.Errorf("list static routes: %w", err)
-	}
-	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
-		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
-	if err != nil {
-		return fmt.Errorf("list routers: %w", err)
-	}
-
-	localRouterUUIDs := make(map[string]bool, len(localRouters))
-	for _, lr := range localRouters {
-		localRouterUUIDs[lr.RouterUUID] = true
-	}
-
-	// Only mark routes owned by a router active on this chassis.
-	routeOwnedLocally := make(map[string]bool)
-	for _, router := range routers {
-		if !localRouterUUIDs[router.UUID] {
-			continue
-		}
-		for _, ruuid := range router.StaticRoutes {
-			routeOwnedLocally[ruuid] = true
-		}
+		return err
 	}
 
 	localChassis := o.state.LocalChassisName
@@ -422,12 +406,6 @@ func (o *OVNClient) MarkTakeoverReady(ctx context.Context, localRouters []LocalR
 	var allOps []ovsdb.Operation
 	for i := range routes {
 		route := routes[i]
-		if !routeOwnedLocally[route.UUID] || route.IPPrefix != "0.0.0.0/0" {
-			continue
-		}
-		if route.ExternalIDs == nil || route.ExternalIDs["ovn-network-agent"] != "managed" {
-			continue
-		}
 		if route.ExternalIDs[takeoverReadyMarkerKey] == localChassis {
 			continue // already advertised by this chassis — idempotent no-op
 		}
@@ -766,9 +744,14 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 // monitor wake it through drainWatchCh, with a short ticker as a safety
 // re-poll (see drainRecheckInterval).
 //
-// Once the ports have migrated, it holds for cfg.DrainSettleDelay before
-// returning (see settleAfterDrain) so the caller does not withdraw this
-// chassis' BGP routes before the takeover chassis is ready to forward.
+// Once the ports have migrated, it runs the takeover handshake (see
+// awaitTakeoverReady): it waits until the takeover chassis stamps its
+// readiness marker onto the managed default routes this chassis used to own,
+// then holds only a small cfg.DrainSettleDelay safety margin before returning.
+// This keeps the caller from withdrawing this chassis' BGP routes before the
+// takeover chassis is ready to forward, while releasing as soon as it is —
+// instead of always paying a fixed settle delay. The whole handshake stays
+// bounded by ctx (drain_timeout).
 //
 // On the next startup, RestoreDrainedGateways sets drained entries back to
 // priority 1 (standby level) so the chassis rejoins the HA group.
@@ -869,7 +852,7 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		}
 		if remaining == 0 {
 			slog.Info("drain: complete, all gateways migrated away")
-			o.settleAfterDrain(ctx)
+			o.awaitTakeoverReady(ctx, localChassisName)
 			return nil
 		}
 		slog.Info("drain: waiting for gateway migration", "remaining_gateways", remaining)
@@ -886,22 +869,79 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	}
 }
 
-// settleAfterDrain pauses for cfg.DrainSettleDelay after the drain has
-// confirmed that all chassisredirect ports migrated away. During the hold
-// this chassis still advertises its FIP /32 routes and keeps its OVS flows,
-// so it continues forwarding external traffic — hairpinning to the new
-// gateway chassis over the tunnel — while the takeover chassis finishes its
-// OVN flow programming, reconcile and BGP advertisement. Without the hold,
-// cleanup() would withdraw the routes the instant the ports moved, before
-// the takeover chassis is ready, blackholing external traffic for the gap.
+// awaitTakeoverReady is the reader half of the drain takeover handshake. After
+// the chassisredirect ports have migrated away, it waits until the takeover
+// chassis stamps its readiness marker (see takeoverReadyMarkerKey) onto every
+// managed default route this chassis used to own, then holds a small
+// cfg.DrainSettleDelay safety margin and returns. This releases the leaving
+// node as soon as the takeover node has actually announced the FIP routes,
+// instead of after a fixed sleep.
 //
-// The wait is bounded by ctx (the drain context), so the settle never
-// pushes total shutdown past drain_timeout. A delay of 0 disables the hold.
-func (o *OVNClient) settleAfterDrain(ctx context.Context) {
+// A DrainSettleDelay of 0 disables the handshake entirely — both the marker
+// wait and the margin — preserving the documented "0 = no hold" escape hatch.
+// Routers whose default route is not agent-managed are excluded from the wait
+// set: no marker can ever appear for them, so if none of the local routers has
+// a managed default route the behaviour degrades to the plain margin hold. The
+// whole wait is bounded by ctx (drain_timeout): a takeover that never signals
+// falls back cleanly at the deadline and proceeds with cleanup.
+func (o *OVNClient) awaitTakeoverReady(ctx context.Context, localChassisName string) {
 	if o.cfg.DrainSettleDelay <= 0 {
+		return // handshake disabled
+	}
+
+	// Resolve the wait set once from the frozen pre-drain router snapshot: the
+	// managed default routes this chassis owned. The read goes through the
+	// cache-consistency guard so a stale NB cache cannot stall the handshake.
+	waitRoutes, err := o.localManagedDefaultRoutes(ctx, o.GetState().LocalRouters)
+	if err != nil {
+		slog.Warn("drain: could not resolve managed default routes, holding the safety margin only", "error", err)
+		o.holdSettleMargin(ctx)
 		return
 	}
-	slog.Info("drain: holding before cleanup so the takeover chassis can settle",
+	if len(waitRoutes) == 0 {
+		// No agent-managed default route to watch — nothing can signal
+		// readiness, so fall back to the plain margin hold.
+		o.holdSettleMargin(ctx)
+		return
+	}
+	waitUUIDs := make(map[string]bool, len(waitRoutes))
+	for _, r := range waitRoutes {
+		waitUUIDs[r.UUID] = true
+	}
+
+	ticker := time.NewTicker(takeoverMarkerPollInterval)
+	defer ticker.Stop()
+
+	for {
+		ready, err := o.takeoverMarkersReady(ctx, waitUUIDs, localChassisName)
+		switch {
+		case err != nil:
+			slog.Warn("drain: readiness marker poll failed, retrying", "error", err)
+		case ready:
+			slog.Info("drain: takeover readiness marker observed, holding safety margin",
+				"settle_delay", o.cfg.DrainSettleDelay)
+			o.holdSettleMargin(ctx)
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			slog.Warn("drain: takeover readiness marker not observed before timeout, proceeding with cleanup")
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// holdSettleMargin waits cfg.DrainSettleDelay after the readiness signal (or,
+// when no marker can be expected, after migration completed). During the hold
+// this chassis still advertises its FIP /32 routes and keeps its OVS flows, so
+// it keeps forwarding external traffic — hairpinning to the new gateway chassis
+// over the tunnel — for a last safety margin before cleanup withdraws the
+// routes. The wait is bounded by ctx (the drain context), so the margin never
+// pushes total shutdown past drain_timeout.
+func (o *OVNClient) holdSettleMargin(ctx context.Context) {
+	slog.Info("drain: holding the safety margin before cleanup",
 		"settle_delay", o.cfg.DrainSettleDelay)
 	timer := time.NewTimer(o.cfg.DrainSettleDelay)
 	defer timer.Stop()
@@ -909,6 +949,81 @@ func (o *OVNClient) settleAfterDrain(ctx context.Context) {
 	case <-ctx.Done():
 	case <-timer.C:
 	}
+}
+
+// localManagedDefaultRoutes returns the agent-managed default routes
+// (0.0.0.0/0 with ExternalIDs["ovn-network-agent"]=="managed") owned by the
+// given locally-active routers, read through the cache-consistency guard so a
+// stale NB cache cannot hide a route. It backs both halves of the drain
+// takeover handshake: the writer stamps the marker onto these routes, the
+// reader resolves its wait set from them.
+func (o *OVNClient) localManagedDefaultRoutes(ctx context.Context, localRouters []LocalRouterInfo) ([]NBLogicalRouterStaticRoute, error) {
+	if len(localRouters) == 0 {
+		return nil, nil
+	}
+	localRouterUUIDs := make(map[string]bool, len(localRouters))
+	for _, lr := range localRouters {
+		localRouterUUIDs[lr.RouterUUID] = true
+	}
+
+	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
+		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
+	if err != nil {
+		return nil, fmt.Errorf("list routers: %w", err)
+	}
+	routeOwnedLocally := make(map[string]bool)
+	for _, router := range routers {
+		if !localRouterUUIDs[router.UUID] {
+			continue
+		}
+		for _, ruuid := range router.StaticRoutes {
+			routeOwnedLocally[ruuid] = true
+		}
+	}
+
+	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
+		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	if err != nil {
+		return nil, fmt.Errorf("list static routes: %w", err)
+	}
+	var out []NBLogicalRouterStaticRoute
+	for i := range routes {
+		route := routes[i]
+		if !routeOwnedLocally[route.UUID] || route.IPPrefix != "0.0.0.0/0" {
+			continue
+		}
+		if route.ExternalIDs != nil && route.ExternalIDs["ovn-network-agent"] == "managed" {
+			out = append(out, route)
+		}
+	}
+	return out, nil
+}
+
+// takeoverMarkersReady reports whether every route in waitUUIDs carries a
+// readiness marker naming a chassis other than localChassisName. A route whose
+// row has vanished counts as satisfied (nothing left to hold for); an empty or
+// self-named marker does not. Read through the cache-consistency guard so a
+// stale cached marker value cannot make the handshake return early or stall.
+func (o *OVNClient) takeoverMarkersReady(ctx context.Context, waitUUIDs map[string]bool, localChassisName string) (bool, error) {
+	routes, err := cachedList(ctx, o.nbClient, "Logical_Router_Static_Route",
+		lrsrCheckColumns, keyOfNBLogicalRouterStaticRoute, decodeNBLogicalRouterStaticRoute)
+	if err != nil {
+		return false, fmt.Errorf("list static routes: %w", err)
+	}
+	markerByUUID := make(map[string]string, len(routes))
+	for _, route := range routes {
+		markerByUUID[route.UUID] = route.ExternalIDs[takeoverReadyMarkerKey]
+	}
+	for uuid := range waitUUIDs {
+		marker, present := markerByUUID[uuid]
+		if !present {
+			continue // route vanished — treat as migrated
+		}
+		if marker == "" || marker == localChassisName {
+			return false, nil // not yet advertised by a takeover chassis
+		}
+	}
+	return true, nil
 }
 
 // RestoreDrainedGateways sets Gateway_Chassis entries that were drained
