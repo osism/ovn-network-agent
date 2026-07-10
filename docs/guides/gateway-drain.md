@@ -8,21 +8,23 @@ and the shutdown sequence diagrams, see
 ## Default behavior
 
 Drain mode is **enabled by default** with a 60-second timeout and a
-3-second post-drain settle delay:
+500-millisecond post-readiness safety margin:
 
 ```yaml
 # Enable/disable drain (default: true)
 drain_on_shutdown: true
 
-# Maximum time to wait for migration (default: 60s)
-# After this timeout, the agent proceeds with shutdown even if some
-# gateways have not yet migrated.
+# Maximum time to wait for migration and the takeover handshake (default: 60s)
+# After this timeout, the agent proceeds with shutdown even if migration
+# or the readiness handshake has not completed.
 drain_timeout: "60s"
 
-# Hold time after migration completes, before cleanup (default: 3s)
-# Keeps this node advertising its FIP routes while the takeover chassis
-# finishes coming up. Set to 0 to disable. See "Settle delay" below.
-drain_settle_delay: "3s"
+# Safety margin held after the takeover chassis signals readiness (default: 500ms)
+# The node first waits for the takeover chassis to signal it can forward
+# (bounded by drain_timeout), then holds this additional margin before
+# cleanup. Set to 0 to disable the wait and the margin. See "Settle
+# delay" below.
+drain_settle_delay: "500ms"
 ```
 
 ## Override via CLI flags
@@ -30,7 +32,7 @@ drain_settle_delay: "3s"
 ```bash
 ovn-network-agent --drain-on-shutdown=false                 # disable drain
 ovn-network-agent --drain-timeout 120s                      # increase timeout
-ovn-network-agent --drain-settle-delay 5s                   # longer settle hold
+ovn-network-agent --drain-settle-delay 1s                   # longer safety margin
 ```
 
 ## Override via environment variables
@@ -39,7 +41,7 @@ ovn-network-agent --drain-settle-delay 5s                   # longer settle hold
 OVN_NETWORK_DRAIN_ON_SHUTDOWN=false                         # disable drain
 OVN_NETWORK_DRAIN_ON_SHUTDOWN=true                          # enable drain (over a config file that disables it)
 OVN_NETWORK_DRAIN_TIMEOUT=120s                              # increase timeout
-OVN_NETWORK_DRAIN_SETTLE_DELAY=5s                           # longer settle hold
+OVN_NETWORK_DRAIN_SETTLE_DELAY=1s                           # longer safety margin
 ```
 
 ## Settle delay
@@ -52,17 +54,31 @@ happen. If the leaving node withdrew its FIP routes the instant the port
 moved, external traffic would be blackholed for that gap (observed as
 ~5 s of packet loss).
 
-`drain_settle_delay` closes that race: after the drain confirms the ports
-have migrated, the agent keeps advertising its FIP `/32` routes and keeps
-its OVS flows for this long, continuing to forward external traffic
-(hairpinned to the new gateway chassis over the tunnel) until the takeover
-chassis has come up. Only then does cleanup withdraw the routes.
+The agents close that race with an active handshake instead of a fixed
+sleep: once the ports have migrated, the leaving node waits for the
+takeover chassis to stamp a readiness marker on the managed default route
+(written only after the takeover node has actually announced its FIP
+routes), and only then holds `drain_settle_delay` as a final safety
+margin before cleanup. Throughout the wait and the margin it keeps
+advertising its FIP `/32` routes and OVS flows, forwarding external
+traffic (hairpinned to the new gateway chassis over the tunnel) until the
+takeover chassis is provably up. For the full mechanism see
+[The takeover handshake](../explanation/gateway-drain#the-takeover-handshake).
 
-The trade-off is shutdown time: a graceful drain takes up to
-`drain_settle_delay` longer. The hold is bounded by `drain_timeout`, so
-total graceful shutdown never exceeds that budget. Set `drain_settle_delay`
-to `0` to disable the hold and have cleanup run as soon as the ports
+`drain_settle_delay` is therefore just the margin held *after* the
+readiness signal, not the whole hold — which is why its default dropped
+from `3s` to `500ms`. The entire handshake (readiness wait plus margin)
+is bounded by `drain_timeout`, so total graceful shutdown never exceeds
+that budget. Set `drain_settle_delay` to `0` to disable the readiness
+wait and the margin entirely and have cleanup run as soon as the ports
 migrate.
+
+**Rolling upgrades.** A peer running a pre-handshake agent never writes
+the readiness marker, so while you upgrade the agent fleet a drain waits
+for the full `drain_timeout` before falling back (safe — it never
+releases early, just slower). If you need faster drains during the
+upgrade window, temporarily lower `drain_timeout` or set
+`drain_settle_delay: 0`.
 
 ## When to disable drain
 
