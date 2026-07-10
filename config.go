@@ -768,6 +768,8 @@ func applyEnvConfig(cfg *Config) {
 	}
 	if v := os.Getenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN"); v == "0" || v == "false" {
 		cfg.DrainOnShutdown = false
+	} else if v == "1" || v == "true" {
+		cfg.DrainOnShutdown = true
 	}
 	if v := os.Getenv("OVN_NETWORK_DRAIN_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {

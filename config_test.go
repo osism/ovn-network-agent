@@ -442,6 +442,33 @@ func TestApplyEnvConfigCleanupOnShutdownFalse(t *testing.T) {
 	}
 }
 
+func TestApplyEnvConfigDrainOnShutdownFalse(t *testing.T) {
+	cfg := Config{DrainOnShutdown: true}
+	t.Setenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN", "false")
+	applyEnvConfig(&cfg)
+	if cfg.DrainOnShutdown {
+		t.Error("DrainOnShutdown should be false when OVN_NETWORK_DRAIN_ON_SHUTDOWN=false")
+	}
+}
+
+func TestApplyEnvConfigDrainOnShutdownTrue(t *testing.T) {
+	cfg := Config{DrainOnShutdown: false}
+	t.Setenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN", "true")
+	applyEnvConfig(&cfg)
+	if !cfg.DrainOnShutdown {
+		t.Error("DrainOnShutdown should be true when OVN_NETWORK_DRAIN_ON_SHUTDOWN=true")
+	}
+}
+
+func TestApplyEnvConfigDrainOnShutdownOne(t *testing.T) {
+	cfg := Config{DrainOnShutdown: false}
+	t.Setenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN", "1")
+	applyEnvConfig(&cfg)
+	if !cfg.DrainOnShutdown {
+		t.Error("DrainOnShutdown should be true when OVN_NETWORK_DRAIN_ON_SHUTDOWN=1")
+	}
+}
+
 func TestApplyEnvConfigCleanupOnShutdownZero(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
 	t.Setenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "0")
