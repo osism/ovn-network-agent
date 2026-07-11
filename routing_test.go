@@ -506,7 +506,8 @@ func TestValidateIP(t *testing.T) {
 		{"10.0.0.1", false},
 		{"192.168.1.1", false},
 		{"255.255.255.255", false},
-		{"::1", false},
+		{"::1", true},         // IPv6 is rejected: the route paths are v4-only.
+		{"2001:db8::1", true}, // IPv6 is rejected.
 		{"", true},
 		{"not-an-ip", true},
 		{"10.0.0.1/32", true},
