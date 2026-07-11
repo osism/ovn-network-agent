@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -158,28 +159,44 @@ func (rm *RouteManager) AddFRRRoute(ip string) error {
 // thousands of FIPs at startup.
 const frrBatchSize = 500
 
-// AddFRRRoutes adds static /32 routes for all given IPs via vtysh.
-// IPs are validated before any commands are executed.  The list is chunked
-// into batches of frrBatchSize to stay within OS argument-list limits.
+// AddFRRRoutes adds static /32 routes for all given IPs via vtysh. Invalid
+// entries are skipped with a warning instead of rejecting the whole batch, so
+// one malformed OVN row degrades only its own FIP. The valid IPs are chunked
+// into batches of frrBatchSize to stay within OS argument-list limits; a failed
+// chunk is logged and the remaining chunks still run. The returned error is the
+// join of every failed chunk (nil when every valid route applied), so a real
+// vtysh command failure still makes ensureRoutes withhold the takeover marker,
+// while un-installable entries are dropped without blocking the rest.
 func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 	if len(ips) == 0 {
 		return nil
 	}
+	valid := make([]string, 0, len(ips))
+	var skipped []string
 	for _, ip := range ips {
 		if err := validateIP(ip); err != nil {
-			return err
+			skipped = append(skipped, ip)
+			continue
 		}
+		valid = append(valid, ip)
 	}
-	if rm.dryRun {
-		slog.Info("[dry-run] would add FRR routes", "count", len(ips), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+	if len(skipped) > 0 {
+		slog.Warn("skipping invalid IPs in FRR route batch", "count", len(skipped), "ips", skipped)
+	}
+	if len(valid) == 0 {
 		return nil
 	}
-	for start := 0; start < len(ips); start += frrBatchSize {
+	if rm.dryRun {
+		slog.Info("[dry-run] would add FRR routes", "count", len(valid), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+		return nil
+	}
+	var errs []error
+	for start := 0; start < len(valid); start += frrBatchSize {
 		end := start + frrBatchSize
-		if end > len(ips) {
-			end = len(ips)
+		if end > len(valid) {
+			end = len(valid)
 		}
-		chunk := ips[start:end]
+		chunk := valid[start:end]
 		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.vrfName)}
 		for _, ip := range chunk {
 			args = append(args, "-c", fmt.Sprintf("ip route %s/32 %s", ip, rm.vethNexthop))
@@ -187,11 +204,14 @@ func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 		args = append(args, "-c", "exit-vrf", "-c", "end")
 		output, err := rm.runVtysh(args...)
 		if err != nil {
-			return fmt.Errorf("vtysh batch add %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output)))
+			slog.Error("failed to add FRR route chunk, continuing with the next",
+				"count", len(chunk), "vrf", rm.vrfName, "error", err, "output", strings.TrimSpace(string(output)))
+			errs = append(errs, fmt.Errorf("vtysh batch add %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output))))
+			continue
 		}
 		slog.Info("FRR routes ensured", "count", len(chunk), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // DelFRRRoute is a convenience wrapper for DelFRRRoutes with a single IP.
