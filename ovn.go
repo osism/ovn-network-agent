@@ -651,11 +651,17 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			continue
 		}
 		ip := nat.ExternalIP
-		if len(effectiveFilters) > 0 {
-			parsedIP := net.ParseIP(ip)
-			if parsedIP == nil || !containedInAny(parsedIP, effectiveFilters) {
-				continue
-			}
+		// Validate every external IP unconditionally: a malformed row must
+		// die here at ingest, regardless of whether a filter is in effect, so
+		// it can never reach an nft/FRR/kernel command payload downstream.
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			slog.Warn("skipping NAT entry with invalid external IP",
+				"external_ip", ip, "nat", nat.UUID, "type", nat.Type)
+			continue
+		}
+		if len(effectiveFilters) > 0 && !containedInAny(parsedIP, effectiveFilters) {
+			continue
 		}
 		natIPToRouterMAC[ip] = routerMAC
 		if seg, ok := natUUIDToSegment[nat.UUID]; ok {
@@ -665,7 +671,16 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		case "dnat_and_snat":
 			fips = append(fips, ip)
 		case "snat":
-			snatIPs = append(snatIPs, ip)
+			// SNATIPs feeds the IPv4-only nft masquerade set (buildNftRuleset's
+			// "table ip"), so keep IPv6 out until full v6 support (#85/#70)
+			// lands. The dual-stack natIPToRouterMAC above still carries the
+			// address for the family-aware OVS hairpin plane (#54).
+			if parsedIP.To4() != nil {
+				snatIPs = append(snatIPs, ip)
+			} else {
+				slog.Debug("excluding non-IPv4 SNAT external IP from the nft masquerade set, IPv6 support tracked in #85/#70",
+					"external_ip", ip)
+			}
 		}
 	}
 
@@ -692,13 +707,21 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		routerMAC := lrpNameToMAC[peer]
 		for _, natAddr := range pb.NatAddresses {
 			for _, ip := range parseNatAddressIPs(natAddr) {
-				if len(effectiveFilters) > 0 {
-					parsedIP := net.ParseIP(ip)
-					if parsedIP == nil || !containedInAny(parsedIP, effectiveFilters) {
-						continue
-					}
+				// parseNatAddressIPs only yields net.ParseIP-valid addresses;
+				// re-parse here so the filter and family gate apply to every
+				// candidate regardless of whether a filter is in effect.
+				parsedIP := net.ParseIP(ip)
+				if len(effectiveFilters) > 0 && !containedInAny(parsedIP, effectiveFilters) {
+					continue
 				}
-				snatIPs = append(snatIPs, ip)
+				// Keep IPv6 out of the IPv4-only nft masquerade set (#85/#70)
+				// while still tracking it for the OVS hairpin plane (#54).
+				if parsedIP.To4() != nil {
+					snatIPs = append(snatIPs, ip)
+				} else {
+					slog.Debug("excluding non-IPv4 SB SNAT address from the nft masquerade set, IPv6 support tracked in #85/#70",
+						"external_ip", ip)
+				}
 				if routerMAC != "" {
 					natIPToRouterMAC[ip] = routerMAC
 				}
