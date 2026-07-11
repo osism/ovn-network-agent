@@ -636,10 +636,13 @@ func TestListFRRRoutes_ParsesStaticRoutes(t *testing.T) {
 S>* 198.51.100.11/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 C>* 10.0.0.0/24 is directly connected, br-ex, 00:00:01
 S>* 203.0.113.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
+S>* 192.0.2.99/32 [1/0] via 192.0.2.1, eth0, weight 1, 00:00:01
 `,
 		nil,
 	)
-	rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+	// The agent owns only statics via its own veth nexthop; an operator static
+	// via a different nexthop (192.0.2.1) must be excluded from the result.
+	rm := &RouteManager{vrfName: "vrf-provider", vethNexthop: "169.254.0.1", execVtyshHook: rec.hook()}
 
 	got, err := rm.ListFRRRoutes()
 	if err != nil {
@@ -647,7 +650,7 @@ S>* 203.0.113.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 	}
 	want := []string{"198.51.100.10", "198.51.100.11", "203.0.113.10"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("ListFRRRoutes() = %v, want %v", got, want)
+		t.Errorf("ListFRRRoutes() = %v, want %v (operator static via a foreign nexthop must be excluded)", got, want)
 	}
 }
 
