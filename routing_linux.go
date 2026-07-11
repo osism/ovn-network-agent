@@ -12,9 +12,12 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// rtProtoOVNNetworkAgent is a custom route protocol number used to tag kernel
-// routes created by ReconcileVethLeakNetworks. This distinguishes them from
-// routes installed by FRR/zebra (which use RTPROT_ZEBRA or RTPROT_STATIC).
+// rtProtoOVNNetworkAgent is a custom route protocol number used to tag every
+// kernel route the agent creates — the per-network veth-leak routes and the
+// per-FIP /32 routes on the provider bridge. It distinguishes agent routes from
+// routes installed by FRR/zebra (RTPROT_ZEBRA/RTPROT_STATIC) and from
+// operator-created routes, so ListKernelRoutes returns only agent-owned routes
+// and reconciliation never reaps a route the agent did not install.
 const rtProtoOVNNetworkAgent = 44
 
 // CheckBridgeDevice verifies that the bridge device exists and that the agent
@@ -342,6 +345,9 @@ func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 		LinkIndex: link.Attrs().Index,
 		Dst:       dst,
 		Scope:     netlink.SCOPE_LINK,
+		// Tag the route as agent-owned so ListKernelRoutes reconciles only
+		// routes the agent installed and never reaps operator-created ones.
+		Protocol: rtProtoOVNNetworkAgent,
 	}
 	if rm.routeTableID > 0 {
 		route.Table = rm.routeTableID
@@ -391,6 +397,10 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 		LinkIndex: link.Attrs().Index,
 		Dst:       dst,
 		Scope:     netlink.SCOPE_LINK,
+		// Match only the agent's own tagged route: a protocol mismatch surfaces
+		// as "no such process" (treated as already-absent below), so a delete
+		// can never remove an operator-created route for the same IP.
+		Protocol: rtProtoOVNNetworkAgent,
 	}
 	if rm.routeTableID > 0 {
 		route.Table = rm.routeTableID
@@ -408,19 +418,20 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 	return nil
 }
 
-// ListKernelRoutes returns all agent-relevant /32 routes as (IP, device)
-// pairs. When a dedicated routing table is configured, the whole table is
-// listed — routes on any interface — so per-segment leftovers survive an
-// agent restart; otherwise routes on the bridge device and its VLAN
-// subinterfaces are listed.
+// ListKernelRoutes returns the agent's own /32 routes as (IP, device) pairs.
+// Only routes tagged with rtProtoOVNNetworkAgent are returned, so operator- and
+// FRR-created routes are invisible to reconciliation and never reaped. When a
+// dedicated routing table is configured, the whole table is listed — routes on
+// any interface — so per-segment leftovers survive an agent restart; otherwise
+// routes on the bridge device and its VLAN subinterfaces are listed.
 func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
 	if rm.dryRun {
 		return nil, nil
 	}
 
 	if rm.routeTableID > 0 {
-		filter := &netlink.Route{Table: rm.routeTableID}
-		routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
+		filter := &netlink.Route{Table: rm.routeTableID, Protocol: rtProtoOVNNetworkAgent}
+		routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PROTOCOL)
 		if err != nil {
 			return nil, fmt.Errorf("list routes in table %d: %w", rm.routeTableID, err)
 		}
@@ -461,6 +472,10 @@ func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
 		}
 		for _, r := range routes {
 			if r.Dst == nil {
+				continue
+			}
+			// Only reconcile the agent's own routes; skip operator/FRR routes.
+			if r.Protocol != rtProtoOVNNetworkAgent {
 				continue
 			}
 			if ones, _ := r.Dst.Mask.Size(); ones == 32 {

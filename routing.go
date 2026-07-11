@@ -267,7 +267,10 @@ func (rm *RouteManager) HasFRRRoute(ip string) bool {
 	return strings.Contains(string(output), "static")
 }
 
-// ListFRRRoutes returns all static /32 routes in the VRF.
+// ListFRRRoutes returns the agent's own static /32 routes in the VRF: those
+// installed via the agent's veth nexthop. This nexthop scoping is the FRR
+// analog of the kernel protocol tag — without it, reconciliation would treat
+// operator-created statics as agent-owned and withdraw them on standby nodes.
 func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
 	if rm.dryRun {
 		return nil, nil
@@ -280,21 +283,38 @@ func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
 	var ips []string
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
-		// Lines like: S>* 198.51.100.10/32 [1/0] via 169.254.0.1, ...
-		if strings.HasPrefix(line, "S") && strings.Contains(line, "/32") {
-			parts := strings.Fields(line)
-			for _, p := range parts {
-				if strings.Contains(p, "/32") {
-					ip, _, _ := net.ParseCIDR(p)
-					if ip != nil {
-						ips = append(ips, ip.String())
-					}
-					break
+		// Lines like: S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, ...
+		if !strings.HasPrefix(line, "S") || !strings.Contains(line, "/32") {
+			continue
+		}
+		// Only report statics installed via the agent's own nexthop.
+		if frrRouteNexthop(line) != rm.vethNexthop {
+			continue
+		}
+		for _, p := range strings.Fields(line) {
+			if strings.Contains(p, "/32") {
+				ip, _, _ := net.ParseCIDR(p)
+				if ip != nil {
+					ips = append(ips, ip.String())
 				}
+				break
 			}
 		}
 	}
 	return ips, nil
+}
+
+// frrRouteNexthop returns the nexthop address in an FRR "show ip route" line —
+// the token following "via", with any trailing comma stripped. Returns "" when
+// the line has no via clause.
+func frrRouteNexthop(line string) string {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == "via" && i+1 < len(fields) {
+			return strings.TrimRight(fields[i+1], ",")
+		}
+	}
+	return ""
 }
 
 // frrRouteEntry is the subset of an FRR `show ip route ... json` route object
