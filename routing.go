@@ -128,10 +128,18 @@ func (rm *RouteManager) listKernelRoutes() ([]kernelRouteEntry, error) {
 	return rm.ListKernelRoutes()
 }
 
-// validateIP checks that the given string is a valid IPv4 address.
+// validateIP checks that the given string is a valid IPv4 address. IPv6 is
+// rejected: the FRR and kernel route paths that call this are IPv4-only (vtysh
+// "ip route .../32", net.CIDRMask(32, 32)), so a v6 address would produce an
+// invalid command or a malformed route. Full IPv6 support is tracked in
+// #85/#70.
 func validateIP(ip string) error {
-	if net.ParseIP(ip) == nil {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
 		return fmt.Errorf("invalid IP address: %q", ip)
+	}
+	if parsed.To4() == nil {
+		return fmt.Errorf("not an IPv4 address: %q", ip)
 	}
 	return nil
 }
