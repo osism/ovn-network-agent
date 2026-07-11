@@ -195,7 +195,12 @@ after an upgrade — that is the intended fix.
   `/32` routes, but this path is not asserted by tests.
 - The **IPv6 kernel path** is out of scope (status quo): bridge IP, proxy
   ARP, `/32` routes, and the virtual gateway are IPv4-only; the per-port
-  IPv6 MAC-tweak flow variant is kept.
+  IPv6 MAC-tweak flow variant is kept. Non-IPv4 NAT and LRP addresses are
+  filtered out of the kernel/FRR desired set at ingest, so a dual-stack
+  router announces its v4 FIPs normally while its v6 OVS flow variants
+  remain. Full IPv6 support is tracked in
+  [#85](https://github.com/osism/ovn-network-agent/issues/85) /
+  [#70](https://github.com/osism/ovn-network-agent/issues/70).
 
 The `localnet_segments` gauge reports how many segments are currently
 bound — see the [metrics reference](../reference/metrics).

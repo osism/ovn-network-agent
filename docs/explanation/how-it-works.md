@@ -44,7 +44,21 @@ provider bridge).
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated
      routing table) and **FRR static routes** in the VRF for each FIP, SNAT
      IP, router LRP gateway IP, and (independent of router locality)
-     configured port-forward VIP.
+     configured port-forward VIP. Only **IPv4** addresses enter this
+     route/announce plane; non-IPv4 NAT and LRP addresses are excluded until
+     full IPv6 support ([#85](https://github.com/osism/ovn-network-agent/issues/85),
+     [#70](https://github.com/osism/ovn-network-agent/issues/70)) lands. A
+     single malformed OVN row (an invalid `external_ip`) degrades only its own
+     FIP — it never fails the whole batch.
+   - **Route ownership** is explicit: every agent-created kernel route is
+     tagged with the agent's route protocol (`proto 44`) and every FRR static
+     route uses the agent's veth next-hop. Reconciliation — including standby
+     cleanup — touches only those agent-owned routes, so operator-created
+     kernel routes on the bridge and operator static routes in the VRF are
+     never removed. On upgrade from a version that predates the protocol tag,
+     still-desired routes are re-tagged automatically on the next reconcile;
+     any stale pre-upgrade leftovers are indistinguishable from operator
+     routes and must be cleaned up once by hand.
    - If configured, reconciles the **FRR prefix-list** with
      `permit <network> ge 32 le 32` entries for each discovered provider
      network.
