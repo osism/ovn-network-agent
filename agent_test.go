@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -101,6 +102,15 @@ func TestComputeEffectiveNetworks(t *testing.T) {
 		eff := a.computeEffectiveNetworks(nil)
 		if len(eff) != 0 {
 			t.Errorf("expected empty, got %v", eff)
+		}
+	})
+
+	t.Run("drops IPv6 networks from a dual-stack discovered set", func(t *testing.T) {
+		_, v6, _ := net.ParseCIDR("2001:db8::/64")
+		a := &Agent{cfg: Config{}}
+		eff := a.computeEffectiveNetworks([]*net.IPNet{discovered, v6})
+		if len(eff) != 1 || eff[0].String() != "198.51.100.0/24" {
+			t.Errorf("expected only the v4 network, got %v", eff)
 		}
 	})
 }
@@ -478,6 +488,80 @@ func TestReconcileWritesMarkerAfterSuccessfulAnnounce(t *testing.T) {
 	}
 	a.reconcile(context.Background(), "test")
 
+	if !hasMarkerUpdate(nb.writeTransacts(), "host-a") {
+		t.Fatalf("reconcile did not stamp the takeover marker for host-a; writes: %v", nb.writeTransacts())
+	}
+}
+
+// TestReconcileMixedFamilyAnnouncesV4AndWritesMarker drives a non-dry-run
+// reconcile for a router whose NAT set carries both a v4 and a v6 FIP (issue
+// #158 test a). The v4 FIP must be announced via vtysh and the v6 string must
+// never reach a vtysh command, so the FRR batch never fails on an IPv6 route —
+// which lets the announce succeed and the takeover marker be stamped. Without
+// the family guard the v6 FIP would reach AddFRRRoutes as an "ip route
+// 2001:db8::50/32" batch, error the whole batch, and withhold the marker.
+//
+// The v4 FIP's kernel route is pre-seeded via listKernelRoutesHook so
+// AddKernelRoute (Linux-only) is never invoked; the OVS hook errors so segment
+// discovery bails cleanly (hairpin reconcile becomes a no-op) — neither path
+// affects the announce outcome under test.
+func TestReconcileMixedFamilyAnnouncesV4AndWritesMarker(t *testing.T) {
+	const (
+		v4FIP  = "198.51.100.50"
+		v6FIP  = "2001:db8::50"
+		bridge = "ovnagent-nonexistent-br"
+		lrpMAC = "fa:16:3e:aa:aa:aa"
+	)
+	rec := newVtyshRecorder()
+	rm := &RouteManager{
+		bridgeDev:     bridge,
+		vrfName:       "vrf-provider",
+		vethNexthop:   "169.254.0.1",
+		execVtyshHook: rec.hook(),
+		execOVSHook: func(*exec.Cmd) ([]byte, error) {
+			return nil, errors.New("test: no ovs available")
+		},
+		// The v4 FIP's /32 already exists on the bridge, so ensureRoutes sees
+		// no missing kernel route and never calls the Linux-only AddKernelRoute.
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: v4FIP, Dev: bridge}}, nil
+		},
+	}
+
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.LocalRouters = []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}}
+	c.state.HasLocalRouters = true
+	c.state.NATIPToRouterMAC = map[string]string{v4FIP: lrpMAC, v6FIP: lrpMAC}
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:     "sr1",
+		IPPrefix: "0.0.0.0/0",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-b",
+			takeoverReadyMarkerKey:      "host-b",
+		},
+	})
+
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	a.reconcile(context.Background(), "test")
+
+	var joined string
+	for _, call := range rec.calls {
+		joined += " " + strings.Join(call, " ")
+	}
+	if !strings.Contains(joined, "ip route "+v4FIP+"/32 169.254.0.1") {
+		t.Errorf("v4 FIP was not announced via vtysh; calls: %v", rec.calls)
+	}
+	if strings.Contains(joined, v6FIP) {
+		t.Errorf("v6 FIP must never reach a vtysh command; calls: %v", rec.calls)
+	}
 	if !hasMarkerUpdate(nb.writeTransacts(), "host-a") {
 		t.Fatalf("reconcile did not stamp the takeover marker for host-a; writes: %v", nb.writeTransacts())
 	}

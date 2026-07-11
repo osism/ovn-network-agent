@@ -297,13 +297,29 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		return desiredSegments[i].LocalnetPort < desiredSegments[j].LocalnetPort
 	})
 
-	// hairpinIPs is the flat list of IPs for kernel routes and FRR.
-	// Map keys are already unique; just sort for deterministic ordering.
+	// hairpinIPs is the flat list of IPs for kernel routes and FRR — the
+	// single choke point where the IPv4-only route/announce plane forks off
+	// the deliberately dual-stack hairpinTargets map. Non-IPv4 addresses (IPv6
+	// FIPs, SNAT IPs, and LRP gateway IPs) are excluded here: everything
+	// downstream (AddKernelRoute, AddFRRRoutes, BGP, the takeover marker) is
+	// IPv4-only, so a v6 address would fail the FRR batch and block the marker.
+	// The OVS hairpin plane keeps the v6 targets (#54); full IPv6 route support
+	// is tracked in #85/#70. Map keys are already unique; just sort.
 	hairpinIPs := make([]string, 0, len(hairpinTargets))
+	var excludedNonV4 []string
 	for ip := range hairpinTargets {
+		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
+			excludedNonV4 = append(excludedNonV4, ip)
+			continue
+		}
 		hairpinIPs = append(hairpinIPs, ip)
 	}
 	sort.Strings(hairpinIPs)
+	if len(excludedNonV4) > 0 {
+		sort.Strings(excludedNonV4)
+		slog.Debug("excluding non-IPv4 addresses from the route/announce plane, IPv6 support tracked in #85/#70",
+			"ips", excludedNonV4)
+	}
 
 	// desiredIPs extends hairpinIPs with port-forward VIPs — these need
 	// kernel routes on br-ex and FRR static routes for BGP announcement,
@@ -537,10 +553,22 @@ func (a *Agent) cleanupStaleChassis(ctx context.Context, allChassis map[string]b
 	setMissingChassis(len(a.missingChassis))
 }
 
-// computeEffectiveNetworks returns the network filters to use: manual config if set,
-// otherwise auto-discovered networks from OVN Logical_Router_Port.
+// computeEffectiveNetworks returns the network filters to use: manual config if
+// set, otherwise auto-discovered networks from OVN Logical_Router_Port. Only
+// IPv4 networks are returned — a.effectiveFilters feeds IPv4-only planes
+// (ReconcileVethLeakNetworks, ReconcileFRRPrefixList, and the "table ip"
+// provider-network rules in ReconcilePortForward), so a v6 network discovered
+// from a dual-stack LRP would otherwise abort those loops mid-way or fail the
+// whole nft ruleset load. Full IPv6 support is tracked in #85/#70.
 func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
-	return effectiveNetworkFilters(a.cfg.NetworkFilters, discovered)
+	eff := effectiveNetworkFilters(a.cfg.NetworkFilters, discovered)
+	v4 := make([]*net.IPNet, 0, len(eff))
+	for _, n := range eff {
+		if n.IP.To4() != nil {
+			v4 = append(v4, n)
+		}
+	}
+	return v4
 }
 
 // segmentRouteUnresolved reports whether an IP on the given localnet segment
