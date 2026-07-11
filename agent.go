@@ -681,14 +681,17 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 		}
 	}
 
-	// Collect stale routes for batch removal. Entries for still-desired IPs
-	// on the wrong device were already moved by the route replace above and
-	// must not withdraw the FRR announcement.
+	// Collect stale routes for batch removal. currentKernel/currentFRR are
+	// already scoped to agent-owned routes (protocol-tagged kernel routes,
+	// veth-nexthop FRR statics), so every listed route that is no longer
+	// desired is the agent's own leftover and safe to withdraw. Entries for
+	// still-desired IPs on the wrong device were already moved by the route
+	// replace above and must not withdraw the FRR announcement.
 	var delFRR []string
 	var removedKernel []kernelRouteEntry
 	removedSet := make(map[string]bool)
 	for _, e := range currentKernel {
-		if desiredSet[e.IP] || !a.isManaged(e.IP) {
+		if desiredSet[e.IP] {
 			continue
 		}
 		slog.Info("removing stale route", "ip", e.IP, "dev", e.Dev)
@@ -702,7 +705,7 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 
 	// Collect orphaned FRR routes that have no corresponding kernel route.
 	for _, ip := range currentFRR {
-		if !desiredSet[ip] && a.isManaged(ip) && !removedSet[ip] {
+		if !desiredSet[ip] && !removedSet[ip] {
 			slog.Info("removing orphaned FRR route", "ip", ip)
 			delFRR = append(delFRR, ip)
 		}
@@ -747,20 +750,19 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	return announced
 }
 
-// removeAllRoutes removes all managed FIP routes.
+// removeAllRoutes removes every agent-owned FIP route. Ownership is scoped by
+// the route listings themselves — ListFRRRoutes returns only statics via the
+// agent's veth nexthop and ListKernelRoutes only protocol-tagged routes — so
+// operator-created routes are never touched.
 // The reason parameter is used in log messages to indicate why routes are being removed.
 func (a *Agent) removeAllRoutes(reason string) {
-	// Collect all managed FRR routes for batch removal (FRR first to stop attracting traffic).
+	// Collect all agent-owned FRR routes for batch removal (FRR first to stop attracting traffic).
 	var delFRR []string
 	currentFRR, err := a.routing.ListFRRRoutes()
 	if err != nil {
 		slog.Error("failed to list FRR routes", "error", err)
 	} else {
-		for _, ip := range currentFRR {
-			if a.isManaged(ip) {
-				delFRR = append(delFRR, ip)
-			}
-		}
+		delFRR = append(delFRR, currentFRR...)
 	}
 
 	if len(delFRR) > 0 {
@@ -778,11 +780,9 @@ func (a *Agent) removeAllRoutes(reason string) {
 			slog.Error("failed to list kernel routes", "error", err)
 		} else {
 			for _, e := range currentKernel {
-				if a.isManaged(e.IP) {
-					slog.Info("removing kernel route", "ip", e.IP, "dev", e.Dev, "reason", reason)
-					if err := a.routing.DelKernelRoute(e.IP, e.Dev); err != nil {
-						slog.Error("failed to remove kernel route", "ip", e.IP, "dev", e.Dev, "error", err)
-					}
+				slog.Info("removing kernel route", "ip", e.IP, "dev", e.Dev, "reason", reason)
+				if err := a.routing.DelKernelRoute(e.IP, e.Dev); err != nil {
+					slog.Error("failed to remove kernel route", "ip", e.IP, "dev", e.Dev, "error", err)
 				}
 			}
 		}
@@ -848,7 +848,8 @@ const consecutiveReAddThreshold = 3
 // (on the right interface) and an FRR static route after route mutations.
 // Any route that disappeared (e.g. due to a vtysh race or unexpected FRR
 // behaviour) is re-added immediately so that existing connections are not
-// disrupted.
+// disrupted. Every desired IP is agent-produced by construction, so all are
+// verified — ownership is no longer inferred from CIDR membership.
 //
 // Returns the number of routes that had to be re-added (0 means all routes
 // were present). The agent tracks consecutive non-zero results and escalates
@@ -886,9 +887,6 @@ func (a *Agent) verifyRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	var reAddFRR []string
 	reAddKernel := 0
 	for _, ip := range desiredIPs {
-		if !a.isManaged(ip) {
-			continue
-		}
 		if !frrSet[ip] {
 			slog.Warn("FRR route missing after route change, re-adding", "ip", ip)
 			reAddFRR = append(reAddFRR, ip)
@@ -946,16 +944,6 @@ func (a *Agent) checkFRRRouteActivity(desiredIPs []string) {
 		slog.Error("FRR static routes are configured but inactive — these FIPs are not advertised via BGP",
 			"count", len(inactive), "ips", inactive, "vrf", a.cfg.VRFName)
 	}
-}
-
-// isManaged returns true if the IP is within any of the effective network CIDRs.
-// If no CIDRs are configured or discovered, all /32 routes on the bridge are considered managed.
-func (a *Agent) isManaged(ip string) bool {
-	if len(a.effectiveFilters) == 0 {
-		return true
-	}
-	parsedIP := net.ParseIP(ip)
-	return parsedIP != nil && containedInAny(parsedIP, a.effectiveFilters)
 }
 
 // uniqueIPs deduplicates and sorts a list of IP strings.

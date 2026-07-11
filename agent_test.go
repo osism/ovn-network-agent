@@ -39,44 +39,6 @@ func TestUniqueIPs(t *testing.T) {
 	}
 }
 
-func TestIsManaged(t *testing.T) {
-	tests := []struct {
-		name  string
-		cidrs []string
-		ip    string
-		want  bool
-	}{
-		{"no filter matches all", nil, "192.168.1.1", true},
-		{"matching CIDR /24", []string{"10.0.0.0/24"}, "10.0.0.5", true},
-		{"non-matching CIDR", []string{"10.0.0.0/24"}, "192.168.1.1", false},
-		{"broader CIDR /16 matches", []string{"10.0.0.0/16"}, "10.0.1.5", true},
-		{"narrower CIDR /24 excludes", []string{"10.0.0.0/24"}, "10.0.1.5", false},
-		{"boundary IP included", []string{"10.0.0.0/24"}, "10.0.0.255", true},
-		{"invalid IP returns false", []string{"10.0.0.0/24"}, "not-an-ip", false},
-		{"multiple CIDRs first matches", []string{"10.0.0.0/24", "172.16.0.0/12"}, "10.0.0.5", true},
-		{"multiple CIDRs second matches", []string{"10.0.0.0/24", "172.16.0.0/12"}, "172.20.0.1", true},
-		{"multiple CIDRs none matches", []string{"10.0.0.0/24", "172.16.0.0/12"}, "192.168.1.1", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var filters []*net.IPNet
-			for _, cidrStr := range tt.cidrs {
-				_, cidr, err := net.ParseCIDR(cidrStr)
-				if err != nil {
-					t.Fatalf("ParseCIDR(%q) error: %v", cidrStr, err)
-				}
-				filters = append(filters, cidr)
-			}
-			a := &Agent{effectiveFilters: filters}
-			got := a.isManaged(tt.ip)
-			if got != tt.want {
-				t.Errorf("isManaged(%q) with cidrs %v = %v, want %v", tt.ip, tt.cidrs, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestComputeEffectiveNetworks(t *testing.T) {
 	_, manual, _ := net.ParseCIDR("10.0.0.0/24")
 	_, discovered, _ := net.ParseCIDR("198.51.100.0/24")
@@ -113,24 +75,6 @@ func TestComputeEffectiveNetworks(t *testing.T) {
 			t.Errorf("expected only the v4 network, got %v", eff)
 		}
 	})
-}
-
-func TestIsManagedWithEffectiveFilters(t *testing.T) {
-	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
-	a := &Agent{effectiveFilters: []*net.IPNet{cidr}}
-
-	if !a.isManaged("198.51.100.10") {
-		t.Error("198.51.100.10 should be managed within 198.51.100.0/24")
-	}
-	if a.isManaged("10.0.0.1") {
-		t.Error("10.0.0.1 should not be managed outside 198.51.100.0/24")
-	}
-
-	// With nil effectiveFilters, all IPs are managed.
-	a.effectiveFilters = nil
-	if !a.isManaged("10.0.0.1") {
-		t.Error("all IPs should be managed when effectiveFilters is nil")
-	}
 }
 
 func TestTriggerReconcile(t *testing.T) {
@@ -175,7 +119,11 @@ func TestVerifyRoutesDryRun(t *testing.T) {
 	}
 }
 
-func TestVerifyRoutesSkipsUnmanagedIPs(t *testing.T) {
+// TestVerifyRoutesVerifiesDesiredRegardlessOfFilters proves route ownership no
+// longer comes from CIDR membership: a desired IP outside effectiveFilters
+// (e.g. a port-forward VIP under a narrow manual network_cidr) is still
+// verified and re-added, matching ensureRoutes which always installed it.
+func TestVerifyRoutesVerifiesDesiredRegardlessOfFilters(t *testing.T) {
 	rm := &RouteManager{
 		bridgeDev:   "br-ex",
 		vrfName:     "vrf-provider",
@@ -188,10 +136,11 @@ func TestVerifyRoutesSkipsUnmanagedIPs(t *testing.T) {
 		effectiveFilters: []*net.IPNet{cidr},
 	}
 
-	// IPs outside the managed CIDR should be skipped — zero re-adds.
+	// Two IPs outside the manual filter. In dry-run every list call returns
+	// empty, so each desired IP is seen as missing → 2 FRR + 2 kernel re-adds.
 	n := a.verifyRoutes([]string{"192.168.1.1", "172.16.0.1"}, nil, nil)
-	if n != 0 {
-		t.Errorf("expected 0 re-adds for unmanaged IPs, got %d", n)
+	if n != 4 {
+		t.Errorf("expected 4 re-adds for desired IPs outside the filter, got %d", n)
 	}
 }
 
@@ -236,8 +185,8 @@ func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
 		}
 	}
 
-	// A cycle with no managed IPs (nothing to re-add) resets the counter.
-	a.verifyRoutes([]string{"192.168.1.1"}, nil, nil) // unmanaged → 0 re-adds
+	// A cycle with an empty desired set (nothing to re-add) resets the counter.
+	a.verifyRoutes(nil, nil, nil)
 	if a.consecutiveReAdds != 0 {
 		t.Errorf("expected consecutiveReAdds=0 after clean cycle, got %d", a.consecutiveReAdds)
 	}
