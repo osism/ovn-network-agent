@@ -699,7 +699,11 @@ func TestReconcileOVSHairpinFlowsNoBindingsIsNoOp(t *testing.T) {
 	}
 }
 
-func TestReconcileOVSHairpinFlowsRejectsInvalidIP(t *testing.T) {
+// TestReconcileOVSHairpinFlowsSkipsInvalidIP proves an invalid IP is skipped
+// with no error and does not prevent the healthy flow from installing (issue
+// #158 test b, hairpin half). The old behaviour deleted every flow up front
+// then aborted on the first invalid IP, leaving the plane permanently empty.
+func TestReconcileOVSHairpinFlowsSkipsInvalidIP(t *testing.T) {
 	rec := newOVSRecorder()
 	rm := &RouteManager{
 		bridgeDev:   "br-ex",
@@ -707,12 +711,47 @@ func TestReconcileOVSHairpinFlowsRejectsInvalidIP(t *testing.T) {
 		execOVSHook: rec.hook(),
 	}
 
-	err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"not-an-ip": {RouterMAC: "aa:aa:aa:aa:aa:aa"}})
-	if err == nil {
-		t.Fatal("expected error for invalid IP, got nil")
+	targets := map[string]HairpinTarget{
+		"not-an-ip":     {RouterMAC: "aa:aa:aa:aa:aa:aa"},
+		"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"},
 	}
-	if !strings.Contains(err.Error(), "invalid IP") {
-		t.Errorf("expected 'invalid IP' in error, got: %v", err)
+	if err := rm.ReconcileOVSHairpinFlows(targets); err != nil {
+		t.Fatalf("ReconcileOVSHairpinFlows() must skip the invalid IP, got: %v", err)
+	}
+
+	wantHealthy := "cookie=0x998,priority=910,ip,in_port=42,ip_dst=5.182.234.199/32,actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:6f:a1:64,output:in_port"
+	if !containsFlow(rec.findAddFlows(), wantHealthy) {
+		t.Errorf("healthy flow not installed despite the invalid sibling; got %v", rec.findAddFlows())
+	}
+}
+
+// TestReconcileOVSHairpinFlowsAddFailureDoesNotStarveOthers proves a failed
+// add-flow for one FIP does not abort the loop: the other FIP's flow still
+// installs and the call returns nil (issue #158 test b). Mirrors
+// TestEnsureSegmentsAddFailureDoesNotStarveOthers.
+func TestReconcileOVSHairpinFlowsAddFailureDoesNotStarveOthers(t *testing.T) {
+	rec := newOVSRecorder()
+	// The flow for the first FIP fails to install.
+	const failingFlow = "cookie=0x998,priority=910,ip,in_port=42,ip_dst=5.182.234.199/32,actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:6f:a1:64,output:in_port"
+	rec.on([]string{"ovs-ofctl", "add-flow", "br-ex", failingFlow}, "add-flow failed", errors.New("bad flow"))
+
+	rm := &RouteManager{
+		bridgeDev:   "br-ex",
+		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
+		execOVSHook: rec.hook(),
+	}
+
+	targets := map[string]HairpinTarget{
+		"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"},
+		"203.0.113.50":  {RouterMAC: "fa:16:3e:00:01:02"},
+	}
+	if err := rm.ReconcileOVSHairpinFlows(targets); err != nil {
+		t.Fatalf("ReconcileOVSHairpinFlows() must tolerate a per-flow add failure, got: %v", err)
+	}
+
+	wantSurviving := "cookie=0x998,priority=910,ip,in_port=42,ip_dst=203.0.113.50/32,actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:00:01:02,output:in_port"
+	if !containsFlow(rec.findAddFlows(), wantSurviving) {
+		t.Errorf("healthy flow not installed after the sibling's add-flow failure; got %v", rec.findAddFlows())
 	}
 }
 
