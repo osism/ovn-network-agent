@@ -131,23 +131,23 @@ func TestScenario_NetworkCIDRsRestartPrunesOutOfScopeFIP(t *testing.T) {
 	testenv.AssertNoFRRRoute(t, fipDropped, 15*time.Second)
 }
 
-// TestScenario_NetworkCIDRsEmptyFiltersClaimAllBridge32s (#57 scenario 3):
+// TestScenario_NetworkCIDRsEmptyFiltersClaimAllBridge32s (#57 scenario 3,
+// updated for #158):
 //
-// With no manual filter AND no locally-active routers (so no auto-discovery),
-// effectiveFilters is empty. The agent must treat every /32 on the bridge
-// as managed — that is the implicit "no filters means manage everything"
-// contract isManaged returning true on empty filters relies on. Without
-// explicit coverage, a refactor that flips that default to "manage nothing"
-// would silently leak orphan routes on chassis idle between gateway moves.
+// With no manual filter AND no locally-active routers, the agent still reaps
+// its own leftover /32 routes on br-ex. Ownership is now scoped by the route
+// protocol tag (rtproto 44) instead of the old "empty filters means manage
+// everything" default: ListKernelRoutes returns only proto-44 routes, so a
+// stray the agent itself planted (or left behind from a previous run) is
+// observed and removed, while operator routes are ignored (covered by
+// TestScenario_OperatorRouteSurvivesStandbyReconcile).
 //
 // We pin the contract down by planting a stray /32 on br-ex with the agent's
-// own protocol number (rtproto 44, the value used for veth-leak per-network
-// routes — the issue calls it out specifically) and verifying the agent
-// reaps it. Path-wise: with no local routers and no port-forward VIPs,
-// reconcile takes the removeAllRoutes branch (agent.go's "no locally active
-// routers and no port forward VIPs"). removeAllRoutes calls isManaged on
-// every kernel /32 on the bridge — empty filters means it returns true,
-// so the stray gets removed.
+// own protocol number (rtproto 44) and verifying the agent reaps it.
+// Path-wise: with no local routers and no port-forward VIPs, reconcile takes
+// the removeAllRoutes branch (agent.go's "no locally active routers and no
+// port forward VIPs"). removeAllRoutes lists the agent-owned kernel /32s —
+// the proto-44 stray is one — and removes them.
 func TestScenario_NetworkCIDRsEmptyFiltersClaimAllBridge32s(t *testing.T) {
 	_, cancel, _, _ := startScenario(t)
 	defer cancel()
@@ -174,13 +174,62 @@ func TestScenario_NetworkCIDRsEmptyFiltersClaimAllBridge32s(t *testing.T) {
 }
 
 // addStrayBridgeRoute plants a /32 on the bridge with the agent's own protocol
-// number (rtproto 44). The agent's ListKernelRoutes ignores protocol — it
-// returns every /32 on the bridge — so the planted route is observable to the
-// agent's reconcile loop the same way a leftover from a previous run would be.
+// number (rtproto 44). ListKernelRoutes returns only proto-44 routes, so the
+// planted route is observed as agent-owned by the reconcile loop — exactly as
+// a leftover from a previous run would be — and is reaped.
 func addStrayBridgeRoute(t *testing.T, ip string) {
 	t.Helper()
 	args := []string{"route", "add", ip + "/32", "dev", testenv.DefaultBridgeDev, "proto", "44"}
 	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
 		t.Fatalf("ip %s: %v (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
+}
+
+// addOperatorBridgeRoute plants a /32 on the bridge WITHOUT the agent's
+// protocol number, standing in for an operator-created debugging route. Because
+// ListKernelRoutes filters on rtproto 44, this route is invisible to the agent
+// and must survive reconciliation.
+func addOperatorBridgeRoute(t *testing.T, ip string) {
+	t.Helper()
+	args := []string{"route", "add", ip + "/32", "dev", testenv.DefaultBridgeDev}
+	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
+		t.Fatalf("ip %s: %v (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+}
+
+// delBridgeRoute removes a /32 planted on the bridge, best-effort.
+func delBridgeRoute(t *testing.T, ip string) {
+	t.Helper()
+	_ = exec.Command("ip", "route", "del", ip+"/32", "dev", testenv.DefaultBridgeDev).Run()
+}
+
+// TestScenario_OperatorRouteSurvivesStandbyReconcile (#158 test c):
+//
+// An operator adds a /32 debugging route on br-ex by hand (kernel default
+// protocol, not rtproto 44). On a standby node — no local routers, no manual
+// filter — the agent runs the removeAllRoutes branch every reconcile. Before
+// #158 the empty-filters "manage everything" default deleted this route; now
+// that ListKernelRoutes is scoped to proto-44 routes, the operator route is
+// invisible to the agent and must persist across several fast reconcile ticks.
+func TestScenario_OperatorRouteSurvivesStandbyReconcile(t *testing.T) {
+	_, cancel, _, _ := startScenario(t)
+	defer cancel()
+
+	const operatorIP = "198.51.100.77"
+	addOperatorBridgeRoute(t, operatorIP)
+	t.Cleanup(func() { delBridgeRoute(t, operatorIP) })
+
+	// Sanity: the route exists before the agent starts.
+	testenv.AssertKernelRoute(t, operatorIP, 1*time.Second)
+
+	cfg := testenv.FastDefaults()
+	// No MakeLocalRouter and no NetworkCIDRs: the standby/idle condition where
+	// reconcile takes the removeAllRoutes branch every tick.
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// FastDefaults ticks at 2s; let ~4 ticks pass, then confirm the operator
+	// route is still present — the agent never owned it, so it is never reaped.
+	time.Sleep(8 * time.Second)
+	testenv.AssertKernelRoute(t, operatorIP, 1*time.Second)
 }
