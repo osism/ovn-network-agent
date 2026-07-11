@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os/exec"
 	"reflect"
@@ -213,18 +214,78 @@ func TestFRRRoutesBatchValidation(t *testing.T) {
 		dryRun:      true,
 	}
 
-	invalid := []string{"10.0.0.1", "not-an-ip", "10.0.0.2"}
-	if err := rm.AddFRRRoutes(invalid); err == nil {
-		t.Error("AddFRRRoutes() with invalid IP should return error")
+	// AddFRRRoutes now skips invalid entries instead of rejecting the whole
+	// batch, so a mixed list applies the valid IPs and returns nil. DelFRRRoutes
+	// keeps fail-fast validation (its inputs are self-sourced from FRR output).
+	mixed := []string{"10.0.0.1", "not-an-ip", "10.0.0.2"}
+	if err := rm.AddFRRRoutes(mixed); err != nil {
+		t.Errorf("AddFRRRoutes() with a mixed list should skip the invalid entry, got: %v", err)
 	}
-	if err := rm.DelFRRRoutes(invalid); err == nil {
+	if err := rm.DelFRRRoutes(mixed); err == nil {
 		t.Error("DelFRRRoutes() with invalid IP should return error")
 	}
 
-	// CIDR notation is not a valid bare IP.
-	cidr := []string{"10.0.0.1/32"}
-	if err := rm.AddFRRRoutes(cidr); err == nil {
-		t.Error("AddFRRRoutes() with CIDR notation should return error")
+	// A list of only-invalid entries is a no-op, not an error.
+	if err := rm.AddFRRRoutes([]string{"10.0.0.1/32"}); err != nil {
+		t.Errorf("AddFRRRoutes() with only invalid entries should be a no-op, got: %v", err)
+	}
+}
+
+// TestAddFRRRoutesSkipsInvalidAndContinues proves a single malformed IP is
+// dropped from the vtysh batch while the healthy IPs still install in one call
+// (issue #158 test b, FRR half).
+func TestAddFRRRoutesSkipsInvalidAndContinues(t *testing.T) {
+	rec := newVtyshRecorder()
+	rm := &RouteManager{
+		vrfName:       "vrf-provider",
+		vethNexthop:   "169.254.0.1",
+		execVtyshHook: rec.hook(),
+	}
+	if err := rm.AddFRRRoutes([]string{"10.0.0.1", "not-an-ip", "10.0.0.2"}); err != nil {
+		t.Fatalf("AddFRRRoutes: unexpected error %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("expected exactly one vtysh batch, got %d: %v", len(rec.calls), rec.calls)
+	}
+	joined := strings.Join(rec.calls[0], " ")
+	if !strings.Contains(joined, "ip route 10.0.0.1/32 169.254.0.1") ||
+		!strings.Contains(joined, "ip route 10.0.0.2/32 169.254.0.1") {
+		t.Errorf("healthy IPs missing from batch: %v", rec.calls[0])
+	}
+	if strings.Contains(joined, "not-an-ip") {
+		t.Errorf("invalid IP must not reach the vtysh batch: %v", rec.calls[0])
+	}
+}
+
+// TestAddFRRRoutesContinuesPastFailedChunk proves a vtysh failure on the first
+// chunk does not abort the remaining chunks: both are issued, and the returned
+// error reflects the failed one (issue #158 test b — a failed chunk no longer
+// aborts the rest).
+func TestAddFRRRoutesContinuesPastFailedChunk(t *testing.T) {
+	// frrBatchSize+1 IPs span exactly two chunks.
+	ips := make([]string, 0, frrBatchSize+1)
+	for i := 0; i < frrBatchSize+1; i++ {
+		ips = append(ips, fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256))
+	}
+
+	var calls int
+	rm := &RouteManager{
+		vrfName:     "vrf-provider",
+		vethNexthop: "169.254.0.1",
+		execVtyshHook: func(*exec.Cmd) ([]byte, error) {
+			calls++
+			if calls == 1 {
+				return []byte("boom"), errors.New("vtysh failed")
+			}
+			return nil, nil
+		},
+	}
+	err := rm.AddFRRRoutes(ips)
+	if err == nil {
+		t.Fatal("expected an aggregated error from the failed chunk, got nil")
+	}
+	if calls != 2 {
+		t.Errorf("expected both chunks to be issued despite the first failing, got %d calls", calls)
 	}
 }
 
