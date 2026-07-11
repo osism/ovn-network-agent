@@ -425,6 +425,12 @@ func HairpinFlow(cookie, ofport, ip, bridgeMAC, routerMAC string, ipv6 bool) str
 //
 // Pass nil or an empty map to remove all hairpin flows (e.g. when no
 // locally-active routers remain).
+//
+// The up-front del-flows sweep is a hard precondition: if it fails the method
+// returns without touching the plane. Per-flow failures thereafter (an invalid
+// IP or a failed add-flow) are logged and skipped so one bad row never leaves
+// the hairpin plane empty for every other FIP — the delete-then-abort behaviour
+// this replaces.
 func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarget) error {
 	if rm.dryRun {
 		slog.Info("[dry-run] would reconcile OVS hairpin flows", "count", len(targets))
@@ -446,7 +452,8 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 	for ip, target := range targets {
 		parsed := net.ParseIP(ip)
 		if parsed == nil {
-			return fmt.Errorf("invalid IP %q", ip)
+			slog.Warn("skipping hairpin flow for invalid IP", "ip", ip)
+			continue
 		}
 		b := rm.segmentBindingFor(target.Segment)
 		if b == nil {
@@ -457,7 +464,9 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 		isIPv6 := parsed.To4() == nil
 		flow := HairpinFlow(ovsCookieHairpin, b.ofport, ip, b.kernelMAC, target.RouterMAC, isIPv6)
 		if err := rm.addOVSFlow(flow); err != nil {
-			return fmt.Errorf("add hairpin flow for %s: %w", ip, err)
+			slog.Warn("failed to add hairpin flow, skipping",
+				"ip", ip, "segment", target.Segment, "error", err)
+			continue
 		}
 	}
 
