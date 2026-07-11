@@ -914,6 +914,142 @@ func TestRefreshStatePopulatesLocalRoutersAndNATs(t *testing.T) {
 	}
 }
 
+// emptyFilterLocalRouterFakes wires an OVNClient whose sole locally-active
+// router has an LRP with no parseable networks, so refreshState discovers no
+// network filters and computes an empty effectiveFilters set. This is the
+// standby/edge condition weakness #3 of issue #158 describes, where NAT
+// external IPs previously reached the command payloads unvalidated.
+func emptyFilterLocalRouterFakes(t *testing.T, nats ...*NBNAT) *OVNClient {
+	t.Helper()
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	chA := "ch-a"
+	sb.setRows("Port_Binding",
+		&SBPortBinding{UUID: "pb-1", LogicalPort: "cr-lrp-local", Type: "chassisredirect", Chassis: &chA},
+	)
+	nb.setRows("Logical_Router_Port",
+		// Empty Networks → no discovered CIDRs → empty effectiveFilters.
+		&NBLogicalRouterPort{UUID: "lrp-uuid-local", Name: "lrp-local", MAC: "fa:16:3e:aa:aa:aa"},
+	)
+	natUUIDs := make([]string, 0, len(nats))
+	rows := make([]any, 0, len(nats))
+	for _, n := range nats {
+		natUUIDs = append(natUUIDs, n.UUID)
+		rows = append(rows, n)
+	}
+	nb.setRows("NAT", rows...)
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-local", Name: "router-local", Ports: []string{"lrp-uuid-local"}, Nat: natUUIDs},
+	)
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+	return c
+}
+
+// TestRefreshStateDropsMalformedNATExternalIP proves a NAT row with an
+// unparseable external_ip is dropped at ingest even when no filter is in
+// effect: the raw string must not survive into SNATIPs, FIPs, or
+// NATIPToRouterMAC (weakness #3, AC "nft/vtysh payloads only ever contain
+// values that passed net.ParseIP").
+func TestRefreshStateDropsMalformedNATExternalIP(t *testing.T) {
+	c := emptyFilterLocalRouterFakes(t,
+		&NBNAT{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"},
+		&NBNAT{UUID: "nat-snat", Type: "snat", ExternalIP: "198.51.100.51"},
+		&NBNAT{UUID: "nat-bad", Type: "snat", ExternalIP: "not-an-ip"},
+	)
+	snap := c.GetState()
+
+	// Precondition for the weakness: no filters were derived.
+	if len(snap.DiscoveredNetworks) != 0 {
+		t.Fatalf("expected empty DiscoveredNetworks, got %v", snap.DiscoveredNetworks)
+	}
+	if got := snap.FIPs; !reflect.DeepEqual(got, []string{"198.51.100.50"}) {
+		t.Errorf("FIPs = %v, want [198.51.100.50]", got)
+	}
+	if got := snap.SNATIPs; !reflect.DeepEqual(got, []string{"198.51.100.51"}) {
+		t.Errorf("SNATIPs = %v, want [198.51.100.51] (malformed row must be dropped)", got)
+	}
+	if _, ok := snap.NATIPToRouterMAC["not-an-ip"]; ok {
+		t.Errorf("NATIPToRouterMAC must not contain the malformed external IP: %v", snap.NATIPToRouterMAC)
+	}
+}
+
+// TestRefreshStateKeepsV6ForHairpinButNotSNATIPs proves the family gate on the
+// nft-bound SNATIPs list is independent of filter presence: with empty filters,
+// a v6 SNAT and a v6 FIP are still tracked in NATIPToRouterMAC (the dual-stack
+// OVS hairpin plane, #54) but never land in SNATIPs (the IPv4-only nft
+// masquerade set). Covers steps 5 and 5b's family gate.
+func TestRefreshStateKeepsV6ForHairpinButNotSNATIPs(t *testing.T) {
+	c := emptyFilterLocalRouterFakes(t,
+		&NBNAT{UUID: "nat-v4snat", Type: "snat", ExternalIP: "198.51.100.51"},
+		&NBNAT{UUID: "nat-v6snat", Type: "snat", ExternalIP: "2001:db8::51"},
+		&NBNAT{UUID: "nat-v6fip", Type: "dnat_and_snat", ExternalIP: "2001:db8::50"},
+	)
+	snap := c.GetState()
+
+	if got := snap.SNATIPs; !reflect.DeepEqual(got, []string{"198.51.100.51"}) {
+		t.Errorf("SNATIPs = %v, want [198.51.100.51] (v6 must be excluded)", got)
+	}
+	// The v6 addresses remain available for the family-aware OVS hairpin plane.
+	for _, ip := range []string{"2001:db8::51", "2001:db8::50"} {
+		if snap.NATIPToRouterMAC[ip] != "fa:16:3e:aa:aa:aa" {
+			t.Errorf("NATIPToRouterMAC[%s] = %q, want the LRP MAC (v6 kept for hairpin)",
+				ip, snap.NATIPToRouterMAC[ip])
+		}
+	}
+	if got := snap.FIPs; !reflect.DeepEqual(got, []string{"2001:db8::50"}) {
+		t.Errorf("FIPs = %v, want [2001:db8::50] (FIP list stays dual-stack)", got)
+	}
+}
+
+// TestRefreshStateKeepsV6SBNatAddressForHairpinButNotSNATIPs drives the same
+// family gate through the SB gateway NatAddresses path (step 5b): a v6 SNAT
+// address discovered from a Port_Binding's NatAddresses stays in
+// NATIPToRouterMAC for the dual-stack OVS hairpin plane (#54) but never lands
+// in the IPv4-only nft masquerade set (SNATIPs, #85/#70). The LRP carries no
+// networks, so effectiveFilters is empty and the To4() gate is the only thing
+// separating the two addresses.
+func TestRefreshStateKeepsV6SBNatAddressForHairpinButNotSNATIPs(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	chA := "ch-a"
+	sb.setRows("Port_Binding",
+		&SBPortBinding{UUID: "pb-cr", LogicalPort: "cr-lrp-local", Type: "chassisredirect", Chassis: &chA},
+		&SBPortBinding{
+			UUID: "pb-patch", LogicalPort: "ext", Type: "patch",
+			Options:     map[string]string{"peer": "lrp-local"},
+			ExternalIDs: map[string]string{"neutron:device_owner": "network:router_gateway"},
+			NatAddresses: []string{
+				"fa:16:3e:11:22:33 198.51.100.60 is_chassis_resident(\"cr-lrp-local\")",
+				"fa:16:3e:11:22:33 2001:db8::60 is_chassis_resident(\"cr-lrp-local\")",
+			},
+		},
+	)
+	nb.setRows("Logical_Router_Port",
+		// Empty Networks → no discovered CIDRs → empty effectiveFilters.
+		&NBLogicalRouterPort{UUID: "lrp-uuid-local", Name: "lrp-local", MAC: "fa:16:3e:aa:aa:aa"},
+	)
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-local", Name: "router-local", Ports: []string{"lrp-uuid-local"}},
+	)
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+	snap := c.GetState()
+
+	if got := snap.SNATIPs; !reflect.DeepEqual(got, []string{"198.51.100.60"}) {
+		t.Errorf("SNATIPs = %v, want [198.51.100.60] (v6 SB SNAT must be excluded)", got)
+	}
+	// The v6 address stays available for the family-aware OVS hairpin plane.
+	if snap.NATIPToRouterMAC["2001:db8::60"] != "fa:16:3e:aa:aa:aa" {
+		t.Errorf("NATIPToRouterMAC[2001:db8::60] = %q, want the LRP MAC (v6 kept for hairpin)",
+			snap.NATIPToRouterMAC["2001:db8::60"])
+	}
+}
+
 // TestRefreshStateResolvesLocalnetSegments verifies the SB-driven segment
 // resolution: each locally-active router is associated with the localnet
 // segment (localnet port + physnet + optional VLAN tag) of its external
