@@ -56,4 +56,11 @@ func main() {
 		}
 		fmt.Printf("wrote %s\n", path)
 	}
+
+	// The shipped operator-facing config surfaces (ovn-network-agent.default,
+	// ovn-network-agent.yaml.sample) must cover every option, the same way
+	// docs/reference/ must — fail the generator if either has drifted.
+	if err := checkSamples(*root, info); err != nil {
+		log.Fatalf("sample config check: %v", err)
+	}
 }
