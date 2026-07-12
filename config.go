@@ -4,9 +4,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -283,14 +283,22 @@ func loadConfig(args []string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("load config %s: %w", *configPath, err)
 		}
-		applyFileConfig(&cfg, &fc)
+		if err := applyFileConfig(&cfg, &fc); err != nil {
+			return Config{}, fmt.Errorf("load config %s: %w", *configPath, err)
+		}
 	}
 
 	// Layer 2: environment variables
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	// Layer 3: CLI flags (only explicitly set ones)
+	var flagErr error
 	fs.Visit(func(f *flag.Flag) {
+		if flagErr != nil {
+			return
+		}
 		switch f.Name {
 		case "ovn-sb-remote":
 			cfg.OVNSBRemote = *fOVNSB
@@ -313,9 +321,12 @@ func loadConfig(args []string) (Config, error) {
 		case "ovs-wrapper":
 			cfg.OVSWrapper = *fOVSWrapper
 		case "reconcile-interval":
-			if d, err := time.ParseDuration(*fInterval); err == nil {
-				cfg.ReconcileInterval = d
+			d, err := time.ParseDuration(*fInterval)
+			if err != nil {
+				flagErr = fmt.Errorf("invalid -reconcile-interval %q: %w", *fInterval, err)
+				return
 			}
+			cfg.ReconcileInterval = d
 		case "log-level":
 			cfg.LogLevel = *fLogLevel
 		case "dry-run":
@@ -325,21 +336,28 @@ func loadConfig(args []string) (Config, error) {
 		case "drain-on-shutdown":
 			cfg.DrainOnShutdown = *fDrainOnShutdown
 		case "drain-timeout":
-			if d, err := time.ParseDuration(*fDrainTimeout); err == nil {
-				cfg.DrainTimeout = d
+			d, err := time.ParseDuration(*fDrainTimeout)
+			if err != nil {
+				flagErr = fmt.Errorf("invalid -drain-timeout %q: %w", *fDrainTimeout, err)
+				return
 			}
+			cfg.DrainTimeout = d
 		case "drain-settle-delay":
-			if d, err := time.ParseDuration(*fDrainSettleDelay); err == nil {
-				cfg.DrainSettleDelay = d
+			d, err := time.ParseDuration(*fDrainSettleDelay)
+			if err != nil {
+				flagErr = fmt.Errorf("invalid -drain-settle-delay %q: %w", *fDrainSettleDelay, err)
+				return
 			}
+			cfg.DrainSettleDelay = d
 		case "frr-prefix-list":
 			cfg.FRRPrefixList = *fFRRPrefixList
 		case "stale-chassis-grace-period":
-			if d, err := time.ParseDuration(*fStaleGrace); err == nil {
-				cfg.StaleChassisGracePeriod = d
-			} else {
-				slog.Warn("ignoring invalid stale-chassis-grace-period flag value", "value", *fStaleGrace, "error", err)
+			d, err := time.ParseDuration(*fStaleGrace)
+			if err != nil {
+				flagErr = fmt.Errorf("invalid -stale-chassis-grace-period %q: %w", *fStaleGrace, err)
+				return
 			}
+			cfg.StaleChassisGracePeriod = d
 		case "metrics-listen":
 			cfg.MetricsListen = *fMetricsListen
 		case "veth-leak-enabled":
@@ -360,6 +378,9 @@ func loadConfig(args []string) (Config, error) {
 			cfg.PortForwardCTZone = *fPortForwardCTZone
 		}
 	})
+	if flagErr != nil {
+		return Config{}, flagErr
+	}
 
 	// Validate configuration
 	if err := validateConfig(&cfg); err != nil {
@@ -624,7 +645,7 @@ func readConfigFile(path string) (configFile, error) {
 	return fc, nil
 }
 
-func applyFileConfig(cfg *Config, fc *configFile) {
+func applyFileConfig(cfg *Config, fc *configFile) error {
 	if fc.OVNSBRemote != "" {
 		cfg.OVNSBRemote = fc.OVNSBRemote
 	}
@@ -656,9 +677,11 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 		cfg.RouteTableID = *fc.RouteTableID
 	}
 	if fc.ReconcileInterval != "" {
-		if d, err := time.ParseDuration(fc.ReconcileInterval); err == nil {
-			cfg.ReconcileInterval = d
+		d, err := time.ParseDuration(fc.ReconcileInterval)
+		if err != nil {
+			return fmt.Errorf("invalid reconcile_interval %q: %w", fc.ReconcileInterval, err)
 		}
+		cfg.ReconcileInterval = d
 	}
 	if fc.LogLevel != "" {
 		cfg.LogLevel = fc.LogLevel
@@ -673,28 +696,28 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 		cfg.DrainOnShutdown = *fc.DrainOnShutdown
 	}
 	if fc.DrainTimeout != "" {
-		if d, err := time.ParseDuration(fc.DrainTimeout); err == nil {
-			cfg.DrainTimeout = d
-		} else {
-			slog.Warn("ignoring invalid drain_timeout in config file", "value", fc.DrainTimeout, "error", err)
+		d, err := time.ParseDuration(fc.DrainTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid drain_timeout %q: %w", fc.DrainTimeout, err)
 		}
+		cfg.DrainTimeout = d
 	}
 	if fc.DrainSettleDelay != "" {
-		if d, err := time.ParseDuration(fc.DrainSettleDelay); err == nil {
-			cfg.DrainSettleDelay = d
-		} else {
-			slog.Warn("ignoring invalid drain_settle_delay in config file", "value", fc.DrainSettleDelay, "error", err)
+		d, err := time.ParseDuration(fc.DrainSettleDelay)
+		if err != nil {
+			return fmt.Errorf("invalid drain_settle_delay %q: %w", fc.DrainSettleDelay, err)
 		}
+		cfg.DrainSettleDelay = d
 	}
 	if fc.FRRPrefixList != "" {
 		cfg.FRRPrefixList = fc.FRRPrefixList
 	}
 	if fc.StaleChassisGracePeriod != "" {
-		if d, err := time.ParseDuration(fc.StaleChassisGracePeriod); err == nil {
-			cfg.StaleChassisGracePeriod = d
-		} else {
-			slog.Warn("ignoring invalid stale_chassis_grace_period in config file", "value", fc.StaleChassisGracePeriod, "error", err)
+		d, err := time.ParseDuration(fc.StaleChassisGracePeriod)
+		if err != nil {
+			return fmt.Errorf("invalid stale_chassis_grace_period %q: %w", fc.StaleChassisGracePeriod, err)
 		}
+		cfg.StaleChassisGracePeriod = d
 	}
 	if fc.MetricsListen != "" {
 		cfg.MetricsListen = fc.MetricsListen
@@ -726,9 +749,10 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if len(fc.PortForwards) > 0 {
 		cfg.PortForwards = fc.PortForwards
 	}
+	return nil
 }
 
-func applyEnvConfig(cfg *Config) {
+func applyEnvConfig(cfg *Config) error {
 	if v := os.Getenv("OVN_NETWORK_OVN_SB_REMOTE"); v != "" {
 		cfg.OVNSBRemote = v
 	}
@@ -757,15 +781,18 @@ func applyEnvConfig(cfg *Config) {
 		cfg.OVSWrapper = v
 	}
 	if v := os.Getenv("OVN_NETWORK_ROUTE_TABLE_ID"); v != "" {
-		var id int
-		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
-			cfg.RouteTableID = id
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_ROUTE_TABLE_ID %q: %w", v, err)
 		}
+		cfg.RouteTableID = id
 	}
 	if v := os.Getenv("OVN_NETWORK_RECONCILE_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.ReconcileInterval = d
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_RECONCILE_INTERVAL %q: %w", v, err)
 		}
+		cfg.ReconcileInterval = d
 	}
 	if v := os.Getenv("OVN_NETWORK_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
@@ -782,28 +809,28 @@ func applyEnvConfig(cfg *Config) {
 		cfg.DrainOnShutdown = true
 	}
 	if v := os.Getenv("OVN_NETWORK_DRAIN_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.DrainTimeout = d
-		} else {
-			slog.Warn("ignoring invalid OVN_NETWORK_DRAIN_TIMEOUT env var", "value", v, "error", err)
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_DRAIN_TIMEOUT %q: %w", v, err)
 		}
+		cfg.DrainTimeout = d
 	}
 	if v := os.Getenv("OVN_NETWORK_DRAIN_SETTLE_DELAY"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.DrainSettleDelay = d
-		} else {
-			slog.Warn("ignoring invalid OVN_NETWORK_DRAIN_SETTLE_DELAY env var", "value", v, "error", err)
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_DRAIN_SETTLE_DELAY %q: %w", v, err)
 		}
+		cfg.DrainSettleDelay = d
 	}
 	if v := os.Getenv("OVN_NETWORK_FRR_PREFIX_LIST"); v != "" {
 		cfg.FRRPrefixList = v
 	}
 	if v := os.Getenv("OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.StaleChassisGracePeriod = d
-		} else {
-			slog.Warn("ignoring invalid OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD env var", "value", v, "error", err)
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD %q: %w", v, err)
 		}
+		cfg.StaleChassisGracePeriod = d
 	}
 	if v := os.Getenv("OVN_NETWORK_METRICS_LISTEN"); v != "" {
 		cfg.MetricsListen = v
@@ -815,33 +842,38 @@ func applyEnvConfig(cfg *Config) {
 		cfg.VethProviderIP = v
 	}
 	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_TABLE_ID"); v != "" {
-		var id int
-		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
-			cfg.VethLeakTableID = id
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_VETH_LEAK_TABLE_ID %q: %w", v, err)
 		}
+		cfg.VethLeakTableID = id
 	}
 	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_RULE_PRIORITY"); v != "" {
-		var prio int
-		if _, err := fmt.Sscanf(v, "%d", &prio); err == nil {
-			cfg.VethLeakRulePriority = prio
+		prio, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_VETH_LEAK_RULE_PRIORITY %q: %w", v, err)
 		}
+		cfg.VethLeakRulePriority = prio
 	}
 	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_DEV"); v != "" {
 		cfg.PortForwardDev = v
 	}
 	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_TABLE_ID"); v != "" {
-		var id int
-		if _, err := fmt.Sscanf(v, "%d", &id); err == nil {
-			cfg.PortForwardTableID = id
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_PORT_FORWARD_TABLE_ID %q: %w", v, err)
 		}
+		cfg.PortForwardTableID = id
 	}
 	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"); v == "1" || v == "true" {
 		cfg.PortForwardL3mdevAccept = true
 	}
 	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_CT_ZONE"); v != "" {
-		var zone int
-		if _, err := fmt.Sscanf(v, "%d", &zone); err == nil {
-			cfg.PortForwardCTZone = zone
+		zone, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_PORT_FORWARD_CT_ZONE %q: %w", v, err)
 		}
+		cfg.PortForwardCTZone = zone
 	}
+	return nil
 }
