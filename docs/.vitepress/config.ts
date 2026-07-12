@@ -28,6 +28,7 @@ export default defineConfig({
         text: 'How-to guides',
         items: [
           { text: 'Install the agent', link: '/guides/installation' },
+          { text: 'Upgrade the agent', link: '/guides/upgrade' },
           { text: 'Configure the agent', link: '/guides/configuration' },
           { text: 'Create a gatewayless provider network', link: '/guides/gatewayless-provider-network' },
           { text: 'Set up port forwarding (DNAT)', link: '/guides/port-forwarding' },
