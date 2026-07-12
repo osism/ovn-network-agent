@@ -448,6 +448,14 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
 	}
 
+	// ReconcileInterval feeds time.NewTicker, which panics on a
+	// non-positive duration — reject it here so a bad value fails the
+	// config load instead of crashing the agent after it has already
+	// mutated system state.
+	if cfg.ReconcileInterval <= 0 {
+		return fmt.Errorf("invalid reconcile-interval: %v (must be positive)", cfg.ReconcileInterval)
+	}
+
 	if cfg.DrainTimeout < 0 {
 		return fmt.Errorf("invalid drain-timeout: must be non-negative")
 	}

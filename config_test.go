@@ -582,62 +582,72 @@ func TestValidateConfig(t *testing.T) {
 	}{
 		{
 			"valid defaults",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider"},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second},
 			false,
 		},
 		{
 			"valid with single CIDR",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", NetworkCIDRs: []string{"10.0.0.0/24"}},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, NetworkCIDRs: []string{"10.0.0.0/24"}},
 			false,
 		},
 		{
 			"valid with multiple CIDRs",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", NetworkCIDRs: []string{"10.0.0.0/24", "172.16.0.0/12"}},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, NetworkCIDRs: []string{"10.0.0.0/24", "172.16.0.0/12"}},
 			false,
 		},
 		{
 			"invalid nexthop",
-			Config{VethNexthop: "bad", VRFName: "vrf-provider"},
+			Config{VethNexthop: "bad", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second},
 			true,
 		},
 		{
 			"invalid VRF name",
-			Config{VethNexthop: "169.254.0.1", VRFName: "bad name"},
+			Config{VethNexthop: "169.254.0.1", VRFName: "bad name", ReconcileInterval: 60 * time.Second},
 			true,
 		},
 		{
 			"invalid CIDR",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", NetworkCIDRs: []string{"bad"}},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, NetworkCIDRs: []string{"bad"}},
 			true,
 		},
 		{
 			"one valid one invalid CIDR",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", NetworkCIDRs: []string{"10.0.0.0/24", "bad"}},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, NetworkCIDRs: []string{"10.0.0.0/24", "bad"}},
 			true,
 		},
 		{
 			"valid route table ID",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 100},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, RouteTableID: 100},
 			false,
 		},
 		{
 			"route table ID zero (main table)",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 0},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, RouteTableID: 0},
 			false,
 		},
 		{
 			"route table ID max",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 252},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, RouteTableID: 252},
 			false,
 		},
 		{
 			"route table ID too high",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: 253},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, RouteTableID: 253},
 			true,
 		},
 		{
 			"route table ID negative",
-			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteTableID: -1},
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 60 * time.Second, RouteTableID: -1},
+			true,
+		},
+		{
+			"reconcile interval zero",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: 0},
+			true,
+		},
+		{
+			"reconcile interval negative",
+			Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", ReconcileInterval: -1 * time.Second},
 			true,
 		},
 	}
@@ -650,6 +660,38 @@ func TestValidateConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadConfigRejectsNonPositiveReconcileInterval(t *testing.T) {
+	t.Run("flag zero", func(t *testing.T) {
+		_, err := loadConfig(fullModeArgs("--reconcile-interval", "0s"))
+		if err == nil {
+			t.Fatal("expected error for --reconcile-interval 0s")
+		}
+	})
+
+	t.Run("flag negative", func(t *testing.T) {
+		_, err := loadConfig(fullModeArgs("--reconcile-interval", "-5s"))
+		if err == nil {
+			t.Fatal("expected error for --reconcile-interval -5s")
+		}
+	})
+
+	t.Run("file zero", func(t *testing.T) {
+		content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+veth_leak_enabled: false
+reconcile_interval: "0s"
+`
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+		if _, err := loadConfig([]string{"--config", path}); err == nil {
+			t.Fatal("expected error for reconcile_interval 0s in config file")
+		}
+	})
 }
 
 func TestLoadConfigRouteTableIDCLI(t *testing.T) {
@@ -979,6 +1021,7 @@ func TestValidateConfigStaleChassisGracePeriodNegative(t *testing.T) {
 	cfg := Config{
 		VethNexthop:             "169.254.0.1",
 		VRFName:                 "vrf-provider",
+		ReconcileInterval:       60 * time.Second,
 		StaleChassisGracePeriod: -1 * time.Minute,
 	}
 	err := validateConfig(&cfg)
@@ -1067,9 +1110,10 @@ drain_settle_delay: "4s"
 
 func TestValidateConfigDrainSettleDelayNegative(t *testing.T) {
 	cfg := Config{
-		VethNexthop:      "169.254.0.1",
-		VRFName:          "vrf-provider",
-		DrainSettleDelay: -1 * time.Second,
+		VethNexthop:       "169.254.0.1",
+		VRFName:           "vrf-provider",
+		ReconcileInterval: 60 * time.Second,
+		DrainSettleDelay:  -1 * time.Second,
 	}
 	err := validateConfig(&cfg)
 	if err == nil {
@@ -1154,6 +1198,7 @@ func TestPortForwardValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
 			VethNexthop:        "169.254.0.1",
+			ReconcileInterval:  60 * time.Second,
 			VethLeakEnabled:    true,
 			VethLeakTableID:    200,
 			PortForwardDev:     "loopback1",
@@ -1486,6 +1531,7 @@ func TestPortForwardMultiBackendValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
 			VethNexthop:        "169.254.0.1",
+			ReconcileInterval:  60 * time.Second,
 			VethLeakEnabled:    true,
 			VethLeakTableID:    200,
 			PortForwardDev:     "loopback1",
@@ -1609,9 +1655,10 @@ port_forwards:
 // VethProviderIP) trips this test instead of silently changing the contract.
 func TestVethProviderIPAutoComputeWrapsAt255_255_255_255(t *testing.T) {
 	cfg := Config{
-		VethNexthop:     "255.255.255.255",
-		VethLeakEnabled: true,
-		VethLeakTableID: 200,
+		VethNexthop:       "255.255.255.255",
+		ReconcileInterval: 60 * time.Second,
+		VethLeakEnabled:   true,
+		VethLeakTableID:   200,
 		// VethProviderIP intentionally unset — triggers auto-compute.
 	}
 
