@@ -5,7 +5,8 @@
 #
 # This file lists every env var consumed by the agent (see applyEnvConfig in
 # config.go). All values shown after "=" are the built-in defaults; uncomment
-# only the lines you need to override.
+# only the lines you need to override. CI (tools/docgen) fails the build if
+# this file misses an env var the agent consumes, so the list stays complete.
 
 # Path to a YAML config file. Equivalent to passing --config on the CLI.
 # Settings in this file are overridden by env vars below (and CLI flags).
@@ -75,6 +76,10 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # Maximum time to wait for gateway drain (Go duration format).
 # After this timeout, shutdown proceeds even if some gateways have not migrated.
 #OVN_NETWORK_DRAIN_TIMEOUT=60s
+
+# Safety margin held after the takeover chassis signals readiness, before
+# cleanup withdraws the FIP routes (Go duration format). Set to "0" to disable.
+#OVN_NETWORK_DRAIN_SETTLE_DELAY=500ms
 
 # FRR prefix-list to manage dynamically. The agent adds/removes
 # "permit <network> ge 32 le 32" entries for each discovered provider network.
