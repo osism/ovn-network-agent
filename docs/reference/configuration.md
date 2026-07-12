@@ -20,6 +20,7 @@ regenerate this page with `go generate ./...`.
 |------|---------|------------|---------|-------------|
 | `--config` | `OVN_NETWORK_CONFIG` | — |  | Path to YAML config file |
 | `--version` | — | — | `false` | Print version and exit |
+| `--check-config` | — | — | `false` | Validate configuration and exit (exit code 0 = valid, 1 = invalid) |
 | `--ovn-sb-remote` | `OVN_NETWORK_OVN_SB_REMOTE` | `ovn_sb_remote` |  | OVN Southbound DB remote, comma-separated for cluster |
 | `--ovn-nb-remote` | `OVN_NETWORK_OVN_NB_REMOTE` | `ovn_nb_remote` |  | OVN Northbound DB remote, comma-separated for cluster |
 | `--bridge-dev` | `OVN_NETWORK_BRIDGE_DEV` | `bridge_dev` | `br-ex` | Provider bridge device for kernel routes |

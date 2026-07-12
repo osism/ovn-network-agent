@@ -554,6 +554,28 @@ func TestLoadConfigDryRunDefault(t *testing.T) {
 	}
 }
 
+func TestLoadConfigCheckConfigFlag(t *testing.T) {
+	t.Run("set", func(t *testing.T) {
+		cfg, err := loadConfig(fullModeArgs("--check-config"))
+		if err != nil {
+			t.Fatalf("loadConfig() error: %v", err)
+		}
+		if !cfg.CheckConfig {
+			t.Error("CheckConfig should be true when --check-config is set")
+		}
+	})
+
+	t.Run("default", func(t *testing.T) {
+		cfg, err := loadConfig(fullModeArgs())
+		if err != nil {
+			t.Fatalf("loadConfig() error: %v", err)
+		}
+		if cfg.CheckConfig {
+			t.Error("CheckConfig should be false by default")
+		}
+	})
+}
+
 func TestApplyEnvConfigDryRun(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_DRY_RUN", "true")

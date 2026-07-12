@@ -28,6 +28,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --check-config: the configuration parsed and validated above; report
+	// success and exit without running the agent. Invalid configs already
+	// exited 1 via the error path above.
+	if cfg.CheckConfig {
+		fmt.Println("configuration OK")
+		return
+	}
+
 	setupLogging(cfg.LogLevel)
 
 	// The OVN-vs-port-forward-only decision is made in config validation

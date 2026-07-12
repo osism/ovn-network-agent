@@ -113,6 +113,38 @@ Switching modes at runtime is not supported — it requires a restart.
   DNAT).
 - **Permissions**: root or `CAP_NET_ADMIN` for netlink route manipulation.
 
+## Validate a configuration
+
+Use `--check-config` to parse and validate the full configuration and exit,
+without connecting to OVN or touching system state. This is the pre-restart
+gate for upgrade automation: run it before restarting a live gateway node so
+a bad config is caught before it can disrupt the agent.
+
+```bash
+ovn-network-agent --check-config --config /etc/ovn-network-agent/config.yaml
+```
+
+The exit code is the contract:
+
+- `0` — the configuration is valid; the command prints `configuration OK`.
+- `1` — the configuration is invalid; the command logs a `configuration
+  error` naming the offending setting.
+
+`--check-config` applies the same layering (CLI flags, environment variables,
+config file) and the same validation the agent runs at startup, so it
+exercises the exact configuration the agent would load.
+
+The agent fails fast on bad input rather than starting with a surprising
+effective value:
+
+- An unparsable or out-of-range value — an unparsable duration or integer, or
+  a non-positive `reconcile_interval` — is a startup error naming the setting,
+  on the flag, environment-variable, and config-file paths alike.
+- An unknown config-file key (for example a typo like `drain_on_shutdow`) is
+  logged as a warning naming the key and then ignored — the key is accepted so
+  a newer config stays forward-compatible with an older agent, but the typo is
+  no longer silent.
+
 ## Where to go next
 
 - [Configuration reference](../reference/configuration) — every setting in one
