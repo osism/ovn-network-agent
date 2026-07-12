@@ -63,6 +63,12 @@
 # Usage:
 #   ./test/e2e/bootstrap.sh                    # against the default `ovn-e2e` lab
 #   LAB_NAME=other ./test/e2e/bootstrap.sh     # override the containerlab lab name
+#
+# When a readiness gate times out, the awaited daemon's own output and
+# surrounding state are dumped to stderr (the job log) so the failure
+# can be root-caused from the collected artifacts. The upstream bgpd
+# start honours:
+#   BGPD_WAIT_SECS=30      # readiness wait per start attempt, seconds
 
 set -euo pipefail
 
@@ -110,6 +116,11 @@ UNDERLAY_LINKS=(
 BGP_ASN_GATEWAYS="${BGP_ASN_GATEWAYS:-65000}"
 BGP_ASN_UPSTREAM="${BGP_ASN_UPSTREAM:-65001}"
 BGP_ROUTER_ID_UPSTREAM="${BGP_ROUTER_ID_UPSTREAM:-100.64.0.1}"
+
+# Upstream bgpd start budget. The daemon is started in-place (see
+# configure_upstream_frr) and polled for readiness; BGPD_WAIT_SECS is
+# the readiness wait per start attempt.
+BGPD_WAIT_SECS="${BGPD_WAIT_SECS:-30}"
 
 CLIENT_NAME="${CLIENT_NAME:-client-1}"
 CLIENT_NODE="clab-${LAB_NAME}-${CLIENT_NAME}"
@@ -161,6 +172,11 @@ wait_for_nb() {
         sleep 1
     done
     echo "OVN NB at ${OVN_CENTRAL} did not become reachable within 60s" >&2
+    # One final probe with stderr passed through so the actual
+    # connection error reaches the job log, plus the central container's
+    # stdout (northd/ovsdb daemon output — see central-entrypoint.sh).
+    nbctl --timeout=2 show 1>&2 || true
+    docker logs --tail 50 "${OVN_CENTRAL}" >&2 || true
     exit 1
 }
 
@@ -194,6 +210,18 @@ wait_for_chassis() {
     done
     echo "SB chassis registration timed out; missing:${missing:-<unknown>}" >&2
     docker exec "${OVN_CENTRAL}" ovn-sbctl list Chassis >&2 || true
+    # For each still-missing gateway, dump the daemon whose registration
+    # we were waiting on (ovn-controller logs to a file, not stdout) plus
+    # the container's entrypoint output, which catches a container that
+    # died before ovn-controller even started.
+    # shellcheck disable=SC2086  # ${missing} is a space-separated name list
+    for name in ${missing}; do
+        log "--- ${name}: ovn-controller.log ---"
+        docker exec "clab-${LAB_NAME}-${name}" \
+            tail -n 50 /var/log/ovn/ovn-controller.log >&2 || true
+        log "--- ${name}: docker logs ---"
+        docker logs --tail 30 "clab-${LAB_NAME}-${name}" >&2 || true
+    done
     exit 1
 }
 
@@ -334,6 +362,27 @@ configure_upstream() {
     "
 }
 
+# Dump the upstream container's FRR daemon state to stderr (the job
+# log) so a bgpd bring-up failure can be root-caused after the fact. The
+# upstream image is unpinned (frrouting/frr:latest), so every command is
+# individually best-effort and drawn from an independent source: a
+# future image change degrades one section, not the whole report.
+dump_upstream_frr_state() {
+    log "dumping ${UPSTREAM_NODE} FRR state for triage"
+    log "--- /etc/frr/daemons ---"
+    docker exec "${UPSTREAM_NODE}" cat /etc/frr/daemons >&2 || true
+    log "--- vtysh show daemons ---"
+    docker exec "${UPSTREAM_NODE}" vtysh -c "show daemons" >&2 || true
+    log "--- vtysh show version ---"
+    docker exec "${UPSTREAM_NODE}" vtysh -c "show version" >&2 || true
+    log "--- process list ---"
+    docker exec "${UPSTREAM_NODE}" ps >&2 || true
+    log "--- tail /var/log/frr/* ---"
+    docker exec "${UPSTREAM_NODE}" sh -c 'tail -n 100 /var/log/frr/* 2>/dev/null' >&2 || true
+    log "--- docker logs (watchfrr / PID 1) ---"
+    docker logs --tail 100 "${UPSTREAM_NODE}" >&2 || true
+}
+
 configure_upstream_frr() {
     log "configuring ${UPSTREAM_NODE} FRR (BGP to each gateway)"
     # bgpd ships disabled (bgpd=no) in the frrouting/frr image. Restart
@@ -343,22 +392,41 @@ configure_upstream_frr() {
     # before this script gets to the vtysh call. Start bgpd in-place
     # instead, and keep the daemons file in sync so a future restart
     # would honour it.
-    docker exec "${UPSTREAM_NODE}" sh -ec '
-        if grep -q "^bgpd=no" /etc/frr/daemons 2>/dev/null; then
-            sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
-        fi
-        if ! pgrep -x bgpd >/dev/null; then
-            /usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr || true
-        fi
-        for _ in $(seq 1 30); do
-            if vtysh -c "show daemons" 2>/dev/null | grep -qw bgpd; then
-                exit 0
-            fi
-            sleep 1
-        done
-        echo "bgpd did not come up on $(hostname)" >&2
+    #
+    # BGPD_WAIT_SECS is passed in via `docker exec --env` (the
+    # ensure_workload_netns pattern) so the script body stays
+    # single-quoted; the start output is captured and surfaced to the
+    # job log instead of discarded, so a failed start names its cause.
+    if ! docker exec -i --env "BGPD_WAIT_SECS=${BGPD_WAIT_SECS}" \
+            "${UPSTREAM_NODE}" sh -eu <<'EOSH'; then
+if grep -q "^bgpd=no" /etc/frr/daemons 2>/dev/null; then
+    sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
+fi
+start_out=""
+if ! pgrep -x bgpd >/dev/null; then
+    if start_out=$(/usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr 2>&1); then
+        :
+    else
+        rc=$?
+        printf 'bgpd start exited %s: %s\n' "${rc}" "${start_out}" >&2
+    fi
+fi
+for _ in $(seq 1 "${BGPD_WAIT_SECS}"); do
+    if vtysh -c "show daemons" 2>/dev/null | grep -qw bgpd; then
+        exit 0
+    fi
+    sleep 1
+done
+echo "bgpd did not come up on $(hostname) within ${BGPD_WAIT_SECS}s" >&2
+if [ -n "${start_out}" ]; then
+    printf 'last bgpd start output: %s\n' "${start_out}" >&2
+fi
+exit 1
+EOSH
+        dump_upstream_frr_state
+        echo "bgpd did not come up on ${UPSTREAM_NODE}" >&2
         exit 1
-    '
+    fi
     # Push BGP config in one vtysh transaction. Build the script with
     # literal newlines — earlier this used $(printf '…\n…') chained with
     # ${var}$(...) concatenation, but command substitution strips
