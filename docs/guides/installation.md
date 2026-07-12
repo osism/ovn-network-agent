@@ -25,6 +25,16 @@ The package installs:
 - `/etc/default/ovn-network-agent` — environment defaults (preserved on upgrade)
 - `/etc/ovn-network-agent/config.yaml.sample` — sample configuration
 
+The package **recommends** `frr` rather than depending on it. `apt`
+installs recommended packages by default; pass `--no-install-recommends`
+where FRR runs outside the host package manager (for example
+containerized), in which case the agent needs a `vtysh` reachable on
+`PATH` to announce BGP routes — it logs a startup warning when `vtysh` is
+missing, so a host left without FRR is not mistaken for a healthy one.
+Upgrading an installed package does **not** restart the running service by
+default — see [Upgrade the agent](./upgrade) for the one-node-at-a-time
+procedure.
+
 After installation, create your configuration and start the service:
 
 ```bash

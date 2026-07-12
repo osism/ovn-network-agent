@@ -2,8 +2,15 @@
 Description=OVN Network Agent — Real-time Floating IP route synchronization via OVN
 Documentation=https://github.com/osism/ovn-network-agent
 
-# Hard dependencies — agent cannot function without these
-Requires=frr.service
+# FRR is a soft dependency, intentionally Wants= rather than Requires=.
+# Requires= propagates FRR's stop to the agent, so every FRR package
+# upgrade or restart would drain this node and fail its gateways over —
+# needless churn. The agent degrades gracefully when vtysh is
+# unavailable (route writes are logged and retried on the next reconcile,
+# default 60s) and FRR may run outside the host package manager entirely
+# (e.g. containerized), where no frr.service unit exists. Wants= keeps the
+# ordering below without coupling the agent's lifecycle to FRR's.
+Wants=frr.service
 After=frr.service
 
 # Soft dependencies — agent needs these but they may be provided by
