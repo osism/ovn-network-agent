@@ -56,7 +56,7 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 #OVN_NETWORK_LOG_LEVEL=info
 
 # Dry-run mode: connect and reconcile but only log what would be done.
-# Accepts "1" / "true" to enable.
+# Accepts "1"/"true" to enable, "0"/"false" to disable.
 #OVN_NETWORK_DRY_RUN=false
 
 # Remove all managed routes on shutdown (default: true)
@@ -126,5 +126,5 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # Enable udp/tcp_l3mdev_accept sysctl. Required when a DNAT backend runs on
 # the same host but in a different VRF than the VIP. This is a global sysctl
 # that affects ALL sockets — only enable when needed.
-# Accepts "1" / "true" to enable.
+# Accepts "1"/"true" to enable, "0"/"false" to disable.
 #OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT=false

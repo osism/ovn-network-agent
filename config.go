@@ -797,16 +797,26 @@ func applyEnvConfig(cfg *Config) error {
 	if v := os.Getenv("OVN_NETWORK_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
 	}
-	if v := os.Getenv("OVN_NETWORK_DRY_RUN"); v == "1" || v == "true" {
-		cfg.DryRun = true
+	if v := os.Getenv("OVN_NETWORK_DRY_RUN"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_DRY_RUN %q: %w", v, err)
+		}
+		cfg.DryRun = b
 	}
-	if v := os.Getenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN"); v == "0" || v == "false" {
-		cfg.CleanupOnShutdown = false
+	if v := os.Getenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_CLEANUP_ON_SHUTDOWN %q: %w", v, err)
+		}
+		cfg.CleanupOnShutdown = b
 	}
-	if v := os.Getenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN"); v == "0" || v == "false" {
-		cfg.DrainOnShutdown = false
-	} else if v == "1" || v == "true" {
-		cfg.DrainOnShutdown = true
+	if v := os.Getenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_DRAIN_ON_SHUTDOWN %q: %w", v, err)
+		}
+		cfg.DrainOnShutdown = b
 	}
 	if v := os.Getenv("OVN_NETWORK_DRAIN_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -835,8 +845,12 @@ func applyEnvConfig(cfg *Config) error {
 	if v := os.Getenv("OVN_NETWORK_METRICS_LISTEN"); v != "" {
 		cfg.MetricsListen = v
 	}
-	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_ENABLED"); v == "0" || v == "false" {
-		cfg.VethLeakEnabled = false
+	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_VETH_LEAK_ENABLED %q: %w", v, err)
+		}
+		cfg.VethLeakEnabled = b
 	}
 	if v := os.Getenv("OVN_NETWORK_VETH_PROVIDER_IP"); v != "" {
 		cfg.VethProviderIP = v
@@ -865,8 +879,12 @@ func applyEnvConfig(cfg *Config) error {
 		}
 		cfg.PortForwardTableID = id
 	}
-	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"); v == "1" || v == "true" {
-		cfg.PortForwardL3mdevAccept = true
+	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT %q: %w", v, err)
+		}
+		cfg.PortForwardL3mdevAccept = b
 	}
 	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_CT_ZONE"); v != "" {
 		zone, err := strconv.Atoi(v)
