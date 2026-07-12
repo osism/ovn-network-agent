@@ -14,6 +14,7 @@ Full documentation is published at
 - [Tutorial — first agent on a test host](https://osism.github.io/ovn-network-agent/tutorials/first-agent)
 - How-to guides:
   - [Install the agent](https://osism.github.io/ovn-network-agent/guides/installation)
+  - [Upgrade the agent](https://osism.github.io/ovn-network-agent/guides/upgrade)
   - [Configure the agent](https://osism.github.io/ovn-network-agent/guides/configuration)
   - [Create a gatewayless provider network](https://osism.github.io/ovn-network-agent/guides/gatewayless-provider-network)
   - [Set up port forwarding (DNAT)](https://osism.github.io/ovn-network-agent/guides/port-forwarding)
