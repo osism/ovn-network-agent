@@ -117,6 +117,19 @@ containers, which is what containerlab requires.
 waits for OVN NB to become reachable from the host, then provisions
 the lab in three layers, described below.
 
+Bring-up gates on three readiness waits: OVN NB reachability, SB
+chassis registration for every gateway, and the upstream `bgpd`. The
+`bgpd` start — the one daemon bootstrap starts itself — is retried up
+to `BGPD_START_ATTEMPTS` (default `3`) times, each attempt waiting
+`BGPD_WAIT_SECS` (default `30` s) for the daemon to register, so a
+one-off startup hiccup heals itself instead of failing the job. When
+any gate times out, the awaited daemon's own output and surrounding
+state are dumped into the job log (and, for a CI run, the collected
+artifacts — see [Triaging a failed run](#triaging-a-failed-run)) so
+the failure can be root-caused after the fact. The mid-run lab recycle
+in `drain-hitless` re-runs the same gates, so it inherits the same
+diagnostics and retries.
+
 ### NB DB
 
 - tenant logical switch `ls0` (`192.168.10.0/24`),
@@ -905,8 +918,15 @@ writes:
   ovn/sb-<table>.txt               — full SB row dumps (Chassis, Port_Binding, …)
   frr/<gateway>-running-config.txt — `vtysh -c "show running-config"`
   frr/<gateway>-bgp-summary.txt    — `vtysh -c "show bgp summary"`
+  frr/upstream-running-config.txt  — upstream `vtysh -c "show running-config"`
+  frr/upstream-show-daemons.txt    — upstream `vtysh -c "show daemons"`
+  frr/upstream-bgp-summary.txt     — upstream `vtysh -c "show bgp summary"`
+  frr/upstream-daemons-file.txt    — upstream `/etc/frr/daemons`
+  frr/upstream-processes.txt       — upstream process list (`ps`)
+  frr/upstream-frr-log.txt         — upstream `/var/log/frr/*` tail
   kernel/<gateway>-ip-route.txt    — `ip route show table all`
   agent/<gateway>.log              — copy of the gateway container's stdout
+  ovn-controller/<gateway>.log     — gateway `ovn-controller` log (chassis-registration daemon)
   hairpin/hairpin-flows-before.txt — `cookie=0x998` flows on master:br-ex before adding FIP_B (hairpin only)
   hairpin/hairpin-flows-after.txt  — `cookie=0x998` flows on master:br-ex after adding FIP_B (hairpin only)
   pf-external/pf-backend.log       — per-connection source-IP log from the workload-side HTTP responder (pf-external only)
