@@ -55,7 +55,9 @@ install: build
 # Regenerate docs/reference/{configuration,cli,metrics}.md from the
 # canonical Go declarations in config.go and metrics.go. See
 # tools/docgen for the implementation. Run after touching either
-# file or the agent's flag/env/YAML surface.
+# file or the agent's flag/env/YAML surface. The generator also fails
+# if ovn-network-agent.default or ovn-network-agent.yaml.sample misses
+# an option the agent consumes.
 docs-gen:
 	go run ./tools/docgen
 
