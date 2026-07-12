@@ -10,7 +10,11 @@ vendor: OSISM GmbH
 homepage: https://github.com/osism/ovn-network-agent
 license: Apache-2.0
 
-depends:
+# Recommends, not Depends: FRR may run outside the host package manager
+# (e.g. containerized), and the agent degrades gracefully without it. It
+# only needs a vtysh on PATH to announce BGP routes. apt installs
+# Recommends by default; use --no-install-recommends to skip host FRR.
+recommends:
   - frr
 
 contents:

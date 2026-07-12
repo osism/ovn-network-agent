@@ -58,6 +58,32 @@ func TestIsNoSuchRoute(t *testing.T) {
 	}
 }
 
+func TestWarnIfVtyshMissing(t *testing.T) {
+	t.Run("warns at WARN level when vtysh is absent", func(t *testing.T) {
+		buf := captureSlog(t)
+		warnIfVtyshMissing(func(string) (string, error) {
+			return "", exec.ErrNotFound
+		})
+		out := buf.String()
+		if !strings.Contains(out, "vtysh not found on PATH") {
+			t.Fatalf("expected a warning about missing vtysh, got: %q", out)
+		}
+		if !strings.Contains(out, "level=WARN") {
+			t.Fatalf("expected the warning at WARN level, got: %q", out)
+		}
+	})
+
+	t.Run("silent when vtysh resolves", func(t *testing.T) {
+		buf := captureSlog(t)
+		warnIfVtyshMissing(func(name string) (string, error) {
+			return "/usr/bin/" + name, nil
+		})
+		if buf.Len() != 0 {
+			t.Fatalf("expected no output when vtysh resolves, got: %q", buf.String())
+		}
+	})
+}
+
 func TestNewRouteManager(t *testing.T) {
 	cfg := Config{
 		BridgeDev:   "br-ex",

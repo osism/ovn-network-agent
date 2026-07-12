@@ -85,6 +85,21 @@ func (rm *RouteManager) runVtysh(args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+// warnIfVtyshMissing logs a warning when vtysh cannot be resolved on PATH. The
+// agent announces Floating IP /32 routes to BGP through vtysh, but FRR is a
+// soft dependency (the unit Wants= it and the package Recommends it), so a host
+// installed with --no-install-recommends — or one that has lost FRR — keeps the
+// service "active" while every route announcement silently no-ops and is only
+// retried on the next reconcile. Emitting this at startup distinguishes a
+// missing-FRR host from one where FRR runs out-of-band by design, instead of
+// leaving the (unread) route-write-and-retry log as the only signal. lookPath
+// is exec.LookPath in production and is injected in tests.
+func warnIfVtyshMissing(lookPath func(string) (string, error)) {
+	if _, err := lookPath("vtysh"); err != nil {
+		slog.Warn("vtysh not found on PATH: BGP route announcements will be logged and retried but never applied until FRR is reachable; install FRR (the package Recommends it) or ensure vtysh is on PATH if FRR runs out-of-band", "error", err)
+	}
+}
+
 func NewRouteManager(cfg Config) *RouteManager {
 	rm := &RouteManager{
 		bridgeDev:               cfg.BridgeDev,

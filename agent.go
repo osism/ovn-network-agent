@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -109,6 +110,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	// specific. In port-forward-only mode the node need not have br-ex, so
 	// the bridge device, its link-local IP and proxy ARP are all skipped.
 	if !a.cfg.PortForwardOnly {
+		// Gateway mode announces Floating IP routes to BGP through vtysh, so
+		// warn once at startup if FRR is not reachable (see warnIfVtyshMissing).
+		// Port-forward-only mode never touches vtysh, so this is skipped there.
+		warnIfVtyshMissing(exec.LookPath)
+
 		// Verify that the bridge device exists and is up before proceeding.
 		if err := a.routing.CheckBridgeDevice(); err != nil {
 			return fmt.Errorf("bridge device check failed: %w", err)
