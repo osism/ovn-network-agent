@@ -120,10 +120,8 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # When set to a host:port, the agent serves Prometheus-formatted metrics on
 # /metrics (and a basic /healthz). Bind to 127.0.0.1 for node-local scraping
 # only; use 0.0.0.0 to expose to remote scrapers.
-# Exposed metrics include: reconcile_total, reconcile_duration_seconds,
-# desired_ips, route_readds_total, consecutive_readds, ovn_connection_state,
-# drain_duration_seconds, drain_total, stale_chassis_cleanup_total,
-# missing_chassis (all prefixed with ovn_network_agent_).
+# The full metric list is generated into the metrics reference:
+# https://osism.github.io/ovn-network-agent/reference/metrics
 # metrics_listen: "127.0.0.1:9273"
 
 # Veth VRF route leaking (replaces contrib/veth-vrf-leak.sh)
