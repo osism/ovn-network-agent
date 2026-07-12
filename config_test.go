@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,7 +172,9 @@ func TestStringOrSliceUnmarshalRejectsMappingInput(t *testing.T) {
 func TestApplyEnvConfigMultipleCIDRs(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_NETWORK_CIDR", "10.0.0.0/24,172.16.0.0/12")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 
 	if len(cfg.NetworkCIDRs) != 2 {
 		t.Fatalf("NetworkCIDRs length = %d, want 2", len(cfg.NetworkCIDRs))
@@ -197,7 +200,9 @@ func TestApplyFileConfig(t *testing.T) {
 		ReconcileInterval: "30s",
 	}
 
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 
 	if cfg.OVNSBRemote != "tcp:10.0.0.1:6642" {
 		t.Errorf("OVNSBRemote = %q, want %q", cfg.OVNSBRemote, "tcp:10.0.0.1:6642")
@@ -231,7 +236,9 @@ func TestApplyFileConfigEmptyFieldsNoOverride(t *testing.T) {
 
 	fc := configFile{} // All empty.
 
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 
 	if cfg.BridgeDev != "br-ex" {
 		t.Errorf("BridgeDev = %q, want %q (should not be overridden)", cfg.BridgeDev, "br-ex")
@@ -253,7 +260,9 @@ func TestApplyEnvConfig(t *testing.T) {
 	t.Setenv("OVN_NETWORK_NETWORK_CIDR", "10.0.0.0/24")
 	t.Setenv("OVN_NETWORK_GATEWAY_PORT", "cr-lrp-test")
 
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 
 	if cfg.OVNSBRemote != "tcp:10.0.0.99:6642" {
 		t.Errorf("OVNSBRemote = %q, want %q", cfg.OVNSBRemote, "tcp:10.0.0.99:6642")
@@ -277,16 +286,101 @@ func TestApplyEnvConfig(t *testing.T) {
 }
 
 func TestApplyEnvConfigInvalidDuration(t *testing.T) {
-	cfg := Config{
-		ReconcileInterval: 60 * time.Second,
+	cases := []struct {
+		env string
+	}{
+		{"OVN_NETWORK_RECONCILE_INTERVAL"},
+		{"OVN_NETWORK_DRAIN_TIMEOUT"},
+		{"OVN_NETWORK_DRAIN_SETTLE_DELAY"},
+		{"OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.env, func(t *testing.T) {
+			cfg := Config{}
+			t.Setenv(tc.env, "notaduration")
 
-	t.Setenv("OVN_NETWORK_RECONCILE_INTERVAL", "notaduration")
+			err := applyEnvConfig(&cfg)
+			if err == nil {
+				t.Fatalf("expected error for %s=notaduration", tc.env)
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error %q does not name %s", err, tc.env)
+			}
+		})
+	}
+}
 
-	applyEnvConfig(&cfg)
+func TestApplyEnvConfigInvalidInt(t *testing.T) {
+	cases := []struct {
+		env string
+	}{
+		{"OVN_NETWORK_ROUTE_TABLE_ID"},
+		{"OVN_NETWORK_VETH_LEAK_TABLE_ID"},
+		{"OVN_NETWORK_VETH_LEAK_RULE_PRIORITY"},
+		{"OVN_NETWORK_PORT_FORWARD_TABLE_ID"},
+		{"OVN_NETWORK_PORT_FORWARD_CT_ZONE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.env, func(t *testing.T) {
+			cfg := Config{}
+			t.Setenv(tc.env, "notanumber")
 
-	if cfg.ReconcileInterval != 60*time.Second {
-		t.Errorf("ReconcileInterval = %v, want %v (should not be overridden by invalid value)", cfg.ReconcileInterval, 60*time.Second)
+			err := applyEnvConfig(&cfg)
+			if err == nil {
+				t.Fatalf("expected error for %s=notanumber", tc.env)
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error %q does not name %s", err, tc.env)
+			}
+		})
+	}
+}
+
+func TestApplyFileConfigInvalidDurations(t *testing.T) {
+	cases := []struct {
+		name string
+		fc   configFile
+		key  string
+	}{
+		{"reconcile_interval", configFile{ReconcileInterval: "notaduration"}, "reconcile_interval"},
+		{"drain_timeout", configFile{DrainTimeout: "notaduration"}, "drain_timeout"},
+		{"drain_settle_delay", configFile{DrainSettleDelay: "notaduration"}, "drain_settle_delay"},
+		{"stale_chassis_grace_period", configFile{StaleChassisGracePeriod: "notaduration"}, "stale_chassis_grace_period"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{}
+			err := applyFileConfig(&cfg, &tc.fc)
+			if err == nil {
+				t.Fatalf("expected error for invalid %s", tc.key)
+			}
+			if !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("error %q does not name %s", err, tc.key)
+			}
+		})
+	}
+}
+
+func TestLoadConfigInvalidDurationFlags(t *testing.T) {
+	cases := []struct {
+		flag string
+	}{
+		{"--reconcile-interval"},
+		{"--drain-timeout"},
+		{"--drain-settle-delay"},
+		{"--stale-chassis-grace-period"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.flag, func(t *testing.T) {
+			_, err := loadConfig(fullModeArgs(tc.flag, "notaduration"))
+			if err == nil {
+				t.Fatalf("expected error for %s notaduration", tc.flag)
+			}
+			name := strings.TrimLeft(tc.flag, "-")
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("error %q does not name %s", err, name)
+			}
+		})
 	}
 }
 
@@ -397,7 +491,9 @@ func TestLoadConfigDryRunDefault(t *testing.T) {
 func TestApplyEnvConfigDryRun(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_DRY_RUN", "true")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if !cfg.DryRun {
 		t.Error("DryRun should be true when OVN_NETWORK_DRY_RUN=true")
 	}
@@ -407,7 +503,9 @@ func TestApplyFileConfigDryRun(t *testing.T) {
 	cfg := Config{}
 	dryRun := true
 	fc := configFile{DryRun: &dryRun}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if !cfg.DryRun {
 		t.Error("DryRun should be true when set in config file")
 	}
@@ -436,7 +534,9 @@ func TestLoadConfigCleanupOnShutdownDisabledViaCLI(t *testing.T) {
 func TestApplyEnvConfigCleanupOnShutdownFalse(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
 	t.Setenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "false")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.CleanupOnShutdown {
 		t.Error("CleanupOnShutdown should be false when OVN_NETWORK_CLEANUP_ON_SHUTDOWN=false")
 	}
@@ -445,7 +545,9 @@ func TestApplyEnvConfigCleanupOnShutdownFalse(t *testing.T) {
 func TestApplyEnvConfigDrainOnShutdownFalse(t *testing.T) {
 	cfg := Config{DrainOnShutdown: true}
 	t.Setenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN", "false")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.DrainOnShutdown {
 		t.Error("DrainOnShutdown should be false when OVN_NETWORK_DRAIN_ON_SHUTDOWN=false")
 	}
@@ -454,7 +556,9 @@ func TestApplyEnvConfigDrainOnShutdownFalse(t *testing.T) {
 func TestApplyEnvConfigDrainOnShutdownTrue(t *testing.T) {
 	cfg := Config{DrainOnShutdown: false}
 	t.Setenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN", "true")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if !cfg.DrainOnShutdown {
 		t.Error("DrainOnShutdown should be true when OVN_NETWORK_DRAIN_ON_SHUTDOWN=true")
 	}
@@ -463,7 +567,9 @@ func TestApplyEnvConfigDrainOnShutdownTrue(t *testing.T) {
 func TestApplyEnvConfigDrainOnShutdownOne(t *testing.T) {
 	cfg := Config{DrainOnShutdown: false}
 	t.Setenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN", "1")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if !cfg.DrainOnShutdown {
 		t.Error("DrainOnShutdown should be true when OVN_NETWORK_DRAIN_ON_SHUTDOWN=1")
 	}
@@ -472,7 +578,9 @@ func TestApplyEnvConfigDrainOnShutdownOne(t *testing.T) {
 func TestApplyEnvConfigCleanupOnShutdownZero(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
 	t.Setenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "0")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.CleanupOnShutdown {
 		t.Error("CleanupOnShutdown should be false when OVN_NETWORK_CLEANUP_ON_SHUTDOWN=0")
 	}
@@ -482,7 +590,9 @@ func TestApplyFileConfigCleanupOnShutdown(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
 	cleanup := false
 	fc := configFile{CleanupOnShutdown: &cleanup}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.CleanupOnShutdown {
 		t.Error("CleanupOnShutdown should be false when set to false in config file")
 	}
@@ -491,7 +601,9 @@ func TestApplyFileConfigCleanupOnShutdown(t *testing.T) {
 func TestApplyFileConfigCleanupOnShutdownNil(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
 	fc := configFile{} // CleanupOnShutdown is nil
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if !cfg.CleanupOnShutdown {
 		t.Error("CleanupOnShutdown should remain true when not set in config file")
 	}
@@ -714,7 +826,9 @@ func TestLoadConfigRouteTableIDInvalid(t *testing.T) {
 func TestApplyEnvConfigRouteTableID(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_ROUTE_TABLE_ID", "42")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 
 	if cfg.RouteTableID != 42 {
 		t.Errorf("RouteTableID = %d, want 42", cfg.RouteTableID)
@@ -846,7 +960,9 @@ func TestApplyEnvConfigVethLeak(t *testing.T) {
 	t.Setenv("OVN_NETWORK_VETH_PROVIDER_IP", "169.254.0.5")
 	t.Setenv("OVN_NETWORK_VETH_LEAK_TABLE_ID", "201")
 	t.Setenv("OVN_NETWORK_VETH_LEAK_RULE_PRIORITY", "3000")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 
 	if cfg.VethLeakEnabled {
 		t.Error("VethLeakEnabled should be false")
@@ -873,7 +989,9 @@ func TestApplyFileConfigVethLeak(t *testing.T) {
 		VethLeakTableID:      &tableID,
 		VethLeakRulePriority: &prio,
 	}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 
 	if cfg.VethLeakEnabled {
 		t.Error("VethLeakEnabled should be false")
@@ -972,7 +1090,9 @@ func TestLoadConfigStaleChassisGracePeriodDisabled(t *testing.T) {
 func TestApplyEnvConfigStaleChassisGracePeriod(t *testing.T) {
 	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
 	t.Setenv("OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD", "3m")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.StaleChassisGracePeriod != 3*time.Minute {
 		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 3*time.Minute)
 	}
@@ -981,7 +1101,9 @@ func TestApplyEnvConfigStaleChassisGracePeriod(t *testing.T) {
 func TestApplyFileConfigStaleChassisGracePeriod(t *testing.T) {
 	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
 	fc := configFile{StaleChassisGracePeriod: "2m"}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.StaleChassisGracePeriod != 2*time.Minute {
 		t.Errorf("StaleChassisGracePeriod = %v, want %v", cfg.StaleChassisGracePeriod, 2*time.Minute)
 	}
@@ -990,7 +1112,9 @@ func TestApplyFileConfigStaleChassisGracePeriod(t *testing.T) {
 func TestApplyFileConfigStaleChassisGracePeriodEmpty(t *testing.T) {
 	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
 	fc := configFile{}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.StaleChassisGracePeriod != 5*time.Minute {
 		t.Errorf("StaleChassisGracePeriod = %v, want %v (should keep default)", cfg.StaleChassisGracePeriod, 5*time.Minute)
 	}
@@ -1063,7 +1187,9 @@ func TestLoadConfigDrainSettleDelayDisabled(t *testing.T) {
 func TestApplyEnvConfigDrainSettleDelay(t *testing.T) {
 	cfg := Config{DrainSettleDelay: 3 * time.Second}
 	t.Setenv("OVN_NETWORK_DRAIN_SETTLE_DELAY", "5s")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.DrainSettleDelay != 5*time.Second {
 		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 5*time.Second)
 	}
@@ -1072,7 +1198,9 @@ func TestApplyEnvConfigDrainSettleDelay(t *testing.T) {
 func TestApplyFileConfigDrainSettleDelay(t *testing.T) {
 	cfg := Config{DrainSettleDelay: 3 * time.Second}
 	fc := configFile{DrainSettleDelay: "10s"}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.DrainSettleDelay != 10*time.Second {
 		t.Errorf("DrainSettleDelay = %v, want %v", cfg.DrainSettleDelay, 10*time.Second)
 	}
@@ -1081,7 +1209,9 @@ func TestApplyFileConfigDrainSettleDelay(t *testing.T) {
 func TestApplyFileConfigDrainSettleDelayEmpty(t *testing.T) {
 	cfg := Config{DrainSettleDelay: 3 * time.Second}
 	fc := configFile{}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.DrainSettleDelay != 3*time.Second {
 		t.Errorf("DrainSettleDelay = %v, want %v (should keep default)", cfg.DrainSettleDelay, 3*time.Second)
 	}
@@ -1124,7 +1254,9 @@ func TestValidateConfigDrainSettleDelayNegative(t *testing.T) {
 func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_FRR_PREFIX_LIST", "MY-LIST")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.FRRPrefixList != "MY-LIST" {
 		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "MY-LIST")
 	}
@@ -1133,7 +1265,9 @@ func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
 func TestApplyFileConfigFRRPrefixList(t *testing.T) {
 	cfg := Config{}
 	fc := configFile{FRRPrefixList: "FILE-LIST"}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.FRRPrefixList != "FILE-LIST" {
 		t.Errorf("FRRPrefixList = %q, want %q", cfg.FRRPrefixList, "FILE-LIST")
 	}
@@ -1390,7 +1524,9 @@ func TestApplyEnvConfigPortForward(t *testing.T) {
 	t.Setenv("OVN_NETWORK_PORT_FORWARD_DEV", "loopback1")
 	t.Setenv("OVN_NETWORK_PORT_FORWARD_TABLE_ID", "202")
 
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 
 	if cfg.PortForwardDev != "loopback1" {
 		t.Errorf("PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
@@ -1433,7 +1569,9 @@ func TestApplyFileConfigPortForward(t *testing.T) {
 		},
 	}
 
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 
 	if cfg.PortForwardDev != "loopback1" {
 		t.Errorf("PortForwardDev = %q, want %q", cfg.PortForwardDev, "loopback1")
@@ -1453,7 +1591,9 @@ func TestApplyFileConfigPortForwardEmpty(t *testing.T) {
 	}
 	fc := configFile{} // no port forward fields set
 
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 
 	if cfg.PortForwardDev != "loopback1" {
 		t.Errorf("PortForwardDev should remain %q, got %q", "loopback1", cfg.PortForwardDev)
@@ -1715,7 +1855,9 @@ func TestLoadConfigMetricsListenViaCLI(t *testing.T) {
 func TestApplyEnvConfigMetricsListen(t *testing.T) {
 	cfg := Config{}
 	t.Setenv("OVN_NETWORK_METRICS_LISTEN", "0.0.0.0:9273")
-	applyEnvConfig(&cfg)
+	if err := applyEnvConfig(&cfg); err != nil {
+		t.Fatalf("applyEnvConfig: %v", err)
+	}
 	if cfg.MetricsListen != "0.0.0.0:9273" {
 		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, "0.0.0.0:9273")
 	}
@@ -1725,7 +1867,9 @@ func TestApplyFileConfigMetricsListen(t *testing.T) {
 	cfg := Config{}
 	listen := "127.0.0.1:9273"
 	fc := configFile{MetricsListen: listen}
-	applyFileConfig(&cfg, &fc)
+	if err := applyFileConfig(&cfg, &fc); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
 	if cfg.MetricsListen != listen {
 		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, listen)
 	}

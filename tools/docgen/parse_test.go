@@ -25,6 +25,7 @@ const configFixture = `package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"time"
 )
@@ -64,16 +65,23 @@ func loadConfig(args []string) (Config, error) {
 		BridgeDev:         "br-ex",
 		ReconcileInterval: 60 * time.Second,
 	}
+	var flagErr error
 	fs.Visit(func(f *flag.Flag) {
+		if flagErr != nil {
+			return
+		}
 		switch f.Name {
 		case "bridge-dev":
 			cfg.BridgeDev = *fBridge
 		case "route-table-id":
 			cfg.RouteTableID = *fTableID
 		case "reconcile-interval":
-			if d, err := time.ParseDuration(*fInterval); err == nil {
-				cfg.ReconcileInterval = d
+			d, err := time.ParseDuration(*fInterval)
+			if err != nil {
+				flagErr = fmt.Errorf("invalid -reconcile-interval %q: %w", *fInterval, err)
+				return
 			}
+			cfg.ReconcileInterval = d
 		case "dry-run":
 			cfg.DryRun = *fDryRun
 		case "ovn-sb-remote":
@@ -83,7 +91,7 @@ func loadConfig(args []string) (Config, error) {
 	return cfg, nil
 }
 
-func applyFileConfig(cfg *Config, fc *configFile) {
+func applyFileConfig(cfg *Config, fc *configFile) error {
 	if fc.BridgeDev != "" {
 		cfg.BridgeDev = fc.BridgeDev
 	}
@@ -91,9 +99,11 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 		cfg.RouteTableID = *fc.RouteTableID
 	}
 	if fc.ReconcileInterval != "" {
-		if d, err := time.ParseDuration(fc.ReconcileInterval); err == nil {
-			cfg.ReconcileInterval = d
+		d, err := time.ParseDuration(fc.ReconcileInterval)
+		if err != nil {
+			return fmt.Errorf("invalid reconcile_interval %q: %w", fc.ReconcileInterval, err)
 		}
+		cfg.ReconcileInterval = d
 	}
 	if fc.DryRun != nil {
 		cfg.DryRun = *fc.DryRun
@@ -101,9 +111,10 @@ func applyFileConfig(cfg *Config, fc *configFile) {
 	if fc.OVNSBRemote != "" {
 		cfg.OVNSBRemote = fc.OVNSBRemote
 	}
+	return nil
 }
 
-func applyEnvConfig(cfg *Config) {
+func applyEnvConfig(cfg *Config) error {
 	if v := os.Getenv("OVN_NETWORK_BRIDGE_DEV"); v != "" {
 		cfg.BridgeDev = v
 	}
@@ -111,10 +122,13 @@ func applyEnvConfig(cfg *Config) {
 		cfg.OVNSBRemote = v
 	}
 	if v := os.Getenv("OVN_NETWORK_RECONCILE_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.ReconcileInterval = d
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid OVN_NETWORK_RECONCILE_INTERVAL %q: %w", v, err)
 		}
+		cfg.ReconcileInterval = d
 	}
+	return nil
 }
 `
 
