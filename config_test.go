@@ -95,6 +95,72 @@ func TestReadConfigFileInvalidYAML(t *testing.T) {
 	}
 }
 
+func TestLoadConfigWarnsOnUnknownFileKey(t *testing.T) {
+	t.Run("typo warns but is accepted", func(t *testing.T) {
+		buf := captureSlog(t)
+		// "drain_on_shutdow" is a typo of "drain_on_shutdown"; the
+		// unknown key must be flagged, and the default (true) applied.
+		content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+veth_leak_enabled: false
+drain_on_shutdow: false
+`
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+
+		cfg, err := loadConfig([]string{"--config", path})
+		if err != nil {
+			t.Fatalf("loadConfig() error: %v", err)
+		}
+		if !cfg.DrainOnShutdown {
+			t.Error("DrainOnShutdown should keep its default (true) when the key is a typo")
+		}
+		if !strings.Contains(buf.String(), "drain_on_shutdow") {
+			t.Errorf("expected a warning naming drain_on_shutdow, got: %q", buf.String())
+		}
+	})
+
+	t.Run("valid file produces no unknown-key warning", func(t *testing.T) {
+		buf := captureSlog(t)
+		content := `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+veth_leak_enabled: false
+drain_on_shutdown: false
+`
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+		if _, err := loadConfig([]string{"--config", path}); err != nil {
+			t.Fatalf("loadConfig() error: %v", err)
+		}
+		if strings.Contains(buf.String(), "unknown keys") {
+			t.Errorf("unexpected unknown-key warning for a valid file: %q", buf.String())
+		}
+	})
+
+	t.Run("comment-only file produces no unknown-key warning", func(t *testing.T) {
+		buf := captureSlog(t)
+		// Only comments and blank lines: the strict probe decode returns
+		// io.EOF, which must not be mistaken for an unknown key.
+		content := "# just a comment\n\n"
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+		if _, err := readConfigFile(path); err != nil {
+			t.Fatalf("readConfigFile() error: %v", err)
+		}
+		if strings.Contains(buf.String(), "unknown keys") {
+			t.Errorf("unexpected unknown-key warning for a comment-only file: %q", buf.String())
+		}
+	})
+}
+
 func TestReadConfigFileNetworkCIDRList(t *testing.T) {
 	content := `
 ovn_sb_remote: "tcp:10.0.0.1:6642"
