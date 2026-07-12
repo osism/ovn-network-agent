@@ -10,6 +10,8 @@
 #   <out>/ovn/{nb,sb}-<table>.txt           — `ovn-nbctl list`/`ovn-sbctl list` dumps
 #   <out>/frr/<gateway>-running-config.txt  — FRR `show running-config`
 #   <out>/frr/<gateway>-bgp-summary.txt     — `show bgp summary`
+#   <out>/frr/upstream-*.txt                — upstream FRR daemon + BGP state
+#   <out>/ovn-controller/<gateway>.log      — gateway ovn-controller log (chassis-registration daemon)
 #   <out>/agent/<gateway>.log               — `docker logs` of the gateway (agent runs in foreground)
 #
 # Best-effort: every command is allowed to fail individually so a single
@@ -122,6 +124,20 @@ collect_frr() {
     done
     capture "${OUT_DIR}/frr/upstream-running-config.txt" \
         exec_in "${UPSTREAM}" vtysh -c "show running-config"
+    # The upstream bgpd start is the one daemon bring-up performs itself
+    # (see bootstrap.sh:configure_upstream_frr); capture the same state
+    # its failure path dumps into the job log so a bring-up flake can be
+    # root-caused from the artifact bundle alone.
+    capture "${OUT_DIR}/frr/upstream-show-daemons.txt" \
+        exec_in "${UPSTREAM}" vtysh -c "show daemons"
+    capture "${OUT_DIR}/frr/upstream-bgp-summary.txt" \
+        exec_in "${UPSTREAM}" vtysh -c "show bgp summary"
+    capture "${OUT_DIR}/frr/upstream-daemons-file.txt" \
+        exec_in "${UPSTREAM}" cat /etc/frr/daemons
+    capture "${OUT_DIR}/frr/upstream-processes.txt" \
+        exec_in "${UPSTREAM}" ps
+    capture "${OUT_DIR}/frr/upstream-frr-log.txt" \
+        exec_in "${UPSTREAM}" sh -c 'tail -n 200 /var/log/frr/* 2>/dev/null'
 }
 
 collect_kernel() {
@@ -146,6 +162,18 @@ collect_agent_logs() {
     done
 }
 
+# The SB chassis-registration gate waits for each gateway's
+# ovn-controller to register. ovn-controller logs to a file rather than
+# the container's stdout (which the entrypoint reserves for the agent),
+# so `docker logs` does not carry it — pull the log file explicitly.
+collect_ovn_controller_logs() {
+    log "ovn-controller logs from each gateway"
+    for gw in "${GATEWAYS[@]}"; do
+        capture "${OUT_DIR}/ovn-controller/${gw}.log" \
+            exec_in "${gw}" cat /var/log/ovn/ovn-controller.log
+    done
+}
+
 main() {
     log "writing artifacts to ${OUT_DIR}"
     collect_inspect
@@ -155,6 +183,7 @@ main() {
     collect_frr
     collect_kernel
     collect_agent_logs
+    collect_ovn_controller_logs
     log "done"
 }
 
