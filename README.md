@@ -74,6 +74,11 @@ original prototype. The built-in veth VRF leak functionality
 (`--veth-leak-enabled`) replaces the standalone script
 [`veth-vrf-leak.sh`](./contrib/veth-vrf-leak.sh).
 
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development setup, commit
+conventions, generated-docs workflow, and the test tiers.
+
 ## Security
 
 To report a security vulnerability, please follow the private disclosure

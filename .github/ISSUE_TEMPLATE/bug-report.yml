@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a problem with ovn-network-agent
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: A clear description of the problem, including the impact.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Agent version
+      description: Output of `ovn-network-agent --version` (or the commit hash if built from source).
+      placeholder: ovn-network-agent 0.6.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (redacted)
+      description: >
+        Your config file and/or `/etc/default/ovn-network-agent`. Strip
+        credentials and site-specific addresses before pasting.
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: Relevant output from `journalctl -u ovn-network-agent` (redact as needed).
+      render: text
+    validations:
+      required: false
