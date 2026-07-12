@@ -69,6 +69,7 @@
 # can be root-caused from the collected artifacts. The upstream bgpd
 # start honours:
 #   BGPD_WAIT_SECS=30      # readiness wait per start attempt, seconds
+#   BGPD_START_ATTEMPTS=3  # bounded retries before bring-up is failed
 
 set -euo pipefail
 
@@ -119,8 +120,11 @@ BGP_ROUTER_ID_UPSTREAM="${BGP_ROUTER_ID_UPSTREAM:-100.64.0.1}"
 
 # Upstream bgpd start budget. The daemon is started in-place (see
 # configure_upstream_frr) and polled for readiness; BGPD_WAIT_SECS is
-# the readiness wait per start attempt.
+# the readiness wait per start attempt, and the start is retried up to
+# BGPD_START_ATTEMPTS times so a one-off startup hiccup does not cost a
+# full job re-run.
 BGPD_WAIT_SECS="${BGPD_WAIT_SECS:-30}"
+BGPD_START_ATTEMPTS="${BGPD_START_ATTEMPTS:-3}"
 
 CLIENT_NAME="${CLIENT_NAME:-client-1}"
 CLIENT_NODE="clab-${LAB_NAME}-${CLIENT_NAME}"
@@ -383,22 +387,25 @@ dump_upstream_frr_state() {
     docker logs --tail 100 "${UPSTREAM_NODE}" >&2 || true
 }
 
-configure_upstream_frr() {
-    log "configuring ${UPSTREAM_NODE} FRR (BGP to each gateway)"
-    # bgpd ships disabled (bgpd=no) in the frrouting/frr image. Restart
-    # is NOT an option here: the container's PID 1 is the watchfrr that
-    # supervises the FRR daemons, and `/usr/lib/frr/frrinit.sh restart`
-    # tears down that whole process tree → the container exits with 137
-    # before this script gets to the vtysh call. Start bgpd in-place
-    # instead, and keep the daemons file in sync so a future restart
-    # would honour it.
-    #
-    # BGPD_WAIT_SECS is passed in via `docker exec --env` (the
-    # ensure_workload_netns pattern) so the script body stays
-    # single-quoted; the start output is captured and surfaced to the
-    # job log instead of discarded, so a failed start names its cause.
-    if ! docker exec -i --env "BGPD_WAIT_SECS=${BGPD_WAIT_SECS}" \
-            "${UPSTREAM_NODE}" sh -eu <<'EOSH'; then
+# Start bgpd on the upstream container and wait for it to register,
+# once. Returns non-zero (without exiting the script) when bgpd does not
+# come up within ${BGPD_WAIT_SECS}, so the caller can retry.
+#
+# bgpd ships disabled (bgpd=no) in the frrouting/frr image. Restart is
+# NOT an option here: the container's PID 1 is the watchfrr that
+# supervises the FRR daemons, and `/usr/lib/frr/frrinit.sh restart`
+# tears down that whole process tree → the container exits with 137
+# before this script gets to the vtysh call. Start bgpd in-place
+# instead, and keep the daemons file in sync so a future restart would
+# honour it.
+#
+# BGPD_WAIT_SECS is passed in via `docker exec --env` (the
+# ensure_workload_netns pattern) so the script body stays single-quoted;
+# the start output is captured and surfaced to the job log instead of
+# discarded, so a failed start names its cause.
+start_upstream_bgpd() {
+    docker exec -i --env "BGPD_WAIT_SECS=${BGPD_WAIT_SECS}" \
+        "${UPSTREAM_NODE}" sh -eu <<'EOSH'
 if grep -q "^bgpd=no" /etc/frr/daemons 2>/dev/null; then
     sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
 fi
@@ -423,10 +430,29 @@ if [ -n "${start_out}" ]; then
 fi
 exit 1
 EOSH
-        dump_upstream_frr_state
-        echo "bgpd did not come up on ${UPSTREAM_NODE}" >&2
-        exit 1
-    fi
+}
+
+configure_upstream_frr() {
+    log "configuring ${UPSTREAM_NODE} FRR (BGP to each gateway)"
+    # Retry the bgpd start within a bounded budget so a transient startup
+    # hiccup heals itself instead of failing the whole job. A wedged
+    # half-start is killed between attempts so it cannot poison the next
+    # one; after the final attempt the daemon state is dumped and the
+    # bring-up aborts.
+    local attempt
+    for attempt in $(seq 1 "${BGPD_START_ATTEMPTS}"); do
+        if start_upstream_bgpd; then
+            log "bgpd up on ${UPSTREAM_NODE} (attempt ${attempt}/${BGPD_START_ATTEMPTS})"
+            break
+        fi
+        log "bgpd start attempt ${attempt}/${BGPD_START_ATTEMPTS} failed on ${UPSTREAM_NODE}"
+        docker exec "${UPSTREAM_NODE}" pkill -x bgpd || true
+        if [ "${attempt}" -eq "${BGPD_START_ATTEMPTS}" ]; then
+            dump_upstream_frr_state
+            echo "bgpd did not come up on ${UPSTREAM_NODE} after ${BGPD_START_ATTEMPTS} attempts" >&2
+            exit 1
+        fi
+    done
     # Push BGP config in one vtysh transaction. Build the script with
     # literal newlines — earlier this used $(printf '…\n…') chained with
     # ${var}$(...) concatenation, but command substitution strips
