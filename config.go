@@ -127,6 +127,12 @@ type Config struct {
 	ReconcileInterval time.Duration
 	LogLevel          string
 	DryRun            bool
+
+	// CheckConfig is CLI-only (--check-config): parse and validate the
+	// configuration, then exit without running the agent. It has no
+	// environment-variable or YAML binding.
+	CheckConfig bool
+
 	CleanupOnShutdown bool
 	DrainOnShutdown   bool
 	DrainTimeout      time.Duration
@@ -217,6 +223,7 @@ func loadConfig(args []string) (Config, error) {
 	var (
 		configPath         = fs.String("config", os.Getenv("OVN_NETWORK_CONFIG"), "Path to YAML config file")
 		showVersion        = fs.Bool("version", false, "Print version and exit")
+		fCheckConfig       = fs.Bool("check-config", false, "Validate configuration and exit (exit code 0 = valid, 1 = invalid)")
 		fOVNSB             = fs.String("ovn-sb-remote", "", "OVN Southbound DB remote, comma-separated for cluster")
 		fOVNNB             = fs.String("ovn-nb-remote", "", "OVN Northbound DB remote, comma-separated for cluster")
 		fBridge            = fs.String("bridge-dev", "", "Provider bridge device for kernel routes")
@@ -384,6 +391,10 @@ func loadConfig(args []string) (Config, error) {
 	if flagErr != nil {
 		return Config{}, flagErr
 	}
+
+	// --check-config is a CLI-only action flag (parse + validate + exit);
+	// it has no env/YAML binding, so it is read straight from the flag.
+	cfg.CheckConfig = *fCheckConfig
 
 	// Validate configuration
 	if err := validateConfig(&cfg); err != nil {

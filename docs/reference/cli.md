@@ -14,6 +14,7 @@ regenerate it with `go generate ./...`.
 |------|---------|-------------|
 | `--config` |  | Path to YAML config file |
 | `--version` | `false` | Print version and exit |
+| `--check-config` | `false` | Validate configuration and exit (exit code 0 = valid, 1 = invalid) |
 | `--ovn-sb-remote` |  | OVN Southbound DB remote, comma-separated for cluster |
 | `--ovn-nb-remote` |  | OVN Northbound DB remote, comma-separated for cluster |
 | `--bridge-dev` | `br-ex` | Provider bridge device for kernel routes |
