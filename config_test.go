@@ -586,6 +586,78 @@ func TestApplyEnvConfigCleanupOnShutdownZero(t *testing.T) {
 	}
 }
 
+// TestApplyEnvConfigBooleansBothDirections locks in the unified boolean
+// env semantics: every boolean env var is honoured in both directions,
+// including the directions that were previously dead (e.g.
+// CLEANUP_ON_SHUTDOWN was false-only, DRY_RUN was true-only). Each case
+// starts from the opposite of the value being set so the change is
+// observable.
+func TestApplyEnvConfigBooleansBothDirections(t *testing.T) {
+	cases := []struct {
+		env   string
+		value string
+		start Config
+		want  bool
+		get   func(Config) bool
+	}{
+		// DRY_RUN was true-only: prove the disable direction now applies.
+		{"OVN_NETWORK_DRY_RUN", "false", Config{DryRun: true}, false, func(c Config) bool { return c.DryRun }},
+		{"OVN_NETWORK_DRY_RUN", "0", Config{DryRun: true}, false, func(c Config) bool { return c.DryRun }},
+		{"OVN_NETWORK_DRY_RUN", "true", Config{DryRun: false}, true, func(c Config) bool { return c.DryRun }},
+		// CLEANUP_ON_SHUTDOWN was false-only: prove the re-enable direction
+		// now overrides a file-level false, per the documented priority.
+		{"OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "true", Config{CleanupOnShutdown: false}, true, func(c Config) bool { return c.CleanupOnShutdown }},
+		{"OVN_NETWORK_CLEANUP_ON_SHUTDOWN", "false", Config{CleanupOnShutdown: true}, false, func(c Config) bool { return c.CleanupOnShutdown }},
+		// DRAIN_ON_SHUTDOWN was already bidirectional; keep it covered.
+		{"OVN_NETWORK_DRAIN_ON_SHUTDOWN", "false", Config{DrainOnShutdown: true}, false, func(c Config) bool { return c.DrainOnShutdown }},
+		{"OVN_NETWORK_DRAIN_ON_SHUTDOWN", "true", Config{DrainOnShutdown: false}, true, func(c Config) bool { return c.DrainOnShutdown }},
+		// VETH_LEAK_ENABLED was false-only: prove the re-enable direction.
+		{"OVN_NETWORK_VETH_LEAK_ENABLED", "true", Config{VethLeakEnabled: false}, true, func(c Config) bool { return c.VethLeakEnabled }},
+		{"OVN_NETWORK_VETH_LEAK_ENABLED", "false", Config{VethLeakEnabled: true}, false, func(c Config) bool { return c.VethLeakEnabled }},
+		// PORT_FORWARD_L3MDEV_ACCEPT was true-only: prove the disable direction.
+		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT", "false", Config{PortForwardL3mdevAccept: true}, false, func(c Config) bool { return c.PortForwardL3mdevAccept }},
+		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT", "true", Config{PortForwardL3mdevAccept: false}, true, func(c Config) bool { return c.PortForwardL3mdevAccept }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
+			cfg := tc.start
+			t.Setenv(tc.env, tc.value)
+			if err := applyEnvConfig(&cfg); err != nil {
+				t.Fatalf("applyEnvConfig: %v", err)
+			}
+			if got := tc.get(cfg); got != tc.want {
+				t.Errorf("%s=%s: field = %v, want %v", tc.env, tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyEnvConfigInvalidBool(t *testing.T) {
+	cases := []struct {
+		env string
+	}{
+		{"OVN_NETWORK_DRY_RUN"},
+		{"OVN_NETWORK_CLEANUP_ON_SHUTDOWN"},
+		{"OVN_NETWORK_DRAIN_ON_SHUTDOWN"},
+		{"OVN_NETWORK_VETH_LEAK_ENABLED"},
+		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.env, func(t *testing.T) {
+			cfg := Config{}
+			t.Setenv(tc.env, "yes")
+
+			err := applyEnvConfig(&cfg)
+			if err == nil {
+				t.Fatalf("expected error for %s=yes", tc.env)
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error %q does not name %s", err, tc.env)
+			}
+		})
+	}
+}
+
 func TestApplyFileConfigCleanupOnShutdown(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
 	cleanup := false
