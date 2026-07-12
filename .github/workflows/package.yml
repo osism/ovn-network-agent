@@ -1,0 +1,47 @@
+name: Package
+
+# Build the .deb with nfpm and drive a full install -> upgrade -> remove
+# -> purge cycle in a container on every PR, so a broken nfpm.yaml or
+# maintainer script fails the PR instead of a release (issue #162).
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deb-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3
+
+      # Two distinct versions make the upgrade path real: the smoke test
+      # asserts the binary is actually swapped and the conffile survives.
+      # The ~ makes these CI versions sort below any real release in dpkg.
+      - name: Build two package versions
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          for v in ci1 ci2; do
+            go build -trimpath -ldflags "-s -w -X main.version=0.0.0~${v}" \
+              -o ovn-network-agent-linux-amd64 .
+            VERSION="0.0.0~${v}" nfpm package --packager deb \
+              --target "ovn-network-agent_${v}_amd64.deb"
+          done
+
+      - name: Smoke-test install/upgrade/remove/purge
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
+            ./test/package/smoke.sh \
+            ovn-network-agent_ci1_amd64.deb ovn-network-agent_ci2_amd64.deb
