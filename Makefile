@@ -50,7 +50,7 @@ clean:
 	rm -f $(BINARY)
 
 install: build
-	install -m 0755 $(BINARY) /usr/local/bin/$(BINARY)
+	install -m 0755 $(BINARY) /usr/bin/$(BINARY)
 
 # Regenerate docs/reference/{configuration,cli,metrics}.md from the
 # canonical Go declarations in config.go and metrics.go. See
