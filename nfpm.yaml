@@ -20,7 +20,7 @@ contents:
     file_info:
       mode: 0755
 
-  - src: ./ovn-network-agent.service.pkg
+  - src: ./ovn-network-agent.service
     dst: /lib/systemd/system/ovn-network-agent.service
 
   - src: ./ovn-network-agent.default

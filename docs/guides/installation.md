@@ -43,7 +43,7 @@ curl -LO https://github.com/osism/ovn-network-agent/releases/download/vVERSION/o
 curl -LO https://github.com/osism/ovn-network-agent/releases/download/v0.1.0/ovn-network-agent-linux-amd64
 
 # Install
-sudo install -m 0755 ovn-network-agent-linux-amd64 /usr/local/bin/ovn-network-agent
+sudo install -m 0755 ovn-network-agent-linux-amd64 /usr/bin/ovn-network-agent
 ```
 
 Set up the systemd service and configuration manually:
@@ -66,7 +66,7 @@ Requires Go 1.26+ (see `go.mod` for the exact minimum).
 
 ```bash
 make build-static
-sudo install -m 0755 ovn-network-agent /usr/local/bin/ovn-network-agent
+sudo install -m 0755 ovn-network-agent /usr/bin/ovn-network-agent
 ```
 
 Other available Makefile targets:
@@ -82,7 +82,7 @@ make test
 make fmt
 make vet
 
-# Install to /usr/local/bin
+# Install to /usr/bin
 sudo make install
 ```
 

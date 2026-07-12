@@ -40,7 +40,6 @@ jobs:
       - name: Build .deb package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed 's|/usr/local/bin/|/usr/bin/|' ovn-network-agent.service > ovn-network-agent.service.pkg
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3
           GOARCH=${{ matrix.goarch }} VERSION="${VERSION}" nfpm package --packager deb --target .
 
