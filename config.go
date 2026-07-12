@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -642,7 +645,27 @@ func readConfigFile(path string) (configFile, error) {
 	if err := yaml.Unmarshal(data, &fc); err != nil {
 		return configFile{}, err
 	}
+	warnUnknownConfigKeys(path, data)
 	return fc, nil
+}
+
+// warnUnknownConfigKeys re-decodes the config file with strict field
+// checking and logs a prominent warning naming any key that does not
+// map to a known configFile field. The lenient yaml.Unmarshal above has
+// already applied the recognised keys; a typo like "drain_on_shutdow"
+// would otherwise be dropped and the default applied silently — exactly
+// where a wrong effective value (drain/cleanup) turns a routine reboot
+// into an outage. Unknown keys are still accepted (never fail the load)
+// so newer config keys stay forward-compatible with an older agent.
+func warnUnknownConfigKeys(path string, data []byte) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var probe configFile
+	// io.EOF is returned for an empty or comment-only file, which is not
+	// an unknown-key condition.
+	if err := dec.Decode(&probe); err != nil && !errors.Is(err, io.EOF) {
+		slog.Warn("config file contains unknown keys (ignored — check for typos)", "path", path, "error", err)
+	}
 }
 
 func applyFileConfig(cfg *Config, fc *configFile) error {
