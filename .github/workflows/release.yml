@@ -5,14 +5,34 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+# Permissions are scoped per job rather than workflow-wide: only the
+# `release` job publishes artifacts, so `test` and `build` run
+# read-only and cannot inherit the write/attestation grants.
+permissions: {}
 
 jobs:
-  build:
+  # A tag can be pushed on any commit; nothing guarantees it went
+  # through a gated PR. Run the unit suite before anything is built,
+  # signed, or attested so an untested commit cannot become a release.
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -race ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -53,6 +73,10 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
