@@ -12,6 +12,19 @@ name: E2E
 on:
   pull_request:
     branches: [main]
+    # E2E is deliberately NOT a required status check, so an `on.paths`
+    # filter is safe here: docs-only PRs simply do not trigger the ~10
+    # min lab suite. If E2E ever becomes required, replace this with the
+    # job-level conditional-skip pattern used in integration.yml, or the
+    # required check will hang Pending on docs-only PRs.
+    #
+    # This docs-only set (docs/**, **.md) is the same predicate the
+    # integration.yml `changes` job encodes as a shell grep. Keep the two
+    # in sync — broadening the set here means updating that grep too, or
+    # the two suites will treat the same PR inconsistently.
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
   workflow_dispatch:
 
 permissions:

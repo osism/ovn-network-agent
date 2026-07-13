@@ -14,7 +14,43 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Docs-only PRs do not need the OVN/OVS/FRR smoke job. `smoke` is a
+  # required status check (its job id is a context in
+  # .github/rulesets/main.json), so this MUST be a job-level `if:` — a
+  # job skipped by `if:` still reports success to the required check,
+  # whereas an `on.paths` filter would leave the required check Pending
+  # forever on docs-only PRs and block the merge.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Detect non-docs changes
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[].filename')
+          # Docs-only predicate: mirror of e2e.yml's `paths-ignore`
+          # (docs/**, **.md). Keep the two in sync — if this set changes,
+          # update e2e.yml's paths-ignore too, or the two suites will
+          # treat the same PR inconsistently.
+          if echo "$files" | grep -qvE '^docs/|\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   smoke:
+    needs: changes
+    # Fail safe: run unless `changes` positively reported a docs-only PR.
+    # If `changes` itself fails, its output is empty (not 'false') and the
+    # required smoke gate still runs rather than being silently skipped.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

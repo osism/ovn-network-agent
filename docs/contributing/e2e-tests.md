@@ -841,19 +841,23 @@ docker image inspect ovn-network-agent/gwnode:e2e \
 
 ## Continuous integration
 
-The harness runs on every push to `main` and on manual
-`workflow_dispatch` via
+The harness runs on pull requests and on manual `workflow_dispatch` via
 [`.github/workflows/e2e.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e.yml).
-The workflow does **not** run on pull requests: spinning the lab up
-adds ~10 minutes to CI on a green run, which is too coarse for the
-per-PR feedback loop the rest of the workflows target.
+Docs-only changes are skipped with a `paths-ignore` filter (`docs/**`,
+`**.md`) so a typo fix does not spin the lab up. The workflow does
+**not** run on push to `main`: the branch ruleset requires PRs to be up
+to date, so the merged commit already passed E2E on its PR and
+re-running the ~10 min suite post-merge would only burn runner time.
 
-Six jobs run, each on its own runner so a regression in one scenario
-is reported in isolation:
+One job runs per scenario, each on its own runner so a regression in one
+scenario is reported in isolation. Every job installs containerlab and
+loads the required kernel modules through the shared
+[`e2e-lab-setup`](https://github.com/osism/ovn-network-agent/blob/main/.github/actions/e2e-lab-setup/action.yml)
+composite action:
 
-- **`baseline`** — installs containerlab, runs `make e2e-up`, executes
-  `test/e2e/scenarios/baseline.sh`, dumps + uploads artifacts on
-  failure (`e2e-artifacts-<run id>-<attempt>`), and always tears the
+- **`baseline`** — runs the `e2e-lab-setup` action and `make e2e-up`,
+  executes `test/e2e/scenarios/baseline.sh`, dumps + uploads artifacts
+  on failure (`e2e-artifacts-<run id>-<attempt>`), and always tears the
   lab down.
 - **`failover`** (`needs: baseline`) — same shape as baseline, but
   executes `test/e2e/scenarios/failover.sh`. On failure the artifact
@@ -864,6 +868,13 @@ is reported in isolation:
   root so the before/after `cookie=0x998` `dump-flows` snapshots are
   bundled with the lab-state dump. On failure the artifact bundle
   is uploaded as `e2e-artifacts-hairpin-<run id>-<attempt>`.
+- **`multi-vlan`** (`needs: baseline`, runs in parallel with the other
+  baseline-gated jobs) — same shape, but executes
+  `test/e2e/scenarios/multi-vlan.sh`. The job points the scenario's
+  `ARTIFACTS_DIR` at the same artifact root so the per-segment
+  flow/link/route snapshots are bundled with the lab-state dump. On
+  failure the artifact bundle is uploaded as
+  `e2e-artifacts-multi-vlan-<run id>-<attempt>`.
 - **`pf-external`** (`needs: baseline`, runs in parallel with
   `failover` and `hairpin`) — same shape, but executes
   `test/e2e/scenarios/pf-external.sh`. The job points the scenario's
@@ -871,6 +882,12 @@ is reported in isolation:
   source-IP log is bundled with the lab-state dump on failure (per
   issue #109's acceptance criterion). On failure the artifact
   bundle is uploaded as `e2e-artifacts-pf-external-<run id>-<attempt>`.
+- **`pf-hairpin`** (`needs: baseline`) — same shape, but executes
+  `test/e2e/scenarios/pf-hairpin.sh`. The job points the scenario's
+  `ARTIFACTS_DIR` at the same artifact root so the phase1-off /
+  phase2-on / teardown `nft` snapshots are bundled with the lab-state
+  dump (per issue #110's acceptance criterion). On failure the artifact
+  bundle is uploaded as `e2e-artifacts-pf-hairpin-<run id>-<attempt>`.
 - **`stale-chassis`** (`needs: failover`) — same shape, but executes
   `test/e2e/scenarios/stale-chassis.sh`. The job points the
   scenario's `ARTIFACTS_DIR` at the same artifact root so the
