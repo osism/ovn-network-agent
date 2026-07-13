@@ -260,89 +260,18 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// Compute effective network filters for this cycle.
 	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
 
-	// hairpinTargets maps each IP that needs a hairpin flow to the MAC of
-	// the router port that owns it and the localnet segment its external
-	// network is on. This includes FIPs, SNAT IPs, and router gateway IPs
-	// (LRP networks). Port-forward VIPs are intentionally excluded because
-	// their DNAT is handled by nftables.
-	//
-	// The MAC is used as mod_dl_dst in the hairpin flow so that OVN's
-	// L2 lookup delivers the reflected packet to the correct router; the
-	// segment selects the patch port the flow binds to.
-	hairpinTargets := make(map[string]HairpinTarget, len(state.NATIPToRouterMAC))
-	for ip, mac := range state.NATIPToRouterMAC {
-		hairpinTargets[ip] = HairpinTarget{RouterMAC: mac, Segment: state.NATIPToSegment[ip]}
-	}
-	// Router gateway IPs (LRP networks) are included so that VMs on a
-	// same-chassis router can reach other routers' gateway addresses,
-	// matching the behaviour seen from outside.
-	for _, lr := range state.LocalRouters {
-		for _, cidr := range lr.LRPNetworks {
-			ip, _, err := net.ParseCIDR(cidr)
-			if err != nil {
-				continue
-			}
-			if lr.LRPMAC != "" {
-				hairpinTargets[ip.String()] = HairpinTarget{RouterMAC: lr.LRPMAC, Segment: segmentName(lr.Segment)}
-			}
-		}
-	}
+	// Everything the cycle needs to derive from OVN is a pure function of the
+	// snapshot plus the configured VIPs (see desired_state.go). Past this
+	// point reconcile only acts on the result.
+	desired := computeDesiredState(state, a.cfg.PortForwards)
+	hairpinTargets := desired.HairpinTargets
+	desiredSegments := desired.Segments
+	desiredIPs := desired.DesiredIPs
 
-	// desiredSegments is the deduplicated set of localnet segments the
-	// locally-active routers need a data plane for. Routers whose segment
-	// is unresolved contribute the "" fallback segment.
-	segmentSet := make(map[string]DesiredSegment)
-	for _, lr := range state.LocalRouters {
-		key := segmentName(lr.Segment)
-		if _, ok := segmentSet[key]; ok {
-			continue
-		}
-		d := DesiredSegment{LocalnetPort: key}
-		if lr.Segment != nil {
-			d.VLANTag = lr.Segment.VLANTag
-		}
-		segmentSet[key] = d
-	}
-	desiredSegments := make([]DesiredSegment, 0, len(segmentSet))
-	for _, d := range segmentSet {
-		desiredSegments = append(desiredSegments, d)
-	}
-	sort.Slice(desiredSegments, func(i, j int) bool {
-		return desiredSegments[i].LocalnetPort < desiredSegments[j].LocalnetPort
-	})
-
-	// hairpinIPs is the flat list of IPs for kernel routes and FRR — the
-	// single choke point where the IPv4-only route/announce plane forks off
-	// the deliberately dual-stack hairpinTargets map. Non-IPv4 addresses (IPv6
-	// FIPs, SNAT IPs, and LRP gateway IPs) are excluded here: everything
-	// downstream (AddKernelRoute, AddFRRRoutes, BGP, the takeover marker) is
-	// IPv4-only, so a v6 address would fail the FRR batch and block the marker.
-	// The OVS hairpin plane keeps the v6 targets (#54); full IPv6 route support
-	// is tracked in #85/#70. Map keys are already unique; just sort.
-	hairpinIPs := make([]string, 0, len(hairpinTargets))
-	var excludedNonV4 []string
-	for ip := range hairpinTargets {
-		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
-			excludedNonV4 = append(excludedNonV4, ip)
-			continue
-		}
-		hairpinIPs = append(hairpinIPs, ip)
-	}
-	sort.Strings(hairpinIPs)
-	if len(excludedNonV4) > 0 {
-		sort.Strings(excludedNonV4)
+	if len(desired.ExcludedNonV4) > 0 {
 		slog.Debug("excluding non-IPv4 addresses from the route/announce plane, IPv6 support tracked in #85/#70",
-			"ips", excludedNonV4)
+			"ips", desired.ExcludedNonV4)
 	}
-
-	// desiredIPs extends hairpinIPs with port-forward VIPs — these need
-	// kernel routes on br-ex and FRR static routes for BGP announcement,
-	// independent of whether any OVN routers are locally active.
-	desiredIPs := hairpinIPs
-	for _, pf := range a.cfg.PortForwards {
-		desiredIPs = append(desiredIPs, pf.VIP)
-	}
-	desiredIPs = uniqueIPs(desiredIPs)
 
 	setDesiredState(len(desiredIPs), len(state.LocalRouters), len(a.effectiveFilters))
 	setLocalnetSegments(len(desiredSegments))
@@ -453,7 +382,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	ipDev := make(map[string]string, len(hairpinTargets))
 	skipKernelRoute := make(map[string]bool)
 	for ip, target := range hairpinTargets {
-		if a.segmentRouteUnresolved(target.Segment, segmentSet) {
+		if a.segmentRouteUnresolved(target.Segment, desired.SegmentByName) {
 			skipKernelRoute[ip] = true
 			continue
 		}
