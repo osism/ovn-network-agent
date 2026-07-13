@@ -781,3 +781,106 @@ func extractChain(ruleset, name string) string {
 	}
 	return ""
 }
+
+// =============================================================================
+// buildNftRuleset collectors and match renderers
+// =============================================================================
+//
+// The golden ruleset tests above pin the assembled output. These cover the
+// input collectors and match renderers directly, including the branches the
+// golden fixtures do not reach.
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestCollectSNATEntries pins the per-rule masquerade override against the
+// VIP-level default — the inheritance rule that decides which backends get a
+// masquerade rule at all. A rule that explicitly opts out of a masquerading VIP
+// must contribute nothing, and a rule with no backend address is skipped.
+func TestCollectSNATEntries(t *testing.T) {
+	got := collectSNATEntries([]PortForwardVIP{
+		{
+			VIP: "198.51.100.10", Masquerade: true,
+			Rules: []PortForwardRule{
+				// Inherits the VIP default (true).
+				{Proto: "tcp", Port: 80, DestAddr: "10.0.0.1"},
+				// Explicitly opts OUT of the masquerading VIP.
+				{Proto: "tcp", Port: 81, DestAddr: "10.0.0.2", Masquerade: boolPtr(false)},
+				// Multiple backends, DestPort translation applies to each.
+				{Proto: "udp", Port: 53, DestAddrs: []string{"10.0.0.3", "10.0.0.4"}, DestPort: 1053},
+				// No backend address at all — nothing to masquerade.
+				{Proto: "tcp", Port: 82},
+			},
+		},
+		{
+			VIP: "198.51.100.11", Masquerade: false,
+			Rules: []PortForwardRule{
+				// Inherits the VIP default (false) — no entry.
+				{Proto: "tcp", Port: 90, DestAddr: "10.0.0.9"},
+				// Explicitly opts IN despite the non-masquerading VIP.
+				{Proto: "tcp", Port: 91, DestAddr: "10.0.0.10", Masquerade: boolPtr(true)},
+			},
+		},
+	})
+
+	want := []snatEntry{
+		{addr: "10.0.0.1", proto: "tcp", port: 80}, // DestPort 0 → falls back to Port
+		{addr: "10.0.0.3", proto: "udp", port: 1053},
+		{addr: "10.0.0.4", proto: "udp", port: 1053},
+		{addr: "10.0.0.10", proto: "tcp", port: 91},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("collectSNATEntries() returned %d entries, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestCtOriginalDaddrMatch pins the family-inference workaround: a single VIP is
+// matched bare (nft infers the family), while a multi-element set must pin the
+// family explicitly with `ip daddr` or nft rejects the rule.
+func TestCtOriginalDaddrMatch(t *testing.T) {
+	tests := []struct {
+		name string
+		vips []string
+		want string
+	}{
+		{"single VIP is matched bare", []string{"198.51.100.10"},
+			"ct original daddr 198.51.100.10"},
+		{"multiple VIPs need an explicit family", []string{"198.51.100.10", "198.51.100.11"},
+			"ct original ip daddr { 198.51.100.10, 198.51.100.11 }"},
+		// No forwards configured: the chains are still emitted (the ruleset is
+		// declarative and replaces the table wholesale), with an empty set.
+		{"no VIPs renders an empty set", nil,
+			"ct original ip daddr {  }"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ctOriginalDaddrMatch(tt.vips); got != tt.want {
+				t.Errorf("ctOriginalDaddrMatch(%v) = %q, want %q", tt.vips, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetMatch(t *testing.T) {
+	if got := setMatch([]string{"10.0.0.1"}); got != "10.0.0.1" {
+		t.Errorf("setMatch(single) = %q, want the bare value", got)
+	}
+	if got := setMatch([]string{"10.0.0.1", "10.0.0.2"}); got != "{ 10.0.0.1, 10.0.0.2 }" {
+		t.Errorf("setMatch(multi) = %q, want an anonymous set", got)
+	}
+}
+
+// TestRuleDestPort pins the port-translation default: a rule with no DestPort
+// forwards to the same port it ingressed on.
+func TestRuleDestPort(t *testing.T) {
+	if got := (PortForwardRule{Port: 80}).destPort(); got != 80 {
+		t.Errorf("destPort() with no DestPort = %d, want the ingress port 80", got)
+	}
+	if got := (PortForwardRule{Port: 80, DestPort: 8080}).destPort(); got != 8080 {
+		t.Errorf("destPort() = %d, want 8080", got)
+	}
+}
