@@ -28,10 +28,9 @@ import (
 //
 // The pause window (10s) is intentionally shorter than libovsdb's 30s
 // inactivity probe: this scenario covers the "stall and recover" path,
-// not the "TCP reconnect" path. Exercising reconnection through a longer
-// outage is the natural follow-up once the ovn_connection_state metric
-// can be asserted to drop and recover (the issue calls this out
-// conditionally on "once metrics is wired").
+// not the "TCP reconnect" path. Reconnection through a longer outage —
+// with ovn_connection_state asserted to drop and recover — is covered by
+// TestScenario_OVNReconnectAfterLongOutage below.
 func TestScenario_OVNDatabasePauseResume(t *testing.T) {
 	ctx, cancel, nb, sb := startScenario(t)
 	defer cancel()
@@ -76,6 +75,110 @@ func TestScenario_OVNDatabasePauseResume(t *testing.T) {
 
 	if !a.Alive() {
 		t.Fatalf("agent exited after DB resume — clean reconnect contract violated (last logs:\n%s)",
+			a.LogTail(60))
+	}
+}
+
+// TestScenario_OVNReconnectAfterLongOutage (#160):
+//
+// TestScenario_OVNDatabasePauseResume keeps its outage under libovsdb's 30s
+// inactivity probe, so it never exercises a real disconnect/reconnect. This
+// scenario holds the outage past the probe (>=45s), so libovsdb actually tears
+// the connection down and re-establishes it. It pins the full reconnect
+// surface a long-running daemon must survive:
+//
+//   - ovn_connection_state drops to 0 for both DBs — the proof the inactivity
+//     probe fired and libovsdb disconnected rather than merely stalling — and
+//     recovers to 1 after resume,
+//   - the agent stays alive across the whole outage,
+//   - the FIP route installed before the outage survives it, and
+//   - a NB change made AFTER reconnect still drives reconciliation, proving
+//     the monitors were re-established and the cache repopulated.
+//
+// It is event-driven (assert on the observed metric / kernel route) rather
+// than sleep-calibrated, with a single deterministic hold to the >30s floor,
+// so it stays green and non-flaky. The agent's metrics endpoint is served by a
+// goroutine independent of OVSDB, so it keeps answering scrapes throughout the
+// outage.
+func TestScenario_OVNReconnectAfterLongOutage(t *testing.T) {
+	// 3-minute ceiling: the outage runs ~60s (the probe-driven disconnect
+	// asserted below) and recovery is asserted with generous budgets, all
+	// comfortably inside it.
+	ctx, cancel, nb, sb := startScenarioWithTimeout(t, 3*time.Minute)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "reconnectlong",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+	const fip1 = "198.51.100.67"
+	testenv.AddFIP(t, ctx, nb, router, fip1, "10.0.0.67")
+
+	cfg := testenv.FastDefaults()
+	addr := testenv.FreeLoopbackAddr(t)
+	cfg.MetricsListen = addr
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	assertConnState := func(db string, want float64, timeout time.Duration) {
+		t.Helper()
+		testenv.AssertMetricEventually(t, addr,
+			"ovn_network_agent_ovn_connection_state",
+			map[string]string{"database": db},
+			func(v float64, present bool) bool { return present && v == want },
+			timeout)
+	}
+
+	// Pre-condition: the route landed and both DB connections read as up.
+	testenv.AssertKernelRoute(t, fip1, 15*time.Second)
+	assertConnState("nb", 1, 10*time.Second)
+	assertConnState("sb", 1, 10*time.Second)
+
+	if !a.Alive() {
+		t.Fatalf("agent exited before the outage; setup is broken (last logs:\n%s)", a.LogTail(40))
+	}
+
+	// Open the outage and hold it past the 30s inactivity probe.
+	start := time.Now()
+	resume := testenv.StopOVNDatabases(t)
+
+	// Both gauges must drop to 0 — the proof the probe fired and libovsdb
+	// disconnected. The drop takes up to ~60s from the last pre-outage
+	// traffic: 30s of silence arm the probe, and the probe echo then gets
+	// options.inactivityTimeout (another 30s) to time out against the
+	// stopped server — WithInactivityCheck's second argument is the
+	// reconnect dial timeout, not the echo timeout. 90s adds real margin.
+	assertConnState("nb", 0, 90*time.Second)
+	assertConnState("sb", 0, 90*time.Second)
+
+	// Honour the >40s outage floor deterministically by holding the remainder
+	// of 45s (the gauge-drop asserts above already consumed most of it).
+	if held := time.Since(start); held < 45*time.Second {
+		time.Sleep(45*time.Second - held)
+	}
+
+	if !a.Alive() {
+		t.Fatalf("agent exited during the OVN outage — resilience contract violated (last logs:\n%s)",
+			a.LogTail(60))
+	}
+
+	resume()
+
+	// Recovery: both gauges climb back to 1.
+	assertConnState("nb", 1, 45*time.Second)
+	assertConnState("sb", 1, 45*time.Second)
+
+	// The pre-outage route survived the disconnect/reconnect.
+	testenv.AssertKernelRoute(t, fip1, 15*time.Second)
+
+	// A NB change made after reconnect still drives reconciliation — the
+	// monitors were re-established and the cache repopulated, not left stale.
+	const fip2 = "198.51.100.68"
+	testenv.AddFIP(t, ctx, nb, router, fip2, "10.0.0.68")
+	testenv.AssertKernelRoute(t, fip2, 30*time.Second)
+
+	if !a.Alive() {
+		t.Fatalf("agent exited after OVN recovery — clean reconnect contract violated (last logs:\n%s)",
 			a.LogTail(60))
 	}
 }
