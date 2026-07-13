@@ -10,6 +10,29 @@ import (
 	"testing"
 )
 
+// AddFRRRoute, DelFRRRoute and HasFRRRoute are single-IP convenience wrappers
+// used only by the tests below. They live here rather than in routing.go so
+// production code carries no unused API — and, in HasFRRRoute's case, no
+// human-readable `show ip route` text parsing outside the test suite.
+func (rm *RouteManager) AddFRRRoute(ip string) error {
+	return rm.AddFRRRoutes([]string{ip})
+}
+
+func (rm *RouteManager) DelFRRRoute(ip string) error {
+	return rm.DelFRRRoutes([]string{ip})
+}
+
+func (rm *RouteManager) HasFRRRoute(ip string) bool {
+	if err := validateIP(ip); err != nil {
+		return false
+	}
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s %s/32", rm.vrfName, ip))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), "static")
+}
+
 // vtyshRecorder captures calls to RouteManager.runVtysh for assertion. It
 // mirrors ovsRecorder in ovs_test.go: it returns canned responses keyed by
 // the full joined command line and falls back to (nil, nil) for unmatched

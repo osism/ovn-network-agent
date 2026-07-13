@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+// dnatCTZoneDefault is the conntrack zone the tests pass to buildNftRuleset. It
+// mirrors the production default (Config.PortForwardCTZone), which the tests
+// never vary; it lives here rather than in nftables.go so production code
+// carries no unused constant.
+const dnatCTZoneDefault = 64000
+
 func TestBuildNftRuleset(t *testing.T) {
 	forwards := []PortForwardVIP{
 		{

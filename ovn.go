@@ -185,8 +185,7 @@ type OVNState struct {
 	LocalRouters    []LocalRouterInfo
 	HasLocalRouters bool
 
-	// NAT entries from NB, filtered to only locally-active routers.
-	FIPs    []string // dnat_and_snat external IPs
+	// SNAT external IPs from NB, filtered to only locally-active routers.
 	SNATIPs []string // snat external IPs
 
 	// NATIPToRouterMAC maps each FIP/SNAT external IP to the MAC of the
@@ -486,7 +485,6 @@ func (o *OVNClient) GetState() OVNState {
 		LocalChassisName:   o.state.LocalChassisName,
 		LocalRouters:       localRouters,
 		HasLocalRouters:    o.state.HasLocalRouters,
-		FIPs:               append([]string{}, o.state.FIPs...),
 		SNATIPs:            append([]string{}, o.state.SNATIPs...),
 		NATIPToRouterMAC:   natIPToMAC,
 		NATIPToSegment:     natIPToSegment,
@@ -786,7 +784,6 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	o.state.mu.Lock()
 	o.state.LocalRouters = localRouters
 	o.state.HasLocalRouters = len(localRouters) > 0
-	o.state.FIPs = fips
 	o.state.SNATIPs = snatIPs
 	o.state.NATIPToRouterMAC = natIPToRouterMAC
 	o.state.NATIPToSegment = natIPToSegment
