@@ -57,6 +57,11 @@ type fakeOVSDBClient struct {
 	// outside the row lock so the hook may block other List operations.
 	// Used by coalescing tests to hold a refresh in-flight.
 	onList func()
+
+	// connected backs Connected(); flipped by setConnected. Guarded by mu so
+	// watchConnectionState's polling goroutine and the test goroutine do not
+	// race under -race.
+	connected bool
 }
 
 func newFakeOVSDBClient(dbm model.ClientDBModel) *fakeOVSDBClient {
@@ -192,6 +197,20 @@ func modelToRow(m model.Model) ovsdb.Row {
 func (f *fakeOVSDBClient) Connect(context.Context) error { return nil }
 func (f *fakeOVSDBClient) Close()                        {}
 func (f *fakeOVSDBClient) Cache() *cache.TableCache      { return nil }
+
+// Connected reports the fake's simulated connection status. setConnected drives
+// it so tests can exercise watchConnectionState's drop/recover mirroring.
+func (f *fakeOVSDBClient) Connected() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.connected
+}
+
+func (f *fakeOVSDBClient) setConnected(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.connected = v
+}
 
 func (f *fakeOVSDBClient) NewMonitor(_ ...client.MonitorOption) *client.Monitor {
 	return &client.Monitor{}
