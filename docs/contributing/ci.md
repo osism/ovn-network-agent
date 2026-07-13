@@ -169,6 +169,24 @@ A PR that touches only `docs/**` or `*.md` skips the heavy suites:
 - **Docs** (`docs.yml`) builds the VitePress site so a dead internal
   link fails the PR instead of the post-merge Pages deploy.
 
+## Integration coverage
+
+The `smoke` job builds the agent with `make build-integration`
+(`go build -cover -covermode=atomic -race`) rather than a plain binary, so
+integration-only Linux code — `main()`, `Connect()`, `routing_linux.go`,
+`nftables_linux.go` — is counted, and the concurrency-heavy paths
+(`refreshLoop`, `drainWatchCh`, event handlers) run under the race detector.
+Each agent process writes counter files to `GOCOVERDIR`; a post-test step
+merges them with `go tool covdata` and prints the total in the job log. This
+figure is **informational**, not a gate — the merge tolerates a run where no
+counters were collected so it never fails the required check.
+
+The enforced coverage floor (`COVERAGE_FLOOR` in `test.yml`) is deliberately
+left unchanged: it gates the **unit** suite, and raising it needs the merged
+unit-plus-integration numbers this instrumentation first makes visible. Revisit
+the floor once those numbers have stabilised across a few runs (issue #160's
+"afterwards revisit" step).
+
 ## Lint gate
 
 [`.golangci.yml`](https://github.com/osism/ovn-network-agent/blob/main/.golangci.yml)

@@ -14,8 +14,8 @@ test/integration/
   scenarios_helpers_test.go                   — shared per-scenario boilerplate (startScenario, readyAgent)
   scenario_fip_test.go                        — FIP add/remove, gatewayless gw, multi-router on one chassis
   scenario_failover_test.go                   — failover, stale-chassis cleanup (incl. multi-stale + one-stale-one-returning), drain & restore-drained
-  scenario_reconnect_test.go                  — OVN database pause/resume resilience (#64 scenario 1)
-  scenario_drain_edges_test.go                — drain edge cases (timeout, no local routers, cleanup_on_shutdown=false)
+  scenario_reconnect_test.go                  — OVN pause/resume resilience + reconnect through the 30s inactivity probe (#64, #160)
+  scenario_drain_edges_test.go                — drain edge cases (timeout, no local routers, cleanup_on_shutdown=false, stuck NB write)
   scenario_drift_test.go                      — periodic-reconcile + verifyRoutes drift recovery (#55)
   scenario_network_cidrs_test.go              — manual network_cidr override vs. auto-discovery, empty-filter sweep
   scenario_gateway_port_test.go               — legacy single-router gateway_port filter (#62)
@@ -33,7 +33,7 @@ test/integration/
   scenario_router_masquerade_ordering_test.go — router_masquerade configured before SNAT NAT exists (#88 item 4)
   scenario_same_batch_fip_test.go             — single OVSDB transaction adds + removes FIPs (#88 item 5)
   scenario_partial_failure_retry_test.go      — FRR write fails, kernel untouched, only FRR re-added (#88 item 6)
-  testenv/                                    — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, WithFailingTool, …
+  testenv/                                    — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, WithFailingTool, StartDrainRebind, StopOVNDatabases, StopNBDatabase, …
 ```
 
 The failure-injection scenarios all share the `TestScenario_FailureInjection_`
@@ -121,4 +121,29 @@ Run `setup.sh` if you see skip messages for the bridge or binaries.
 ## CI
 
 `.github/workflows/integration.yml` runs the same flow on `ubuntu-latest`:
-`setup.sh` → `make build` → `go test -tags=integration ...` under sudo.
+`setup.sh` → `make build-integration` → `go test -tags=integration ...`
+under sudo, then a coverage-report step.
+
+## Coverage instrumentation
+
+CI builds the agent with `make build-integration`
+(`go build -cover -covermode=atomic -race`) so integration-only Linux code
+(`main()`, `Connect()`, `routing_linux.go`, `nftables_linux.go`) is counted
+and the concurrency-heavy paths run under the race detector. Each agent
+process writes per-process counter files to the directory named by
+`GOCOVERDIR`, which `testenv.RunAgent` propagates to the subprocess; only
+agents that exit cleanly on SIGTERM emit their counters (a SIGKILL loses
+them, which is acceptable best-effort).
+
+To collect and read the merged figure locally:
+
+```sh
+make build-integration
+mkdir -p covdata
+sudo OVN_AGENT_BINARY=$PWD/ovn-network-agent GOCOVERDIR=$PWD/covdata \
+    go test -tags=integration -count=1 -timeout 25m ./test/integration/...
+go tool covdata percent -i covdata
+```
+
+The published figure is informational; the enforced unit-coverage floor
+lives in `test.yml` (see the CI docs for why it is tracked separately).
