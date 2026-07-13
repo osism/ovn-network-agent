@@ -159,6 +159,14 @@ func RunAgent(t *testing.T, cfg AgentConfig) *AgentProc {
 	bin := AgentBinary(t)
 	cmd := exec.Command(bin, "--config", configPath)
 	cmd.Env = append(os.Environ(), "GOTRACEBACK=all")
+	// A -cover-built agent (see `make build-integration`) writes per-process
+	// coverage counter files to GOCOVERDIR on clean (SIGTERM) exit. os.Environ()
+	// already carries it when the CI job sets it, but propagate it explicitly so
+	// the contract is visible at the spawn site. A SIGKILL'd agent loses its
+	// counters, which is acceptable best-effort.
+	if dir := os.Getenv("GOCOVERDIR"); dir != "" {
+		cmd.Env = append(cmd.Env, "GOCOVERDIR="+dir)
+	}
 	// ExtraEnv must REPLACE existing entries with the same key, not append.
 	// Linux's getenv() returns the first matching entry, so a trailing
 	// "PATH=<shim>:..." would be ignored — the agent would still resolve
