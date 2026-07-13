@@ -553,6 +553,90 @@ func TestReconcileSkipsMarkerWithoutLocalRouters(t *testing.T) {
 	}
 }
 
+// TestReconcileFailedAnnounceWithholdsMarker pins the failure side of the
+// takeover-readiness gate (agent.go: `announced && state.HasLocalRouters`).
+// A node that owns local routers but whose announce fails — here the FRR
+// batch add errors, so ensureRoutes returns false — must NOT stamp the
+// readiness marker, because it has attracted BGP traffic it cannot deliver.
+// A draining peer polls that marker before releasing its own FIP routes, so a
+// premature marker would blackhole traffic during the HA window this handshake
+// exists to protect.
+//
+// This is the negative twin of TestReconcileMixedFamilyAnnouncesV4AndWritesMarker
+// (which drives a successful announce and asserts the marker IS written) and of
+// TestReconcileSkipsMarkerWithoutLocalRouters (which pins the HasLocalRouters
+// half). Dropping the `announced` conjunct — the mutation `if
+// state.HasLocalRouters` — makes this test fail: the marker would be written
+// despite the failed announce.
+func TestReconcileFailedAnnounceWithholdsMarker(t *testing.T) {
+	const (
+		fip    = "198.51.100.50"
+		bridge = "ovnagent-nonexistent-br"
+		lrpMAC = "fa:16:3e:aa:aa:aa"
+	)
+	rec := newVtyshRecorder()
+	// Arm the FRR batch-add for the FIP to fail. AddFRRRoutes joins the batch
+	// errors and returns non-nil, so ensureRoutes sets announced = false.
+	rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
+		"-c", "ip route " + fip + "/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
+		"", errors.New("test: vtysh add failed"))
+	rm := &RouteManager{
+		bridgeDev:     bridge,
+		vrfName:       "vrf-provider",
+		vethNexthop:   "169.254.0.1",
+		execVtyshHook: rec.hook(),
+		execOVSHook: func(*exec.Cmd) ([]byte, error) {
+			return nil, errors.New("test: no ovs available")
+		},
+		// Pre-seed the FIP /32 on the bridge so ensureRoutes never calls the
+		// Linux-only AddKernelRoute — the announce fails purely on the FRR add.
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: fip, Dev: bridge}}, nil
+		},
+	}
+
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.LocalRouters = []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}}
+	c.state.HasLocalRouters = true
+	c.state.NATIPToRouterMAC = map[string]string{fip: lrpMAC}
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:     "sr1",
+		IPPrefix: "0.0.0.0/0",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-b",
+			takeoverReadyMarkerKey:      "host-b",
+		},
+	})
+
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	a.reconcile(context.Background(), "test")
+
+	// Vacuity guard: the failing announce path must actually have been driven —
+	// the FRR add was attempted for the FIP.
+	attempted := false
+	for _, call := range rec.calls {
+		if strings.Contains(strings.Join(call, " "), "ip route "+fip+"/32 169.254.0.1") {
+			attempted = true
+			break
+		}
+	}
+	if !attempted {
+		t.Fatalf("FRR add for %s was never attempted; calls: %v", fip, rec.calls)
+	}
+
+	if hasMarkerUpdate(nb.writeTransacts(), "host-a") {
+		t.Fatalf("reconcile stamped the takeover marker after a failed announce; writes: %v", nb.writeTransacts())
+	}
+}
+
 // hasMarkerUpdate reports whether any recorded write updates a
 // Logical_Router_Static_Route external_ids with a takeover readiness marker
 // naming chassis.
