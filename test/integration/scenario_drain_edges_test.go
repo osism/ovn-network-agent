@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"os/exec"
 	"strings"
 	"testing"
@@ -180,81 +179,22 @@ func TestScenario_DrainKeepsRoutesWhenCleanupDisabled(t *testing.T) {
 	peerUUID := testenv.MakeChassis(t, ctx, sb, "drainkeep-peer")
 	gcName := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
 
-	// Goroutine: when NB shows priority=0 for our local Gateway_Chassis,
-	// rebind the CR Port_Binding to the peer so countLocalCRPorts → 0 and
-	// drain completes without hitting drain_timeout.
-	errCh := make(chan error, 1)
-	pctx, pcancel := context.WithCancel(ctx)
-	defer pcancel()
-	go func() {
-		tick := time.NewTicker(50 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-pctx.Done():
-				return
-			case <-tick.C:
-				var entries []testenv.NBGatewayChassis
-				if err := nb.List(ctx, &entries); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				for _, gc := range entries {
-					if gc.Name != gcName || gc.Priority != 0 {
-						continue
-					}
-					rebind := &testenv.SBPortBinding{UUID: router.CRPortUUID, Chassis: &peerUUID}
-					ops, opErr := sb.Where(rebind).Update(rebind, &rebind.Chassis)
-					if opErr != nil {
-						select {
-						case errCh <- opErr:
-						default:
-						}
-						return
-					}
-					if _, opErr := sb.Transact(ctx, ops...); opErr != nil {
-						select {
-						case errCh <- opErr:
-						default:
-						}
-						return
-					}
-					// The takeover node has "arrived": stamp the readiness
-					// marker on the managed default route so the leaving node's
-					// handshake releases on the marker, not at drain_timeout.
-					mark := &testenv.NBLogicalRouterStaticRoute{UUID: managedRoute.UUID, ExternalIDs: markerExtIDs}
-					mops, mErr := nb.Where(mark).Update(mark, &mark.ExternalIDs)
-					if mErr != nil {
-						select {
-						case errCh <- mErr:
-						default:
-						}
-						return
-					}
-					if _, mErr := nb.Transact(ctx, mops...); mErr != nil {
-						select {
-						case errCh <- mErr:
-						default:
-						}
-					}
-					return
-				}
-			}
-		}
-	}()
+	// When NB shows priority=0 for our local Gateway_Chassis, the helper
+	// rebinds the CR Port_Binding to the peer so countLocalCRPorts → 0 and
+	// stamps the readiness marker so drain completes without hitting
+	// drain_timeout.
+	d := testenv.StartDrainRebind(t, ctx, nb, sb, testenv.DrainRebindOpts{
+		GatewayChassisName: gcName,
+		CRPortUUID:         router.CRPortUUID,
+		PeerChassisUUID:    peerUUID,
+		MarkerRouteUUID:    managedRoute.UUID,
+		MarkerExternalIDs:  markerExtIDs,
+	})
 
 	if err := a.Stop(45 * time.Second); err != nil {
 		t.Fatalf("agent stop: %v", err)
 	}
-	pcancel()
-	select {
-	case err := <-errCh:
-		t.Fatalf("drain helper goroutine error: %v", err)
-	default:
-	}
+	d.Finish(t)
 
 	// Drain happened: NB Gateway_Chassis priority is 0.
 	gc, ok := testenv.FindGatewayChassis(t, ctx, nb, gcName)
@@ -327,59 +267,19 @@ func TestScenario_DrainSettleTimeoutFallback(t *testing.T) {
 	peerUUID := testenv.MakeChassis(t, ctx, sb, "drainfallback-peer")
 	gcName := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
 
-	errCh := make(chan error, 1)
-	pctx, pcancel := context.WithCancel(ctx)
-	defer pcancel()
-	go func() {
-		tick := time.NewTicker(50 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-pctx.Done():
-				return
-			case <-tick.C:
-				var entries []testenv.NBGatewayChassis
-				if err := nb.List(ctx, &entries); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				for _, gc := range entries {
-					if gc.Name != gcName || gc.Priority != 0 {
-						continue
-					}
-					rebind := &testenv.SBPortBinding{UUID: router.CRPortUUID, Chassis: &peerUUID}
-					ops, opErr := sb.Where(rebind).Update(rebind, &rebind.Chassis)
-					if opErr != nil {
-						select {
-						case errCh <- opErr:
-						default:
-						}
-						return
-					}
-					if _, opErr := sb.Transact(ctx, ops...); opErr != nil {
-						select {
-						case errCh <- opErr:
-						default:
-						}
-					}
-					return
-				}
-			}
-		}
-	}()
+	// Rebind the CR port once priority hits 0 so the migration wait completes,
+	// but deliberately stamp NO readiness marker (MarkerRouteUUID empty),
+	// forcing the handshake to fall back at drain_timeout.
+	d := testenv.StartDrainRebind(t, ctx, nb, sb, testenv.DrainRebindOpts{
+		GatewayChassisName: gcName,
+		CRPortUUID:         router.CRPortUUID,
+		PeerChassisUUID:    peerUUID,
+	})
 
 	if err := a.Stop(15 * time.Second); err != nil {
 		t.Fatalf("agent stop: %v", err)
 	}
-	pcancel()
-	select {
-	case err := <-errCh:
-		t.Fatalf("drain helper goroutine error: %v", err)
-	default:
-	}
+	d.Finish(t)
 
 	logs := a.LogTail(100000)
 	if !strings.Contains(logs, "takeover readiness marker not observed before timeout") {

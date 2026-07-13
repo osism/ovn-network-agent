@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -124,78 +123,18 @@ func TestScenario_MetricsDrainOutcomeCompleted(t *testing.T) {
 	peerUUID := testenv.MakeChassis(t, ctx, sb, "metdrain-peer")
 	gcName := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
 
-	errCh := make(chan error, 1)
-	pctx, pcancel := context.WithCancel(ctx)
-	defer pcancel()
-	go func() {
-		tick := time.NewTicker(50 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-pctx.Done():
-				return
-			case <-tick.C:
-				var entries []testenv.NBGatewayChassis
-				if err := nb.List(ctx, &entries); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				for _, gc := range entries {
-					if gc.Name != gcName || gc.Priority != 0 {
-						continue
-					}
-					rebind := &testenv.SBPortBinding{UUID: router.CRPortUUID, Chassis: &peerUUID}
-					ops, opErr := sb.Where(rebind).Update(rebind, &rebind.Chassis)
-					if opErr != nil {
-						select {
-						case errCh <- opErr:
-						default:
-						}
-						return
-					}
-					if _, opErr := sb.Transact(ctx, ops...); opErr != nil {
-						select {
-						case errCh <- opErr:
-						default:
-						}
-						return
-					}
-					// The takeover node has "arrived": stamp the readiness marker on
-					// the managed default route so the leaving node's handshake releases
-					// on the marker instead of blocking until drain_timeout.
-					mark := &testenv.NBLogicalRouterStaticRoute{UUID: managedRoute.UUID, ExternalIDs: markerExtIDs}
-					mops, mErr := nb.Where(mark).Update(mark, &mark.ExternalIDs)
-					if mErr != nil {
-						select {
-						case errCh <- mErr:
-						default:
-						}
-						return
-					}
-					if _, mErr := nb.Transact(ctx, mops...); mErr != nil {
-						select {
-						case errCh <- mErr:
-						default:
-						}
-					}
-					return
-				}
-			}
-		}
-	}()
+	d := testenv.StartDrainRebind(t, ctx, nb, sb, testenv.DrainRebindOpts{
+		GatewayChassisName: gcName,
+		CRPortUUID:         router.CRPortUUID,
+		PeerChassisUUID:    peerUUID,
+		MarkerRouteUUID:    managedRoute.UUID,
+		MarkerExternalIDs:  markerExtIDs,
+	})
 
 	if err := a.Stop(45 * time.Second); err != nil {
 		t.Fatalf("agent stop: %v", err)
 	}
-	pcancel()
-	select {
-	case err := <-errCh:
-		t.Fatalf("drain helper goroutine error: %v", err)
-	default:
-	}
+	d.Finish(t)
 
 	// Drain success path: log line is emitted on the same branch that
 	// records drain_total{outcome="completed"}.
