@@ -12,6 +12,13 @@ permissions: read-all
 
 jobs:
   add-to-project-boards:
-    uses: osism/.github/.github/workflows/add-to-project.yml@main
+    # Pinned by SHA, not @main: this runs on pull_request_target with a
+    # cross-repo PAT, so a moved `main` upstream must not silently change
+    # what executes here. Bump deliberately (see docs/contributing/ci.md).
+    # SHA is osism/.github @main as of 2026-07-13.
+    uses: osism/.github/.github/workflows/add-to-project.yml@b57ddf3f8be8035457adb666aeef86eda8672aaa # main
     secrets:
+      # ADD_TO_PROJECT_PAT should be a fine-grained PAT scoped to the
+      # minimum: organization Projects read/write (plus the default repo
+      # metadata read). Rotating it to that scope is an org-admin task.
       ADD_TO_PROJECT_PAT: ${{ secrets.ADD_TO_PROJECT_PAT }}
