@@ -781,6 +781,96 @@ func TestEnsureRoutesReturnsAnnounceOutcome(t *testing.T) {
 	})
 }
 
+// inactiveRoutesGauge reads the single-series ovn_network_agent_inactive_routes
+// gauge from the test registry.
+func inactiveRoutesGauge(t *testing.T, m *metricsRegistry) float64 {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather(): %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_inactive_routes" {
+			continue
+		}
+		series := mf.GetMetric()
+		if len(series) == 0 {
+			t.Fatalf("inactive_routes gauge has no series")
+		}
+		return series[0].GetGauge().GetValue()
+	}
+	t.Fatalf("metric ovn_network_agent_inactive_routes not found in registry")
+	return 0
+}
+
+// TestCheckFRRRouteActivity pins the two uncovered branches of
+// checkFRRRouteActivity (agent.go). The documented contract is that a failed
+// vtysh check leaves the inactive_routes gauge at its previous value rather
+// than falsely resetting it to zero, and that a configured-but-inactive route
+// bumps the gauge and logs an alert. Deleting the early return on the error
+// path — which would zero the alerting metric during a vtysh outage — is
+// caught by the "vtysh error keeps gauge" subtest.
+func TestCheckFRRRouteActivity(t *testing.T) {
+	const fip = "198.51.100.10"
+	const jsonCmd = "show ip route vrf vrf-provider static json"
+	newAgent := func(rec *vtyshRecorder) *Agent {
+		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		return &Agent{routing: rm, cfg: Config{VRFName: "vrf-provider"}}
+	}
+
+	t.Run("vtysh error keeps gauge", func(t *testing.T) {
+		m := withTestMetrics(t)
+		logs := captureSlog(t)
+		// A prior cycle observed one inactive route. The failing check must
+		// not clobber that value with a false zero.
+		setInactiveRoutes(3)
+
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", jsonCmd}, "", errors.New("test: vtysh unreachable"))
+		newAgent(rec).checkFRRRouteActivity([]string{fip})
+
+		if got := inactiveRoutesGauge(t, m); got != 3 {
+			t.Errorf("gauge after failed check = %v, want 3 (unchanged)", got)
+		}
+		if !strings.Contains(logs.String(), "could not verify FRR route activity") {
+			t.Errorf("expected the check-failure warning; logs:\n%s", logs.String())
+		}
+	})
+
+	t.Run("inactive route sets gauge and logs alert", func(t *testing.T) {
+		m := withTestMetrics(t)
+		logs := captureSlog(t)
+
+		rec := newVtyshRecorder()
+		// selected/installed are omitted (FRR drops them when false), so the
+		// route is configured but not advertised.
+		rec.on([]string{"vtysh", "-c", jsonCmd},
+			`{"`+fip+`/32":[{"prefix":"`+fip+`/32","protocol":"static"}]}`, nil)
+		newAgent(rec).checkFRRRouteActivity([]string{fip})
+
+		if got := inactiveRoutesGauge(t, m); got != 1 {
+			t.Errorf("gauge with one inactive route = %v, want 1", got)
+		}
+		if !strings.Contains(logs.String(), "FRR static routes are configured but inactive") {
+			t.Errorf("expected the inactive-route alert; logs:\n%s", logs.String())
+		}
+	})
+
+	t.Run("healthy route resets gauge", func(t *testing.T) {
+		m := withTestMetrics(t)
+		setInactiveRoutes(3)
+
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", jsonCmd},
+			`{"`+fip+`/32":[{"prefix":"`+fip+`/32","protocol":"static","selected":true,"installed":true}]}`, nil)
+		newAgent(rec).checkFRRRouteActivity([]string{fip})
+
+		if got := inactiveRoutesGauge(t, m); got != 0 {
+			t.Errorf("gauge with a healthy route = %v, want 0", got)
+		}
+	})
+}
+
 // TestRemoveAllRoutesWithStubbedFRRList exercises the FRR-driven removal
 // path: a stub vtysh hook reports two managed routes, the agent batches
 // the deletion, and a BGP soft-refresh follows because routes were removed.
