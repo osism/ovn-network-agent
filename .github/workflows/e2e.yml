@@ -17,6 +17,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs only for PRs; push/schedule runs on main are
+  # the green-main signal and must never cancel each other mid-history.
+  # A force-push that supersedes a PR can otherwise leave up to eight
+  # ~15 min lab runners churning on stale commits.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   baseline:
     name: Baseline reachability
