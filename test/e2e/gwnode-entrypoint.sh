@@ -56,6 +56,34 @@ start_ovs() {
     exit 1
 }
 
+# ovn-controller resolves the SB remote's hostname with OVS's internal
+# unbound-based resolver, which only queries the resolv.conf nameserver
+# and never reads /etc/hosts. Docker's embedded DNS intermittently stops
+# answering for a freshly recreated containerlab management network
+# (observed after drain-hitless's `make e2e-down && make e2e-up`
+# recycle: "dns_resolve|WARN|central: failed to resolve" for minutes),
+# which strands ovn-controller in a reconnect loop so the chassis never
+# registers in SB. glibc resolution keeps working throughout because
+# containerlab writes the lab nodes into /etc/hosts, so resolve the
+# hostname here once with getent and hand ovn-controller a numeric IP.
+resolve_sb_remote() {
+    local proto host port ip
+    IFS=: read -r proto host port <<<"${OVN_SB_REMOTE}"
+    if [[ -z "${host}" || -z "${port}" || "${host}" =~ ^[0-9.]+$ ]]; then
+        return 0 # already numeric, or a form we do not understand — keep
+    fi
+    for _ in $(seq 1 30); do
+        ip="$(getent hosts "${host}" | awk '{print $1; exit}')"
+        if [ -n "${ip}" ]; then
+            log "resolved SB remote ${host} -> ${ip} for ovn-controller"
+            OVN_SB_REMOTE="${proto}:${ip}:${port}"
+            return 0
+        fi
+        sleep 1
+    done
+    log "WARNING: ${host} did not resolve within 30s; leaving ovn-remote as-is"
+}
+
 configure_ovs() {
     log "configuring Open_vSwitch external_ids for ovn-controller"
     ovs-vsctl set Open_vSwitch . \
@@ -167,6 +195,7 @@ EOF
 
 main() {
     start_ovs
+    resolve_sb_remote
     configure_ovs
     start_ovn_controller
     setup_vrf
