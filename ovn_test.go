@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1861,5 +1862,89 @@ func TestNATCollectionAddSBGatewayNATAddresses(t *testing.T) {
 		if _, ok := nc.IPToRouterMAC[ip]; ok {
 			t.Errorf("%s leaked in despite the device_owner / locality filter", ip)
 		}
+	}
+}
+
+// TestCRPortLRPName pins the schema-backed chassisredirect→LRP join. The
+// authoritative source is options:distributed-port (written by ovn-northd); the
+// "cr-<LRP>" name form is only an ovn-nbctl/Neutron convention, so it survives
+// as a warned fallback and a row matching neither is skipped rather than mapped
+// to a bogus LRP.
+func TestCRPortLRPName(t *testing.T) {
+	tests := []struct {
+		name      string
+		pb        SBPortBinding
+		want      string
+		wantWarn  bool
+		warnMatch string
+	}{
+		{
+			name: "distributed-port wins",
+			pb: SBPortBinding{
+				LogicalPort: "cr-lrp-abc",
+				Options:     map[string]string{"distributed-port": "lrp-abc"},
+			},
+			want: "lrp-abc",
+		},
+		{
+			// The whole point of the schema join: a port whose name does NOT
+			// follow the convention still resolves, because northd told us.
+			name: "non-conventional name still resolves via the option",
+			pb: SBPortBinding{
+				LogicalPort: "gw-port-7",
+				Options:     map[string]string{"distributed-port": "lrp-abc"},
+			},
+			want: "lrp-abc",
+		},
+		{
+			name:      "falls back to the cr- convention with a warning",
+			pb:        SBPortBinding{LogicalPort: "cr-lrp-abc"},
+			want:      "lrp-abc",
+			wantWarn:  true,
+			warnMatch: "no options:distributed-port",
+		},
+		{
+			name:      "unresolvable row is skipped with a warning",
+			pb:        SBPortBinding{LogicalPort: "gw-port-7"},
+			want:      "",
+			wantWarn:  true,
+			warnMatch: "cannot resolve the LRP",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureSlog(t)
+			got := crPortLRPName(tc.pb)
+			if got != tc.want {
+				t.Errorf("crPortLRPName() = %q, want %q", got, tc.want)
+			}
+			logged := buf.String()
+			if tc.wantWarn && !strings.Contains(logged, tc.warnMatch) {
+				t.Errorf("expected a warning containing %q, got: %s", tc.warnMatch, logged)
+			}
+			if !tc.wantWarn && strings.Contains(logged, "level=WARN") {
+				t.Errorf("unexpected warning: %s", logged)
+			}
+		})
+	}
+}
+
+// TestLocalCRPortsUsesDistributedPort drives the join through localCRPorts: a
+// chassisredirect port whose name breaks the cr- convention must still map to
+// its LRP, and an unresolvable row must not enter the map at all.
+func TestLocalCRPortsUsesDistributedPort(t *testing.T) {
+	chA := "ch-a"
+	hostByRef := map[string]string{"ch-a": "host-a"}
+
+	got := localCRPorts([]SBPortBinding{
+		{UUID: "pb-1", LogicalPort: "gw-port-7", Type: "chassisredirect", Chassis: &chA,
+			Options: map[string]string{"distributed-port": "lrp-abc"}},
+		{UUID: "pb-2", LogicalPort: "no-convention", Type: "chassisredirect", Chassis: &chA},
+	}, hostByRef, "host-a", "")
+
+	want := map[string]string{"lrp-abc": "gw-port-7"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("localCRPorts() = %v, want %v (option join wins; unresolvable row dropped)", got, want)
 	}
 }
