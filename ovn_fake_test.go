@@ -428,7 +428,7 @@ func newOVNClientWithFakes(t testingT, localChassis string) (*OVNClient, *fakeOV
 	c := NewOVNClient(Config{}, nil)
 	c.nbClient = nb
 	c.sbClient = sb
-	c.state.LocalChassisName = localChassis
+	c.state.SetLocalChassisName(localChassis)
 	return c, nb, sb
 }
 

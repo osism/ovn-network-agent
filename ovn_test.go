@@ -64,8 +64,15 @@ func TestNewOVNClient(t *testing.T) {
 
 	c := NewOVNClient(cfg, cb)
 
-	if c.state == nil {
-		t.Fatal("state should not be nil")
+	// The state holder's zero value is usable: a snapshot taken before any
+	// refresh yields an empty state (with initialised maps) rather than
+	// panicking or exposing nil collections.
+	snap := c.GetState()
+	if snap.HasLocalRouters || len(snap.LocalRouters) != 0 {
+		t.Errorf("fresh client state = %+v, want empty", snap)
+	}
+	if snap.NATIPToRouterMAC == nil || snap.AllChassisNames == nil {
+		t.Error("snapshot maps should be initialised, not nil")
 	}
 	if c.cfg.OVNSBRemote != cfg.OVNSBRemote {
 		t.Errorf("cfg.OVNSBRemote = %q, want %q", c.cfg.OVNSBRemote, cfg.OVNSBRemote)
@@ -79,13 +86,15 @@ func TestNewOVNClient(t *testing.T) {
 
 func TestGetStateSnapshot(t *testing.T) {
 	c := NewOVNClient(Config{}, nil)
-	c.state.LocalChassisName = "node1"
-	c.state.LocalRouters = []LocalRouterInfo{
-		{RouterName: "router1", RouterUUID: "uuid1", LRPName: "lrp-abc", LRPUUID: "lrp-uuid1", LRPNetworks: []string{"10.0.0.1/24"}, CRPort: "cr-lrp-abc"},
-		{RouterName: "router2", RouterUUID: "uuid2", LRPName: "lrp-def", LRPUUID: "lrp-uuid2", LRPNetworks: []string{"172.16.0.1/16"}, CRPort: "cr-lrp-def"},
-	}
-	c.state.HasLocalRouters = true
-	c.state.SNATIPs = []string{"10.0.0.100", "10.0.0.101"}
+	c.state.Replace(OVNState{
+		LocalChassisName: "node1",
+		LocalRouters: []LocalRouterInfo{
+			{RouterName: "router1", RouterUUID: "uuid1", LRPName: "lrp-abc", LRPUUID: "lrp-uuid1", LRPNetworks: []string{"10.0.0.1/24"}, CRPort: "cr-lrp-abc"},
+			{RouterName: "router2", RouterUUID: "uuid2", LRPName: "lrp-def", LRPUUID: "lrp-uuid2", LRPNetworks: []string{"172.16.0.1/16"}, CRPort: "cr-lrp-def"},
+		},
+		HasLocalRouters: true,
+		SNATIPs:         []string{"10.0.0.100", "10.0.0.101"},
+	})
 
 	snap := c.GetState()
 
@@ -105,21 +114,73 @@ func TestGetStateSnapshot(t *testing.T) {
 		t.Errorf("SNATIPs length = %d, want 2", len(snap.SNATIPs))
 	}
 
-	// Verify snapshot is a copy (modifying snap doesn't affect original).
+	// Verify snapshot is a copy: mutating it must not affect a fresh snapshot
+	// read back from the holder's live state.
 	snap.SNATIPs[0] = "modified"
-	if c.state.SNATIPs[0] == "modified" {
+	if c.GetState().SNATIPs[0] == "modified" {
 		t.Error("GetState should return a copy of SNATIPs, not a reference")
 	}
 
 	snap.LocalRouters[0].RouterName = "modified"
-	if c.state.LocalRouters[0].RouterName == "modified" {
+	if c.GetState().LocalRouters[0].RouterName == "modified" {
 		t.Error("GetState should return a copy of LocalRouters, not a reference")
+	}
+}
+
+// TestOVNStateCloneReallocatesEveryReferenceField is the guard that replaces
+// the old hand-maintained 9-field deep copy: it walks OVNState by reflection
+// and asserts that clone() re-allocates every reference-typed field (slice,
+// map, pointer). Adding such a field to OVNState without extending clone()
+// fails here — where the old code would have silently handed out a snapshot
+// aliasing (or zero-valuing) the holder's live state.
+func TestOVNStateCloneReallocatesEveryReferenceField(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	// Populate every field so each reference type has something to alias.
+	src := OVNState{
+		LocalChassisName:   "node1",
+		LocalRouters:       []LocalRouterInfo{{RouterName: "r1"}},
+		HasLocalRouters:    true,
+		SNATIPs:            []string{"198.51.100.1"},
+		NATIPToRouterMAC:   map[string]string{"198.51.100.1": "aa:bb:cc:dd:ee:ff"},
+		NATIPToSegment:     map[string]string{"198.51.100.1": "physnet1"},
+		DiscoveredNetworks: []*net.IPNet{cidr},
+		AllChassisNames:    map[string]bool{"node1": true},
+	}
+
+	// Every field must be non-zero, or the re-allocation check below would
+	// vacuously pass for a field the fixture forgot to populate.
+	sv := reflect.ValueOf(src)
+	for i := 0; i < sv.NumField(); i++ {
+		if sv.Field(i).IsZero() {
+			t.Fatalf("fixture does not populate OVNState.%s — extend it, then extend clone()",
+				sv.Type().Field(i).Name)
+		}
+	}
+
+	got := reflect.ValueOf(src.clone())
+	for i := 0; i < sv.NumField(); i++ {
+		name := sv.Type().Field(i).Name
+		orig, cloned := sv.Field(i), got.Field(i)
+		switch orig.Kind() {
+		case reflect.Slice, reflect.Map:
+			if orig.UnsafePointer() == cloned.UnsafePointer() {
+				t.Errorf("clone() did not re-allocate OVNState.%s — the snapshot aliases the live state", name)
+			}
+			if orig.Len() != cloned.Len() {
+				t.Errorf("clone() lost content of OVNState.%s: len %d, want %d", name, cloned.Len(), orig.Len())
+			}
+		default:
+			// Scalars copy by value; just verify the content survived.
+			if !reflect.DeepEqual(orig.Interface(), cloned.Interface()) {
+				t.Errorf("clone() lost OVNState.%s: got %v, want %v", name, cloned, orig)
+			}
+		}
 	}
 }
 
 func TestGetStateSnapshotNoLocalRouters(t *testing.T) {
 	c := NewOVNClient(Config{}, nil)
-	c.state.LocalChassisName = "node1"
+	c.state.SetLocalChassisName("node1")
 
 	snap := c.GetState()
 
@@ -165,7 +226,7 @@ func TestUniqueNetworks(t *testing.T) {
 func TestGetStateIncludesDiscoveredNetworks(t *testing.T) {
 	_, net1, _ := net.ParseCIDR("198.51.100.0/24")
 	c := NewOVNClient(Config{}, nil)
-	c.state.DiscoveredNetworks = []*net.IPNet{net1}
+	c.state.Replace(OVNState{DiscoveredNetworks: []*net.IPNet{net1}})
 
 	snap := c.GetState()
 	if len(snap.DiscoveredNetworks) != 1 {
@@ -177,17 +238,17 @@ func TestGetStateIncludesDiscoveredNetworks(t *testing.T) {
 
 	// Verify snapshot is a copy.
 	snap.DiscoveredNetworks[0] = nil
-	if c.state.DiscoveredNetworks[0] == nil {
+	if c.GetState().DiscoveredNetworks[0] == nil {
 		t.Error("GetState should return a copy of DiscoveredNetworks")
 	}
 }
 
 func TestGetStateIncludesAllChassisNames(t *testing.T) {
 	c := NewOVNClient(Config{}, nil)
-	c.state.AllChassisNames = map[string]bool{
+	c.state.Replace(OVNState{AllChassisNames: map[string]bool{
 		"node-1": true,
 		"node-2": true,
-	}
+	}})
 
 	snap := c.GetState()
 	if len(snap.AllChassisNames) != 2 {
@@ -199,7 +260,7 @@ func TestGetStateIncludesAllChassisNames(t *testing.T) {
 
 	// Verify snapshot is a copy.
 	snap.AllChassisNames["node-3"] = true
-	if c.state.AllChassisNames["node-3"] {
+	if c.GetState().AllChassisNames["node-3"] {
 		t.Error("GetState should return a copy of AllChassisNames")
 	}
 }
@@ -294,7 +355,7 @@ func TestRefreshStateMatchesFQDNChassisHostname(t *testing.T) {
 	})
 	nb.setRows("NAT", &NBNAT{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"})
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	snap := c.GetState()
 
@@ -961,7 +1022,7 @@ func TestRefreshStatePopulatesLocalRoutersAndNATs(t *testing.T) {
 		&NBNAT{UUID: "nat-remote", Type: "snat", ExternalIP: "203.0.113.50"},
 	)
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 
 	snap := c.GetState()
@@ -1042,7 +1103,7 @@ func emptyFilterLocalRouterFakes(t *testing.T, nats ...*NBNAT) *OVNClient {
 		&NBLogicalRouter{UUID: "lr-local", Name: "router-local", Ports: []string{"lrp-uuid-local"}, Nat: natUUIDs},
 	)
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	return c
 }
@@ -1135,7 +1196,7 @@ func TestRefreshStateKeepsV6SBNatAddressForHairpinButNotSNATIPs(t *testing.T) {
 		&NBLogicalRouter{UUID: "lr-local", Name: "router-local", Ports: []string{"lrp-uuid-local"}},
 	)
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	snap := c.GetState()
 
@@ -1220,7 +1281,7 @@ func TestRefreshStateResolvesLocalnetSegments(t *testing.T) {
 		&NBNAT{UUID: "nat-none", Type: "dnat_and_snat", ExternalIP: "203.0.113.50"},
 	)
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	snap := c.GetState()
 
@@ -1271,7 +1332,7 @@ func TestRefreshStateResolvesLocalnetSegments(t *testing.T) {
 
 	// The snapshot must be a copy, not a reference.
 	snap.NATIPToSegment["198.51.100.50"] = "modified"
-	if c.state.NATIPToSegment["198.51.100.50"] == "modified" {
+	if c.GetState().NATIPToSegment["198.51.100.50"] == "modified" {
 		t.Error("GetState should return a copy of NATIPToSegment, not a reference")
 	}
 }
@@ -1292,7 +1353,7 @@ func TestRefreshStateNoLocalRouters(t *testing.T) {
 	nb.setRows("Logical_Router",
 		&NBLogicalRouter{UUID: "lr-r", Name: "router-r", Ports: []string{"lrp-r"}})
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	snap := c.GetState()
 

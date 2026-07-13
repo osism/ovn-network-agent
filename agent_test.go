@@ -415,8 +415,10 @@ func TestReconcileWritesMarkerAfterSuccessfulAnnounce(t *testing.T) {
 		dryRun:      true,
 	}
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
-	c.state.LocalRouters = []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1"}}
-	c.state.HasLocalRouters = true
+	c.state.Replace(OVNState{
+		LocalRouters:    []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1"}},
+		HasLocalRouters: true,
+	})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
 		UUID:     "sr1",
@@ -478,9 +480,11 @@ func TestReconcileMixedFamilyAnnouncesV4AndWritesMarker(t *testing.T) {
 	}
 
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
-	c.state.LocalRouters = []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}}
-	c.state.HasLocalRouters = true
-	c.state.NATIPToRouterMAC = map[string]string{v4FIP: lrpMAC, v6FIP: lrpMAC}
+	c.state.Replace(OVNState{
+		LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
+		HasLocalRouters:  true,
+		NATIPToRouterMAC: map[string]string{v4FIP: lrpMAC, v6FIP: lrpMAC},
+	})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
 		UUID:     "sr1",
@@ -596,9 +600,11 @@ func TestReconcileFailedAnnounceWithholdsMarker(t *testing.T) {
 	}
 
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
-	c.state.LocalRouters = []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}}
-	c.state.HasLocalRouters = true
-	c.state.NATIPToRouterMAC = map[string]string{fip: lrpMAC}
+	c.state.Replace(OVNState{
+		LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
+		HasLocalRouters:  true,
+		NATIPToRouterMAC: map[string]string{fip: lrpMAC},
+	})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
 		UUID:     "sr1",
@@ -1236,17 +1242,19 @@ func TestReconcileCompletesPromptlyOnCancelledContext(t *testing.T) {
 	// Populate state so reconcile takes the HasLocalRouters branch and
 	// therefore reaches the ctx-aware EnsureGatewayRouting /
 	// EnsureActivePriorityLead calls.
-	c.state.LocalRouters = []LocalRouterInfo{
-		{
-			RouterName:  "router1",
-			RouterUUID:  "lr-1",
-			LRPName:     "lrp-abc",
-			LRPMAC:      "aa:aa:aa:aa:aa:aa",
-			LRPNetworks: []string{"198.51.100.0/24"},
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{
+			{
+				RouterName:  "router1",
+				RouterUUID:  "lr-1",
+				LRPName:     "lrp-abc",
+				LRPMAC:      "aa:aa:aa:aa:aa:aa",
+				LRPNetworks: []string{"198.51.100.0/24"},
+			},
 		},
-	}
-	c.state.HasLocalRouters = true
-	c.state.DiscoveredNetworks = []*net.IPNet{cidr}
+		HasLocalRouters:    true,
+		DiscoveredNetworks: []*net.IPNet{cidr},
+	})
 
 	a := &Agent{
 		cfg:            Config{},

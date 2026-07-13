@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"sort"
@@ -174,9 +175,13 @@ func segmentName(seg *LocalnetSegment) string {
 	return seg.LocalnetPort
 }
 
+// OVNState is a plain, lock-free snapshot of the agent's derived OVN view. It
+// carries no mutex: ovnStateHolder guards the live copy and GetState hands out
+// a deep clone, so a snapshot can be read without synchronisation and never
+// aliases the holder's state. Splitting the guard from the value removes the
+// hand-maintained-copy hazard where a field added to the struct but forgotten
+// in the copy silently yielded a zero-value snapshot.
 type OVNState struct {
-	mu sync.RWMutex
-
 	// Derived state
 	LocalChassisName string
 
@@ -207,10 +212,79 @@ type OVNState struct {
 	AllChassisNames map[string]bool
 }
 
+// clone returns a deep copy of s in which every reference-typed field is
+// re-allocated, so a snapshot handed to a caller shares no backing array or map
+// with — and cannot be mutated through — the holder's live state. Growing
+// OVNState with a new slice/map/pointer field is a one-line edit here; the
+// clone-completeness test fails until it is made.
+func (s OVNState) clone() OVNState {
+	out := s // scalar fields (LocalChassisName, HasLocalRouters) copy directly
+	out.LocalRouters = append([]LocalRouterInfo{}, s.LocalRouters...)
+	out.SNATIPs = append([]string{}, s.SNATIPs...)
+	out.DiscoveredNetworks = append([]*net.IPNet{}, s.DiscoveredNetworks...)
+	out.NATIPToRouterMAC = cloneMap(s.NATIPToRouterMAC)
+	out.NATIPToSegment = cloneMap(s.NATIPToSegment)
+	out.AllChassisNames = cloneMap(s.AllChassisNames)
+	return out
+}
+
+// cloneMap returns a non-nil copy of the given map, mirroring GetState's
+// historical make+copy so a snapshot always exposes an initialised map even
+// when the live field is nil.
+func cloneMap[K comparable, V any](m map[K]V) map[K]V {
+	out := make(map[K]V, len(m))
+	maps.Copy(out, m)
+	return out
+}
+
+// ovnStateHolder guards the live OVNState. Every read and write goes through it,
+// and Snapshot hands out a deep clone so readers never touch the guarded value
+// directly. It must not be copied after first use (it embeds a mutex); the
+// OVNClient that owns it is always used by pointer.
+type ovnStateHolder struct {
+	mu    sync.RWMutex
+	state OVNState
+}
+
+// Snapshot returns a deep, lock-free copy of the current state.
+func (h *ovnStateHolder) Snapshot() OVNState {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.state.clone()
+}
+
+// Replace swaps in a freshly computed state. LocalChassisName is not part of a
+// refresh — it is set once at connect time from the OS hostname — so when the
+// caller leaves it empty it is carried over from the current state rather than
+// being clobbered with the zero value.
+func (h *ovnStateHolder) Replace(next OVNState) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if next.LocalChassisName == "" {
+		next.LocalChassisName = h.state.LocalChassisName
+	}
+	h.state = next
+}
+
+// SetLocalChassisName records the local chassis name (the OS hostname resolved
+// at connect time). It is the only field mutated outside a full Replace.
+func (h *ovnStateHolder) SetLocalChassisName(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.state.LocalChassisName = name
+}
+
+// LocalChassisName returns the recorded local chassis name.
+func (h *ovnStateHolder) LocalChassisName() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.state.LocalChassisName
+}
+
 type OVNClient struct {
 	sbClient ovsdbClient
 	nbClient ovsdbClient
-	state    *OVNState
+	state    ovnStateHolder
 	cfg      Config
 
 	onChange func() // callback when state changes
@@ -247,7 +321,6 @@ type OVNClient struct {
 func NewOVNClient(cfg Config, onChange func()) *OVNClient {
 	return &OVNClient{
 		cfg:          cfg,
-		state:        &OVNState{},
 		onChange:     onChange,
 		debounceCh:   make(chan struct{}, 1),
 		immediateCh:  make(chan struct{}, 1),
@@ -260,9 +333,7 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("get hostname: %w", err)
 	}
-	o.state.mu.Lock()
-	o.state.LocalChassisName = hostname
-	o.state.mu.Unlock()
+	o.state.SetLocalChassisName(hostname)
 
 	slog.Info("connecting to OVN databases", "hostname", hostname)
 
@@ -461,36 +532,9 @@ func (o *OVNClient) drainSignals() {
 	}
 }
 
-// GetState returns a snapshot of the current OVN state.
+// GetState returns a deep snapshot of the current OVN state.
 func (o *OVNClient) GetState() OVNState {
-	o.state.mu.RLock()
-	defer o.state.mu.RUnlock()
-	localRouters := make([]LocalRouterInfo, len(o.state.LocalRouters))
-	copy(localRouters, o.state.LocalRouters)
-	discoveredNets := make([]*net.IPNet, len(o.state.DiscoveredNetworks))
-	copy(discoveredNets, o.state.DiscoveredNetworks)
-	allChassis := make(map[string]bool, len(o.state.AllChassisNames))
-	for k, v := range o.state.AllChassisNames {
-		allChassis[k] = v
-	}
-	natIPToMAC := make(map[string]string, len(o.state.NATIPToRouterMAC))
-	for k, v := range o.state.NATIPToRouterMAC {
-		natIPToMAC[k] = v
-	}
-	natIPToSegment := make(map[string]string, len(o.state.NATIPToSegment))
-	for k, v := range o.state.NATIPToSegment {
-		natIPToSegment[k] = v
-	}
-	return OVNState{
-		LocalChassisName:   o.state.LocalChassisName,
-		LocalRouters:       localRouters,
-		HasLocalRouters:    o.state.HasLocalRouters,
-		SNATIPs:            append([]string{}, o.state.SNATIPs...),
-		NATIPToRouterMAC:   natIPToMAC,
-		NATIPToSegment:     natIPToSegment,
-		DiscoveredNetworks: discoveredNets,
-		AllChassisNames:    allChassis,
-	}
+	return o.state.Snapshot()
 }
 
 // refreshState performs a unified state refresh from both OVN databases.
@@ -531,7 +575,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		allChassisNames[shortHostname(ch.Hostname)] = true
 	}
 
-	localChassisName := o.state.LocalChassisName
+	localChassisName := o.state.LocalChassisName()
 
 	// Collect LRP names from chassisredirect ports active on this chassis.
 	// A chassisredirect logical_port has the form "cr-lrp-<LRP_NAME>".
@@ -780,16 +824,18 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		}
 	}
 
-	// Step 6: Update state atomically.
-	o.state.mu.Lock()
-	o.state.LocalRouters = localRouters
-	o.state.HasLocalRouters = len(localRouters) > 0
-	o.state.SNATIPs = snatIPs
-	o.state.NATIPToRouterMAC = natIPToRouterMAC
-	o.state.NATIPToSegment = natIPToSegment
-	o.state.DiscoveredNetworks = discoveredNets
-	o.state.AllChassisNames = allChassisNames
-	o.state.mu.Unlock()
+	// Step 6: Update state atomically. Replace preserves LocalChassisName
+	// (set once at connect time), so the refresh never needs to re-read or
+	// re-supply it.
+	o.state.Replace(OVNState{
+		LocalRouters:       localRouters,
+		HasLocalRouters:    len(localRouters) > 0,
+		SNATIPs:            snatIPs,
+		NATIPToRouterMAC:   natIPToRouterMAC,
+		NATIPToSegment:     natIPToSegment,
+		DiscoveredNetworks: discoveredNets,
+		AllChassisNames:    allChassisNames,
+	})
 
 	slog.Info("state updated",
 		"local_routers", len(localRouters),
