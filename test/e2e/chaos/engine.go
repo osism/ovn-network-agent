@@ -1,0 +1,531 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"math/rand/v2"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Node lifecycle. A node is only eligible as a fault target while it is
+// `healthy` — the issue's "a node is only re-killed after it has
+// returned and converged". A node the runner could not bring back is
+// parked in `unconverged` and never targeted again; the run fails on the
+// violation that put it there and stops injecting (see park).
+const (
+	nodeHealthy     = "healthy"
+	nodeDisrupted   = "disrupted"
+	nodeConverging  = "converging"
+	nodeUnconverged = "unconverged"
+)
+
+// Guardrail skip reasons, journaled on the decision they blocked.
+const (
+	skipTargetNotHealthy = "target-not-healthy"
+	skipNoHealthyPeer    = "no-healthy-peer"
+	skipNoWeightedAction = "no-weighted-action"
+)
+
+// Violation kinds.
+const (
+	violationRecoveryTimeout = "recovery-timeout"
+	violationActionFailed    = "action-failed"
+	violationAgentDown       = "agent-down"
+	violationDualClaim       = "dual-claim"
+	violationStartState      = "start-state-not-green"
+	violationChecksNeverRan  = "checks-never-ran"
+)
+
+// convergePollInterval is how often the engine re-checks a recovering
+// node against its recovery budget.
+const convergePollInterval = 5 * time.Second
+
+// restoreTimeout backstops one restore. It is deliberately not the
+// action's recovery budget: the budget is the SLO the *lab* is held to
+// once the node is back, while the restore is the runner reassembling
+// what a container lifecycle event destroyed. The longest restore path
+// (a gateway-kill on the workload host) chains four wait loops that sum
+// to 190s on their own — bounding it by the 180s budget would cut a slow
+// but healthy bring-up off half-way and report the runner's own
+// arithmetic as an action the lab could not recover from. Every command
+// underneath is bounded by cmdTimeout, so this is a backstop against a
+// wedged restore, not the thing that paces it.
+const restoreTimeout = 5 * time.Minute
+
+// action is one fault the engine can inject. inject and restore are the
+// two halves of the fault; between them the engine holds the fault for a
+// seeded duration drawn from [holdMin, holdMax].
+type action struct {
+	name           string
+	weight         int
+	holdMin        time.Duration
+	holdMax        time.Duration
+	recoveryBudget time.Duration
+	inject         func(ctx context.Context, l *lab, target string) error
+	restore        func(ctx context.Context, l *lab, target string) error
+}
+
+// probeSource is the slice of the prober the engine consumes.
+type probeSource interface {
+	allGreen() bool
+	redTargets() []string
+	recoverySince(anchor time.Time) map[string]int64
+}
+
+// engine drives one chaos run. Every decision it makes is drawn from
+// `rng`, which is seeded from the run's inputs alone — so identical
+// inputs replay the identical decision sequence.
+type engine struct {
+	rng      *rand.Rand
+	lab      *lab
+	actions  []*action
+	probes   probeSource
+	jrnl     *journal
+	rec      *runRecord
+	duration time.Duration
+	tickMin  time.Duration
+	tickMax  time.Duration
+
+	// wait blocks for a duration unless ctx is cancelled first. Every wait
+	// the tick loop makes goes through it, so a Ctrl-C is observed while
+	// the engine is idling out a tick interval or holding a fault instead
+	// of only after that wait has run its course.
+	wait func(ctx context.Context, d time.Duration) bool
+	now  func() time.Time
+
+	// abort ends the tick loop early: set by park, read by run, both on
+	// the engine's own goroutine.
+	abort bool
+
+	mu    sync.Mutex
+	nodes map[string]string
+
+	// vipOwner is the master the port-forward VIP routes currently point
+	// at, so a re-point is only issued (and journaled) when it moves.
+	vipOwner string
+}
+
+func newEngine(l *lab, actions []*action, probes probeSource, jrnl *journal, rec *runRecord) *engine {
+	e := &engine{
+		rng:      rand.New(rand.NewPCG(uint64(rec.Inputs.Seed), 0)),
+		lab:      l,
+		actions:  actions,
+		probes:   probes,
+		jrnl:     jrnl,
+		rec:      rec,
+		duration: time.Duration(rec.Inputs.DurationMS) * time.Millisecond,
+		tickMin:  time.Duration(rec.Inputs.TickMinMS) * time.Millisecond,
+		tickMax:  time.Duration(rec.Inputs.TickMaxMS) * time.Millisecond,
+		wait:     waitFor,
+		now:      time.Now,
+		nodes:    map[string]string{},
+	}
+	for _, gw := range gatewayNames() {
+		e.nodes[gw] = nodeHealthy
+	}
+	return e
+}
+
+// waitFor blocks for d, reporting whether the full duration elapsed. It
+// returns false the moment ctx is cancelled.
+func waitFor(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (e *engine) nodeState(gw string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.nodes[gw]
+}
+
+func (e *engine) setNodeState(gw, state string) {
+	e.mu.Lock()
+	e.nodes[gw] = state
+	e.mu.Unlock()
+	e.jrnl.emit(event{Event: evNodeState, Target: gw, State: state})
+}
+
+// healthyNodes snapshots the nodes currently in service. The baseline
+// checks only hold these to the agent-alive invariant — a node under
+// fault is meant to have no agent.
+func (e *engine) healthyNodes() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var healthy []string
+	for _, gw := range gatewayNames() {
+		if e.nodes[gw] == nodeHealthy {
+			healthy = append(healthy, gw)
+		}
+	}
+	return healthy
+}
+
+func (e *engine) violate(v violationRecord) {
+	v.TS = e.now().UTC().Format(time.RFC3339Nano)
+	e.mu.Lock()
+	e.rec.Violations = append(e.rec.Violations, v)
+	e.mu.Unlock()
+	e.jrnl.emit(event{
+		Event: evViolation, Kind: v.Kind, Tick: v.Tick,
+		Action: v.Action, Target: v.Target, Detail: v.Detail,
+	})
+}
+
+// recordChecks folds what the baseline sweep evaluated into the run
+// record, so a reader of summary.json can tell a run that asserted the
+// invariants from one that never got to.
+func (e *engine) recordChecks(counts checkCounts) {
+	e.mu.Lock()
+	e.rec.Checks = counts
+	e.mu.Unlock()
+}
+
+// decision is what one tick draws from the seeded stream, before any
+// guardrail is consulted.
+type decision struct {
+	tick     int
+	interval time.Duration
+	action   *action
+	target   string
+	hold     time.Duration
+}
+
+// draw takes exactly four values from the stream, in a fixed order:
+// interval, action, target, hold. The count is fixed so that a guardrail
+// skip cannot shift the stream — the run that skips a decision draws the
+// same values afterwards as the run that executed it, which is what
+// makes a replay comparable across labs that behaved differently.
+func (e *engine) draw(tick int) decision {
+	d := decision{tick: tick}
+	d.interval = e.drawDuration(e.tickMin, e.tickMax)
+
+	total := 0
+	for _, a := range e.actions {
+		total += a.weight
+	}
+	if total == 0 {
+		// Probe-and-check-only run: no action to pick, so no target and
+		// no hold to draw either.
+		return d
+	}
+	pick := e.rng.IntN(total)
+	for _, a := range e.actions {
+		if pick < a.weight {
+			d.action = a
+			break
+		}
+		pick -= a.weight
+	}
+	gateways := gatewayNames()
+	d.target = gateways[e.rng.IntN(len(gateways))]
+	d.hold = e.drawDuration(d.action.holdMin, d.action.holdMax)
+	return d
+}
+
+// drawDuration takes one value from the stream even when the bounds
+// collapse, so the draw count per action never depends on its bounds.
+func (e *engine) drawDuration(low, high time.Duration) time.Duration {
+	span := high - low
+	if span < 0 {
+		span = 0
+	}
+	return low + time.Duration(e.rng.Int64N(int64(span)+1))
+}
+
+// guardrails decides whether a drawn decision may execute. They keep a
+// run meaningful: the fault target must have returned and converged
+// since it was last hit, and at least one other gateway must stay
+// healthy so the lab always has somewhere to fail over to.
+func (e *engine) guardrails(d decision) string {
+	if d.action == nil {
+		return skipNoWeightedAction
+	}
+	if e.nodeState(d.target) != nodeHealthy {
+		return skipTargetNotHealthy
+	}
+	for _, gw := range e.healthyNodes() {
+		if gw != d.target {
+			return ""
+		}
+	}
+	return skipNoHealthyPeer
+}
+
+// run is the tick loop: draw, wait, check the guardrails, execute,
+// record — until the duration expires. After the deadline no further
+// fault is injected; an action already in flight runs to completion.
+func (e *engine) run(ctx context.Context) {
+	deadline := e.now().Add(e.duration)
+	for tick := 1; e.now().Before(deadline); tick++ {
+		d := e.draw(tick)
+		if !e.wait(ctx, d.interval) || !e.now().Before(deadline) {
+			return
+		}
+
+		e.rec.Ticks = tick
+		e.rec.Decisions.Total++
+		skip := e.guardrails(d)
+		ev := event{
+			Event:      evDecision,
+			Tick:       tick,
+			IntervalMS: d.interval.Milliseconds(),
+			Executed:   boolPtr(skip == ""),
+			SkipReason: skip,
+		}
+		if d.action != nil {
+			ev.Action = d.action.name
+			ev.Target = d.target
+			ev.HoldMS = d.hold.Milliseconds()
+		}
+		e.jrnl.emit(ev)
+
+		if skip != "" {
+			e.rec.Decisions.Skipped++
+			continue
+		}
+		e.rec.Decisions.Executed++
+		e.rec.ActionsByName[d.action.name]++
+		e.execute(ctx, d)
+		if e.abort {
+			return
+		}
+	}
+}
+
+// execute injects the fault, holds it, restores it, then gates on
+// convergence before the node is eligible again.
+func (e *engine) execute(ctx context.Context, d decision) {
+	e.setNodeState(d.target, nodeDisrupted)
+
+	injectedAt := e.now()
+	e.jrnl.emit(event{Event: evInject, Tick: d.tick, Action: d.action.name, Target: d.target})
+	if err := d.action.inject(ctx, e.lab, d.target); err != nil {
+		e.undo(ctx, d, err)
+		return
+	}
+
+	// The hold is interruptible, but a cancelled run still has to undo the
+	// fault it is holding — so it falls through to the restore below
+	// rather than returning here.
+	e.wait(ctx, d.hold)
+
+	// An injected fault must be undone even when the run is cancelled, or
+	// the lab is left with a dead gateway whose restart policy is off and
+	// no scenario after it can run. A cancelled ctx would kill every
+	// docker invocation on sight, and the restore is long enough to be
+	// interrupted half-way through — startAndRestoreGateway waits out two
+	// daemon bring-ups and pushes BGP — so it always runs on a context of
+	// its own, detached from the signal and bounded by restoreTimeout.
+	restoreCtx, cancelRestore := context.WithTimeout(
+		context.WithoutCancel(ctx), restoreTimeout)
+	defer cancelRestore()
+
+	e.jrnl.emit(event{Event: evRestore, Tick: d.tick, Action: d.action.name, Target: d.target})
+	if err := d.action.restore(restoreCtx, e.lab, d.target); err != nil {
+		e.failAction(d, "restore", err)
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	restoredAt := e.now()
+	e.setNodeState(d.target, nodeConverging)
+
+	e.converge(ctx, d, injectedAt, restoredAt)
+}
+
+// undo restores a fault whose inject failed half-way, then fails the
+// action.
+//
+// An inject is not atomic: injectGatewayKill and injectAgentTerminate
+// both pin the docker restart policy to "no" before the step that can
+// fail, so bailing out on the error would hand the lab a gateway docker
+// will never revive — with its containerlab veth to `upstream` gone for
+// good — and only `make e2e-down && make e2e-up` gets it back. The
+// restore is the one path that puts the policy back (and re-wires the
+// underlay), so it runs even here: on the same detached, bounded context
+// the held-fault restore uses, since the inject may well have failed
+// because the run was cancelled underneath it.
+func (e *engine) undo(ctx context.Context, d decision, injectErr error) {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreTimeout)
+	defer cancel()
+
+	detail := "undo after a failed inject"
+	if err := d.action.restore(restoreCtx, e.lab, d.target); err != nil {
+		detail += ": " + err.Error()
+	}
+	e.jrnl.emit(event{
+		Event: evRestore, Tick: d.tick, Action: d.action.name,
+		Target: d.target, Detail: detail,
+	})
+	e.failAction(d, "inject", injectErr)
+}
+
+// failAction parks the node: a fault the runner could not inject or undo
+// leaves the lab in a state it cannot reason about, so the node is never
+// targeted again and the run fails.
+func (e *engine) failAction(d decision, phase string, err error) {
+	e.violate(violationRecord{
+		Kind: violationActionFailed, Tick: d.tick,
+		Action: d.action.name, Target: d.target,
+		Detail: fmt.Sprintf("%s: %v", phase, err),
+	})
+	e.park(d.target)
+}
+
+// park takes a node out of the run for good and stops the tick loop.
+//
+// Whatever the parked node was carrying stays dark for the rest of the
+// run — it is never re-targeted and never re-healed — and converged()
+// gates on *every* probe being green. So no later action against any
+// other gateway could converge either: each one would burn its full
+// recovery budget on a condition that can no longer be satisfied, park
+// its own target, and fill the record with violations derived from this
+// one. The violation that got here has already failed the run; stopping
+// leaves an artifact bundle that shows the original fault instead of the
+// cascade.
+func (e *engine) park(gw string) {
+	e.setNodeState(gw, nodeUnconverged)
+	e.abort = true
+	e.jrnl.emit(event{
+		Event: evRunAborted, Target: gw,
+		Detail: "node parked: no later action could converge with its data path down",
+	})
+}
+
+// converge polls the restored node back to health within the action's
+// recovery budget: the container healthy, the chassis back in SB, the
+// VIP routes following the current master, and every probe target green.
+// Budget expiry is the reachability-recovery violation the run asserts
+// against.
+func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time) {
+	deadline := restoredAt.Add(d.action.recoveryBudget)
+	for e.now().Before(deadline) {
+		if ctx.Err() != nil {
+			return
+		}
+		if e.converged(ctx, d.target) {
+			e.setNodeState(d.target, nodeHealthy)
+			fromRestore := e.probes.recoverySince(restoredAt)
+			e.rec.Recoveries = append(e.rec.Recoveries, recoveryRecord{
+				Tick:          d.tick,
+				Action:        d.action.name,
+				Target:        d.target,
+				BudgetMS:      d.action.recoveryBudget.Milliseconds(),
+				ConvergedMS:   e.now().Sub(restoredAt).Milliseconds(),
+				FromInjectMS:  e.probes.recoverySince(injectedAt),
+				FromRestoreMS: fromRestore,
+				CROwnerAfter:  e.vipOwner,
+			})
+			e.jrnl.emit(event{
+				Event: evConverged, Tick: d.tick, Action: d.action.name,
+				Target: d.target, CROwner: e.vipOwner, RecoveryMS: fromRestore,
+			})
+			return
+		}
+		e.wait(ctx, convergePollInterval)
+	}
+	e.violate(violationRecord{
+		Kind: violationRecoveryTimeout, Tick: d.tick,
+		Action: d.action.name, Target: d.target,
+		Detail: fmt.Sprintf("not converged within %s; red probes: %s",
+			d.action.recoveryBudget, strings.Join(e.probes.redTargets(), ",")),
+	})
+	e.park(d.target)
+}
+
+// converged reports whether the restored node is back in service and the
+// data path is green again.
+func (e *engine) converged(ctx context.Context, gw string) bool {
+	if e.lab.containerHealth(ctx, gw) != "healthy" {
+		return false
+	}
+	if !e.lab.chassisInSB(ctx, gw) {
+		return false
+	}
+	e.followMaster(ctx)
+	return e.probes.allGreen()
+}
+
+// followMaster keeps the port-forward VIP's hand-plumbed routes pointed
+// at whichever chassis currently owns cr-lr0-public. Re-election is the
+// whole point of the fault set, and the agent does not manage
+// Load_Balancer VIP routes — so without this the VIP probe would stay
+// red for the rest of the run after the first migration.
+func (e *engine) followMaster(ctx context.Context) {
+	master := e.lab.currentMaster(ctx)
+	if master == "" || master == e.vipOwner {
+		return
+	}
+	if err := e.lab.ensureVIPRouting(ctx, master); err != nil {
+		e.jrnl.emit(event{Event: evVIPRepoint, Target: master, Detail: err.Error()})
+		return
+	}
+	e.vipOwner = master
+	e.jrnl.emit(event{Event: evVIPRepoint, Target: master})
+}
+
+// parseWeights parses the `-weights name=n,...` flag against the action
+// registry, rejecting names the registry does not know. Unnamed actions
+// keep their default weight.
+func parseWeights(spec string, actions []*action) (map[string]int, error) {
+	weights := map[string]int{}
+	for _, a := range actions {
+		weights[a.name] = a.weight
+	}
+	for _, pair := range strings.Split(spec, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			return nil, fmt.Errorf("weight %q is not name=value", pair)
+		}
+		name = strings.TrimSpace(name)
+		if _, known := weights[name]; !known {
+			return nil, fmt.Errorf("unknown action %q in -weights (known: %s)",
+				name, strings.Join(actionNames(actions), ", "))
+		}
+		weight, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("weight for %q: %w", name, err)
+		}
+		if weight < 0 {
+			return nil, fmt.Errorf("weight for %q is negative", name)
+		}
+		weights[name] = weight
+	}
+	return weights, nil
+}
+
+func actionNames(actions []*action) []string {
+	names := make([]string, 0, len(actions))
+	for _, a := range actions {
+		names = append(names, a.name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// applyWeights overrides the registry's default weights in place. The
+// registry order is untouched: the weighted pick walks it in order, so
+// the order is part of the replay contract.
+func applyWeights(actions []*action, weights map[string]int) {
+	for _, a := range actions {
+		if w, ok := weights[a.name]; ok {
+			a.weight = w
+		}
+	}
+}
