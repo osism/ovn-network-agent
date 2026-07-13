@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
@@ -205,11 +206,26 @@ func serverKeySet[T any](
 	return set, nil
 }
 
+// consistencySelectTimeout bounds every consistency-guard select. The guard's
+// contract is to degrade to the monitor cache when the server cannot answer,
+// but under client.WithReconnect a Transact against an unresponsive server
+// (SIGSTOP'd, network blackhole) does not fail — it blocks on the caller's
+// context while holding the libovsdb client's rpc mutex read-side. Unbounded,
+// that stalls reconciliation for the whole outage and blocks the inactivity
+// probe's Disconnect (a write-lock acquisition) indefinitely, so the client
+// can never even begin reconnecting. The bound must sit well under the 30s
+// inactivity probe so a stuck select releases the mutex before the probe
+// needs it; a healthy projection select answers in milliseconds. A var so the
+// unit test can shrink it.
+var consistencySelectTimeout = 5 * time.Second
+
 // directSelect runs an OVSDB select on table, bypassing the monitor cache.
 // With columns nil every column is returned; otherwise only the named ones.
 // Where is left empty — Operation.MarshalJSON encodes a conditionless select
 // as the match-everything form.
 func directSelect(ctx context.Context, c ovsdbClient, table string, columns []string) ([]ovsdb.Row, error) {
+	ctx, cancel := context.WithTimeout(ctx, consistencySelectTimeout)
+	defer cancel()
 	op := ovsdb.Operation{
 		Op:      ovsdb.OperationSelect,
 		Table:   table,
