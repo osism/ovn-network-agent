@@ -9,7 +9,41 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+// applyYAMLConfig applies a config-file fragment to cfg through the option
+// registry — the file layer exactly as loadConfig drives it. Tests express the
+// file layer as the YAML an operator would actually write, rather than as a
+// mirror struct that no longer exists.
+func applyYAMLConfig(t *testing.T, cfg *Config, content string) error {
+	t.Helper()
+	var doc configDoc
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+		t.Fatalf("parse test yaml: %v", err)
+	}
+	return applyFileConfig(cfg, doc)
+}
+
+// readFileConfig writes content to a temp config file and returns the Config
+// produced by the file layer, exercising readConfigFile + applyFileConfig.
+func readFileConfig(t *testing.T, content string) (Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	doc, err := readConfigFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	var cfg Config
+	if err := applyFileConfig(&cfg, doc); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
 
 // fullModeArgs prepends the OVN remote flags required for full mode to the
 // given extra flags. Tests that exercise unrelated config fields use it so
@@ -23,7 +57,7 @@ func fullModeArgs(extra ...string) []string {
 }
 
 func TestReadConfigFile(t *testing.T) {
-	content := `
+	cfg, err := readFileConfig(t, `
 ovn_sb_remote: "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642"
 ovn_nb_remote: "tcp:10.0.0.1:6641"
 bridge_dev: "br-provider"
@@ -34,46 +68,41 @@ gateway_port: "cr-lrp-abc123"
 reconcile_interval: "30s"
 log_level: "debug"
 cleanup_on_shutdown: false
-`
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("write test config: %v", err)
-	}
-
-	fc, err := readConfigFile(path)
+`)
 	if err != nil {
-		t.Fatalf("readConfigFile() error: %v", err)
+		t.Fatalf("readFileConfig() error: %v", err)
 	}
 
-	if fc.OVNSBRemote != "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642" {
-		t.Errorf("OVNSBRemote = %q, want %q", fc.OVNSBRemote, "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642")
+	if cfg.OVNSBRemote != "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642" {
+		t.Errorf("OVNSBRemote = %q, want %q", cfg.OVNSBRemote, "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642")
 	}
-	if fc.OVNNBRemote != "tcp:10.0.0.1:6641" {
-		t.Errorf("OVNNBRemote = %q, want %q", fc.OVNNBRemote, "tcp:10.0.0.1:6641")
+	if cfg.OVNNBRemote != "tcp:10.0.0.1:6641" {
+		t.Errorf("OVNNBRemote = %q, want %q", cfg.OVNNBRemote, "tcp:10.0.0.1:6641")
 	}
-	if fc.BridgeDev != "br-provider" {
-		t.Errorf("BridgeDev = %q, want %q", fc.BridgeDev, "br-provider")
+	if cfg.BridgeDev != "br-provider" {
+		t.Errorf("BridgeDev = %q, want %q", cfg.BridgeDev, "br-provider")
 	}
-	if fc.VRFName != "vrf-test" {
-		t.Errorf("VRFName = %q, want %q", fc.VRFName, "vrf-test")
+	if cfg.VRFName != "vrf-test" {
+		t.Errorf("VRFName = %q, want %q", cfg.VRFName, "vrf-test")
 	}
-	if fc.VethNexthop != "169.254.0.2" {
-		t.Errorf("VethNexthop = %q, want %q", fc.VethNexthop, "169.254.0.2")
+	if cfg.VethNexthop != "169.254.0.2" {
+		t.Errorf("VethNexthop = %q, want %q", cfg.VethNexthop, "169.254.0.2")
 	}
-	if len(fc.NetworkCIDR) != 1 || fc.NetworkCIDR[0] != "192.0.2.0/24" {
-		t.Errorf("NetworkCIDR = %v, want [192.0.2.0/24]", fc.NetworkCIDR)
+	// A scalar network_cidr is accepted as a one-element list.
+	if len(cfg.NetworkCIDRs) != 1 || cfg.NetworkCIDRs[0] != "192.0.2.0/24" {
+		t.Errorf("NetworkCIDRs = %v, want [192.0.2.0/24]", cfg.NetworkCIDRs)
 	}
-	if fc.GatewayPort != "cr-lrp-abc123" {
-		t.Errorf("GatewayPort = %q, want %q", fc.GatewayPort, "cr-lrp-abc123")
+	if cfg.GatewayPort != "cr-lrp-abc123" {
+		t.Errorf("GatewayPort = %q, want %q", cfg.GatewayPort, "cr-lrp-abc123")
 	}
-	if fc.ReconcileInterval != "30s" {
-		t.Errorf("ReconcileInterval = %q, want %q", fc.ReconcileInterval, "30s")
+	if cfg.ReconcileInterval != 30*time.Second {
+		t.Errorf("ReconcileInterval = %v, want %v", cfg.ReconcileInterval, 30*time.Second)
 	}
-	if fc.LogLevel != "debug" {
-		t.Errorf("LogLevel = %q, want %q", fc.LogLevel, "debug")
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "debug")
 	}
-	if fc.CleanupOnShutdown == nil || *fc.CleanupOnShutdown != false {
-		t.Errorf("CleanupOnShutdown = %v, want false", fc.CleanupOnShutdown)
+	if cfg.CleanupOnShutdown {
+		t.Error("CleanupOnShutdown = true, want false")
 	}
 }
 
@@ -162,28 +191,20 @@ drain_on_shutdown: false
 }
 
 func TestReadConfigFileNetworkCIDRList(t *testing.T) {
-	content := `
-ovn_sb_remote: "tcp:10.0.0.1:6642"
-ovn_nb_remote: "tcp:10.0.0.1:6641"
+	cfg, err := readFileConfig(t, `
 network_cidr:
   - "192.0.2.0/24"
   - "198.51.100.0/24"
-`
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("write test config: %v", err)
-	}
-
-	fc, err := readConfigFile(path)
+`)
 	if err != nil {
-		t.Fatalf("readConfigFile() error: %v", err)
+		t.Fatalf("readFileConfig() error: %v", err)
 	}
 
-	if len(fc.NetworkCIDR) != 2 {
-		t.Fatalf("NetworkCIDR length = %d, want 2", len(fc.NetworkCIDR))
+	if len(cfg.NetworkCIDRs) != 2 {
+		t.Fatalf("NetworkCIDRs length = %d, want 2", len(cfg.NetworkCIDRs))
 	}
-	if fc.NetworkCIDR[0] != "192.0.2.0/24" || fc.NetworkCIDR[1] != "198.51.100.0/24" {
-		t.Errorf("NetworkCIDR = %v, want [192.0.2.0/24 198.51.100.0/24]", fc.NetworkCIDR)
+	if cfg.NetworkCIDRs[0] != "192.0.2.0/24" || cfg.NetworkCIDRs[1] != "198.51.100.0/24" {
+		t.Errorf("NetworkCIDRs = %v, want [192.0.2.0/24 198.51.100.0/24]", cfg.NetworkCIDRs)
 	}
 }
 
@@ -208,28 +229,22 @@ func TestStringOrSliceUnmarshalRejectsMappingInput(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			if err := os.WriteFile(path, []byte(tt.yaml), 0644); err != nil {
-				t.Fatalf("write test config: %v", err)
-			}
-
-			// Must not panic on a mapping node — the function decodes the
-			// value into a []string in the non-scalar branch, and yaml.v3
-			// returns an error from Decode rather than panicking. Catch any
-			// panic explicitly so a future refactor that drops the safe
-			// Decode path is flagged here.
+			// Must not panic on a mapping node — the option decodes the value
+			// into a StringOrSlice, and yaml.v3 returns an error from Decode
+			// rather than panicking. Catch any panic explicitly so a future
+			// refactor that drops the safe Decode path is flagged here.
 			defer func() {
 				if r := recover(); r != nil {
 					t.Fatalf("UnmarshalYAML panicked on mapping input: %v", r)
 				}
 			}()
 
-			fc, err := readConfigFile(path)
+			cfg, err := readFileConfig(t, tt.yaml)
 			if err == nil {
-				t.Fatalf("expected decode error for mapping input, got success with NetworkCIDR=%v", fc.NetworkCIDR)
+				t.Fatalf("expected decode error for mapping input, got success with NetworkCIDRs=%v", cfg.NetworkCIDRs)
 			}
-			if errStr := err.Error(); errStr == "" {
-				t.Errorf("decode error message is empty")
+			if !strings.Contains(err.Error(), "network_cidr") {
+				t.Errorf("error %q does not name network_cidr", err)
 			}
 		})
 	}
@@ -259,14 +274,12 @@ func TestApplyFileConfig(t *testing.T) {
 		LogLevel:          "info",
 	}
 
-	fc := configFile{
-		OVNSBRemote:       "tcp:10.0.0.1:6642",
-		OVNNBRemote:       "tcp:10.0.0.1:6641",
-		BridgeDev:         "br-provider",
-		ReconcileInterval: "30s",
-	}
-
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, `
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+bridge_dev: "br-provider"
+reconcile_interval: "30s"
+`); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 
@@ -279,7 +292,7 @@ func TestApplyFileConfig(t *testing.T) {
 	if cfg.BridgeDev != "br-provider" {
 		t.Errorf("BridgeDev = %q, want %q", cfg.BridgeDev, "br-provider")
 	}
-	// Unchanged fields keep defaults.
+	// Keys absent from the file keep their prior value.
 	if cfg.VRFName != "vrf-provider" {
 		t.Errorf("VRFName = %q, want %q", cfg.VRFName, "vrf-provider")
 	}
@@ -300,9 +313,8 @@ func TestApplyFileConfigEmptyFieldsNoOverride(t *testing.T) {
 		LogLevel:  "info",
 	}
 
-	fc := configFile{} // All empty.
-
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	// An empty file must not clobber anything.
+	if err := applyYAMLConfig(t, &cfg, "\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 
@@ -311,6 +323,15 @@ func TestApplyFileConfigEmptyFieldsNoOverride(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q (should not be overridden)", cfg.LogLevel, "info")
+	}
+
+	// An explicitly empty string must likewise not clobber a real value:
+	// that is the historical `if fc.X != ""` contract.
+	if err := applyYAMLConfig(t, &cfg, `bridge_dev: ""`+"\n"); err != nil {
+		t.Fatalf("applyFileConfig: %v", err)
+	}
+	if cfg.BridgeDev != "br-ex" {
+		t.Errorf("BridgeDev = %q, want br-ex (empty string must not override)", cfg.BridgeDev)
 	}
 }
 
@@ -405,21 +426,23 @@ func TestApplyEnvConfigInvalidInt(t *testing.T) {
 func TestApplyFileConfigInvalidDurations(t *testing.T) {
 	cases := []struct {
 		name string
-		fc   configFile
+		yaml string
 		key  string
 	}{
-		{"reconcile_interval", configFile{ReconcileInterval: "notaduration"}, "reconcile_interval"},
-		{"drain_timeout", configFile{DrainTimeout: "notaduration"}, "drain_timeout"},
-		{"drain_settle_delay", configFile{DrainSettleDelay: "notaduration"}, "drain_settle_delay"},
-		{"stale_chassis_grace_period", configFile{StaleChassisGracePeriod: "notaduration"}, "stale_chassis_grace_period"},
+		{"reconcile_interval", "reconcile_interval: notaduration\n", "reconcile_interval"},
+		{"drain_timeout", "drain_timeout: notaduration\n", "drain_timeout"},
+		{"drain_settle_delay", "drain_settle_delay: notaduration\n", "drain_settle_delay"},
+		{"stale_chassis_grace_period", "stale_chassis_grace_period: notaduration\n", "stale_chassis_grace_period"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Config{}
-			err := applyFileConfig(&cfg, &tc.fc)
+			err := applyYAMLConfig(t, &cfg, tc.yaml)
 			if err == nil {
 				t.Fatalf("expected error for invalid %s", tc.key)
 			}
+			// The error must name the key as it appears in the file, not the
+			// flag or the env var.
 			if !strings.Contains(err.Error(), tc.key) {
 				t.Errorf("error %q does not name %s", err, tc.key)
 			}
@@ -589,9 +612,7 @@ func TestApplyEnvConfigDryRun(t *testing.T) {
 
 func TestApplyFileConfigDryRun(t *testing.T) {
 	cfg := Config{}
-	dryRun := true
-	fc := configFile{DryRun: &dryRun}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "dry_run: true\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if !cfg.DryRun {
@@ -748,9 +769,7 @@ func TestApplyEnvConfigInvalidBool(t *testing.T) {
 
 func TestApplyFileConfigCleanupOnShutdown(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
-	cleanup := false
-	fc := configFile{CleanupOnShutdown: &cleanup}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "cleanup_on_shutdown: false\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if cfg.CleanupOnShutdown {
@@ -760,8 +779,9 @@ func TestApplyFileConfigCleanupOnShutdown(t *testing.T) {
 
 func TestApplyFileConfigCleanupOnShutdownNil(t *testing.T) {
 	cfg := Config{CleanupOnShutdown: true}
-	fc := configFile{} // CleanupOnShutdown is nil
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	// Key absent entirely: an explicit `false` must be distinguishable from
+	// "not set", so the prior value has to survive.
+	if err := applyYAMLConfig(t, &cfg, "bridge_dev: br-ex\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if !cfg.CleanupOnShutdown {
@@ -1140,16 +1160,12 @@ func TestApplyEnvConfigVethLeak(t *testing.T) {
 
 func TestApplyFileConfigVethLeak(t *testing.T) {
 	cfg := Config{VethLeakEnabled: true, VethLeakTableID: 200, VethLeakRulePriority: 2000}
-	enabled := false
-	tableID := 201
-	prio := 3000
-	fc := configFile{
-		VethLeakEnabled:      &enabled,
-		VethProviderIP:       "169.254.0.5",
-		VethLeakTableID:      &tableID,
-		VethLeakRulePriority: &prio,
-	}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, `
+veth_leak_enabled: false
+veth_provider_ip: "169.254.0.5"
+veth_leak_table_id: 201
+veth_leak_rule_priority: 3000
+`); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 
@@ -1260,8 +1276,7 @@ func TestApplyEnvConfigStaleChassisGracePeriod(t *testing.T) {
 
 func TestApplyFileConfigStaleChassisGracePeriod(t *testing.T) {
 	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
-	fc := configFile{StaleChassisGracePeriod: "2m"}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "stale_chassis_grace_period: 2m\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if cfg.StaleChassisGracePeriod != 2*time.Minute {
@@ -1271,8 +1286,7 @@ func TestApplyFileConfigStaleChassisGracePeriod(t *testing.T) {
 
 func TestApplyFileConfigStaleChassisGracePeriodEmpty(t *testing.T) {
 	cfg := Config{StaleChassisGracePeriod: 5 * time.Minute}
-	fc := configFile{}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "bridge_dev: br-ex\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if cfg.StaleChassisGracePeriod != 5*time.Minute {
@@ -1357,8 +1371,7 @@ func TestApplyEnvConfigDrainSettleDelay(t *testing.T) {
 
 func TestApplyFileConfigDrainSettleDelay(t *testing.T) {
 	cfg := Config{DrainSettleDelay: 3 * time.Second}
-	fc := configFile{DrainSettleDelay: "10s"}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "drain_settle_delay: 10s\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if cfg.DrainSettleDelay != 10*time.Second {
@@ -1368,8 +1381,7 @@ func TestApplyFileConfigDrainSettleDelay(t *testing.T) {
 
 func TestApplyFileConfigDrainSettleDelayEmpty(t *testing.T) {
 	cfg := Config{DrainSettleDelay: 3 * time.Second}
-	fc := configFile{}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "bridge_dev: br-ex\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if cfg.DrainSettleDelay != 3*time.Second {
@@ -1424,8 +1436,7 @@ func TestApplyEnvConfigFRRPrefixList(t *testing.T) {
 
 func TestApplyFileConfigFRRPrefixList(t *testing.T) {
 	cfg := Config{}
-	fc := configFile{FRRPrefixList: "FILE-LIST"}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "frr_prefix_list: FILE-LIST\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 	if cfg.FRRPrefixList != "FILE-LIST" {
@@ -1720,16 +1731,16 @@ func TestApplyFileConfigPortForward(t *testing.T) {
 		PortForwardDev:     "loopback1",
 		PortForwardTableID: 201,
 	}
-	tableID := 205
-	fc := configFile{
-		PortForwardDev:     "loopback1",
-		PortForwardTableID: &tableID,
-		PortForwards: []PortForwardVIP{
-			{VIP: "198.51.100.10", Rules: []PortForwardRule{{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100"}}},
-		},
-	}
-
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, `
+port_forward_dev: "loopback1"
+port_forward_table_id: 205
+port_forwards:
+  - vip: "198.51.100.10"
+    rules:
+      - proto: tcp
+        port: 80
+        dest_addr: "10.0.0.100"
+`); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 
@@ -1740,7 +1751,11 @@ func TestApplyFileConfigPortForward(t *testing.T) {
 		t.Errorf("PortForwardTableID = %d, want %d", cfg.PortForwardTableID, 205)
 	}
 	if len(cfg.PortForwards) != 1 {
-		t.Errorf("len(PortForwards) = %d, want 1", len(cfg.PortForwards))
+		t.Fatalf("len(PortForwards) = %d, want 1", len(cfg.PortForwards))
+	}
+	pf := cfg.PortForwards[0]
+	if pf.VIP != "198.51.100.10" || len(pf.Rules) != 1 || pf.Rules[0].DestAddr != "10.0.0.100" {
+		t.Errorf("PortForwards[0] = %+v, want the nested rule decoded", pf)
 	}
 }
 
@@ -1749,9 +1764,7 @@ func TestApplyFileConfigPortForwardEmpty(t *testing.T) {
 		PortForwardDev:     "loopback1",
 		PortForwardTableID: 201,
 	}
-	fc := configFile{} // no port forward fields set
-
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "bridge_dev: br-ex\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
 
@@ -1760,6 +1773,9 @@ func TestApplyFileConfigPortForwardEmpty(t *testing.T) {
 	}
 	if cfg.PortForwardTableID != 201 {
 		t.Errorf("PortForwardTableID should remain %d, got %d", 201, cfg.PortForwardTableID)
+	}
+	if len(cfg.PortForwards) != 0 {
+		t.Errorf("PortForwards should remain empty, got %+v", cfg.PortForwards)
 	}
 }
 
@@ -2025,13 +2041,11 @@ func TestApplyEnvConfigMetricsListen(t *testing.T) {
 
 func TestApplyFileConfigMetricsListen(t *testing.T) {
 	cfg := Config{}
-	listen := "127.0.0.1:9273"
-	fc := configFile{MetricsListen: listen}
-	if err := applyFileConfig(&cfg, &fc); err != nil {
+	if err := applyYAMLConfig(t, &cfg, "metrics_listen: \"127.0.0.1:9273\"\n"); err != nil {
 		t.Fatalf("applyFileConfig: %v", err)
 	}
-	if cfg.MetricsListen != listen {
-		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, listen)
+	if cfg.MetricsListen != "127.0.0.1:9273" {
+		t.Errorf("MetricsListen = %q, want %q", cfg.MetricsListen, "127.0.0.1:9273")
 	}
 }
 
@@ -2226,4 +2240,106 @@ func TestLoadConfigRejectsIncompleteOVN(t *testing.T) {
 			t.Error("expected error when only ovn-nb-remote is set")
 		}
 	})
+}
+
+// TestConfigOptionsRegistry guards the registry's core promise: an option is
+// declared once, and its three names (flag, environment variable, config-file
+// key) are derived from that one declaration rather than repeated. If a future
+// row hand-writes an inconsistent name, or a duplicate slips in, this fails.
+func TestConfigOptionsRegistry(t *testing.T) {
+	opts := configOptions()
+	if len(opts) == 0 {
+		t.Fatal("configOptions() is empty")
+	}
+
+	seenFlag := map[string]bool{}
+	seenKey := map[string]bool{}
+	seenEnv := map[string]bool{}
+
+	for _, o := range opts {
+		if o.Key == "" {
+			t.Errorf("option %+v has no config-file key", o)
+		}
+		if o.Usage == "" {
+			t.Errorf("option %q has no usage text", o.Key)
+		}
+		if seenKey[o.Key] {
+			t.Errorf("duplicate config-file key %q", o.Key)
+		}
+		seenKey[o.Key] = true
+
+		// Every option must be settable from a config file.
+		if o.applyYAML == nil {
+			t.Errorf("option %q has no YAML binding", o.Key)
+		}
+
+		if o.Flag == "" {
+			// A YAML-only option must have no flag or env plumbing at all.
+			if o.register != nil || o.applyFlag != nil || o.applyEnv != nil {
+				t.Errorf("YAML-only option %q must not declare flag/env bindings", o.Key)
+			}
+			if o.EnvVar() != "" {
+				t.Errorf("YAML-only option %q must have no env var, got %q", o.Key, o.EnvVar())
+			}
+			continue
+		}
+
+		if seenFlag[o.Flag] {
+			t.Errorf("duplicate flag %q", o.Flag)
+		}
+		seenFlag[o.Flag] = true
+		if seenEnv[o.EnvVar()] {
+			t.Errorf("duplicate env var %q", o.EnvVar())
+		}
+		seenEnv[o.EnvVar()] = true
+
+		// A flagged option must carry the full set of bindings.
+		if o.register == nil || o.applyFlag == nil || o.applyEnv == nil {
+			t.Errorf("option %q is missing a flag/env binding", o.Flag)
+		}
+
+		// The derivation itself: names must follow mechanically from the flag.
+		wantKey := strings.ReplaceAll(o.Flag, "-", "_")
+		if o.Key != wantKey {
+			t.Errorf("option %q: Key = %q, want %q (derived from the flag)", o.Flag, o.Key, wantKey)
+		}
+		wantEnv := "OVN_NETWORK_" + strings.ToUpper(wantKey)
+		if o.EnvVar() != wantEnv {
+			t.Errorf("option %q: EnvVar() = %q, want %q", o.Flag, o.EnvVar(), wantEnv)
+		}
+	}
+}
+
+// TestConfigOptionsDefaultsMatchLoadConfig proves the registry's defaults are
+// the ones actually applied: loading with no file, no env and no flags must
+// reproduce every applyDefault.
+func TestConfigOptionsDefaultsMatchLoadConfig(t *testing.T) {
+	var want Config
+	for _, o := range configOptions() {
+		if o.applyDefault != nil {
+			o.applyDefault(&want)
+		}
+	}
+
+	got, err := loadConfig(fullModeArgs())
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+
+	// The OVN remotes come from fullModeArgs, and these three are derived by
+	// validateMode/validateConfig rather than declared as options.
+	want.OVNSBRemote = got.OVNSBRemote
+	want.OVNNBRemote = got.OVNNBRemote
+	want.NetworkFilters = got.NetworkFilters
+	want.PortForwardEnabled = got.PortForwardEnabled
+	want.PortForwardOnly = got.PortForwardOnly
+	want.VethProviderIP = got.VethProviderIP
+
+	if got.BridgeDev != want.BridgeDev || got.VRFName != want.VRFName ||
+		got.ReconcileInterval != want.ReconcileInterval ||
+		got.DrainSettleDelay != want.DrainSettleDelay ||
+		got.CleanupOnShutdown != want.CleanupOnShutdown ||
+		got.PortForwardCTZone != want.PortForwardCTZone {
+		t.Errorf("loadConfig defaults diverge from the registry:\n got %+v\nwant %+v", got, want)
+	}
 }

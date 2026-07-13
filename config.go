@@ -1,14 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -177,42 +176,296 @@ type Config struct {
 	PortForwards            []PortForwardVIP // VIP forwarding rules from config
 }
 
-// configFile is the YAML representation of the config file.
-type configFile struct {
-	OVNSBRemote       string        `yaml:"ovn_sb_remote"`
-	OVNNBRemote       string        `yaml:"ovn_nb_remote"`
-	BridgeDev         string        `yaml:"bridge_dev"`
-	VRFName           string        `yaml:"vrf_name"`
-	VethNexthop       string        `yaml:"veth_nexthop"`
-	NetworkCIDR       StringOrSlice `yaml:"network_cidr"`
-	GatewayPort       string        `yaml:"gateway_port"`
-	RouteTableID      *int          `yaml:"route_table_id"`
-	BridgeIP          string        `yaml:"bridge_ip"`
-	OVSWrapper        string        `yaml:"ovs_wrapper"`
-	ReconcileInterval string        `yaml:"reconcile_interval"`
-	LogLevel          string        `yaml:"log_level"`
-	DryRun            *bool         `yaml:"dry_run"`
-	CleanupOnShutdown *bool         `yaml:"cleanup_on_shutdown"`
-	DrainOnShutdown   *bool         `yaml:"drain_on_shutdown"`
-	DrainTimeout      string        `yaml:"drain_timeout"`
-	DrainSettleDelay  string        `yaml:"drain_settle_delay"`
+// =============================================================================
+// Configuration option registry
+// =============================================================================
+//
+// Every configuration knob is declared exactly once, as one row of
+// configOptions(). A row carries the option's CLI flag name, its default, its
+// usage text and the Config field it binds to; the environment variable and the
+// YAML key are *derived* from the flag name, so the three names an option is
+// known by cannot drift apart.
+//
+// Adding an option is one row. Flag registration, the default, all three
+// precedence layers (file < env < flag) and the generated reference docs follow
+// from it — replacing the six hand-synchronised sites this previously took.
+// tools/docgen parses this same table to produce docs/reference/.
 
-	FRRPrefixList string `yaml:"frr_prefix_list"`
+// configOption is one configuration knob.
+type configOption struct {
+	// Flag is the CLI flag name, e.g. "reconcile-interval". Empty for
+	// YAML-only options.
+	Flag string
+	// Key is the config-file key, e.g. "reconcile_interval". Derived from
+	// Flag unless the option is YAML-only.
+	Key string
+	// Usage is the flag help text and the option's description in the docs.
+	Usage string
 
-	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period"`
+	// register declares the flag on fs, bound to this option's own storage.
+	// Nil for YAML-only options.
+	register func(fs *flag.FlagSet)
+	// applyDefault seeds cfg with the option's default.
+	applyDefault func(cfg *Config)
+	// applyFlag copies the parsed flag value into cfg. Called only for flags
+	// the user set explicitly (fs.Visit), so an unset flag never overrides a
+	// value from the file or the environment. Nil for YAML-only options.
+	applyFlag func(cfg *Config) error
+	// applyEnv parses an environment value into cfg. Nil for YAML-only options.
+	applyEnv func(cfg *Config, v string) error
+	// applyYAML decodes this option's config-file node into cfg.
+	applyYAML func(cfg *Config, n *yaml.Node) error
+}
 
-	MetricsListen string `yaml:"metrics_listen"`
+// envVarName derives an option's environment variable from its flag name:
+// "reconcile-interval" -> "OVN_NETWORK_RECONCILE_INTERVAL".
+func envVarName(flagName string) string {
+	return "OVN_NETWORK_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
 
-	VethLeakEnabled      *bool  `yaml:"veth_leak_enabled"`
-	VethProviderIP       string `yaml:"veth_provider_ip"`
-	VethLeakTableID      *int   `yaml:"veth_leak_table_id"`
-	VethLeakRulePriority *int   `yaml:"veth_leak_rule_priority"`
+// yamlKeyName derives an option's config-file key from its flag name:
+// "reconcile-interval" -> "reconcile_interval".
+func yamlKeyName(flagName string) string {
+	return strings.ReplaceAll(flagName, "-", "_")
+}
 
-	PortForwardDev          string           `yaml:"port_forward_dev"`
-	PortForwardTableID      *int             `yaml:"port_forward_table_id"`
-	PortForwardL3mdevAccept *bool            `yaml:"port_forward_l3mdev_accept"`
-	PortForwardCTZone       *int             `yaml:"port_forward_ct_zone"`
-	PortForwards            []PortForwardVIP `yaml:"port_forwards"`
+// EnvVar returns the environment variable that sets this option, or "" when it
+// has none (YAML-only options).
+func (o configOption) EnvVar() string {
+	if o.Flag == "" {
+		return ""
+	}
+	return envVarName(o.Flag)
+}
+
+// newOpt builds the name/usage skeleton shared by every typed constructor.
+func newOpt(flagName, usage string) configOption {
+	return configOption{Flag: flagName, Key: yamlKeyName(flagName), Usage: usage}
+}
+
+// stringOpt declares a string option. The file layer treats an empty string as
+// "not set", matching the historical `if fc.X != ""` behaviour.
+func stringOpt(flagName, def, usage string, field func(*Config) *string) configOption {
+	o := newOpt(flagName, usage)
+	var v string
+	o.register = func(fs *flag.FlagSet) { fs.StringVar(&v, flagName, def, usage) }
+	o.applyDefault = func(cfg *Config) { *field(cfg) = def }
+	o.applyFlag = func(cfg *Config) error { *field(cfg) = v; return nil }
+	o.applyEnv = func(cfg *Config, s string) error { *field(cfg) = s; return nil }
+	o.applyYAML = func(cfg *Config, n *yaml.Node) error {
+		var s string
+		if err := n.Decode(&s); err != nil {
+			return fmt.Errorf("invalid %s: %w", o.Key, err)
+		}
+		if s != "" {
+			*field(cfg) = s
+		}
+		return nil
+	}
+	return o
+}
+
+// boolOpt declares a boolean option. The flag is a real bool flag, so the bare
+// `-dry-run` form keeps working; in the file layer the key's mere presence sets
+// the value, which is what the old *bool config fields expressed.
+func boolOpt(flagName string, def bool, usage string, field func(*Config) *bool) configOption {
+	o := newOpt(flagName, usage)
+	var v bool
+	o.register = func(fs *flag.FlagSet) { fs.BoolVar(&v, flagName, def, usage) }
+	o.applyDefault = func(cfg *Config) { *field(cfg) = def }
+	o.applyFlag = func(cfg *Config) error { *field(cfg) = v; return nil }
+	o.applyEnv = func(cfg *Config, s string) error {
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", o.EnvVar(), s, err)
+		}
+		*field(cfg) = b
+		return nil
+	}
+	o.applyYAML = func(cfg *Config, n *yaml.Node) error {
+		var b bool
+		if err := n.Decode(&b); err != nil {
+			return fmt.Errorf("invalid %s: %w", o.Key, err)
+		}
+		*field(cfg) = b
+		return nil
+	}
+	return o
+}
+
+// intOpt declares an integer option.
+func intOpt(flagName string, def int, usage string, field func(*Config) *int) configOption {
+	o := newOpt(flagName, usage)
+	var v int
+	o.register = func(fs *flag.FlagSet) { fs.IntVar(&v, flagName, def, usage) }
+	o.applyDefault = func(cfg *Config) { *field(cfg) = def }
+	o.applyFlag = func(cfg *Config) error { *field(cfg) = v; return nil }
+	o.applyEnv = func(cfg *Config, s string) error {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", o.EnvVar(), s, err)
+		}
+		*field(cfg) = n
+		return nil
+	}
+	o.applyYAML = func(cfg *Config, n *yaml.Node) error {
+		var i int
+		if err := n.Decode(&i); err != nil {
+			return fmt.Errorf("invalid %s: %w", o.Key, err)
+		}
+		*field(cfg) = i
+		return nil
+	}
+	return o
+}
+
+// durationOpt declares a time.Duration option. The flag is registered as a
+// string so the parse failure can name the flag ("-reconcile-interval") rather
+// than surfacing flag package's generic duration error.
+func durationOpt(flagName string, def time.Duration, usage string, field func(*Config) *time.Duration) configOption {
+	o := newOpt(flagName, usage)
+	var v string
+	o.register = func(fs *flag.FlagSet) { fs.StringVar(&v, flagName, "", usage) }
+	o.applyDefault = func(cfg *Config) { *field(cfg) = def }
+	o.applyFlag = func(cfg *Config) error {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid -%s %q: %w", flagName, v, err)
+		}
+		*field(cfg) = d
+		return nil
+	}
+	o.applyEnv = func(cfg *Config, s string) error {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", o.EnvVar(), s, err)
+		}
+		*field(cfg) = d
+		return nil
+	}
+	o.applyYAML = func(cfg *Config, n *yaml.Node) error {
+		var s string
+		if err := n.Decode(&s); err != nil {
+			return fmt.Errorf("invalid %s: %w", o.Key, err)
+		}
+		if s == "" {
+			return nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", o.Key, s, err)
+		}
+		*field(cfg) = d
+		return nil
+	}
+	return o
+}
+
+// stringSliceOpt declares a list option. The flag and environment forms are
+// comma-separated; the YAML form accepts either a scalar or a list
+// (StringOrSlice).
+func stringSliceOpt(flagName, usage string, field func(*Config) *[]string) configOption {
+	o := newOpt(flagName, usage)
+	var v string
+	o.register = func(fs *flag.FlagSet) { fs.StringVar(&v, flagName, "", usage) }
+	o.applyFlag = func(cfg *Config) error { *field(cfg) = splitAndTrim(v, ","); return nil }
+	o.applyEnv = func(cfg *Config, s string) error { *field(cfg) = splitAndTrim(s, ","); return nil }
+	o.applyYAML = func(cfg *Config, n *yaml.Node) error {
+		var list StringOrSlice
+		if err := n.Decode(&list); err != nil {
+			return fmt.Errorf("invalid %s: %w", o.Key, err)
+		}
+		if len(list) > 0 {
+			*field(cfg) = []string(list)
+		}
+		return nil
+	}
+	return o
+}
+
+// portForwardsOpt declares the port_forwards list, which has no flag or
+// environment form: it is a nested structure that only the config file can
+// express.
+func portForwardsOpt(key, usage string, field func(*Config) *[]PortForwardVIP) configOption {
+	return configOption{
+		Key:   key,
+		Usage: usage,
+		applyYAML: func(cfg *Config, n *yaml.Node) error {
+			var pfs []PortForwardVIP
+			if err := n.Decode(&pfs); err != nil {
+				return fmt.Errorf("invalid %s: %w", key, err)
+			}
+			if len(pfs) > 0 {
+				*field(cfg) = pfs
+			}
+			return nil
+		},
+	}
+}
+
+// configOptions is the single declaration of every configuration option. Order
+// is the order flags appear in --help and in the generated reference tables.
+func configOptions() []configOption {
+	return []configOption{
+		stringOpt("ovn-sb-remote", "", "OVN Southbound DB remote, comma-separated for cluster",
+			func(c *Config) *string { return &c.OVNSBRemote }),
+		stringOpt("ovn-nb-remote", "", "OVN Northbound DB remote, comma-separated for cluster",
+			func(c *Config) *string { return &c.OVNNBRemote }),
+		stringOpt("bridge-dev", "br-ex", "Provider bridge device for kernel routes",
+			func(c *Config) *string { return &c.BridgeDev }),
+		stringOpt("vrf-name", "vrf-provider", "VRF name for FRR routes",
+			func(c *Config) *string { return &c.VRFName }),
+		stringOpt("veth-nexthop", "169.254.0.1", "Nexthop IP for FRR static routes in the VRF",
+			func(c *Config) *string { return &c.VethNexthop }),
+		stringSliceOpt("network-cidr", "Filter FIPs by CIDRs (comma-separated, e.g. 10.0.0.0/24,172.16.0.0/12), empty = all",
+			func(c *Config) *[]string { return &c.NetworkCIDRs }),
+		stringOpt("gateway-port", "", "Chassisredirect port filter; empty = track all routers automatically",
+			func(c *Config) *string { return &c.GatewayPort }),
+		intOpt("route-table-id", 0, "Routing table ID for FIP routes (1-252); 0 = main table",
+			func(c *Config) *int { return &c.RouteTableID }),
+		stringOpt("bridge-ip", "169.254.169.254", "IP to add to bridge device for ARP resolution (default: 169.254.169.254)",
+			func(c *Config) *string { return &c.BridgeIP }),
+		stringOpt("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl (e.g. 'docker exec openvswitch_vswitchd')",
+			func(c *Config) *string { return &c.OVSWrapper }),
+		durationOpt("reconcile-interval", 60*time.Second, "Full reconciliation interval (e.g. 60s, 5m)",
+			func(c *Config) *time.Duration { return &c.ReconcileInterval }),
+		stringOpt("log-level", "info", "Log level (debug, info, warn, error)",
+			func(c *Config) *string { return &c.LogLevel }),
+		boolOpt("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done",
+			func(c *Config) *bool { return &c.DryRun }),
+		boolOpt("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)",
+			func(c *Config) *bool { return &c.CleanupOnShutdown }),
+		boolOpt("drain-on-shutdown", true, "Drain HA gateways before shutdown by lowering Gateway_Chassis priority",
+			func(c *Config) *bool { return &c.DrainOnShutdown }),
+		durationOpt("drain-timeout", 60*time.Second, "Max time to wait for gateway drain (e.g. 60s)",
+			func(c *Config) *time.Duration { return &c.DrainTimeout }),
+		durationOpt("drain-settle-delay", 500*time.Millisecond, "Safety margin held after the takeover chassis signals readiness, before cleanup (e.g. 500ms; 0 disables the hold)",
+			func(c *Config) *time.Duration { return &c.DrainSettleDelay }),
+		stringOpt("frr-prefix-list", "ANNOUNCED-NETWORKS", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)",
+			func(c *Config) *string { return &c.FRRPrefixList }),
+		durationOpt("stale-chassis-grace-period", 5*time.Minute, "Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable)",
+			func(c *Config) *time.Duration { return &c.StaleChassisGracePeriod }),
+		boolOpt("veth-leak-enabled", true, "Enable veth VRF route leaking",
+			func(c *Config) *bool { return &c.VethLeakEnabled }),
+		stringOpt("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)",
+			func(c *Config) *string { return &c.VethProviderIP }),
+		intOpt("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)",
+			func(c *Config) *int { return &c.VethLeakTableID }),
+		intOpt("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules",
+			func(c *Config) *int { return &c.VethLeakRulePriority }),
+		stringOpt("metrics-listen", "", "Address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9273); empty = disabled",
+			func(c *Config) *string { return &c.MetricsListen }),
+		stringOpt("port-forward-dev", "loopback1", "Loopback device for VIP addresses in VRF (default: loopback1)",
+			func(c *Config) *string { return &c.PortForwardDev }),
+		intOpt("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)",
+			func(c *Config) *int { return &c.PortForwardTableID }),
+		boolOpt("port-forward-l3mdev-accept", false, "Set udp/tcp_l3mdev_accept=1 for cross-VRF same-host DNAT backends",
+			func(c *Config) *bool { return &c.PortForwardL3mdevAccept }),
+		intOpt("port-forward-ct-zone", 64000, "Conntrack zone for DNAT flows (must not collide with OVN zones, 1-65535)",
+			func(c *Config) *int { return &c.PortForwardCTZone }),
+		portForwardsOpt("port_forwards", "See sample config for usage.",
+			func(c *Config) *[]PortForwardVIP { return &c.PortForwards }),
+	}
 }
 
 // loadConfig builds the configuration with the following priority
@@ -220,42 +473,19 @@ type configFile struct {
 func loadConfig(args []string) (Config, error) {
 	fs := flag.NewFlagSet("ovn-network-agent", flag.ContinueOnError)
 
-	var (
-		configPath         = fs.String("config", os.Getenv("OVN_NETWORK_CONFIG"), "Path to YAML config file")
-		showVersion        = fs.Bool("version", false, "Print version and exit")
-		fCheckConfig       = fs.Bool("check-config", false, "Validate configuration and exit (exit code 0 = valid, 1 = invalid)")
-		fOVNSB             = fs.String("ovn-sb-remote", "", "OVN Southbound DB remote, comma-separated for cluster")
-		fOVNNB             = fs.String("ovn-nb-remote", "", "OVN Northbound DB remote, comma-separated for cluster")
-		fBridge            = fs.String("bridge-dev", "", "Provider bridge device for kernel routes")
-		fVRF               = fs.String("vrf-name", "", "VRF name for FRR routes")
-		fNexthop           = fs.String("veth-nexthop", "", "Nexthop IP for FRR static routes in the VRF")
-		fCIDR              = fs.String("network-cidr", "", "Filter FIPs by CIDRs (comma-separated, e.g. 10.0.0.0/24,172.16.0.0/12), empty = all")
-		fGWPort            = fs.String("gateway-port", "", "Chassisredirect port filter; empty = track all routers automatically")
-		fTableID           = fs.Int("route-table-id", 0, "Routing table ID for FIP routes (1-252); 0 = main table")
-		fBridgeIP          = fs.String("bridge-ip", "", "IP to add to bridge device for ARP resolution (default: 169.254.169.254)")
-		fOVSWrapper        = fs.String("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl (e.g. 'docker exec openvswitch_vswitchd')")
-		fInterval          = fs.String("reconcile-interval", "", "Full reconciliation interval (e.g. 60s, 5m)")
-		fLogLevel          = fs.String("log-level", "", "Log level (debug, info, warn, error)")
-		fDryRun            = fs.Bool("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done")
-		fCleanupOnShutdown = fs.Bool("cleanup-on-shutdown", true, "Remove all managed routes on shutdown (SIGINT/SIGTERM)")
-		fDrainOnShutdown   = fs.Bool("drain-on-shutdown", true, "Drain HA gateways before shutdown by lowering Gateway_Chassis priority")
-		fDrainTimeout      = fs.String("drain-timeout", "", "Max time to wait for gateway drain (e.g. 60s)")
-		fDrainSettleDelay  = fs.String("drain-settle-delay", "", "Safety margin held after the takeover chassis signals readiness, before cleanup (e.g. 500ms; 0 disables the hold)")
+	// CLI-only action flags. These select what the process does rather than
+	// configure how it behaves, so they have no environment or YAML binding
+	// and stay outside the option registry.
+	configPath := fs.String("config", os.Getenv("OVN_NETWORK_CONFIG"), "Path to YAML config file")
+	showVersion := fs.Bool("version", false, "Print version and exit")
+	fCheckConfig := fs.Bool("check-config", false, "Validate configuration and exit (exit code 0 = valid, 1 = invalid)")
 
-		fFRRPrefixList        = fs.String("frr-prefix-list", "", "FRR prefix-list name to manage dynamically (default: ANNOUNCED-NETWORKS)")
-		fStaleGrace           = fs.String("stale-chassis-grace-period", "", "Grace period before cleaning up entries from missing chassis (e.g. 5m, 0 to disable)")
-		fVethLeakEnabled      = fs.Bool("veth-leak-enabled", true, "Enable veth VRF route leaking")
-		fVethProviderIP       = fs.String("veth-provider-ip", "", "IP of the veth-provider side (default: veth-nexthop + 1)")
-		fVethLeakTableID      = fs.Int("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)")
-		fVethLeakRulePriority = fs.Int("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules")
-
-		fMetricsListen = fs.String("metrics-listen", "", "Address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9273); empty = disabled")
-
-		fPortForwardDev          = fs.String("port-forward-dev", "", "Loopback device for VIP addresses in VRF (default: loopback1)")
-		fPortForwardTableID      = fs.Int("port-forward-table-id", 201, "Routing table ID for DNAT return traffic (1-252)")
-		fPortForwardL3mdevAccept = fs.Bool("port-forward-l3mdev-accept", false, "Set udp/tcp_l3mdev_accept=1 for cross-VRF same-host DNAT backends")
-		fPortForwardCTZone       = fs.Int("port-forward-ct-zone", 64000, "Conntrack zone for DNAT flows (must not collide with OVN zones, 1-65535)")
-	)
+	opts := configOptions()
+	for _, o := range opts {
+		if o.register != nil {
+			o.register(fs)
+		}
+	}
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -266,34 +496,20 @@ func loadConfig(args []string) (Config, error) {
 	}
 
 	// Layer 0: defaults
-	cfg := Config{
-		BridgeDev:               "br-ex",
-		VRFName:                 "vrf-provider",
-		VethNexthop:             "169.254.0.1",
-		BridgeIP:                "169.254.169.254",
-		ReconcileInterval:       60 * time.Second,
-		LogLevel:                "info",
-		CleanupOnShutdown:       true,
-		DrainOnShutdown:         true,
-		DrainTimeout:            60 * time.Second,
-		DrainSettleDelay:        500 * time.Millisecond,
-		FRRPrefixList:           "ANNOUNCED-NETWORKS",
-		StaleChassisGracePeriod: 5 * time.Minute,
-		VethLeakEnabled:         true,
-		VethLeakTableID:         200,
-		VethLeakRulePriority:    2000,
-		PortForwardDev:          "loopback1",
-		PortForwardTableID:      201,
-		PortForwardCTZone:       64000,
+	var cfg Config
+	for _, o := range opts {
+		if o.applyDefault != nil {
+			o.applyDefault(&cfg)
+		}
 	}
 
 	// Layer 1: config file
 	if *configPath != "" {
-		fc, err := readConfigFile(*configPath)
+		doc, err := readConfigFile(*configPath)
 		if err != nil {
 			return Config{}, fmt.Errorf("load config %s: %w", *configPath, err)
 		}
-		if err := applyFileConfig(&cfg, &fc); err != nil {
+		if err := applyFileConfig(&cfg, doc); err != nil {
 			return Config{}, fmt.Errorf("load config %s: %w", *configPath, err)
 		}
 	}
@@ -304,88 +520,23 @@ func loadConfig(args []string) (Config, error) {
 	}
 
 	// Layer 3: CLI flags (only explicitly set ones)
+	byFlag := make(map[string]configOption, len(opts))
+	for _, o := range opts {
+		if o.Flag != "" {
+			byFlag[o.Flag] = o
+		}
+	}
 	var flagErr error
 	fs.Visit(func(f *flag.Flag) {
 		if flagErr != nil {
 			return
 		}
-		switch f.Name {
-		case "ovn-sb-remote":
-			cfg.OVNSBRemote = *fOVNSB
-		case "ovn-nb-remote":
-			cfg.OVNNBRemote = *fOVNNB
-		case "bridge-dev":
-			cfg.BridgeDev = *fBridge
-		case "vrf-name":
-			cfg.VRFName = *fVRF
-		case "veth-nexthop":
-			cfg.VethNexthop = *fNexthop
-		case "network-cidr":
-			cfg.NetworkCIDRs = splitAndTrim(*fCIDR, ",")
-		case "gateway-port":
-			cfg.GatewayPort = *fGWPort
-		case "route-table-id":
-			cfg.RouteTableID = *fTableID
-		case "bridge-ip":
-			cfg.BridgeIP = *fBridgeIP
-		case "ovs-wrapper":
-			cfg.OVSWrapper = *fOVSWrapper
-		case "reconcile-interval":
-			d, err := time.ParseDuration(*fInterval)
-			if err != nil {
-				flagErr = fmt.Errorf("invalid -reconcile-interval %q: %w", *fInterval, err)
-				return
-			}
-			cfg.ReconcileInterval = d
-		case "log-level":
-			cfg.LogLevel = *fLogLevel
-		case "dry-run":
-			cfg.DryRun = *fDryRun
-		case "cleanup-on-shutdown":
-			cfg.CleanupOnShutdown = *fCleanupOnShutdown
-		case "drain-on-shutdown":
-			cfg.DrainOnShutdown = *fDrainOnShutdown
-		case "drain-timeout":
-			d, err := time.ParseDuration(*fDrainTimeout)
-			if err != nil {
-				flagErr = fmt.Errorf("invalid -drain-timeout %q: %w", *fDrainTimeout, err)
-				return
-			}
-			cfg.DrainTimeout = d
-		case "drain-settle-delay":
-			d, err := time.ParseDuration(*fDrainSettleDelay)
-			if err != nil {
-				flagErr = fmt.Errorf("invalid -drain-settle-delay %q: %w", *fDrainSettleDelay, err)
-				return
-			}
-			cfg.DrainSettleDelay = d
-		case "frr-prefix-list":
-			cfg.FRRPrefixList = *fFRRPrefixList
-		case "stale-chassis-grace-period":
-			d, err := time.ParseDuration(*fStaleGrace)
-			if err != nil {
-				flagErr = fmt.Errorf("invalid -stale-chassis-grace-period %q: %w", *fStaleGrace, err)
-				return
-			}
-			cfg.StaleChassisGracePeriod = d
-		case "metrics-listen":
-			cfg.MetricsListen = *fMetricsListen
-		case "veth-leak-enabled":
-			cfg.VethLeakEnabled = *fVethLeakEnabled
-		case "veth-provider-ip":
-			cfg.VethProviderIP = *fVethProviderIP
-		case "veth-leak-table-id":
-			cfg.VethLeakTableID = *fVethLeakTableID
-		case "veth-leak-rule-priority":
-			cfg.VethLeakRulePriority = *fVethLeakRulePriority
-		case "port-forward-dev":
-			cfg.PortForwardDev = *fPortForwardDev
-		case "port-forward-table-id":
-			cfg.PortForwardTableID = *fPortForwardTableID
-		case "port-forward-l3mdev-accept":
-			cfg.PortForwardL3mdevAccept = *fPortForwardL3mdevAccept
-		case "port-forward-ct-zone":
-			cfg.PortForwardCTZone = *fPortForwardCTZone
+		o, ok := byFlag[f.Name]
+		if !ok || o.applyFlag == nil {
+			return
+		}
+		if err := o.applyFlag(&cfg); err != nil {
+			flagErr = err
 		}
 	})
 	if flagErr != nil {
@@ -647,285 +798,76 @@ func isValidIdentifier(s string) bool {
 	return len(s) > 0
 }
 
-func readConfigFile(path string) (configFile, error) {
+// configDoc is a config file decoded into raw YAML nodes, keyed by top-level
+// key. Decoding into nodes rather than a mirror struct is what removes the
+// second place an option had to be declared: applyFileConfig walks the option
+// registry and asks each option to decode its own node.
+type configDoc map[string]yaml.Node
+
+func readConfigFile(path string) (configDoc, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return configFile{}, err
+		return nil, err
 	}
-	var fc configFile
-	if err := yaml.Unmarshal(data, &fc); err != nil {
-		return configFile{}, err
+	var doc configDoc
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
 	}
-	warnUnknownConfigKeys(path, data)
-	return fc, nil
+	return doc, nil
 }
 
-// warnUnknownConfigKeys re-decodes the config file with strict field
-// checking and logs a prominent warning naming any key that does not
-// map to a known configFile field. The lenient yaml.Unmarshal above has
-// already applied the recognised keys; a typo like "drain_on_shutdow"
-// would otherwise be dropped and the default applied silently — exactly
-// where a wrong effective value (drain/cleanup) turns a routine reboot
-// into an outage. Unknown keys are still accepted (never fail the load)
-// so newer config keys stay forward-compatible with an older agent.
-func warnUnknownConfigKeys(path string, data []byte) {
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	var probe configFile
-	// io.EOF is returned for an empty or comment-only file, which is not
-	// an unknown-key condition.
-	if err := dec.Decode(&probe); err != nil && !errors.Is(err, io.EOF) {
-		slog.Warn("config file contains unknown keys (ignored — check for typos)", "path", path, "error", err)
+// applyFileConfig applies every config-file key that maps to a registry option.
+//
+// Keys the registry does not know are warned about but never rejected: a typo
+// like "drain_on_shutdow" would otherwise be dropped and the default applied
+// silently — exactly where a wrong effective value (drain/cleanup) turns a
+// routine reboot into an outage — while still letting a newer config file load
+// on an older agent.
+func applyFileConfig(cfg *Config, doc configDoc) error {
+	known := make(map[string]bool, len(doc))
+	for _, o := range configOptions() {
+		if o.applyYAML == nil {
+			continue
+		}
+		known[o.Key] = true
+		node, ok := doc[o.Key]
+		if !ok {
+			continue
+		}
+		if err := o.applyYAML(cfg, &node); err != nil {
+			return err
+		}
 	}
-}
 
-func applyFileConfig(cfg *Config, fc *configFile) error {
-	if fc.OVNSBRemote != "" {
-		cfg.OVNSBRemote = fc.OVNSBRemote
-	}
-	if fc.OVNNBRemote != "" {
-		cfg.OVNNBRemote = fc.OVNNBRemote
-	}
-	if fc.BridgeDev != "" {
-		cfg.BridgeDev = fc.BridgeDev
-	}
-	if fc.VRFName != "" {
-		cfg.VRFName = fc.VRFName
-	}
-	if fc.VethNexthop != "" {
-		cfg.VethNexthop = fc.VethNexthop
-	}
-	if len(fc.NetworkCIDR) > 0 {
-		cfg.NetworkCIDRs = []string(fc.NetworkCIDR)
-	}
-	if fc.GatewayPort != "" {
-		cfg.GatewayPort = fc.GatewayPort
-	}
-	if fc.BridgeIP != "" {
-		cfg.BridgeIP = fc.BridgeIP
-	}
-	if fc.OVSWrapper != "" {
-		cfg.OVSWrapper = fc.OVSWrapper
-	}
-	if fc.RouteTableID != nil {
-		cfg.RouteTableID = *fc.RouteTableID
-	}
-	if fc.ReconcileInterval != "" {
-		d, err := time.ParseDuration(fc.ReconcileInterval)
-		if err != nil {
-			return fmt.Errorf("invalid reconcile_interval %q: %w", fc.ReconcileInterval, err)
+	var unknown []string
+	for key := range doc {
+		if !known[key] {
+			unknown = append(unknown, key)
 		}
-		cfg.ReconcileInterval = d
 	}
-	if fc.LogLevel != "" {
-		cfg.LogLevel = fc.LogLevel
-	}
-	if fc.DryRun != nil {
-		cfg.DryRun = *fc.DryRun
-	}
-	if fc.CleanupOnShutdown != nil {
-		cfg.CleanupOnShutdown = *fc.CleanupOnShutdown
-	}
-	if fc.DrainOnShutdown != nil {
-		cfg.DrainOnShutdown = *fc.DrainOnShutdown
-	}
-	if fc.DrainTimeout != "" {
-		d, err := time.ParseDuration(fc.DrainTimeout)
-		if err != nil {
-			return fmt.Errorf("invalid drain_timeout %q: %w", fc.DrainTimeout, err)
-		}
-		cfg.DrainTimeout = d
-	}
-	if fc.DrainSettleDelay != "" {
-		d, err := time.ParseDuration(fc.DrainSettleDelay)
-		if err != nil {
-			return fmt.Errorf("invalid drain_settle_delay %q: %w", fc.DrainSettleDelay, err)
-		}
-		cfg.DrainSettleDelay = d
-	}
-	if fc.FRRPrefixList != "" {
-		cfg.FRRPrefixList = fc.FRRPrefixList
-	}
-	if fc.StaleChassisGracePeriod != "" {
-		d, err := time.ParseDuration(fc.StaleChassisGracePeriod)
-		if err != nil {
-			return fmt.Errorf("invalid stale_chassis_grace_period %q: %w", fc.StaleChassisGracePeriod, err)
-		}
-		cfg.StaleChassisGracePeriod = d
-	}
-	if fc.MetricsListen != "" {
-		cfg.MetricsListen = fc.MetricsListen
-	}
-	if fc.VethLeakEnabled != nil {
-		cfg.VethLeakEnabled = *fc.VethLeakEnabled
-	}
-	if fc.VethProviderIP != "" {
-		cfg.VethProviderIP = fc.VethProviderIP
-	}
-	if fc.VethLeakTableID != nil {
-		cfg.VethLeakTableID = *fc.VethLeakTableID
-	}
-	if fc.VethLeakRulePriority != nil {
-		cfg.VethLeakRulePriority = *fc.VethLeakRulePriority
-	}
-	if fc.PortForwardDev != "" {
-		cfg.PortForwardDev = fc.PortForwardDev
-	}
-	if fc.PortForwardTableID != nil {
-		cfg.PortForwardTableID = *fc.PortForwardTableID
-	}
-	if fc.PortForwardL3mdevAccept != nil {
-		cfg.PortForwardL3mdevAccept = *fc.PortForwardL3mdevAccept
-	}
-	if fc.PortForwardCTZone != nil {
-		cfg.PortForwardCTZone = *fc.PortForwardCTZone
-	}
-	if len(fc.PortForwards) > 0 {
-		cfg.PortForwards = fc.PortForwards
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		slog.Warn("config file contains unknown keys (ignored — check for typos)",
+			"keys", strings.Join(unknown, ", "))
 	}
 	return nil
 }
 
+// applyEnvConfig applies every option whose environment variable is set to a
+// non-empty value. The variable name is derived from the flag name, so it can
+// never drift from it.
 func applyEnvConfig(cfg *Config) error {
-	if v := os.Getenv("OVN_NETWORK_OVN_SB_REMOTE"); v != "" {
-		cfg.OVNSBRemote = v
-	}
-	if v := os.Getenv("OVN_NETWORK_OVN_NB_REMOTE"); v != "" {
-		cfg.OVNNBRemote = v
-	}
-	if v := os.Getenv("OVN_NETWORK_BRIDGE_DEV"); v != "" {
-		cfg.BridgeDev = v
-	}
-	if v := os.Getenv("OVN_NETWORK_VRF_NAME"); v != "" {
-		cfg.VRFName = v
-	}
-	if v := os.Getenv("OVN_NETWORK_VETH_NEXTHOP"); v != "" {
-		cfg.VethNexthop = v
-	}
-	if v := os.Getenv("OVN_NETWORK_NETWORK_CIDR"); v != "" {
-		cfg.NetworkCIDRs = splitAndTrim(v, ",")
-	}
-	if v := os.Getenv("OVN_NETWORK_GATEWAY_PORT"); v != "" {
-		cfg.GatewayPort = v
-	}
-	if v := os.Getenv("OVN_NETWORK_BRIDGE_IP"); v != "" {
-		cfg.BridgeIP = v
-	}
-	if v := os.Getenv("OVN_NETWORK_OVS_WRAPPER"); v != "" {
-		cfg.OVSWrapper = v
-	}
-	if v := os.Getenv("OVN_NETWORK_ROUTE_TABLE_ID"); v != "" {
-		id, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_ROUTE_TABLE_ID %q: %w", v, err)
+	for _, o := range configOptions() {
+		if o.applyEnv == nil {
+			continue
 		}
-		cfg.RouteTableID = id
-	}
-	if v := os.Getenv("OVN_NETWORK_RECONCILE_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_RECONCILE_INTERVAL %q: %w", v, err)
+		v := os.Getenv(o.EnvVar())
+		if v == "" {
+			continue
 		}
-		cfg.ReconcileInterval = d
-	}
-	if v := os.Getenv("OVN_NETWORK_LOG_LEVEL"); v != "" {
-		cfg.LogLevel = v
-	}
-	if v := os.Getenv("OVN_NETWORK_DRY_RUN"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_DRY_RUN %q: %w", v, err)
+		if err := o.applyEnv(cfg, v); err != nil {
+			return err
 		}
-		cfg.DryRun = b
-	}
-	if v := os.Getenv("OVN_NETWORK_CLEANUP_ON_SHUTDOWN"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_CLEANUP_ON_SHUTDOWN %q: %w", v, err)
-		}
-		cfg.CleanupOnShutdown = b
-	}
-	if v := os.Getenv("OVN_NETWORK_DRAIN_ON_SHUTDOWN"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_DRAIN_ON_SHUTDOWN %q: %w", v, err)
-		}
-		cfg.DrainOnShutdown = b
-	}
-	if v := os.Getenv("OVN_NETWORK_DRAIN_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_DRAIN_TIMEOUT %q: %w", v, err)
-		}
-		cfg.DrainTimeout = d
-	}
-	if v := os.Getenv("OVN_NETWORK_DRAIN_SETTLE_DELAY"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_DRAIN_SETTLE_DELAY %q: %w", v, err)
-		}
-		cfg.DrainSettleDelay = d
-	}
-	if v := os.Getenv("OVN_NETWORK_FRR_PREFIX_LIST"); v != "" {
-		cfg.FRRPrefixList = v
-	}
-	if v := os.Getenv("OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_STALE_CHASSIS_GRACE_PERIOD %q: %w", v, err)
-		}
-		cfg.StaleChassisGracePeriod = d
-	}
-	if v := os.Getenv("OVN_NETWORK_METRICS_LISTEN"); v != "" {
-		cfg.MetricsListen = v
-	}
-	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_ENABLED"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_VETH_LEAK_ENABLED %q: %w", v, err)
-		}
-		cfg.VethLeakEnabled = b
-	}
-	if v := os.Getenv("OVN_NETWORK_VETH_PROVIDER_IP"); v != "" {
-		cfg.VethProviderIP = v
-	}
-	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_TABLE_ID"); v != "" {
-		id, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_VETH_LEAK_TABLE_ID %q: %w", v, err)
-		}
-		cfg.VethLeakTableID = id
-	}
-	if v := os.Getenv("OVN_NETWORK_VETH_LEAK_RULE_PRIORITY"); v != "" {
-		prio, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_VETH_LEAK_RULE_PRIORITY %q: %w", v, err)
-		}
-		cfg.VethLeakRulePriority = prio
-	}
-	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_DEV"); v != "" {
-		cfg.PortForwardDev = v
-	}
-	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_TABLE_ID"); v != "" {
-		id, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_PORT_FORWARD_TABLE_ID %q: %w", v, err)
-		}
-		cfg.PortForwardTableID = id
-	}
-	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT %q: %w", v, err)
-		}
-		cfg.PortForwardL3mdevAccept = b
-	}
-	if v := os.Getenv("OVN_NETWORK_PORT_FORWARD_CT_ZONE"); v != "" {
-		zone, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_PORT_FORWARD_CT_ZONE %q: %w", v, err)
-		}
-		cfg.PortForwardCTZone = zone
 	}
 	return nil
 }

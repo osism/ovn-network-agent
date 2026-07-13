@@ -25,7 +25,6 @@ const configFixture = `package main
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"time"
 )
@@ -34,101 +33,55 @@ type PortForwardRule struct {
 	Proto string ` + "`yaml:\"proto\"`" + ` // "tcp" or "udp"
 }
 
+type PortForwardVIP struct {
+	VIP string ` + "`yaml:\"vip\"`" + ` // anycast VIP address
+}
+
 type Config struct {
 	BridgeDev         string
 	RouteTableID      int
 	ReconcileInterval time.Duration
 	DryRun            bool
 	OVNSBRemote       string
+	NetworkCIDRs      []string
+	PortForwards      []PortForwardVIP // VIP forwarding rules from config
 }
 
-type configFile struct {
-	BridgeDev         string ` + "`yaml:\"bridge_dev\"`" + `
-	RouteTableID      *int   ` + "`yaml:\"route_table_id\"`" + `
-	ReconcileInterval string ` + "`yaml:\"reconcile_interval\"`" + `
-	DryRun            *bool  ` + "`yaml:\"dry_run\"`" + `
-	OVNSBRemote       string ` + "`yaml:\"ovn_sb_remote\"`" + `
+type configOption struct {
+	Flag  string
+	Key   string
+	Usage string
+}
+
+func configOptions() []configOption {
+	return []configOption{
+		stringOpt("ovn-sb-remote", "", "OVN SB remote",
+			func(c *Config) *string { return &c.OVNSBRemote }),
+		stringOpt("bridge-dev", "br-ex", "Provider bridge device",
+			func(c *Config) *string { return &c.BridgeDev }),
+		intOpt("route-table-id", 0, "Routing table ID (1-252); 0 = main",
+			func(c *Config) *int { return &c.RouteTableID }),
+		durationOpt("reconcile-interval", 60*time.Second, "Reconcile interval (e.g. 60s)",
+			func(c *Config) *time.Duration { return &c.ReconcileInterval }),
+		boolOpt("dry-run", false, "Dry-run mode",
+			func(c *Config) *bool { return &c.DryRun }),
+		stringSliceOpt("network-cidr", "Filter FIPs by CIDRs",
+			func(c *Config) *[]string { return &c.NetworkCIDRs }),
+		portForwardsOpt("port_forwards", "See sample config for usage.",
+			func(c *Config) *[]PortForwardVIP { return &c.PortForwards }),
+	}
 }
 
 func loadConfig(args []string) (Config, error) {
 	fs := flag.NewFlagSet("ovn-network-agent", flag.ContinueOnError)
-	var (
-		configPath = fs.String("config", os.Getenv("OVN_NETWORK_CONFIG"), "Path to YAML config file")
-		fBridge    = fs.String("bridge-dev", "", "Provider bridge device")
-		fTableID   = fs.Int("route-table-id", 0, "Routing table ID (1-252); 0 = main")
-		fInterval  = fs.String("reconcile-interval", "", "Reconcile interval (e.g. 60s)")
-		fDryRun    = fs.Bool("dry-run", false, "Dry-run mode")
-		fOVNSB     = fs.String("ovn-sb-remote", "", "OVN SB remote")
-	)
+	configPath := fs.String("config", os.Getenv("OVN_NETWORK_CONFIG"), "Path to YAML config file")
 	_ = configPath
-	cfg := Config{
-		BridgeDev:         "br-ex",
-		ReconcileInterval: 60 * time.Second,
-	}
-	var flagErr error
-	fs.Visit(func(f *flag.Flag) {
-		if flagErr != nil {
-			return
+	for _, o := range configOptions() {
+		if o.register != nil {
+			o.register(fs)
 		}
-		switch f.Name {
-		case "bridge-dev":
-			cfg.BridgeDev = *fBridge
-		case "route-table-id":
-			cfg.RouteTableID = *fTableID
-		case "reconcile-interval":
-			d, err := time.ParseDuration(*fInterval)
-			if err != nil {
-				flagErr = fmt.Errorf("invalid -reconcile-interval %q: %w", *fInterval, err)
-				return
-			}
-			cfg.ReconcileInterval = d
-		case "dry-run":
-			cfg.DryRun = *fDryRun
-		case "ovn-sb-remote":
-			cfg.OVNSBRemote = *fOVNSB
-		}
-	})
-	return cfg, nil
-}
-
-func applyFileConfig(cfg *Config, fc *configFile) error {
-	if fc.BridgeDev != "" {
-		cfg.BridgeDev = fc.BridgeDev
 	}
-	if fc.RouteTableID != nil {
-		cfg.RouteTableID = *fc.RouteTableID
-	}
-	if fc.ReconcileInterval != "" {
-		d, err := time.ParseDuration(fc.ReconcileInterval)
-		if err != nil {
-			return fmt.Errorf("invalid reconcile_interval %q: %w", fc.ReconcileInterval, err)
-		}
-		cfg.ReconcileInterval = d
-	}
-	if fc.DryRun != nil {
-		cfg.DryRun = *fc.DryRun
-	}
-	if fc.OVNSBRemote != "" {
-		cfg.OVNSBRemote = fc.OVNSBRemote
-	}
-	return nil
-}
-
-func applyEnvConfig(cfg *Config) error {
-	if v := os.Getenv("OVN_NETWORK_BRIDGE_DEV"); v != "" {
-		cfg.BridgeDev = v
-	}
-	if v := os.Getenv("OVN_NETWORK_OVN_SB_REMOTE"); v != "" {
-		cfg.OVNSBRemote = v
-	}
-	if v := os.Getenv("OVN_NETWORK_RECONCILE_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("invalid OVN_NETWORK_RECONCILE_INTERVAL %q: %w", v, err)
-		}
-		cfg.ReconcileInterval = d
-	}
-	return nil
+	return Config{}, nil
 }
 `
 
@@ -184,9 +137,12 @@ func TestParseSource_Flags(t *testing.T) {
 		t.Fatalf("parseSource: %v", err)
 	}
 
+	// The CLI-only action flags come first (they are declared directly on
+	// the FlagSet), then the option registry in table order.
 	wantFlags := []string{
-		"config", "bridge-dev", "route-table-id",
-		"reconcile-interval", "dry-run", "ovn-sb-remote",
+		"config",
+		"ovn-sb-remote", "bridge-dev", "route-table-id",
+		"reconcile-interval", "dry-run", "network-cidr",
 	}
 	if len(info.Flags) != len(wantFlags) {
 		t.Fatalf("got %d flags, want %d (%v)", len(info.Flags), len(wantFlags), flagNames(info.Flags))
@@ -194,6 +150,60 @@ func TestParseSource_Flags(t *testing.T) {
 	for i, want := range wantFlags {
 		if info.Flags[i].Name != want {
 			t.Errorf("Flags[%d].Name = %q, want %q", i, info.Flags[i].Name, want)
+		}
+	}
+}
+
+// TestParseSource_YAMLOnlyOption pins the registry's flag-less rows: they must
+// surface as YAML-only keys (with their Config field resolved so the reference
+// table can show the Go type), not as phantom CLI flags.
+func TestParseSource_YAMLOnlyOption(t *testing.T) {
+	dir := writeFixture(t, map[string]string{
+		"config.go":  configFixture,
+		"metrics.go": metricsFixture,
+	})
+
+	info, err := parseSource(dir)
+	if err != nil {
+		t.Fatalf("parseSource: %v", err)
+	}
+
+	if len(info.YAMLOnly) != 1 {
+		t.Fatalf("got %d YAML-only options, want 1: %+v", len(info.YAMLOnly), info.YAMLOnly)
+	}
+	got := info.YAMLOnly[0]
+	if got.Key != "port_forwards" || got.ConfigField != "PortForwards" {
+		t.Errorf("YAMLOnly[0] = %+v, want key=port_forwards field=PortForwards", got)
+	}
+	// It must not also appear as a CLI flag.
+	for _, fl := range info.Flags {
+		if fl.Name == "port_forwards" {
+			t.Error("the YAML-only option leaked into the flag list")
+		}
+	}
+	// And its YAML key must still be resolvable by Config field.
+	if info.YAMLByField["PortForwards"] != "port_forwards" {
+		t.Errorf("YAMLByField[PortForwards] = %q, want port_forwards", info.YAMLByField["PortForwards"])
+	}
+}
+
+// TestParseSource_DerivedEnvAndYAMLNames pins the derivation the registry
+// relies on: an option's env var and YAML key follow mechanically from its flag
+// name, so no row can declare them inconsistently.
+func TestParseSource_DerivedEnvAndYAMLNames(t *testing.T) {
+	cases := []struct {
+		flag, env, yaml string
+	}{
+		{"ovn-sb-remote", "OVN_NETWORK_OVN_SB_REMOTE", "ovn_sb_remote"},
+		{"reconcile-interval", "OVN_NETWORK_RECONCILE_INTERVAL", "reconcile_interval"},
+		{"port-forward-l3mdev-accept", "OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT", "port_forward_l3mdev_accept"},
+	}
+	for _, tc := range cases {
+		if got := envVarName(tc.flag); got != tc.env {
+			t.Errorf("envVarName(%q) = %q, want %q", tc.flag, got, tc.env)
+		}
+		if got := yamlKeyName(tc.flag); got != tc.yaml {
+			t.Errorf("yamlKeyName(%q) = %q, want %q", tc.flag, got, tc.yaml)
 		}
 	}
 }
