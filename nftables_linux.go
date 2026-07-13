@@ -18,6 +18,17 @@ func nftCmd(args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+// nftTableExists reports whether the agent's nft table is currently present,
+// asking nft for its JSON table listing rather than inferring existence from
+// the wording of a failed delete. See nftHasTable.
+func nftTableExists() (bool, error) {
+	out, err := nftCmd("-j", "list", "tables")
+	if err != nil {
+		return false, fmt.Errorf("nft list tables: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nftHasTable(out, "ip", nftTableName)
+}
+
 // SetupPortForward performs the initial port forwarding setup.
 // Must be called after SetupVethLeak (requires the veth pair to exist).
 func (rm *RouteManager) SetupPortForward() error {
@@ -114,15 +125,23 @@ func (rm *RouteManager) TeardownPortForward() error {
 		}
 	}
 
-	// 1. Delete nftables table (stops all DNAT immediately).
-	if out, err := nftCmd("delete", "table", "ip", nftTableName); err != nil {
-		errStr := string(out)
-		if !strings.Contains(errStr, "No such file") && !strings.Contains(errStr, "does not exist") {
-			slog.Warn("failed to delete nftables table", "error", err, "output", strings.TrimSpace(errStr))
+	// 1. Delete nftables table (stops all DNAT immediately). Ask nft whether
+	// the table exists first, rather than deleting blindly and treating an
+	// error whose text contains "No such file" as benign: with the existence
+	// known up front, any delete failure is a real one.
+	switch exists, err := nftTableExists(); {
+	case err != nil:
+		slog.Warn("failed to list nftables tables", "error", err)
+		recordErr(fmt.Errorf("list nftables tables: %w", err))
+	case !exists:
+		slog.Debug("nftables table already absent, nothing to delete", "table", nftTableName)
+	default:
+		if out, err := nftCmd("delete", "table", "ip", nftTableName); err != nil {
+			slog.Warn("failed to delete nftables table", "error", err, "output", strings.TrimSpace(string(out)))
 			recordErr(fmt.Errorf("delete nftables table: %w", err))
+		} else {
+			slog.Info("nftables table removed", "table", nftTableName)
 		}
-	} else {
-		slog.Info("nftables table removed", "table", nftTableName)
 	}
 
 	// 2. Remove DNAT policy routing (ip rule + routes in table).

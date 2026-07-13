@@ -884,3 +884,53 @@ func TestRuleDestPort(t *testing.T) {
 		t.Errorf("destPort() = %d, want 8080", got)
 	}
 }
+
+// TestNftHasTable covers the structured existence check that replaced matching
+// the wording of a failed `nft delete table`. The teardown path branches on it,
+// so a false negative would leave the DNAT table installed after shutdown and a
+// spurious error would mask a real delete failure.
+func TestNftHasTable(t *testing.T) {
+	const doc = `{"nftables": [
+	  {"metainfo": {"version": "1.0.6", "release_name": "Lester Gooch"}},
+	  {"table": {"family": "ip", "name": "ovn-network-agent", "handle": 1}},
+	  {"table": {"family": "ip6", "name": "some-other", "handle": 2}},
+	  {"table": {"family": "inet", "name": "filter", "handle": 3}}
+	]}`
+
+	tests := []struct {
+		name         string
+		doc          string
+		family, tbl  string
+		want         bool
+		wantParseErr bool
+	}{
+		{"table present", doc, "ip", "ovn-network-agent", true, false},
+		// Same name, different family — nft treats these as distinct tables,
+		// and deleting "ip" when only "ip6" exists would fail.
+		{"same name in another family is not a match", doc, "ip6", "ovn-network-agent", false, false},
+		{"absent table", doc, "ip", "not-installed", false, false},
+		{"no tables at all", `{"nftables": [{"metainfo": {}}]}`, "ip", "ovn-network-agent", false, false},
+		{"empty document", `{}`, "ip", "ovn-network-agent", false, false},
+		// A malformed document must be an error, not a silent "absent": the
+		// latter would skip the delete and leave DNAT rules behind.
+		{"malformed json", `{not json`, "ip", "ovn-network-agent", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := nftHasTable([]byte(tt.doc), tt.family, tt.tbl)
+			if tt.wantParseErr {
+				if err == nil {
+					t.Fatal("expected a parse error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("nftHasTable: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("nftHasTable(%s/%s) = %v, want %v", tt.family, tt.tbl, got, tt.want)
+			}
+		})
+	}
+}
