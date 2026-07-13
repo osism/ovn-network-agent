@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -37,6 +37,15 @@ build:
 build-static:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BINARY) .
 
+# Instrumented agent binary for the CI integration job: coverage counters
+# (-cover, so integration-only Linux code shows up in the merged figure) plus
+# the race detector (-race, which drives refreshLoop / drainWatchCh / event
+# handlers under real OVSDB event storms). -covermode=atomic is required with
+# -race, and -race needs cgo, so this builds only on a Linux host — it is not a
+# darwin cross-build.
+build-integration:
+	GOOS=linux go build $(GOFLAGS) -cover -covermode=atomic -race -ldflags '$(LDFLAGS)' -o $(BINARY) .
+
 fmt:
 	go fmt ./...
 
@@ -52,7 +61,7 @@ test:
 # https://osism.github.io/ovn-network-agent/contributing/integration-tests)
 # for local-run prerequisites.
 test-integration: build
-	OVN_AGENT_BINARY=$(CURDIR)/$(BINARY) go test -tags=integration -v -count=1 ./test/integration/...
+	OVN_AGENT_BINARY=$(CURDIR)/$(BINARY) go test -tags=integration -v -count=1 -timeout 25m ./test/integration/...
 
 clean:
 	rm -f $(BINARY)

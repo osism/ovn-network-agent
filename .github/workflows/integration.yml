@@ -52,7 +52,10 @@ jobs:
     # required smoke gate still runs rather than being silently skipped.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30 minutes: the instrumented (-cover -race) binary is slower than a
+    # plain build, and the >=45s reconnect outage scenario adds a couple of
+    # minutes on top of the base suite.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -63,14 +66,36 @@ jobs:
       - name: Bootstrap OVN/OVS/FRR/nftables stack
         run: sudo ./test/integration/setup.sh
 
-      - name: Build agent
-        run: make build
+      # Coverage-instrumented (-cover) and race-checked (-race) agent binary so
+      # integration-only Linux code (main(), Connect(), routing_linux.go,
+      # nftables_linux.go) shows up in the merged coverage figure and the
+      # concurrency-heavy paths run under the race detector.
+      - name: Build instrumented agent
+        run: make build-integration
 
       # The agent needs CAP_NET_ADMIN for netlink operations (see
       # routing_linux.go). Run as root via sudo, preserving the Go env so
-      # `go test` finds the toolchain installed by setup-go.
+      # `go test` finds the toolchain installed by setup-go. GOCOVERDIR
+      # collects one set of counter files per agent process that exits cleanly.
       - name: Run integration tests
         run: |
+          mkdir -p covdata
           sudo --preserve-env=PATH,GOROOT,GOPATH,GOTOOLCHAIN \
             env "OVN_AGENT_BINARY=$PWD/ovn-network-agent" \
-            "$(which go)" test -tags=integration -v -count=1 ./test/integration/...
+            "GOCOVERDIR=$PWD/covdata" \
+            "$(which go)" test -tags=integration -v -count=1 -timeout 25m ./test/integration/...
+
+      # Publish the merged integration coverage figure in the job log. This is
+      # informational (not a gate), so it tolerates a covdata dir with no
+      # counters — e.g. if every agent were SIGKILL'd rather than SIGTERM'd.
+      # The agents run as root, so make the counter files readable first.
+      - name: Report integration coverage
+        if: ${{ always() }}
+        run: |
+          sudo chmod -R a+r covdata || true
+          if ! go tool covdata percent -i covdata; then
+            echo "no integration coverage counters collected"
+            exit 0
+          fi
+          go tool covdata textfmt -i covdata -o integration-coverage.out
+          go tool cover -func=integration-coverage.out | tail -n 1
