@@ -337,6 +337,24 @@ func TestKeyOfSBPortBindingIncludesSegmentColumns(t *testing.T) {
 	}
 }
 
+// TestKeyOfSBPortBindingIncludesExternalIDs guards the SB-NAT filter input:
+// step 5b keys the router-gateway address off Port_Binding.external_ids
+// (neutron:device_owner), so a dropped UPDATE to that map must register as
+// content drift — otherwise the guard the check was built to provide would let
+// a stale device_owner silently misdirect the desired set.
+func TestKeyOfSBPortBindingIncludesExternalIDs(t *testing.T) {
+	base := SBPortBinding{
+		UUID: "pb-1", Type: "patch", LogicalPort: "external-port",
+		ExternalIDs: map[string]string{"neutron:device_owner": "network:router_gateway"},
+	}
+	changed := base
+	changed.ExternalIDs = map[string]string{"neutron:device_owner": "network:floatingip"}
+
+	if keyOfSBPortBinding(changed) == keyOfSBPortBinding(base) {
+		t.Error("external_ids change did not alter the content key")
+	}
+}
+
 // TestDecodeSBPortBindingSegmentColumns round-trips the columns the segment
 // resolution reads from a direct server select: the datapath UUID reference
 // and the optional VLAN tag, including the OVSDB empty-set encoding for an
