@@ -41,6 +41,15 @@ test/e2e/
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     drain-hitless.sh        — graceful drain vs hard kill, hitless comparison (issue #113)
     collect-artifacts.sh    — dump lab state for offline triage
+  chaos/                    — seeded chaos runner, `make e2e-chaos` (issue #176)
+    main.go                 — flags, wiring, exit codes, artifact collection
+    engine.go               — the seeded tick loop: draw, guardrails, execute, converge
+    actions.go              — the fault registry (four starter actions)
+    lab.go                  — the single seam to docker / containerlab
+    state.go                — the combined start state and the node-restore path
+    probe.go                — continuous reachability probe from client-1
+    checks.go               — baseline invariants (agents alive, no dual claim)
+    journal.go              — the JSONL journal and the run record
   pf-backend/
     main.go                 — tiny HTTP responder shipped at /usr/local/bin/pf-backend
                               in the gwnode image; logs each connection's source IP
@@ -217,6 +226,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | Scenario | `make` target | What it asserts | Issue |
 | --- | --- | --- | --- |
 | [Baseline](#baseline) | `e2e-baseline` | An external client reaches a FIP once the agent reconciles. | [#45](https://github.com/osism/ovn-network-agent/issues/45) |
+| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence the agents stay alive, reachability recovers within budget, and no gateway port is claimed twice. | [#176](https://github.com/osism/ovn-network-agent/issues/176) |
 | [Drain-hitless](#drain-hitless) | `e2e-drain-hitless` | A graceful `SIGTERM` drain loses fewer packets than a hard `docker kill` of the same chassis. | [#113](https://github.com/osism/ovn-network-agent/issues/113) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
 | [Hairpin](#hairpin) | `e2e-hairpin` | The `cookie=0x998` hairpin flow reflects FIP-to-FIP traffic on `br-ex`. | [#108](https://github.com/osism/ovn-network-agent/issues/108) |
@@ -226,9 +236,10 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | [Stale chassis](#stale-chassis) | `e2e-stale-chassis` | Surviving peers garbage-collect the NB rows of a hard-killed chassis. | [#111](https://github.com/osism/ovn-network-agent/issues/111) |
 
 Every scenario except `baseline` runs the baseline first as a sanity
-gate; set `SANITY_GATE=0` to skip it. The subsections below describe
-what each scenario does and which environment variables it accepts for
-triage.
+gate; set `SANITY_GATE=0` to skip it. The [chaos runner](#chaos-runner)
+is the one exception: it gates on its own combined start state instead,
+which is a superset of the baseline. The subsections below describe what
+each scenario does and which environment variables it accepts for triage.
 
 ### Baseline
 
@@ -847,6 +858,202 @@ would otherwise silently double.
 `PROBE_INTERVAL`, `PROBE_COUNT`, `PROBE_PRELUDE`, `FAILOVER_TIMEOUT`,
 `GRACEFUL_MAX_OUTAGE_MS`, `SKIP_RECYCLE`, `RECYCLE_ON_EXIT`,
 `SANITY_GATE`.
+
+### Chaos runner
+
+```sh
+make e2e-chaos
+make e2e-chaos CHAOS_FLAGS="-duration 3m -seed 7 -out /tmp/chaos-a"
+```
+
+[`chaos/`](https://github.com/osism/ovn-network-agent/tree/main/test/e2e/chaos)
+is not a scenario but a driver. The eight scenarios each prove one fault
+in isolation; production faults overlap and repeat. The runner drives the
+same lab through a *randomized* fault sequence for a bounded duration and
+leaves a journal you can triage from — and replay.
+
+It is a Go `main` package rather than another bash script for two
+reasons: `$RANDOM` is not stable across bash versions, which would break
+the replay contract outright, and the run needs concurrent probing plus
+structured artifacts. Its unit tests run under `make test` on any
+platform (they drive the real engine against a fake `docker`).
+
+**Inputs — and the replay contract.** The seed, the duration, the tick
+bounds and the action weights are the *only* inputs, and every decision
+the engine makes is drawn from a PCG stream seeded by `-seed` alone:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-seed` | `42` | Seeds every decision: the tick interval, the action, the target, the hold. |
+| `-duration` | `10m` | How long to keep injecting faults. Must be at least `1s`. |
+| `-tick-min` / `-tick-max` | `10s` / `30s` | Bounds of the interval between decisions. `-tick-min` must be at least `100ms`: a tick interval near zero spins the loop and grows the journal without bound, on a run where no fault fits between two ticks. |
+| `-weights` | registry defaults | `name=n,…`; an unknown action name is rejected. `-weights gateway-kill=0` disables a fault. |
+| `-lab` | `ovn-e2e` | containerlab lab name. |
+| `-out` | `chaos-artifacts` | Where the journal, the run record and the lab-state dump land. |
+| `-collect` | `test/e2e/scenarios/collect-artifacts.sh` | The lab-state collector, run into `<out>/lab-state` when the run does not pass. The default is repo-relative, so run the binary from the repo root (`make e2e-chaos` does). |
+
+Two runs with identical inputs against identically-behaving labs replay
+the identical action sequence. Diff them:
+
+```sh
+make e2e-up && make e2e-chaos CHAOS_FLAGS="-duration 3m -out /tmp/chaos-a"
+make e2e-down && make e2e-up
+make e2e-chaos CHAOS_FLAGS="-duration 3m -out /tmp/chaos-b"
+
+diff \
+  <(jq -c 'select(.event=="decision") | {tick,action,target,interval_ms,hold_ms}' /tmp/chaos-a/journal.jsonl) \
+  <(jq -c 'select(.event=="decision") | {tick,action,target,interval_ms,hold_ms}' /tmp/chaos-b/journal.jsonl)
+```
+
+Each tick draws exactly four values — interval, action, target, hold —
+**before** the guardrails are consulted, so a guardrail skip cannot shift
+the stream: the run that skipped a decision draws the same values
+afterwards as the run that executed it. Wall clock only bounds *how many*
+ticks fit in `-duration`, so a slower lab truncates the tail of the
+sequence rather than changing it.
+
+**Combined start state.** The runner layers the existing scenarios'
+setups onto the bootstrap baseline, so one run exercises all of them at
+once: `hairpin.sh`'s second FIP (`192.0.2.12` with a `vm2` responder),
+`multi-vlan.sh`'s two VLAN provider networks (tags 101/102, routers
+pinned to `gateway-1`), and `pf-external.sh`'s `Load_Balancer` VIP
+(`192.0.2.50:80` in front of the `vm1` backend). The layering is
+idempotent, which is what makes it reusable as the post-fault restore
+path. If the start state is not green within 120 s the run aborts with
+exit code 2 — a fault injected into a lab that was not green to begin
+with would report false violations for the rest of the run.
+
+**Probes.** A goroutine per target samples reachability from `client-1`
+once a second for the whole run, so loss *during* a fault hold is
+recorded even while the engine is blocked:
+
+| Probe | Target |
+| --- | --- |
+| `fip-vm1` | `ping 192.0.2.10` |
+| `fip-vm2` | `ping 192.0.2.12` |
+| `fip-vlan101` | `ping 198.51.100.10` |
+| `fip-vlan102` | `ping 203.0.113.10` |
+| `pf-vip` | `curl http://192.0.2.50:80/` |
+
+The baseline lab's second FIP, `192.0.2.11`, is deliberately **not**
+probed: `bootstrap.sh` seeds its NAT row but nothing answers behind
+`192.168.10.11`, so it would be red for the whole run.
+
+**Actions.** The starter set reuses the fault mechanics the scenarios
+already prove. The registry order and the weights are part of the replay
+contract — a new action is appended, never inserted.
+
+| Action | Weight | Hold | Recovery budget | Mechanic |
+| --- | --- | --- | --- | --- |
+| `controller-restart` | 3 | 10–30 s | 90 s | `ovn-ctl stop_controller` / `start_controller` ([failover](#failover)) |
+| `gateway-kill` | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
+| `agent-terminate` | 2 | 10–30 s | 180 s | `kill -TERM 1` — the agent is PID 1 ([drain-hitless](#drain-hitless)) |
+| `gateway-restart` | 2 | — | 180 s | `docker restart` ([pf-hairpin](#port-forward-hairpin-masquerade)) |
+
+Every action that kills a container first runs `docker update
+--restart=no`, exactly as `drain-hitless.sh` does — containerlab deploys
+with `restart: always`, so without it docker revives the node before the
+fault is observable at all. The policy is restored on the way back.
+
+`agent-terminate` only exercises the agent's *drain* path when the lab
+was deployed with `E2E_DRAIN_ON_SHUTDOWN=true` (see
+[Drain-hitless](#drain-hitless)); otherwise the SIGTERM is just a
+graceful exit. The fault is the same either way — the drain only changes
+how much the run loses.
+
+**Guardrails** keep a run meaningful. A decision is skipped (and
+journaled with its `skip_reason`) when the target has not returned and
+converged since it was last hit, or when it is the last healthy gateway.
+
+**Convergence and recovery budgets.** After each restore the runner polls
+the node back to health: the container healthy, its chassis back in SB,
+and every probe green. Budget expiry is a `recovery-timeout` violation
+and parks the node — it is never targeted again and the run fails. A park
+also ends the run early (journaled as `run-aborted`): the parked node's
+data path stays dark, and since convergence gates on *every* probe being
+green, no later action could converge either — the rest of the duration
+would produce nothing but violations derived from the first one.
+Budgets are measured from the *restore*, not from the injection:
+resources pinned to the node under fault (the VLAN routers and the VIP on
+`gateway-1`, every responder on `gateway-3`) are legitimately dark while
+it is held down. The probe-loss buckets still record what happened
+mid-hold.
+
+**Baseline checks** sweep every 10 s, independently of what the engine is
+doing: every node the run considers healthy must be running an agent, and
+no `chassisredirect` port may be claimed by two chassis at once
+(`chassis` ∪ `additional_chassis`). A sweep the runner could not answer —
+central under load, the `sbctl --timeout=5` expiring — is journaled as
+`check-error` and counted, not swallowed. The counts are the record's
+evidence that the invariants were evaluated at all: a run whose every
+dual-claim lookup failed asserted nothing, and fails with a
+`checks-never-ran` violation instead of reporting a clean pass.
+
+::: details Why the runner re-wires the containerlab veth
+Any container exit destroys the containerlab veth
+`gateway-N:eth1 ↔ upstream:ethN`, and `docker start` does not bring it
+back — which is why [failover](#failover) stops only `ovn-controller` and
+why [stale-chassis](#stale-chassis) and [drain-hitless](#drain-hitless)
+tell you to recycle the whole lab. A chaos runner cannot recycle: the
+guardrails only re-target a node that has *returned*. So `restoreNode`
+re-creates the link with `containerlab tools veth create`, re-applies the
+underlay `/30` and the BGP session `bootstrap.sh` seeds, and — on
+`gateway-3` — rebuilds the netns responders and the port-forward backend
+its destroyed network namespace took with it. This needs the same
+privileges `containerlab deploy` already does.
+:::
+
+::: details Why the runner re-points the port-forward VIP
+`pf-external.sh` pins the VIP's two routes (the forward route on
+`upstream`, the scope-link route on `br-ex`) to `gateway-1`, because the
+agent does not propagate `Load_Balancer` VIPs into the underlay. A chaos
+run migrates the master, so the runner re-points both at whichever
+chassis currently owns `cr-lr0-public` — the job an external orchestrator
+does in production — and journals it as `vip-repoint`. Without it the VIP
+probe would go permanently red on the first re-election and every later
+violation would be noise.
+:::
+
+::: warning Destructive — recycle the lab afterwards
+A chaos run leaves the lab wherever the anti-flap election landed:
+`cr-lr0-public` is generally **not** back on `gateway-1`, and the runner
+deliberately never re-asserts priorities mid-run. Chain
+`make e2e-down && make e2e-up` before running scenarios that assume the
+bootstrap master.
+:::
+
+**Artifacts.** Both land under `-out`:
+
+```
+<out>/
+  journal.jsonl   — one JSON object per decision and phase, in order
+  summary.json    — the run record (schema chaos-run-record/v1)
+  lab-state/      — collect-artifacts.sh dump, on a non-zero exit only
+```
+
+`journal.jsonl` carries `run-start` (the echoed inputs), `state-applied`,
+one `decision` per tick (with the drawn values and either `executed` or a
+`skip_reason`), `inject` / `restore` / `converged`, `node-state`,
+`probe-transition`, `vip-repoint`, `violation` and `run-end`.
+`summary.json` aggregates the run: inputs, tick and decision counts,
+actions by name, how many baseline sweeps ran and how many of them
+evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
+loss buckets, the per-action recovery durations, and every violation.
+
+**Exit codes:** `0` the run passed, `1` the run recorded a violation,
+`2` the runner could not set the run up (bad flags, a start state that
+never went green). On any non-zero exit the lab's existing
+`collect-artifacts.sh` bundle is dumped into `<out>/lab-state`.
+
+**In CI.** The `chaos` job in
+[`e2e.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e.yml)
+runs on `workflow_dispatch` only, with `-seed 42 -duration 3m`, and
+uploads the journal, the summary and the lab-state dump on every outcome.
+It is not on the PR path: the sibling scenarios each assert one fault and
+leave the lab baseline-green, while a chaos run is a randomized sequence
+that deliberately leaves the master wherever the last election put it.
+Dispatch it from the Actions tab when you touch the agent's failover,
+drain or chassis-cleanup paths.
 
 ### Manual setup for triage
 
