@@ -1,8 +1,10 @@
 name: Build
 
-# Only validates that the module graph is clean; the release binaries are
-# built solely by release.yml on `v*` tags. This runs on pull requests
-# and not on push to `main`: the merged commit already passed on its PR.
+# Validates the module graph and that the tree cross-compiles for every
+# release target; the release binaries themselves are built solely by
+# release.yml on `v*` tags. This runs on pull requests and not on push
+# to `main`: the branch ruleset in .github/rulesets/main.json requires
+# PRs to be up to date, so the merged commit already passed here.
 on:
   pull_request:
     branches: [main]
@@ -33,3 +35,14 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+      # arm64 is otherwise first compiled at release-tag time
+      # (release.yml builds a linux/arm64 matrix leg); surface
+      # cross-compile breakage on the PR instead. CGO_ENABLED=0 mirrors
+      # the release build.
+      - name: Cross-compile for linux/arm64
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+        run: go build ./...
