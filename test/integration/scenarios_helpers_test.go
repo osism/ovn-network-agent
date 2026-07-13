@@ -28,14 +28,17 @@ func readBridgeMAC(t *testing.T) string {
 	return mac
 }
 
-// scenarioCtx is a per-test context with a hard 90s ceiling. All scenarios
-// in this suite are sub-3-minute by design, so they should never need more.
-func scenarioCtx(t *testing.T) (context.Context, context.CancelFunc) {
+// startScenario is startScenarioWithTimeout with the default 90s context
+// ceiling. Almost every reconciliation test in this suite is sub-3-minute by
+// design and fits inside it; the long-outage reconnect scenario passes a
+// larger ceiling explicitly.
+func startScenario(t *testing.T) (context.Context, context.CancelFunc, client.Client, client.Client) {
 	t.Helper()
-	return context.WithTimeout(context.Background(), 90*time.Second)
+	return startScenarioWithTimeout(t, 90*time.Second)
 }
 
-// startScenario performs the boilerplate every reconciliation test shares:
+// startScenarioWithTimeout performs the boilerplate every reconciliation test
+// shares, with a caller-chosen per-test context ceiling:
 //
 //   - testenv.Setup (host preconditions)
 //   - PauseOVNNorthd so direct SB writes survive
@@ -47,14 +50,14 @@ func scenarioCtx(t *testing.T) (context.Context, context.CancelFunc) {
 //
 // Returns the per-test context, the NB client, and the SB client. The caller
 // is responsible for spawning the agent and asserting the scenario.
-func startScenario(t *testing.T) (context.Context, context.CancelFunc, client.Client, client.Client) {
+func startScenarioWithTimeout(t *testing.T, timeout time.Duration) (context.Context, context.CancelFunc, client.Client, client.Client) {
 	t.Helper()
 	testenv.Setup(t)
 	testenv.PauseOVNNorthd(t)
 	testenv.PauseOVNController(t)
 	testenv.EnsureBridgePatchPort(t)
 
-	ctx, cancel := scenarioCtx(t)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	nb := testenv.NewNBClient(t, ctx)
 	sb := testenv.NewSBClient(t, ctx)
 	testenv.ResetOVNState(t, ctx, nb, sb)
@@ -62,7 +65,7 @@ func startScenario(t *testing.T) (context.Context, context.CancelFunc, client.Cl
 
 	// On failure, dump enough state for postmortem diagnosis without an
 	// operator having to ssh in and re-run commands. ctx may be cancelled
-	// by the time cleanup runs (the scenario context has a 90s ceiling),
+	// by the time cleanup runs (the scenario context has a bounded ceiling),
 	// so use a fresh background context for the OVN dump.
 	t.Cleanup(func() {
 		if t.Failed() {
