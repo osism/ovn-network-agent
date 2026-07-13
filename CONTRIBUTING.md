@@ -13,6 +13,14 @@ make test      # run the unit tests
 make fmt vet   # format and vet
 ```
 
+Run the same lint gate CI enforces (keep the version in sync with
+[`.github/workflows/lint.yml`](./.github/workflows/lint.yml)):
+
+```bash
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+golangci-lint run   # config and exclusions live in .golangci.yml
+```
+
 ## Commit conventions
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org):
@@ -63,6 +71,16 @@ option the agent consumes.
 | Integration     | `make test-integration`              | Linux + root (`CAP_NET_ADMIN`); see [Integration tests](https://osism.github.io/ovn-network-agent/contributing/integration-tests). |
 | E2E             | `make e2e-up` then `make e2e-<scenario>` | containerlab lab; see [Containerlab E2E harness](https://osism.github.io/ovn-network-agent/contributing/e2e-tests). |
 | Package smoke   | `test/package/smoke.sh`              | Runs on every PR via the Package workflow (see below). |
+
+### CI gates
+
+`main` is protected by a committed branch ruleset
+([`.github/rulesets/main.json`](./.github/rulesets/main.json)) that
+requires a pull request and the Test / Lint / Build / Integration status
+checks, kept up to date with `main`. The full gate map, the schedules,
+and the maintenance procedures (linter version, containerlab pin, PAT
+scope) are documented at
+[CI pipeline](https://osism.github.io/ovn-network-agent/contributing/ci).
 
 Run the package smoke test locally the way CI does. Keep the `nfpm` version
 below in sync with the pin in [`.github/workflows/`](./.github/workflows) —
