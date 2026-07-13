@@ -894,8 +894,8 @@ func (h *sbEventHandler) OnAdd(table string, m model.Model) {
 	h.handleChange(table)
 }
 
-func (h *sbEventHandler) OnUpdate(table string, old, new model.Model) {
-	if h.isChassisRedirect(table, new) {
+func (h *sbEventHandler) OnUpdate(table string, old, updated model.Model) {
+	if h.isChassisRedirect(table, updated) {
 		slog.Debug("chassisredirect port updated, immediate refresh")
 		h.ovn.signalDrainWatch()
 		h.ovn.immediateStateRefresh()
@@ -941,7 +941,7 @@ func (h *nbEventHandler) OnAdd(table string, m model.Model) {
 	h.handleChange(table)
 }
 
-func (h *nbEventHandler) OnUpdate(table string, old, new model.Model) {
+func (h *nbEventHandler) OnUpdate(table string, old, updated model.Model) {
 	h.handleChange(table)
 }
 
