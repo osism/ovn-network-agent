@@ -24,31 +24,15 @@ const (
 
 // RouteManager handles kernel routes on the provider bridge and FRR static routes.
 type RouteManager struct {
-	bridgeDev    string
-	bridgeIP     string
-	vrfName      string
-	vethNexthop  string
-	routeTableID int
-	ovsWrapper   []string // prefix args for ovs-vsctl/ovs-ofctl (e.g. ["docker", "exec", "openvswitch_vswitchd"])
-	dryRun       bool
+	// cfg is the agent configuration. RouteManager reads the settings it
+	// needs straight from it rather than copying them into per-field
+	// duplicates: a new config option becomes usable here the moment it is
+	// added to Config, with no second place to keep in sync.
+	cfg Config
 
-	// Veth VRF leak settings
-	vethLeakEnabled      bool
-	vethProviderIP       string
-	vethLeakTableID      int
-	vethLeakRulePriority int
-	networkFilters       []*net.IPNet // from manual config (may be empty for auto-discovery)
-
-	// FRR prefix-list management
-	frrPrefixList string
-
-	// Port forwarding (DNAT) settings
-	portForwardEnabled      bool
-	portForwardDev          string
-	portForwardTableID      int
-	portForwardL3mdevAccept bool
-	portForwardCTZone       int
-	portForwards            []PortForwardVIP
+	// ovsWrapper is derived from cfg.OVSWrapper: prefix args for
+	// ovs-vsctl/ovs-ofctl (e.g. ["docker", "exec", "openvswitch_vswitchd"]).
+	ovsWrapper []string
 
 	// segments maps each localnet port name to its resolved OVS/kernel
 	// binding (populated on first use, revalidated every reconcile). The
@@ -101,26 +85,7 @@ func warnIfVtyshMissing(lookPath func(string) (string, error)) {
 }
 
 func NewRouteManager(cfg Config) *RouteManager {
-	rm := &RouteManager{
-		bridgeDev:               cfg.BridgeDev,
-		bridgeIP:                cfg.BridgeIP,
-		vrfName:                 cfg.VRFName,
-		vethNexthop:             cfg.VethNexthop,
-		routeTableID:            cfg.RouteTableID,
-		dryRun:                  cfg.DryRun,
-		vethLeakEnabled:         cfg.VethLeakEnabled,
-		vethProviderIP:          cfg.VethProviderIP,
-		vethLeakTableID:         cfg.VethLeakTableID,
-		vethLeakRulePriority:    cfg.VethLeakRulePriority,
-		networkFilters:          cfg.NetworkFilters,
-		frrPrefixList:           cfg.FRRPrefixList,
-		portForwardEnabled:      cfg.PortForwardEnabled,
-		portForwardDev:          cfg.PortForwardDev,
-		portForwardTableID:      cfg.PortForwardTableID,
-		portForwardL3mdevAccept: cfg.PortForwardL3mdevAccept,
-		portForwardCTZone:       cfg.PortForwardCTZone,
-		portForwards:            cfg.PortForwards,
-	}
+	rm := &RouteManager{cfg: cfg}
 	if cfg.OVSWrapper != "" {
 		rm.ovsWrapper = strings.Fields(cfg.OVSWrapper)
 	}
@@ -196,8 +161,8 @@ func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 	if len(valid) == 0 {
 		return nil
 	}
-	if rm.dryRun {
-		slog.Info("[dry-run] would add FRR routes", "count", len(valid), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would add FRR routes", "count", len(valid), "vrf", rm.cfg.VRFName, "nexthop", rm.cfg.VethNexthop)
 		return nil
 	}
 	var errs []error
@@ -207,19 +172,19 @@ func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 			end = len(valid)
 		}
 		chunk := valid[start:end]
-		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.vrfName)}
+		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.cfg.VRFName)}
 		for _, ip := range chunk {
-			args = append(args, "-c", fmt.Sprintf("ip route %s/32 %s", ip, rm.vethNexthop))
+			args = append(args, "-c", fmt.Sprintf("ip route %s/32 %s", ip, rm.cfg.VethNexthop))
 		}
 		args = append(args, "-c", "exit-vrf", "-c", "end")
 		output, err := rm.runVtysh(args...)
 		if err != nil {
 			slog.Error("failed to add FRR route chunk, continuing with the next",
-				"count", len(chunk), "vrf", rm.vrfName, "error", err, "output", strings.TrimSpace(string(output)))
+				"count", len(chunk), "vrf", rm.cfg.VRFName, "error", err, "output", strings.TrimSpace(string(output)))
 			errs = append(errs, fmt.Errorf("vtysh batch add %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output))))
 			continue
 		}
-		slog.Info("FRR routes ensured", "count", len(chunk), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+		slog.Info("FRR routes ensured", "count", len(chunk), "vrf", rm.cfg.VRFName, "nexthop", rm.cfg.VethNexthop)
 	}
 	return errors.Join(errs...)
 }
@@ -236,8 +201,8 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 			return err
 		}
 	}
-	if rm.dryRun {
-		slog.Info("[dry-run] would remove FRR routes", "count", len(ips), "vrf", rm.vrfName, "nexthop", rm.vethNexthop)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would remove FRR routes", "count", len(ips), "vrf", rm.cfg.VRFName, "nexthop", rm.cfg.VethNexthop)
 		return nil
 	}
 	for start := 0; start < len(ips); start += frrBatchSize {
@@ -246,16 +211,16 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 			end = len(ips)
 		}
 		chunk := ips[start:end]
-		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.vrfName)}
+		args := []string{"-c", "conf t", "-c", fmt.Sprintf("vrf %s", rm.cfg.VRFName)}
 		for _, ip := range chunk {
-			args = append(args, "-c", fmt.Sprintf("no ip route %s/32 %s", ip, rm.vethNexthop))
+			args = append(args, "-c", fmt.Sprintf("no ip route %s/32 %s", ip, rm.cfg.VethNexthop))
 		}
 		args = append(args, "-c", "exit-vrf", "-c", "end")
 		output, err := rm.runVtysh(args...)
 		if err != nil {
 			return fmt.Errorf("vtysh batch del %d routes: %w (output: %s)", len(chunk), err, strings.TrimSpace(string(output)))
 		}
-		slog.Info("FRR routes removed", "count", len(chunk), "vrf", rm.vrfName)
+		slog.Info("FRR routes removed", "count", len(chunk), "vrf", rm.cfg.VRFName)
 	}
 	return nil
 }
@@ -265,10 +230,10 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 // analog of the kernel protocol tag — without it, reconciliation would treat
 // operator-created statics as agent-owned and withdraw them on standby nodes.
 func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		return nil, nil
 	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static", rm.vrfName))
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static", rm.cfg.VRFName))
 	if err != nil {
 		return nil, fmt.Errorf("vtysh list routes: %w", err)
 	}
@@ -281,7 +246,7 @@ func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
 			continue
 		}
 		// Only report statics installed via the agent's own nexthop.
-		if frrRouteNexthop(line) != rm.vethNexthop {
+		if frrRouteNexthop(line) != rm.cfg.VethNexthop {
 			continue
 		}
 		for _, p := range strings.Fields(line) {
@@ -327,10 +292,10 @@ type frrRouteEntry struct {
 // handled by ensureRoutes. ListFRRRoutes cannot tell the two apart because it
 // matches any configured route, which is why this distinct check exists.
 func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
-	if rm.dryRun || len(ips) == 0 {
+	if rm.cfg.DryRun || len(ips) == 0 {
 		return nil, nil
 	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static json", rm.vrfName))
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static json", rm.cfg.VRFName))
 	if err != nil {
 		return nil, fmt.Errorf("vtysh list routes json: %w (output: %s)", err, strings.TrimSpace(string(output)))
 	}
@@ -369,15 +334,15 @@ func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
 // RefreshBGP triggers an outbound BGP soft-refresh so that peers learn about
 // route changes immediately instead of waiting for the MRAI timer.
 func (rm *RouteManager) RefreshBGP() error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would refresh BGP outbound")
 		return nil
 	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("clear ip bgp vrf %s * soft out", rm.vrfName))
+	output, err := rm.runVtysh("-c", fmt.Sprintf("clear ip bgp vrf %s * soft out", rm.cfg.VRFName))
 	if err != nil {
 		return fmt.Errorf("BGP soft-refresh: %w (output: %s)", err, strings.TrimSpace(string(output)))
 	}
-	slog.Info("BGP outbound soft-refresh triggered", "vrf", rm.vrfName)
+	slog.Info("BGP outbound soft-refresh triggered", "vrf", rm.cfg.VRFName)
 	return nil
 }
 
@@ -397,12 +362,12 @@ type prefixListEntry struct {
 // Safety: frrPrefixList is validated by isValidIdentifier (alphanumeric, hyphen,
 // underscore, dot) in config validation. Network strings come from net.IPNet.String().
 func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
-	if rm.frrPrefixList == "" {
+	if rm.cfg.FRRPrefixList == "" {
 		return nil, nil
 	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip prefix-list %s", rm.frrPrefixList))
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip prefix-list %s", rm.cfg.FRRPrefixList))
 	if err != nil {
-		return nil, fmt.Errorf("vtysh show prefix-list %s: %w (output: %s)", rm.frrPrefixList, err, strings.TrimSpace(string(output)))
+		return nil, fmt.Errorf("vtysh show prefix-list %s: %w (output: %s)", rm.cfg.FRRPrefixList, err, strings.TrimSpace(string(output)))
 	}
 
 	outStr := string(output)
@@ -431,11 +396,11 @@ func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 // "permit <network> ge 32 le 32" entry per desired network.
 // Pass nil to remove all managed entries (cleanup).
 func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
-	if rm.frrPrefixList == "" {
+	if rm.cfg.FRRPrefixList == "" {
 		return nil
 	}
-	if rm.dryRun {
-		slog.Info("[dry-run] would reconcile FRR prefix-list", "name", rm.frrPrefixList, "networks", len(networks))
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would reconcile FRR prefix-list", "name", rm.cfg.FRRPrefixList, "networks", len(networks))
 		return nil
 	}
 
@@ -465,13 +430,13 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
 			maxSeq += 5
 			output, err := rm.runVtysh(
 				"-c", "conf t",
-				"-c", fmt.Sprintf("ip prefix-list %s seq %d permit %s ge 32 le 32", rm.frrPrefixList, maxSeq, network),
+				"-c", fmt.Sprintf("ip prefix-list %s seq %d permit %s ge 32 le 32", rm.cfg.FRRPrefixList, maxSeq, network),
 				"-c", "end",
 			)
 			if err != nil {
 				return fmt.Errorf("add prefix-list entry %s seq %d: %w (output: %s)", network, maxSeq, err, strings.TrimSpace(string(output)))
 			}
-			slog.Info("FRR prefix-list entry added", "name", rm.frrPrefixList, "network", network, "seq", maxSeq)
+			slog.Info("FRR prefix-list entry added", "name", rm.cfg.FRRPrefixList, "network", network, "seq", maxSeq)
 		}
 	}
 
@@ -480,13 +445,13 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
 		if !desired[network] {
 			output, err := rm.runVtysh(
 				"-c", "conf t",
-				"-c", fmt.Sprintf("no ip prefix-list %s seq %d permit %s ge 32 le 32", rm.frrPrefixList, seq, network),
+				"-c", fmt.Sprintf("no ip prefix-list %s seq %d permit %s ge 32 le 32", rm.cfg.FRRPrefixList, seq, network),
 				"-c", "end",
 			)
 			if err != nil {
 				return fmt.Errorf("remove prefix-list entry %s seq %d: %w (output: %s)", network, seq, err, strings.TrimSpace(string(output)))
 			}
-			slog.Info("FRR prefix-list entry removed", "name", rm.frrPrefixList, "network", network, "seq", seq)
+			slog.Info("FRR prefix-list entry removed", "name", rm.cfg.FRRPrefixList, "network", network, "seq", seq)
 		}
 	}
 

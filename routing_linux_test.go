@@ -16,14 +16,14 @@ import (
 const nonexistentBridge = "ovnagent-nonexistent-br"
 
 func TestEnsureBridgeIPRejectsInvalidIP(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	if err := rm.EnsureBridgeIP("not-an-ip"); err == nil {
 		t.Fatal("EnsureBridgeIP(invalid) should return error")
 	}
 }
 
 func TestEnsureBridgeIPWrapsLinkLookupError(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	err := rm.EnsureBridgeIP("169.254.169.254")
 	if err == nil {
 		t.Fatal("EnsureBridgeIP should error when the bridge device is missing")
@@ -34,14 +34,14 @@ func TestEnsureBridgeIPWrapsLinkLookupError(t *testing.T) {
 }
 
 func TestRemoveBridgeIPRejectsInvalidIP(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	if err := rm.RemoveBridgeIP("not-an-ip"); err == nil {
 		t.Fatal("RemoveBridgeIP(invalid) should return error")
 	}
 }
 
 func TestRemoveBridgeIPWrapsLinkLookupError(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	err := rm.RemoveBridgeIP("169.254.169.254")
 	if err == nil {
 		t.Fatal("RemoveBridgeIP should error when the bridge device is missing")
@@ -49,7 +49,7 @@ func TestRemoveBridgeIPWrapsLinkLookupError(t *testing.T) {
 }
 
 func TestAddKernelRouteWrapsLinkLookupError(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	err := rm.AddKernelRoute("10.0.0.1", nonexistentBridge)
 	if err == nil {
 		t.Fatal("AddKernelRoute should error when the bridge device is missing")
@@ -65,7 +65,7 @@ func TestAddKernelRouteRejectsInvalidIP(t *testing.T) {
 }
 
 func TestDelKernelRouteWrapsLinkLookupError(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	err := rm.DelKernelRoute("10.0.0.1", nonexistentBridge)
 	if err == nil {
 		t.Fatal("DelKernelRoute should error when the bridge device is missing")
@@ -76,7 +76,7 @@ func TestEnableProxyARPWritesProcSysOrErrors(t *testing.T) {
 	// proc path: /proc/sys/net/ipv4/conf/<dev>/proxy_arp. With a synthetic
 	// bridge that does not exist, the os.WriteFile call returns ENOENT and
 	// the function wraps it. This exercises the error-wrap branch.
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	err := rm.EnableProxyARP()
 	if err == nil {
 		t.Fatal("EnableProxyARP should error when the bridge's proxy_arp sysctl is absent")
@@ -84,28 +84,28 @@ func TestEnableProxyARPWritesProcSysOrErrors(t *testing.T) {
 }
 
 func TestCleanupRoutingTableNoOpWhenTableIDZero(t *testing.T) {
-	rm := &RouteManager{routeTableID: 0}
+	rm := &RouteManager{cfg: Config{RouteTableID: 0}}
 	if err := rm.CleanupRoutingTable(); err != nil {
 		t.Errorf("CleanupRoutingTable with table 0 should be a no-op, got: %v", err)
 	}
 }
 
 func TestCleanupRoutingTableDryRun(t *testing.T) {
-	rm := &RouteManager{routeTableID: 100, dryRun: true}
+	rm := &RouteManager{cfg: Config{RouteTableID: 100, DryRun: true}}
 	if err := rm.CleanupRoutingTable(); err != nil {
 		t.Errorf("CleanupRoutingTable in dry-run should not error, got: %v", err)
 	}
 }
 
 func TestGetBridgeMACReturnsErrorForMissingBridge(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	if _, err := rm.GetBridgeMAC(); err == nil {
 		t.Fatal("GetBridgeMAC should error when the bridge is missing")
 	}
 }
 
 func TestCheckBridgeDeviceDryRunSkips(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge, dryRun: true}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge, DryRun: true}}
 	if err := rm.CheckBridgeDevice(); err != nil {
 		t.Errorf("CheckBridgeDevice in dry-run should not error, got: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestSegmentIfaceNameLength(t *testing.T) {
 }
 
 func TestEnsureSegmentInterfaceWrapsLinkLookupError(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	_, _, err := rm.EnsureSegmentInterface(101)
 	if err == nil {
 		t.Fatal("EnsureSegmentInterface should error when the bridge device is missing")
@@ -154,7 +154,7 @@ func TestEnsureSegmentInterfaceWrapsLinkLookupError(t *testing.T) {
 }
 
 func TestEnsureSegmentInterfaceRejectsOverlongName(t *testing.T) {
-	rm := &RouteManager{bridgeDev: "br-provider-x"}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-provider-x"}}
 	_, _, err := rm.EnsureSegmentInterface(4094)
 	if err == nil {
 		t.Fatal("EnsureSegmentInterface should reject a name over the kernel limit")
@@ -221,14 +221,14 @@ func TestVerifyAdoptedSegmentLink(t *testing.T) {
 }
 
 func TestPruneSegmentInterfacesWrapsLinkLookupError(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	if err := rm.PruneSegmentInterfaces(nil); err == nil {
 		t.Fatal("PruneSegmentInterfaces should error when the bridge device is missing")
 	}
 }
 
 func TestTeardownSegmentInterfacesDryRun(t *testing.T) {
-	rm := &RouteManager{bridgeDev: nonexistentBridge, dryRun: true}
+	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge, DryRun: true}}
 	if err := rm.TeardownSegmentInterfaces(); err != nil {
 		t.Errorf("TeardownSegmentInterfaces in dry-run should not error, got: %v", err)
 	}

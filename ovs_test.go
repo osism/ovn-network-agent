@@ -149,10 +149,7 @@ func TestMACTweakFlow(t *testing.T) {
 }
 
 func TestOVSCmdWrapperPrepended(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:  "br-ex",
-		ovsWrapper: []string{"docker", "exec", "openvswitch_vswitchd"},
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, ovsWrapper: []string{"docker", "exec", "openvswitch_vswitchd"}}
 
 	cmd := rm.ovsCmd("ovs-ofctl", "add-flow", "br-ex", "flow")
 	want := []string{"docker", "exec", "openvswitch_vswitchd", "ovs-ofctl", "add-flow", "br-ex", "flow"}
@@ -162,7 +159,7 @@ func TestOVSCmdWrapperPrepended(t *testing.T) {
 }
 
 func TestOVSCmdNoWrapper(t *testing.T) {
-	rm := &RouteManager{bridgeDev: "br-ex"}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}}
 
 	cmd := rm.ovsCmd("ovs-ofctl", "add-flow", "br-ex", "flow")
 	want := []string{"ovs-ofctl", "add-flow", "br-ex", "flow"}
@@ -193,11 +190,7 @@ func TestEnsureSegmentsWithCachedFallbackKeepsFlatFlowSet(t *testing.T) {
 		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
 		"42\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	if err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}}); err != nil {
 		t.Fatalf("EnsureSegments() error: %v", err)
@@ -259,13 +252,9 @@ func TestEnsureSegmentsInstallsFlowsPerPatchPort(t *testing.T) {
 		[]string{"ovs-vsctl", "get", "Interface", "patch-seg102", "ofport"},
 		"6\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-		segmentIfaceHook: func(tag int) (string, string, error) {
-			return fmt.Sprintf("br-ex.%d", tag), fmt.Sprintf("aa:bb:cc:dd:ee:%02x", tag), nil
-		},
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook(), segmentIfaceHook: func(tag int) (string, string, error) {
+		return fmt.Sprintf("br-ex.%d", tag), fmt.Sprintf("aa:bb:cc:dd:ee:%02x", tag), nil
+	}}
 
 	tag101, tag102 := 101, 102
 	desired := []DesiredSegment{
@@ -333,16 +322,12 @@ func TestEnsureSegmentsSkipsSegmentWhenIfaceFails(t *testing.T) {
 		[]string{"ovs-vsctl", "get", "Interface", "patch-seg102", "ofport"},
 		"6\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-		segmentIfaceHook: func(tag int) (string, string, error) {
-			if tag == 102 {
-				return "", "", errors.New("interface name too long")
-			}
-			return fmt.Sprintf("br-ex.%d", tag), "aa:bb:cc:dd:ee:65", nil
-		},
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook(), segmentIfaceHook: func(tag int) (string, string, error) {
+		if tag == 102 {
+			return "", "", errors.New("interface name too long")
+		}
+		return fmt.Sprintf("br-ex.%d", tag), "aa:bb:cc:dd:ee:65", nil
+	}}
 
 	tag101, tag102 := 101, 102
 	desired := []DesiredSegment{
@@ -399,10 +384,7 @@ func TestEnsureSegmentsFallbackDiscoveryWhenUncached(t *testing.T) {
 		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
 		"42\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, execOVSHook: rec.hook()}
 
 	err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}})
 	if err == nil {
@@ -429,11 +411,7 @@ func TestEnsureSegmentsTolersDelFailure(t *testing.T) {
 		[]string{"ovs-ofctl", "del-flows", "br-ex", "cookie=0x999/-1"},
 		"some output", errors.New("transient ofctl error"),
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	if err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}}); err != nil {
 		t.Fatalf("EnsureSegments() should swallow del-flows error, got: %v", err)
@@ -478,13 +456,9 @@ func TestEnsureSegmentsAddFailureDoesNotStarveOthers(t *testing.T) {
 			"cookie=0x999,priority=900,ip,in_port=5,actions=mod_dl_dst:aa:bb:cc:dd:ee:65,NORMAL"},
 		"add-flow failed", errors.New("bad flow"),
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-		segmentIfaceHook: func(tag int) (string, string, error) {
-			return fmt.Sprintf("br-ex.%d", tag), fmt.Sprintf("aa:bb:cc:dd:ee:%02x", tag), nil
-		},
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook(), segmentIfaceHook: func(tag int) (string, string, error) {
+		return fmt.Sprintf("br-ex.%d", tag), fmt.Sprintf("aa:bb:cc:dd:ee:%02x", tag), nil
+	}}
 
 	tag101, tag102 := 101, 102
 	desired := []DesiredSegment{
@@ -534,11 +508,7 @@ func TestEnsureSegmentsRediscoversWhenOfportChanges(t *testing.T) {
 		[]string{"ovs-vsctl", "--if-exists", "get", "Interface", "patch-provnet-0", "type"},
 		"patch\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}})
 	if err == nil || !strings.Contains(err.Error(), "get bridge MAC") {
@@ -566,14 +536,9 @@ func TestEnsureSegmentsRediscoversWhenSegmentSetChanges(t *testing.T) {
 		[]string{"ovs-vsctl", "get", "Interface", "patch-seg101", "ofport"},
 		"5\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-		segmentIfaceHook: func(tag int) (string, string, error) {
-			return fmt.Sprintf("br-ex.%d", tag), "aa:bb:cc:dd:ee:65", nil
-		},
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook(), segmentIfaceHook: func(tag int) (string, string, error) {
+		return fmt.Sprintf("br-ex.%d", tag), "aa:bb:cc:dd:ee:65", nil
+	}}
 
 	tag101 := 101
 	if err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: "seg-101", VLANTag: &tag101}}); err != nil {
@@ -589,11 +554,7 @@ func TestEnsureSegmentsRediscoversWhenSegmentSetChanges(t *testing.T) {
 
 func TestReconcileOVSHairpinFlowsInstallsExpectedFlows(t *testing.T) {
 	rec := newOVSRecorder()
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	targets := map[string]HairpinTarget{
 		"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"},
@@ -632,14 +593,10 @@ func TestReconcileOVSHairpinFlowsInstallsExpectedFlows(t *testing.T) {
 func TestReconcileOVSHairpinFlowsPerSegment(t *testing.T) {
 	rec := newOVSRecorder()
 	tag101, tag102 := 101, 102
-	rm := &RouteManager{
-		bridgeDev: "br-ex",
-		segments: map[string]*segmentBinding{
-			"seg-101": {patchPort: "patch-seg101", ofport: "5", kernelDev: "br-ex.101", kernelMAC: "aa:bb:cc:dd:ee:65", vlanTag: &tag101},
-			"seg-102": {patchPort: "patch-seg102", ofport: "6", kernelDev: "br-ex.102", kernelMAC: "aa:bb:cc:dd:ee:66", vlanTag: &tag102},
-		},
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: map[string]*segmentBinding{
+		"seg-101": {patchPort: "patch-seg101", ofport: "5", kernelDev: "br-ex.101", kernelMAC: "aa:bb:cc:dd:ee:65", vlanTag: &tag101},
+		"seg-102": {patchPort: "patch-seg102", ofport: "6", kernelDev: "br-ex.102", kernelMAC: "aa:bb:cc:dd:ee:66", vlanTag: &tag102},
+	}, execOVSHook: rec.hook()}
 
 	targets := map[string]HairpinTarget{
 		"198.51.100.50": {RouterMAC: "fa:16:3e:00:01:01", Segment: "seg-101"},
@@ -665,11 +622,7 @@ func TestReconcileOVSHairpinFlowsPerSegment(t *testing.T) {
 
 func TestReconcileOVSHairpinFlowsEmptyMapClearsAll(t *testing.T) {
 	rec := newOVSRecorder()
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	if err := rm.ReconcileOVSHairpinFlows(nil); err != nil {
 		t.Fatalf("ReconcileOVSHairpinFlows(nil) error: %v", err)
@@ -686,7 +639,7 @@ func TestReconcileOVSHairpinFlowsEmptyMapClearsAll(t *testing.T) {
 func TestReconcileOVSHairpinFlowsNoBindingsIsNoOp(t *testing.T) {
 	rec := newOVSRecorder()
 	rm := &RouteManager{
-		bridgeDev:   "br-ex",
+		cfg:         Config{BridgeDev: "br-ex"},
 		execOVSHook: rec.hook(),
 		// segments intentionally empty.
 	}
@@ -705,11 +658,7 @@ func TestReconcileOVSHairpinFlowsNoBindingsIsNoOp(t *testing.T) {
 // then aborted on the first invalid IP, leaving the plane permanently empty.
 func TestReconcileOVSHairpinFlowsSkipsInvalidIP(t *testing.T) {
 	rec := newOVSRecorder()
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	targets := map[string]HairpinTarget{
 		"not-an-ip":     {RouterMAC: "aa:aa:aa:aa:aa:aa"},
@@ -735,11 +684,7 @@ func TestReconcileOVSHairpinFlowsAddFailureDoesNotStarveOthers(t *testing.T) {
 	const failingFlow = "cookie=0x998,priority=910,ip,in_port=42,ip_dst=5.182.234.199/32,actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:6f:a1:64,output:in_port"
 	rec.on([]string{"ovs-ofctl", "add-flow", "br-ex", failingFlow}, "add-flow failed", errors.New("bad flow"))
 
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		segments:    fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
 
 	targets := map[string]HairpinTarget{
 		"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"},
@@ -757,11 +702,7 @@ func TestReconcileOVSHairpinFlowsAddFailureDoesNotStarveOthers(t *testing.T) {
 
 func TestReconcileOVSHairpinFlowsDryRun(t *testing.T) {
 	rec := newOVSRecorder()
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		dryRun:      true,
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", DryRun: true}, execOVSHook: rec.hook()}
 
 	if err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"10.0.0.1": {RouterMAC: "aa:aa:aa:aa:aa:aa"}}); err != nil {
 		t.Fatalf("dry-run should not error: %v", err)
@@ -773,10 +714,7 @@ func TestReconcileOVSHairpinFlowsDryRun(t *testing.T) {
 
 func TestRemoveOVSFlowsIssuesBothDeletes(t *testing.T) {
 	rec := newOVSRecorder()
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook()}
 
 	if err := rm.RemoveOVSFlows(); err != nil {
 		t.Fatalf("RemoveOVSFlows() error: %v", err)
@@ -797,10 +735,7 @@ func TestRemoveOVSFlowsMACTweakFailureStops(t *testing.T) {
 		[]string{"ovs-ofctl", "del-flows", "br-ex", "cookie=0x999/-1"},
 		"err output", errors.New("ofctl exit 1"),
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook()}
 
 	if err := rm.RemoveOVSFlows(); err == nil {
 		t.Fatal("expected error when MAC-tweak del-flows fails")
@@ -825,10 +760,7 @@ func TestDiscoverPatchPortFindsPatchType(t *testing.T) {
 		[]string{"ovs-vsctl", "--if-exists", "get", "Interface", "patch-provnet-0", "type"},
 		"patch\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook()}
 
 	port, err := rm.discoverPatchPort()
 	if err != nil {
@@ -853,10 +785,7 @@ func TestDiscoverPatchPortNoPatchFound(t *testing.T) {
 		[]string{"ovs-vsctl", "--if-exists", "get", "Interface", "phy-eth1", "type"},
 		"\n", nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		execOVSHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook()}
 
 	if _, err := rm.discoverPatchPort(); err == nil {
 		t.Error("expected error when no patch port present")
@@ -882,10 +811,7 @@ func TestGetOFPortRejectsInvalidValues(t *testing.T) {
 				[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
 				tt.out, nil,
 			)
-			rm := &RouteManager{
-				bridgeDev:   "br-ex",
-				execOVSHook: rec.hook(),
-			}
+			rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook()}
 			got, err := rm.getOFPort("patch-provnet-0")
 			if tt.wantErr {
 				if err == nil {

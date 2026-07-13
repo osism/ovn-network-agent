@@ -65,20 +65,15 @@ func itoa(n int) string {
 func TestApplyNftRulesetReissuesIdenticalRulesetAfterFailure(t *testing.T) {
 	dir := installFakeNft(t)
 
-	rm := &RouteManager{
-		portForwardEnabled: true,
-		portForwardDev:     "loopback1",
-		portForwardCTZone:  64000,
-		portForwards: []PortForwardVIP{
-			{
-				VIP:       "198.51.100.10",
-				ManageVIP: true,
-				Rules: []PortForwardRule{
-					{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100", DestPort: 8080},
-				},
+	rm := &RouteManager{cfg: Config{PortForwardEnabled: true, PortForwardDev: "loopback1", PortForwardCTZone: 64000, PortForwards: []PortForwardVIP{
+		{
+			VIP:       "198.51.100.10",
+			ManageVIP: true,
+			Rules: []PortForwardRule{
+				{Proto: "tcp", Port: 80, DestAddr: "10.0.0.100", DestPort: 8080},
 			},
 		},
-	}
+	}}}
 
 	// First call: nft fails → wrapped error returned.
 	err := rm.applyNftRuleset(nil, nil)
@@ -156,7 +151,7 @@ func TestEnsureVethForwardingSurfacesSysctlError(t *testing.T) {
 	})
 
 	t.Run("port_forward_accept_local", func(t *testing.T) {
-		rm := &RouteManager{portForwardEnabled: true}
+		rm := &RouteManager{cfg: Config{PortForwardEnabled: true}}
 		err := rm.ensureVethForwarding()
 		if err == nil {
 			t.Fatal("expected error when veth sysctl path is missing, got nil")

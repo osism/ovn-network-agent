@@ -87,8 +87,8 @@ func (rm *RouteManager) runOVS(binary string, args ...string) ([]byte, error) {
 //
 // Every binding is re-validated on every call via refreshSegmentBindings.
 func (rm *RouteManager) EnsureSegments(desired []DesiredSegment) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would ensure OVS MAC-tweak flows", "dev", rm.bridgeDev, "segments", len(desired))
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would ensure OVS MAC-tweak flows", "dev", rm.cfg.BridgeDev, "segments", len(desired))
 		return nil
 	}
 
@@ -110,7 +110,7 @@ func (rm *RouteManager) EnsureSegments(desired []DesiredSegment) error {
 	}
 
 	// Delete existing agent-managed flows (idempotent replace).
-	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
+	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.cfg.BridgeDev,
 		fmt.Sprintf("cookie=%s/-1", ovsCookieMACTweak)); err != nil {
 		slog.Warn("failed to delete old OVS flows", "error", err, "output", strings.TrimSpace(string(out)))
 	}
@@ -142,7 +142,7 @@ func (rm *RouteManager) EnsureSegments(desired []DesiredSegment) error {
 		}
 	}
 
-	slog.Debug("OVS MAC-tweak flows ensured", "dev", rm.bridgeDev, "segments", len(rm.segments))
+	slog.Debug("OVS MAC-tweak flows ensured", "dev", rm.cfg.BridgeDev, "segments", len(rm.segments))
 	return nil
 }
 
@@ -181,9 +181,9 @@ func (rm *RouteManager) refreshSegmentBindings(desired []DesiredSegment) error {
 
 	// Map localnet port name → provider-bridge patch port, from the
 	// external_ids ovn-controller stamps on the patch Port rows.
-	out, err := rm.runOVS("ovs-vsctl", "list-ports", rm.bridgeDev)
+	out, err := rm.runOVS("ovs-vsctl", "list-ports", rm.cfg.BridgeDev)
 	if err != nil {
-		return fmt.Errorf("list-ports %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("list-ports %s: %w (output: %s)", rm.cfg.BridgeDev, err, strings.TrimSpace(string(out)))
 	}
 	patchByLocalnet := make(map[string]string)
 	for _, port := range strings.Fields(strings.TrimSpace(string(out))) {
@@ -211,7 +211,7 @@ func (rm *RouteManager) refreshSegmentBindings(desired []DesiredSegment) error {
 			// deployments bit-compatible with the pre-segment behavior.
 			if d.LocalnetPort != "" {
 				slog.Warn("localnet segment has no matching patch port on the provider bridge, using single-patch fallback",
-					"localnet_port", d.LocalnetPort, "dev", rm.bridgeDev)
+					"localnet_port", d.LocalnetPort, "dev", rm.cfg.BridgeDev)
 			}
 			if fallback == nil {
 				fallback, err = rm.fallbackBinding()
@@ -234,7 +234,7 @@ func (rm *RouteManager) refreshSegmentBindings(desired []DesiredSegment) error {
 			if err != nil {
 				return fmt.Errorf("get bridge MAC: %w", err)
 			}
-			binding.kernelDev = rm.bridgeDev
+			binding.kernelDev = rm.cfg.BridgeDev
 			binding.kernelMAC = mac.String()
 		} else {
 			tag := *d.VLANTag
@@ -316,7 +316,7 @@ func (rm *RouteManager) ensureSegmentInterface(tag int) (string, string, error) 
 func (rm *RouteManager) fallbackBinding() (*segmentBinding, error) {
 	patchPort, err := rm.discoverPatchPort()
 	if err != nil {
-		return nil, fmt.Errorf("discover patch port on %s: %w", rm.bridgeDev, err)
+		return nil, fmt.Errorf("discover patch port on %s: %w", rm.cfg.BridgeDev, err)
 	}
 	ofport, err := rm.getOFPort(patchPort)
 	if err != nil {
@@ -329,7 +329,7 @@ func (rm *RouteManager) fallbackBinding() (*segmentBinding, error) {
 	return &segmentBinding{
 		patchPort: patchPort,
 		ofport:    ofport,
-		kernelDev: rm.bridgeDev,
+		kernelDev: rm.cfg.BridgeDev,
 		kernelMAC: mac.String(),
 	}, nil
 }
@@ -351,7 +351,7 @@ func (rm *RouteManager) SegmentDev(localnetPort string) string {
 	if b := rm.segmentBindingFor(localnetPort); b != nil {
 		return b.kernelDev
 	}
-	return rm.bridgeDev
+	return rm.cfg.BridgeDev
 }
 
 // SegmentResolved reports whether the given localnet segment has its own
@@ -432,7 +432,7 @@ func HairpinFlow(cookie, ofport, ip, bridgeMAC, routerMAC string, ipv6 bool) str
 // the hairpin plane empty for every other FIP — the delete-then-abort behaviour
 // this replaces.
 func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarget) error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would reconcile OVS hairpin flows", "count", len(targets))
 		return nil
 	}
@@ -444,9 +444,9 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 
 	// Full replace: delete all current hairpin flows then reinstall.
 	// The replacement window is sub-millisecond and tolerable.
-	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
+	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.cfg.BridgeDev,
 		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin)); err != nil {
-		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.cfg.BridgeDev, err, strings.TrimSpace(string(out)))
 	}
 
 	for ip, target := range targets {
@@ -476,23 +476,23 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 
 // RemoveOVSFlows removes all agent-managed OVS flows from the bridge device.
 func (rm *RouteManager) RemoveOVSFlows() error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would remove OVS MAC-tweak flows", "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would remove OVS MAC-tweak flows", "dev", rm.cfg.BridgeDev)
 		return nil
 	}
-	out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
+	out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.cfg.BridgeDev,
 		fmt.Sprintf("cookie=%s/-1", ovsCookieMACTweak))
 	if err != nil {
-		return fmt.Errorf("del OVS flows on %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("del OVS flows on %s: %w (output: %s)", rm.cfg.BridgeDev, err, strings.TrimSpace(string(out)))
 	}
-	slog.Info("OVS MAC-tweak flows removed", "dev", rm.bridgeDev)
+	slog.Info("OVS MAC-tweak flows removed", "dev", rm.cfg.BridgeDev)
 
-	hout, herr := rm.runOVS("ovs-ofctl", "del-flows", rm.bridgeDev,
+	hout, herr := rm.runOVS("ovs-ofctl", "del-flows", rm.cfg.BridgeDev,
 		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin))
 	if herr != nil {
-		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.bridgeDev, herr, strings.TrimSpace(string(hout)))
+		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.cfg.BridgeDev, herr, strings.TrimSpace(string(hout)))
 	}
-	slog.Info("OVS hairpin flows removed", "dev", rm.bridgeDev)
+	slog.Info("OVS hairpin flows removed", "dev", rm.cfg.BridgeDev)
 
 	return nil
 }
@@ -500,9 +500,9 @@ func (rm *RouteManager) RemoveOVSFlows() error {
 // discoverPatchPort finds the patch-type port on the bridge device that
 // connects to OVN's integration bridge.
 func (rm *RouteManager) discoverPatchPort() (string, error) {
-	out, err := rm.runOVS("ovs-vsctl", "list-ports", rm.bridgeDev)
+	out, err := rm.runOVS("ovs-vsctl", "list-ports", rm.cfg.BridgeDev)
 	if err != nil {
-		return "", fmt.Errorf("list-ports %s: %w (output: %s)", rm.bridgeDev, err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("list-ports %s: %w (output: %s)", rm.cfg.BridgeDev, err, strings.TrimSpace(string(out)))
 	}
 
 	ports := strings.Fields(strings.TrimSpace(string(out)))
@@ -516,7 +516,7 @@ func (rm *RouteManager) discoverPatchPort() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no patch port found on bridge %s", rm.bridgeDev)
+	return "", fmt.Errorf("no patch port found on bridge %s", rm.cfg.BridgeDev)
 }
 
 // getOFPort returns the OpenFlow port number for an OVS port.
@@ -533,9 +533,9 @@ func (rm *RouteManager) getOFPort(port string) (string, error) {
 }
 
 func (rm *RouteManager) addOVSFlow(flow string) error {
-	out, err := rm.runOVS("ovs-ofctl", "add-flow", rm.bridgeDev, flow)
+	out, err := rm.runOVS("ovs-ofctl", "add-flow", rm.cfg.BridgeDev, flow)
 	if err != nil {
-		return fmt.Errorf("ovs-ofctl add-flow %s %q: %w (output: %s)", rm.bridgeDev, flow, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("ovs-ofctl add-flow %s %q: %w (output: %s)", rm.cfg.BridgeDev, flow, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

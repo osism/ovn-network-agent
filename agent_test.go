@@ -97,12 +97,7 @@ func TestTriggerReconcile(t *testing.T) {
 }
 
 func TestVerifyRoutesDryRun(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	a := &Agent{
 		routing:          rm,
@@ -124,12 +119,7 @@ func TestVerifyRoutesDryRun(t *testing.T) {
 // (e.g. a port-forward VIP under a narrow manual network_cidr) is still
 // verified and re-added, matching ensureRoutes which always installed it.
 func TestVerifyRoutesVerifiesDesiredRegardlessOfFilters(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	a := &Agent{
 		routing:          rm,
@@ -145,12 +135,7 @@ func TestVerifyRoutesVerifiesDesiredRegardlessOfFilters(t *testing.T) {
 }
 
 func TestVerifyRoutesEmptyDesired(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	a := &Agent{routing: rm}
 
 	// Empty desired list should be a no-op.
@@ -163,12 +148,7 @@ func TestVerifyRoutesEmptyDesired(t *testing.T) {
 }
 
 func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	a := &Agent{
 		routing:          rm,
@@ -207,9 +187,11 @@ func TestEnsureRoutesDevMismatchDoesNotWithdrawFRR(t *testing.T) {
 		nil,
 	)
 	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
+		cfg: Config{
+			BridgeDev:   "ovnagent-nonexistent-br",
+			VRFName:     "vrf-provider",
+			VethNexthop: "169.254.0.1",
+		},
 		// The kernel route exists, but on the bridge device instead of the
 		// segment's VLAN interface.
 		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
@@ -244,15 +226,9 @@ func TestEnsureRoutesStaleEntryRemovedWithItsDevice(t *testing.T) {
 `,
 		nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
-			return []kernelRouteEntry{{IP: "198.51.100.99", Dev: "br-ex.101"}}, nil
-		},
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+		return []kernelRouteEntry{{IP: "198.51.100.99", Dev: "br-ex.101"}}, nil
+	}, execVtyshHook: rec.hook()}
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
@@ -280,15 +256,9 @@ func TestVerifyRoutesDetectsDevMismatch(t *testing.T) {
 `,
 		nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
-			return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "ovnagent-nonexistent-br"}}, nil
-		},
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+		return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "ovnagent-nonexistent-br"}}, nil
+	}, execVtyshHook: rec.hook()}
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
@@ -318,7 +288,7 @@ func TestSegmentRouteUnresolved(t *testing.T) {
 		"seg-101": {LocalnetPort: "seg-101", VLANTag: &tag}, // VLAN segment
 		"":        {LocalnetPort: ""},                       // flat / fallback
 	}
-	rm := &RouteManager{bridgeDev: "br-ex", segments: map[string]*segmentBinding{}}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: map[string]*segmentBinding{}}
 	a := &Agent{routing: rm}
 
 	// VLAN segment with no binding this cycle → must be skipped.
@@ -355,15 +325,9 @@ func TestVerifyRoutesLeavesUnresolvedVLANRouteInPlace(t *testing.T) {
 `,
 		nil,
 	)
-	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
-			return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "br-ex.101"}}, nil
-		},
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+		return []kernelRouteEntry{{IP: "198.51.100.10", Dev: "br-ex.101"}}, nil
+	}, execVtyshHook: rec.hook()}
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
@@ -378,12 +342,7 @@ func TestVerifyRoutesLeavesUnresolvedVLANRouteInPlace(t *testing.T) {
 // the agent calls removeAllRoutes("no locally active routers …") and
 // cleans up veth-leak, prefix-list, and hairpin-flow state.
 func TestReconcileNoLocalRoutersInvokesRemoveAllRoutes(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	c, _, _ := newOVNClientWithFakes(t, "host-a")
 	// state.HasLocalRouters defaults to false; DiscoveredNetworks empty.
 	a := &Agent{
@@ -408,12 +367,7 @@ func TestReconcileNoLocalRoutersInvokesRemoveAllRoutes(t *testing.T) {
 // GetBridgeMAC fail, so EnsureGatewayRouting writes nothing and the marker
 // update is the only NB write.
 func TestReconcileWritesMarkerAfterSuccessfulAnnounce(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	c.state.Replace(OVNState{
 		LocalRouters:    []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1"}},
@@ -465,9 +419,11 @@ func TestReconcileMixedFamilyAnnouncesV4AndWritesMarker(t *testing.T) {
 	)
 	rec := newVtyshRecorder()
 	rm := &RouteManager{
-		bridgeDev:     bridge,
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
+		cfg: Config{
+			BridgeDev:   bridge,
+			VRFName:     "vrf-provider",
+			VethNexthop: "169.254.0.1",
+		},
 		execVtyshHook: rec.hook(),
 		execOVSHook: func(*exec.Cmd) ([]byte, error) {
 			return nil, errors.New("test: no ovs available")
@@ -524,12 +480,7 @@ func TestReconcileMixedFamilyAnnouncesV4AndWritesMarker(t *testing.T) {
 // with no locally-active routers the node is not a takeover candidate, so even
 // though NB holds a managed default route, reconcile must not stamp a marker.
 func TestReconcileSkipsMarkerWithoutLocalRouters(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "ovnagent-nonexistent-br",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	// HasLocalRouters defaults to false.
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
@@ -585,9 +536,11 @@ func TestReconcileFailedAnnounceWithholdsMarker(t *testing.T) {
 		"-c", "ip route " + fip + "/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
 		"", errors.New("test: vtysh add failed"))
 	rm := &RouteManager{
-		bridgeDev:     bridge,
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
+		cfg: Config{
+			BridgeDev:   bridge,
+			VRFName:     "vrf-provider",
+			VethNexthop: "169.254.0.1",
+		},
 		execVtyshHook: rec.hook(),
 		execOVSHook: func(*exec.Cmd) ([]byte, error) {
 			return nil, errors.New("test: no ovs available")
@@ -665,12 +618,7 @@ func hasMarkerUpdate(writes [][]ovsdb.Operation, chassis string) bool {
 // mode List* helpers return (nil, nil) so the function walks every branch
 // (FRR list, kernel list, BGP refresh skipped because no routes to remove).
 func TestRemoveAllRoutesDryRun(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	a := &Agent{routing: rm}
 	a.removeAllRoutes("test reason")
 }
@@ -691,12 +639,7 @@ S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 		nil,
 	)
 
-	rm := &RouteManager{
-		bridgeDev:     "ovnagent-nonexistent-br",
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
@@ -738,12 +681,7 @@ S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 func TestEnsureRoutesReturnsAnnounceOutcome(t *testing.T) {
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	newAgent := func(rec *vtyshRecorder) *Agent {
-		rm := &RouteManager{
-			bridgeDev:     "ovnagent-nonexistent-br",
-			vrfName:       "vrf-provider",
-			vethNexthop:   "169.254.0.1",
-			execVtyshHook: rec.hook(),
-		}
+		rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 		return &Agent{cfg: Config{PortForwardOnly: true}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 	}
 
@@ -820,7 +758,7 @@ func TestCheckFRRRouteActivity(t *testing.T) {
 	const fip = "198.51.100.10"
 	const jsonCmd = "show ip route vrf vrf-provider static json"
 	newAgent := func(rec *vtyshRecorder) *Agent {
-		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 		return &Agent{routing: rm, cfg: Config{VRFName: "vrf-provider"}}
 	}
 
@@ -893,12 +831,14 @@ S>* 198.51.100.11/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 		// Use a synthetic bridge name that does not exist on either macOS
 		// or Linux CI hosts so ListKernelRoutes errors out (netlink) or
 		// returns "only supported on Linux" (stub) instead of touching real
-		// kernel state. dryRun is intentionally false here because the
+		// kernel state. DryRun is intentionally false here because the
 		// FRR-list short-circuits to nil in dry-run mode and would skip
 		// the code path we want to exercise.
-		bridgeDev:     "ovnagent-nonexistent-br",
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
+		cfg: Config{
+			BridgeDev:   "ovnagent-nonexistent-br",
+			VRFName:     "vrf-provider",
+			VethNexthop: "169.254.0.1",
+		},
 		execVtyshHook: rec.hook(),
 	}
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
@@ -932,12 +872,7 @@ S>* 198.51.100.11/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
 // touching real system state. The OVN nb client is a fake so the final
 // RemoveManagedNBEntries call uses the in-memory rows.
 func TestCleanupRunsShutdownPipeline(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	c, _, _ := newOVNClientWithFakes(t, "host-a")
 	a := &Agent{
 		cfg:     Config{BridgeIP: "169.254.169.254"},
@@ -1232,12 +1167,7 @@ func TestMissingChassisGracePeriodTracking(t *testing.T) {
 // fast-return, not a partial-write hang.
 func TestReconcileCompletesPromptlyOnCancelledContext(t *testing.T) {
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 	c, _, _ := newOVNClientWithFakes(t, "host-a")
 	// Populate state so reconcile takes the HasLocalRouters branch and
 	// therefore reaches the ctx-aware EnsureGatewayRouting /
