@@ -537,73 +537,71 @@ func (o *OVNClient) GetState() OVNState {
 	return o.state.Snapshot()
 }
 
-// refreshState performs a unified state refresh from both OVN databases.
-// It determines which routers are locally active and collects their NAT entries.
+// =============================================================================
+// refreshState step helpers
+// =============================================================================
 //
-// Mapping chain:
-//
-//	SB chassisredirect (logical_port="cr-lrp-X", chassis=local?)
-//	  → NB Logical_Router_Port (name="lrp-X")
-//	  → NB Logical_Router (ports ⊇ {LRP UUID}, nat = {NAT UUIDs})
-//	  → NB NAT (external_ip)
-func (o *OVNClient) refreshState(ctx context.Context) {
-	// Step 1: Find all chassisredirect port bindings and resolve chassis hostnames.
-	// Every table is read through cachedList, which falls back to a direct
-	// server select when the monitor cache is missing rows (see ovn_cache.go).
-	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
-		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
-	if err != nil {
-		slog.Error("failed to list port bindings", "error", err)
-		return
-	}
+// Each helper below is a pure function of the rows it is handed: no OVSDB
+// client, no locking, no state mutation. refreshState reads the five tables and
+// threads the intermediate maps through them in the documented order, which
+// keeps the join's ordering invariants locally verifiable — every step can be
+// unit-tested against a hand-built row set.
 
-	chassis, err := cachedList(ctx, o.sbClient, "Chassis",
-		chCheckColumns, keyOfSBChassis, decodeSBChassis)
-	if err != nil {
-		slog.Error("failed to list chassis", "error", err)
-		return
-	}
-
-	chassisHostname := make(map[string]string, len(chassis))
-	allChassisNames := make(map[string]bool, len(chassis))
+// chassisIndex builds the two chassis lookups the refresh needs:
+// hostnameByRef resolves a Port_Binding.chassis reference (which may hold
+// either the UUID or the name) to that chassis' hostname, and allChassisNames
+// is the set of chassis short hostnames used for stale-chassis cleanup.
+func chassisIndex(chassis []SBChassis) (hostnameByRef map[string]string, allChassisNames map[string]bool) {
+	hostnameByRef = make(map[string]string, len(chassis)*2)
+	allChassisNames = make(map[string]bool, len(chassis))
 	for _, ch := range chassis {
-		chassisHostname[ch.UUID] = ch.Hostname
-		chassisHostname[ch.Name] = ch.Hostname
+		hostnameByRef[ch.UUID] = ch.Hostname
+		hostnameByRef[ch.Name] = ch.Hostname
 		// cleanupStaleChassis looks these keys up by the short chassis name
 		// stamped on managed-route external_ids, so normalise FQDN SB
 		// hostnames to the same leading label.
 		allChassisNames[shortHostname(ch.Hostname)] = true
 	}
+	return hostnameByRef, allChassisNames
+}
 
-	localChassisName := o.state.LocalChassisName()
-
-	// Collect LRP names from chassisredirect ports active on this chassis.
-	// A chassisredirect logical_port has the form "cr-lrp-<LRP_NAME>".
-	// localLRPNames maps: LRP name → CR port logical_port name.
+// localCRPorts returns the chassisredirect ports currently bound to this
+// chassis, as a map of LRP name → chassisredirect logical_port name.
+// A chassisredirect logical_port has the form "cr-<LRP_NAME>". When gatewayPort
+// is set the scan is restricted to that single port.
+func localCRPorts(
+	portBindings []SBPortBinding,
+	hostnameByRef map[string]string,
+	localChassisName string,
+	gatewayPort string,
+) map[string]string {
 	localLRPNames := make(map[string]string)
 	for _, pb := range portBindings {
 		if pb.Type != "chassisredirect" || pb.Chassis == nil || *pb.Chassis == "" {
 			continue
 		}
 		// If gateway_port is configured, restrict to that single port.
-		if o.cfg.GatewayPort != "" && pb.LogicalPort != o.cfg.GatewayPort {
+		if gatewayPort != "" && pb.LogicalPort != gatewayPort {
 			continue
 		}
-		hostname := chassisHostname[*pb.Chassis]
-		if hostnamesEqual(hostname, localChassisName) {
-			lrpName := strings.TrimPrefix(pb.LogicalPort, "cr-")
-			localLRPNames[lrpName] = pb.LogicalPort
+		if !hostnamesEqual(hostnameByRef[*pb.Chassis], localChassisName) {
+			continue
 		}
+		lrpName := strings.TrimPrefix(pb.LogicalPort, "cr-")
+		localLRPNames[lrpName] = pb.LogicalPort
 	}
+	return localLRPNames
+}
 
-	// Step 1b: Resolve each local LRP's localnet segment. A gateway LRP's
-	// peer logical switch (the external network) carries a localnet port
-	// whose SB Port_Binding holds the physnet name (options:network_name)
-	// and the optional VLAN tag. Two joins over the Port_Binding table:
-	// localnet rows indexed by datapath, then the switch-side patch rows
-	// (options:peer == LRP name) sharing that datapath. Deliberately no
-	// neutron:device_owner filter: the join must also work for non-Neutron
-	// topologies (e.g. the E2E lab) that set no external_ids.
+// segmentsByLRP resolves each local LRP's localnet segment. A gateway LRP's
+// peer logical switch (the external network) carries a localnet port whose SB
+// Port_Binding holds the physnet name (options:network_name) and the optional
+// VLAN tag. Two joins over the Port_Binding table: localnet rows indexed by
+// datapath, then the switch-side patch rows (options:peer == LRP name) sharing
+// that datapath. Deliberately no neutron:device_owner filter: the join must
+// also work for non-Neutron topologies (e.g. the E2E lab) that set no
+// external_ids.
+func segmentsByLRP(portBindings []SBPortBinding, localLRPNames map[string]string) map[string]*LocalnetSegment {
 	localnetByDatapath := make(map[string]SBPortBinding)
 	for _, pb := range portBindings {
 		if pb.Type == "localnet" {
@@ -636,51 +634,60 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		}
 		segmentByLRP[peer] = seg
 	}
+	return segmentByLRP
+}
 
-	// Step 2: Build NB Logical_Router_Port name → UUID map.
-	lrps, err := cachedList(ctx, o.nbClient, "Logical_Router_Port",
-		lrpCheckColumns, keyOfNBLogicalRouterPort, decodeNBLogicalRouterPort)
-	if err != nil {
-		slog.Error("failed to list logical router ports", "error", err)
-		return
+// lrpIndex bundles the two Logical_Router_Port lookups the router join needs.
+type lrpIndex struct {
+	byName map[string]NBLogicalRouterPort
+	byUUID map[string]NBLogicalRouterPort
+}
+
+// indexLRPs indexes the NB Logical_Router_Port rows by name and UUID.
+func indexLRPs(lrps []NBLogicalRouterPort) lrpIndex {
+	idx := lrpIndex{
+		byName: make(map[string]NBLogicalRouterPort, len(lrps)),
+		byUUID: make(map[string]NBLogicalRouterPort, len(lrps)),
 	}
-	lrpNameToUUID := make(map[string]string, len(lrps))
-	lrpByUUID := make(map[string]NBLogicalRouterPort, len(lrps))
-	lrpNameToMAC := make(map[string]string, len(lrps))
 	for _, lrp := range lrps {
-		lrpNameToUUID[lrp.Name] = lrp.UUID
-		lrpByUUID[lrp.UUID] = lrp
-		lrpNameToMAC[lrp.Name] = lrp.MAC
+		idx.byName[lrp.Name] = lrp
+		idx.byUUID[lrp.UUID] = lrp
 	}
+	return idx
+}
 
-	// Resolve local LRP names → UUIDs.
-	localLRPUUIDs := make(map[string]bool)
+// localLRPUUIDSet resolves the locally-active LRP names to their NB UUIDs.
+// Names with no matching LRP row are dropped.
+func localLRPUUIDSet(localLRPNames map[string]string, idx lrpIndex) map[string]bool {
+	uuids := make(map[string]bool, len(localLRPNames))
 	for lrpName := range localLRPNames {
-		if uuid, ok := lrpNameToUUID[lrpName]; ok {
-			localLRPUUIDs[uuid] = true
+		if lrp, ok := idx.byName[lrpName]; ok {
+			uuids[lrp.UUID] = true
 		}
 	}
+	return uuids
+}
 
-	// Step 3: Find routers that own a locally-active LRP. Collect their NAT UUIDs.
-	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
-		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
-	if err != nil {
-		slog.Error("failed to list logical routers", "error", err)
-		return
-	}
-
-	// natUUIDToRouterMAC maps each NAT UUID to the MAC of the router port
-	// that owns it, so hairpin flows can set the correct dl_dst.
-	// natUUIDToSegment records the owning router's localnet segment
-	// alongside, so per-IP state lands on the right patch port/interface.
-	natUUIDToRouterMAC := make(map[string]string)
-	natUUIDToSegment := make(map[string]string)
-	var localRouters []LocalRouterInfo
+// collectLocalRouters finds the routers that own a locally-active LRP.
+// Alongside the router list it returns the two NAT-UUID indexes the NAT step
+// consumes: natUUIDToRouterMAC maps each NAT UUID to the MAC of the router port
+// that owns it (so hairpin flows can set the correct dl_dst), and
+// natUUIDToSegment records the owning router's localnet segment (so per-IP
+// state lands on the right patch port/interface).
+func collectLocalRouters(
+	routers []NBLogicalRouter,
+	idx lrpIndex,
+	localLRPUUIDs map[string]bool,
+	localLRPNames map[string]string,
+	segmentByLRP map[string]*LocalnetSegment,
+) (localRouters []LocalRouterInfo, natUUIDToRouterMAC, natUUIDToSegment map[string]string) {
+	natUUIDToRouterMAC = make(map[string]string)
+	natUUIDToSegment = make(map[string]string)
 	for _, router := range routers {
 		var matchedLRP *NBLogicalRouterPort
 		for _, portUUID := range router.Ports {
 			if localLRPUUIDs[portUUID] {
-				lrp := lrpByUUID[portUUID]
+				lrp := idx.byUUID[portUUID]
 				matchedLRP = &lrp
 				break
 			}
@@ -708,8 +715,12 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			}
 		}
 	}
+	return localRouters, natUUIDToRouterMAC, natUUIDToSegment
+}
 
-	// Step 4: Extract network CIDRs from locally-active LRPs.
+// discoverLRPNetworks extracts the deduplicated network CIDRs of the
+// locally-active LRPs. A malformed CIDR is warned about and skipped.
+func discoverLRPNetworks(localRouters []LocalRouterInfo) []*net.IPNet {
 	var discoveredNets []*net.IPNet
 	for _, lr := range localRouters {
 		for _, ns := range lr.LRPNetworks {
@@ -721,22 +732,36 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			discoveredNets = append(discoveredNets, cidr)
 		}
 	}
-	discoveredNets = uniqueNetworks(discoveredNets)
+	return uniqueNetworks(discoveredNets)
+}
 
-	// Determine effective network filters: manual config takes precedence over auto-discovery.
-	effectiveFilters := effectiveNetworkFilters(o.cfg.NetworkFilters, discoveredNets)
+// natCollection accumulates the NAT-derived state. Steps 5 (NB NAT rows) and 5b
+// (SB gateway NatAddresses) both feed the same three outputs, so they share one
+// accumulator rather than threading three parallel maps by hand.
+//
+// FIPCount tracks the dnat_and_snat entries purely so the state-updated log line
+// can report them; no downstream consumer reads the FIP list itself.
+type natCollection struct {
+	FIPCount      int
+	SNATIPs       []string
+	IPToRouterMAC map[string]string
+	IPToSegment   map[string]string
+}
 
-	// Step 5: Filter NAT entries to only those belonging to locally-active routers.
-	nats, err := cachedList(ctx, o.nbClient, "NAT",
-		natCheckColumns, keyOfNBNAT, decodeNBNAT)
-	if err != nil {
-		slog.Error("failed to list NAT entries", "error", err)
-		return
+func newNATCollection() *natCollection {
+	return &natCollection{
+		IPToRouterMAC: make(map[string]string),
+		IPToSegment:   make(map[string]string),
 	}
+}
 
-	var fips, snatIPs []string
-	natIPToRouterMAC := make(map[string]string)
-	natIPToSegment := make(map[string]string)
+// addNBNATs folds the NB NAT rows of locally-active routers into nc (step 5).
+// Rows whose NAT UUID is not owned by a local router are ignored.
+func (nc *natCollection) addNBNATs(
+	nats []NBNAT,
+	natUUIDToRouterMAC, natUUIDToSegment map[string]string,
+	filters []*net.IPNet,
+) {
 	for _, nat := range nats {
 		routerMAC, ok := natUUIDToRouterMAC[nat.UUID]
 		if !ok {
@@ -752,36 +777,44 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 				"external_ip", ip, "nat", nat.UUID, "type", nat.Type)
 			continue
 		}
-		if len(effectiveFilters) > 0 && !containedInAny(parsedIP, effectiveFilters) {
+		if len(filters) > 0 && !containedInAny(parsedIP, filters) {
 			continue
 		}
-		natIPToRouterMAC[ip] = routerMAC
+		nc.IPToRouterMAC[ip] = routerMAC
 		if seg, ok := natUUIDToSegment[nat.UUID]; ok {
-			natIPToSegment[ip] = seg
+			nc.IPToSegment[ip] = seg
 		}
 		switch nat.Type {
 		case "dnat_and_snat":
-			fips = append(fips, ip)
+			nc.FIPCount++
 		case "snat":
 			// SNATIPs feeds the IPv4-only nft masquerade set (buildNftRuleset's
 			// "table ip"), so keep IPv6 out until full v6 support (#85/#70)
-			// lands. The dual-stack natIPToRouterMAC above still carries the
+			// lands. The dual-stack IPToRouterMAC above still carries the
 			// address for the family-aware OVS hairpin plane (#54).
 			if parsedIP.To4() != nil {
-				snatIPs = append(snatIPs, ip)
+				nc.SNATIPs = append(nc.SNATIPs, ip)
 			} else {
 				slog.Debug("excluding non-IPv4 SNAT external IP from the nft masquerade set, IPv6 support tracked in #85/#70",
 					"external_ip", ip)
 			}
 		}
 	}
+}
 
-	// Step 5b: Extract SNAT IPs from SB gateway port NatAddresses.
-	// When a router has an external gateway but no connected internal subnets,
-	// Neutron has not yet created the NB NAT entry. However, the SB
-	// Port_Binding for the gateway patch port already contains the NAT IP
-	// in its NatAddresses field. Extract these so routes are announced
-	// as soon as the gateway is set.
+// addSBGatewayNATAddresses folds the SB gateway port NatAddresses into nc
+// (step 5b). When a router has an external gateway but no connected internal
+// subnets, Neutron has not yet created the NB NAT entry — yet the SB
+// Port_Binding for the gateway patch port already carries the NAT IP in its
+// NatAddresses field. Extracting these announces routes as soon as the gateway
+// is set.
+func (nc *natCollection) addSBGatewayNATAddresses(
+	portBindings []SBPortBinding,
+	localLRPNames map[string]string,
+	idx lrpIndex,
+	segmentByLRP map[string]*LocalnetSegment,
+	filters []*net.IPNet,
+) {
 	for _, pb := range portBindings {
 		if pb.Type != "patch" {
 			continue
@@ -796,33 +829,106 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 		if pb.ExternalIDs["neutron:device_owner"] != "network:router_gateway" {
 			continue
 		}
-		routerMAC := lrpNameToMAC[peer]
+		routerMAC := idx.byName[peer].MAC
 		for _, natAddr := range pb.NatAddresses {
 			for _, ip := range parseNatAddressIPs(natAddr) {
 				// parseNatAddressIPs only yields net.ParseIP-valid addresses;
 				// re-parse here so the filter and family gate apply to every
 				// candidate regardless of whether a filter is in effect.
 				parsedIP := net.ParseIP(ip)
-				if len(effectiveFilters) > 0 && !containedInAny(parsedIP, effectiveFilters) {
+				if len(filters) > 0 && !containedInAny(parsedIP, filters) {
 					continue
 				}
 				// Keep IPv6 out of the IPv4-only nft masquerade set (#85/#70)
 				// while still tracking it for the OVS hairpin plane (#54).
 				if parsedIP.To4() != nil {
-					snatIPs = append(snatIPs, ip)
+					nc.SNATIPs = append(nc.SNATIPs, ip)
 				} else {
 					slog.Debug("excluding non-IPv4 SB SNAT address from the nft masquerade set, IPv6 support tracked in #85/#70",
 						"external_ip", ip)
 				}
 				if routerMAC != "" {
-					natIPToRouterMAC[ip] = routerMAC
+					nc.IPToRouterMAC[ip] = routerMAC
 				}
 				if seg := segmentByLRP[peer]; seg != nil {
-					natIPToSegment[ip] = seg.LocalnetPort
+					nc.IPToSegment[ip] = seg.LocalnetPort
 				}
 			}
 		}
 	}
+}
+
+// refreshState performs a unified state refresh from both OVN databases.
+// It determines which routers are locally active and collects their NAT entries.
+//
+// Mapping chain:
+//
+//	SB chassisredirect (logical_port="cr-lrp-X", chassis=local?)
+//	  → NB Logical_Router_Port (name="lrp-X")
+//	  → NB Logical_Router (ports ⊇ {LRP UUID}, nat = {NAT UUIDs})
+//	  → NB NAT (external_ip)
+//
+// Every table is read through cachedList, which falls back to a direct server
+// select when the monitor cache is missing rows or holds a stale column (see
+// ovn_cache.go). The per-step joins themselves are the pure helpers above; this
+// function only sequences them and publishes the result.
+func (o *OVNClient) refreshState(ctx context.Context) {
+	// Step 1: chassisredirect port bindings and chassis hostnames.
+	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
+		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
+	if err != nil {
+		slog.Error("failed to list port bindings", "error", err)
+		return
+	}
+	chassis, err := cachedList(ctx, o.sbClient, "Chassis",
+		chCheckColumns, keyOfSBChassis, decodeSBChassis)
+	if err != nil {
+		slog.Error("failed to list chassis", "error", err)
+		return
+	}
+	hostnameByRef, allChassisNames := chassisIndex(chassis)
+	localLRPNames := localCRPorts(portBindings, hostnameByRef,
+		o.state.LocalChassisName(), o.cfg.GatewayPort)
+
+	// Step 1b: resolve each local LRP's localnet segment.
+	segmentByLRP := segmentsByLRP(portBindings, localLRPNames)
+
+	// Step 2: index the NB logical router ports.
+	lrps, err := cachedList(ctx, o.nbClient, "Logical_Router_Port",
+		lrpCheckColumns, keyOfNBLogicalRouterPort, decodeNBLogicalRouterPort)
+	if err != nil {
+		slog.Error("failed to list logical router ports", "error", err)
+		return
+	}
+	idx := indexLRPs(lrps)
+	localLRPUUIDs := localLRPUUIDSet(localLRPNames, idx)
+
+	// Step 3: find the routers that own a locally-active LRP.
+	routers, err := cachedList(ctx, o.nbClient, "Logical_Router",
+		lrCheckColumns, keyOfNBLogicalRouter, decodeNBLogicalRouter)
+	if err != nil {
+		slog.Error("failed to list logical routers", "error", err)
+		return
+	}
+	localRouters, natUUIDToRouterMAC, natUUIDToSegment := collectLocalRouters(
+		routers, idx, localLRPUUIDs, localLRPNames, segmentByLRP)
+
+	// Step 4: derive the network CIDRs, then the effective filters. Manual
+	// config takes precedence over auto-discovery.
+	discoveredNets := discoverLRPNetworks(localRouters)
+	effectiveFilters := effectiveNetworkFilters(o.cfg.NetworkFilters, discoveredNets)
+
+	// Step 5 + 5b: collect the NAT external IPs of the locally-active routers,
+	// from NB NAT rows and from the SB gateway port NatAddresses.
+	nats, err := cachedList(ctx, o.nbClient, "NAT",
+		natCheckColumns, keyOfNBNAT, decodeNBNAT)
+	if err != nil {
+		slog.Error("failed to list NAT entries", "error", err)
+		return
+	}
+	nc := newNATCollection()
+	nc.addNBNATs(nats, natUUIDToRouterMAC, natUUIDToSegment, effectiveFilters)
+	nc.addSBGatewayNATAddresses(portBindings, localLRPNames, idx, segmentByLRP, effectiveFilters)
 
 	// Step 6: Update state atomically. Replace preserves LocalChassisName
 	// (set once at connect time), so the refresh never needs to re-read or
@@ -830,17 +936,17 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	o.state.Replace(OVNState{
 		LocalRouters:       localRouters,
 		HasLocalRouters:    len(localRouters) > 0,
-		SNATIPs:            snatIPs,
-		NATIPToRouterMAC:   natIPToRouterMAC,
-		NATIPToSegment:     natIPToSegment,
+		SNATIPs:            nc.SNATIPs,
+		NATIPToRouterMAC:   nc.IPToRouterMAC,
+		NATIPToSegment:     nc.IPToSegment,
 		DiscoveredNetworks: discoveredNets,
 		AllChassisNames:    allChassisNames,
 	})
 
 	slog.Info("state updated",
 		"local_routers", len(localRouters),
-		"fips", len(fips),
-		"snat_ips", len(snatIPs),
+		"fips", nc.FIPCount,
+		"snat_ips", len(nc.SNATIPs),
 		"discovered_networks", len(discoveredNets),
 	)
 	for _, lr := range localRouters {
