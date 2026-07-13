@@ -25,9 +25,6 @@ type sourceInfo struct {
 	// Flags are CLI flags declared in loadConfig, in source order.
 	Flags []flagInfo
 
-	// FlagByField indexes Flags by their associated Config field.
-	FlagByField map[string]*flagInfo
-
 	// EnvByField maps Config field name to the env var that sets it.
 	EnvByField map[string]string
 
@@ -39,9 +36,21 @@ type sourceInfo struct {
 	// taken from the `cfg := Config{...}` composite in loadConfig.
 	DefaultByField map[string]string
 
+	// YAMLOnly are registry options with no CLI flag (currently
+	// port_forwards), in table order.
+	YAMLOnly []yamlOnlyInfo
+
 	// Metrics are Prometheus collectors declared in newMetricsRegistry,
 	// in source order.
 	Metrics []metricInfo
+}
+
+// yamlOnlyInfo is a config-file-only option: it has a YAML key and a
+// Config field, but no CLI flag and no environment variable.
+type yamlOnlyInfo struct {
+	Key         string
+	ConfigField string
+	Desc        string
 }
 
 type structInfo struct {
@@ -99,7 +108,6 @@ func parseSource(root string) (*sourceInfo, error) {
 
 	info := &sourceInfo{
 		Structs:        map[string]*structInfo{},
-		FlagByField:    map[string]*flagInfo{},
 		EnvByField:     map[string]string{},
 		YAMLByField:    map[string]string{},
 		DefaultByField: map[string]string{},
@@ -107,8 +115,7 @@ func parseSource(root string) (*sourceInfo, error) {
 
 	parseStructs(cfgFile, info)
 	parseLoadConfig(cfgFile, info)
-	parseApplyFileConfig(cfgFile, info)
-	parseApplyEnvConfig(cfgFile, info)
+	parseConfigOptions(cfgFile, info)
 
 	if err := parseMetrics(metricsFile, info); err != nil {
 		return nil, err
@@ -155,90 +162,31 @@ func parseStructs(f *ast.File, info *sourceInfo) {
 	}
 }
 
-// parseLoadConfig walks loadConfig to extract three independent
-// facts: every flag declared on the FlagSet, the literal default
-// values from `cfg := Config{...}`, and the flag→Config-field
-// mapping encoded in the `fs.Visit` switch.
+// parseLoadConfig collects the CLI-only action flags declared directly on
+// the FlagSet in loadConfig (--config, --version, --check-config). Every
+// other flag comes from the option registry (see parseConfigOptions);
+// these three configure what the process *does* rather than how it
+// behaves, so they carry no env/YAML binding.
 func parseLoadConfig(f *ast.File, info *sourceInfo) {
 	fn := findFunc(f, "loadConfig")
-	if fn == nil || fn.Body == nil {
+	if fn == nil {
 		return
 	}
-
-	// Map local flag-variable name (e.g. fOVNSB) to the flag info
-	// extracted from its fs.<Type>("name", default, "usage") call.
-	flagsByVar := map[string]*flagInfo{}
-
-	for _, stmt := range fn.Body.List {
-		switch s := stmt.(type) {
-		case *ast.DeclStmt:
-			gen, ok := s.Decl.(*ast.GenDecl)
-			if !ok || gen.Tok != token.VAR {
-				continue
-			}
-			for _, spec := range gen.Specs {
-				vs, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				for i, name := range vs.Names {
-					if i >= len(vs.Values) {
-						continue
-					}
-					call, ok := vs.Values[i].(*ast.CallExpr)
-					if !ok {
-						continue
-					}
-					fi := flagFromCall(call)
-					if fi == nil {
-						continue
-					}
-					flagsByVar[name.Name] = fi
-				}
-			}
-		case *ast.AssignStmt:
-			collectDefaults(s, info)
-		case *ast.ExprStmt:
-			// fs.Visit(func(f *flag.Flag) { switch f.Name { case ... } })
-			collectFlagFieldMapping(s, flagsByVar)
-		}
-	}
-
-	// Now flagsByVar contains both the metadata from fs.<Type>(...) and,
-	// after collectFlagFieldMapping, the ConfigField target. Preserve
-	// source order by re-walking the var declarations.
-	for _, stmt := range fn.Body.List {
-		ds, ok := stmt.(*ast.DeclStmt)
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
 		if !ok {
-			continue
+			return true
 		}
-		gen, ok := ds.Decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
-			continue
+		if fi := flagFromCall(call); fi != nil {
+			info.Flags = append(info.Flags, *fi)
 		}
-		for _, spec := range gen.Specs {
-			vs, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-			for _, name := range vs.Names {
-				fi, ok := flagsByVar[name.Name]
-				if !ok || fi.Name == "" {
-					continue
-				}
-				info.Flags = append(info.Flags, *fi)
-				if fi.ConfigField != "" {
-					last := &info.Flags[len(info.Flags)-1]
-					info.FlagByField[fi.ConfigField] = last
-				}
-			}
-		}
-	}
+		return true
+	})
 }
 
-// flagFromCall recognises calls of the form
-// `fs.<Kind>("name", default, "usage")` and returns a partially
-// populated flagInfo (ConfigField is filled in later).
+// flagFromCall builds a flagInfo from an `fs.String/Int/Bool(...)` call.
+// Only the CLI-only action flags are declared this way now; every other
+// flag comes from the option registry.
 func flagFromCall(call *ast.CallExpr) *flagInfo {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
@@ -304,268 +252,168 @@ func getenvCallArg(expr ast.Expr) (string, bool) {
 	return stringLit(call.Args[0])
 }
 
-// collectDefaults extracts default values from `cfg := Config{ ... }`.
-// Only key-value composite-literal entries are considered.
-func collectDefaults(s *ast.AssignStmt, info *sourceInfo) {
-	if s.Tok != token.DEFINE || len(s.Lhs) != 1 || len(s.Rhs) != 1 {
-		return
-	}
-	ident, ok := s.Lhs[0].(*ast.Ident)
-	if !ok || ident.Name != "cfg" {
-		return
-	}
-	cl, ok := s.Rhs[0].(*ast.CompositeLit)
-	if !ok {
-		return
-	}
-	typIdent, ok := cl.Type.(*ast.Ident)
-	if !ok || typIdent.Name != "Config" {
-		return
-	}
-	for _, elt := range cl.Elts {
-		kv, ok := elt.(*ast.KeyValueExpr)
-		if !ok {
-			continue
-		}
-		key, ok := kv.Key.(*ast.Ident)
-		if !ok {
-			continue
-		}
-		info.DefaultByField[key.Name] = exprString(kv.Value)
-	}
+// optConstructors maps each registry constructor to the flag kind it
+// declares. A YAML-only constructor maps to "" — it has no flag.
+var optConstructors = map[string]string{
+	"stringOpt":       "string",
+	"boolOpt":         "bool",
+	"intOpt":          "int",
+	"durationOpt":     "string",
+	"stringSliceOpt":  "string",
+	"portForwardsOpt": "",
 }
 
-// collectFlagFieldMapping walks `fs.Visit(func(f *flag.Flag) { switch f.Name { ... } })`
-// and records the flag-name → Config-field mapping encoded in each
-// `case "flag-name":` clause body.
-func collectFlagFieldMapping(es *ast.ExprStmt, flagsByVar map[string]*flagInfo) {
-	call, ok := es.X.(*ast.CallExpr)
-	if !ok {
+// parseConfigOptions reads the option registry — the single table in
+// config.go that declares every configuration knob — and derives from it
+// everything the reference pages need: the flag list (in table order),
+// each option's default and usage, the Config field it binds to, and the
+// env var / YAML key derived from its flag name.
+//
+// This replaces the six hand-synchronised code shapes docgen used to
+// walk (flag block, defaults composite, fs.Visit switch, configFile
+// struct, applyFileConfig, applyEnvConfig). One table in, one table out.
+func parseConfigOptions(f *ast.File, info *sourceInfo) {
+	fn := findFunc(f, "configOptions")
+	if fn == nil {
 		return
 	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Visit" {
-		return
-	}
-	if len(call.Args) != 1 {
-		return
-	}
-	fn, ok := call.Args[0].(*ast.FuncLit)
-	if !ok || fn.Body == nil {
-		return
-	}
-
-	// Build local-var → flag-name index so we can match the body of
-	// each case to the right flag entry.
-	flagByLocalVar := map[string]*flagInfo{}
-	for v, fi := range flagsByVar {
-		flagByLocalVar[v] = fi
-	}
-
 	for _, stmt := range fn.Body.List {
-		sw, ok := stmt.(*ast.SwitchStmt)
+		ret, ok := stmt.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			continue
+		}
+		lit, ok := ret.Results[0].(*ast.CompositeLit)
 		if !ok {
 			continue
 		}
-		for _, c := range sw.Body.List {
-			cc, ok := c.(*ast.CaseClause)
-			if !ok || len(cc.List) != 1 {
-				continue
-			}
-			flagName, ok := stringLit(cc.List[0])
+		for _, elt := range lit.Elts {
+			call, ok := elt.(*ast.CallExpr)
 			if !ok {
 				continue
 			}
-			field := extractConfigField(cc.Body)
-			if field == "" {
+			ident, ok := call.Fun.(*ast.Ident)
+			if !ok {
 				continue
 			}
-			for _, fi := range flagByLocalVar {
-				if fi.Name == flagName {
-					fi.ConfigField = field
-				}
+			kind, known := optConstructors[ident.Name]
+			if !known {
+				continue
 			}
+			appendOption(info, ident.Name, kind, call)
 		}
 	}
 }
 
-// extractConfigField returns the Config field name written to by the
-// first `cfg.<Field> = ...` assignment encountered in a case body. We
-// look only at the first assignment because some cases wrap a
-// time.ParseDuration call in an `if`, but the first cfg.X access
-// inside still identifies the field.
-func extractConfigField(body []ast.Stmt) string {
-	var found string
-	for _, st := range body {
-		ast.Inspect(st, func(n ast.Node) bool {
-			if found != "" {
-				return false
-			}
-			as, ok := n.(*ast.AssignStmt)
-			if !ok || len(as.Lhs) != 1 {
-				return true
-			}
-			sel, ok := as.Lhs[0].(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			ident, ok := sel.X.(*ast.Ident)
-			if !ok || ident.Name != "cfg" {
-				return true
-			}
-			found = sel.Sel.Name
-			return false
+// appendOption records one registry row.
+//
+// The constructors share a positional shape:
+//
+//	stringOpt/boolOpt/intOpt/durationOpt(flag, default, usage, accessor)
+//	stringSliceOpt(flag, usage, accessor)          — no default
+//	portForwardsOpt(yamlKey, usage, accessor)      — YAML-only, no flag
+func appendOption(info *sourceInfo, ctor, kind string, call *ast.CallExpr) {
+	if len(call.Args) < 3 {
+		return
+	}
+	first, ok := stringLit(call.Args[0])
+	if !ok {
+		return
+	}
+
+	var def, usage string
+	var accessor ast.Expr
+	switch ctor {
+	case "stringSliceOpt", "portForwardsOpt":
+		// (name, usage, accessor) — no default literal.
+		if usage, ok = stringLit(call.Args[1]); !ok {
+			return
+		}
+		accessor = call.Args[2]
+	default:
+		// (flag, default, usage, accessor)
+		if len(call.Args) < 4 {
+			return
+		}
+		def = exprString(call.Args[1])
+		if usage, ok = stringLit(call.Args[2]); !ok {
+			return
+		}
+		accessor = call.Args[3]
+	}
+
+	field := accessorField(accessor)
+
+	if ctor == "portForwardsOpt" {
+		// YAML-only: no flag, no env var. first is the YAML key.
+		info.YAMLOnly = append(info.YAMLOnly, yamlOnlyInfo{
+			Key:         first,
+			ConfigField: field,
+			Desc:        usage,
 		})
-		if found != "" {
-			break
+		if field != "" {
+			info.YAMLByField[field] = first
 		}
-	}
-	return found
-}
-
-// parseApplyFileConfig walks applyFileConfig to discover the
-// configFile.Y field that backs each Config.X assignment. The
-// resulting Config-field → YAML-key mapping lets us print the
-// canonical YAML key alongside every flag. Each top-level statement
-// in applyFileConfig is treated as a single (fc-field, cfg-field)
-// pair so we correctly resolve assignments wrapped in `if`/parse
-// blocks (e.g. `if fc.ReconcileInterval != "" { … cfg.ReconcileInterval = d }`).
-func parseApplyFileConfig(f *ast.File, info *sourceInfo) {
-	fn := findFunc(f, "applyFileConfig")
-	if fn == nil || fn.Body == nil {
 		return
 	}
 
-	cfgFileStruct := info.Structs["configFile"]
-	if cfgFileStruct == nil {
+	fi := flagInfo{
+		Name:        first,
+		Kind:        kind,
+		Default:     def,
+		Usage:       usage,
+		ConfigField: field,
+	}
+	info.Flags = append(info.Flags, fi)
+
+	if field == "" {
 		return
 	}
-	yamlByFileField := map[string]string{}
-	for _, sf := range cfgFileStruct.Fields {
-		if sf.YAMLTag != "" {
-			yamlByFileField[sf.Name] = sf.YAMLTag
-		}
-	}
-
-	for _, stmt := range fn.Body.List {
-		fileField := firstFCField(stmt)
-		cfgField := firstCFGAssignment(stmt)
-		if fileField == "" || cfgField == "" {
-			continue
-		}
-		if yaml, ok := yamlByFileField[fileField]; ok {
-			info.YAMLByField[cfgField] = yaml
-		}
+	// The env var and the YAML key are derived from the flag name — the
+	// same derivation config.go performs at runtime — so they can never
+	// drift from it.
+	info.EnvByField[field] = envVarName(first)
+	info.YAMLByField[field] = yamlKeyName(first)
+	if def != "" {
+		info.DefaultByField[field] = def
 	}
 }
 
-// firstCFGAssignment returns the Config field on the LHS of the first
-// `cfg.<Field> = …` assignment inside node.
-func firstCFGAssignment(node ast.Node) string {
-	var out string
-	ast.Inspect(node, func(n ast.Node) bool {
-		if out != "" {
-			return false
-		}
-		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Lhs) != 1 {
-			return true
-		}
-		sel, ok := as.Lhs[0].(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		ident, ok := sel.X.(*ast.Ident)
-		if !ok || ident.Name != "cfg" {
-			return true
-		}
-		out = sel.Sel.Name
-		return false
-	})
-	return out
+// envVarName mirrors config.go: "reconcile-interval" -> "OVN_NETWORK_RECONCILE_INTERVAL".
+func envVarName(flagName string) string {
+	return "OVN_NETWORK_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
 }
 
-// firstFCField returns the first selector of the form fc.<Field>
-// found anywhere inside node. We dig through StarExpr, CallExpr, and
-// SelectorExpr wrappers (e.g. `*fc.RouteTableID`,
-// `time.ParseDuration(fc.X)`).
-func firstFCField(node ast.Node) string {
-	var out string
-	ast.Inspect(node, func(n ast.Node) bool {
-		if out != "" {
-			return false
-		}
-		sel, ok := n.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		ident, ok := sel.X.(*ast.Ident)
-		if !ok || ident.Name != "fc" {
-			return true
-		}
-		out = sel.Sel.Name
-		return false
-	})
-	return out
+// yamlKeyName mirrors config.go: "reconcile-interval" -> "reconcile_interval".
+func yamlKeyName(flagName string) string {
+	return strings.ReplaceAll(flagName, "-", "_")
 }
 
-// parseApplyEnvConfig walks applyEnvConfig and pairs each
-// os.Getenv("NAME") call with the Config field assigned inside the
-// enclosing `if` body.
-func parseApplyEnvConfig(f *ast.File, info *sourceInfo) {
-	fn := findFunc(f, "applyEnvConfig")
-	if fn == nil || fn.Body == nil {
-		return
+// accessorField extracts "BridgeDev" from an accessor closure of the form
+//
+//	func(c *Config) *string { return &c.BridgeDev }
+func accessorField(expr ast.Expr) string {
+	fn, ok := expr.(*ast.FuncLit)
+	if !ok || fn.Body == nil {
+		return ""
 	}
 	for _, stmt := range fn.Body.List {
-		ifs, ok := stmt.(*ast.IfStmt)
-		if !ok || ifs.Init == nil {
+		ret, ok := stmt.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
 			continue
 		}
-		envName := getenvFromIfInit(ifs.Init)
-		if envName == "" {
+		unary, ok := ret.Results[0].(*ast.UnaryExpr)
+		if !ok || unary.Op != token.AND {
 			continue
 		}
-		field := extractConfigField(ifs.Body.List)
-		if field == "" {
+		sel, ok := unary.X.(*ast.SelectorExpr)
+		if !ok {
 			continue
 		}
-		info.EnvByField[field] = envName
+		return sel.Sel.Name
 	}
+	return ""
 }
 
-// getenvFromIfInit returns the literal argument of an `os.Getenv("X")`
-// call when it appears in the init position of an `if` statement.
-func getenvFromIfInit(init ast.Stmt) string {
-	as, ok := init.(*ast.AssignStmt)
-	if !ok || len(as.Rhs) != 1 {
-		return ""
-	}
-	call, ok := as.Rhs[0].(*ast.CallExpr)
-	if !ok {
-		return ""
-	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Getenv" {
-		return ""
-	}
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok || ident.Name != "os" {
-		return ""
-	}
-	if len(call.Args) != 1 {
-		return ""
-	}
-	name, ok := stringLit(call.Args[0])
-	if !ok {
-		return ""
-	}
-	return name
-}
-
-// parseMetrics extracts the Prometheus namespace constant and every
-// `prometheus.New<Kind>{Vec}` constructor used to populate the
-// metricsRegistry struct literal in newMetricsRegistry.
 func parseMetrics(f *ast.File, info *sourceInfo) error {
 	for _, decl := range f.Decls {
 		gen, ok := decl.(*ast.GenDecl)

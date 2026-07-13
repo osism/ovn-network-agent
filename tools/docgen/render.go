@@ -252,8 +252,9 @@ func durationLiteral(raw string) (string, bool) {
 	return m[1] + suffix, true
 }
 
-// extraYAMLOnlyRow describes a Config field that ships a YAML key on
-// configFile but has no CLI flag (currently port_forwards).
+// extraYAMLOnlyRow describes a registry option with a YAML key but no CLI
+// flag (currently port_forwards). Its Go type is read off the Config
+// field the option binds to.
 type extraYAMLOnlyRow struct {
 	key  string
 	typ  string
@@ -261,23 +262,17 @@ type extraYAMLOnlyRow struct {
 }
 
 func extraYAMLOnlyRows(info *sourceInfo) []extraYAMLOnlyRow {
-	cf, ok := info.Structs["configFile"]
-	if !ok {
-		return nil
-	}
+	cfgStruct := info.Structs["Config"]
 	var rows []extraYAMLOnlyRow
-	for _, f := range cf.Fields {
-		if f.YAMLTag == "" {
-			continue
-		}
-		// Skip keys already covered by a flag row.
-		if hasFlagForYAML(info, f.YAMLTag) {
-			continue
-		}
-		row := extraYAMLOnlyRow{
-			key:  f.YAMLTag,
-			typ:  f.Type,
-			desc: f.Comment,
+	for _, o := range info.YAMLOnly {
+		row := extraYAMLOnlyRow{key: o.Key, desc: o.Desc}
+		if cfgStruct != nil {
+			for _, f := range cfgStruct.Fields {
+				if f.Name == o.ConfigField {
+					row.typ = f.Type
+					break
+				}
+			}
 		}
 		if row.desc == "" {
 			row.desc = "See sample config for usage."
@@ -285,18 +280,6 @@ func extraYAMLOnlyRows(info *sourceInfo) []extraYAMLOnlyRow {
 		rows = append(rows, row)
 	}
 	return rows
-}
-
-func hasFlagForYAML(info *sourceInfo, yamlKey string) bool {
-	for _, fl := range info.Flags {
-		if fl.ConfigField == "" {
-			continue
-		}
-		if info.YAMLByField[fl.ConfigField] == yamlKey {
-			return true
-		}
-	}
-	return false
 }
 
 // mdCode wraps a value in backticks for Markdown.
