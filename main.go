@@ -1,3 +1,6 @@
+// Command ovn-network-agent is an event-driven agent that keeps host
+// routing, FRR, and nftables state in sync with OVN on gateway nodes of
+// OVN-based OpenStack environments.
 package main
 
 import (
