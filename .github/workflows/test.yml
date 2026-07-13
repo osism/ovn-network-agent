@@ -1,8 +1,21 @@
 name: Test
 
+# The unit suite runs on pull requests (the primary gate) and also:
+#   - push to main: the backstop for anything that reaches main outside
+#     the PR path (a direct push, or two semantically conflicting PRs
+#     merged in sequence) plus post-merge confirmation under the branch
+#     ruleset in .github/rulesets/main.json.
+#   - weekly schedule: catches runner/kernel drift, toolchain updates,
+#     and dependency rot during quiet periods with no PR activity.
+# The cron is staggered off codeql/scorecard's `0 6 * * 1` so the
+# Monday burst does not all fire at once.
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "30 5 * * 1"
 
 permissions:
   contents: read
