@@ -566,9 +566,11 @@ func chassisIndex(chassis []SBChassis) (hostnameByRef map[string]string, allChas
 }
 
 // localCRPorts returns the chassisredirect ports currently bound to this
-// chassis, as a map of LRP name → chassisredirect logical_port name.
-// A chassisredirect logical_port has the form "cr-<LRP_NAME>". When gatewayPort
-// is set the scan is restricted to that single port.
+// chassis, as a map of LRP name → chassisredirect logical_port name. When
+// gatewayPort is set the scan is restricted to that single port.
+//
+// The LRP is resolved via crPortLRPName (options:distributed-port), not by
+// slicing the port name.
 func localCRPorts(
 	portBindings []SBPortBinding,
 	hostnameByRef map[string]string,
@@ -587,10 +589,35 @@ func localCRPorts(
 		if !hostnamesEqual(hostnameByRef[*pb.Chassis], localChassisName) {
 			continue
 		}
-		lrpName := strings.TrimPrefix(pb.LogicalPort, "cr-")
-		localLRPNames[lrpName] = pb.LogicalPort
+		if lrpName := crPortLRPName(pb); lrpName != "" {
+			localLRPNames[lrpName] = pb.LogicalPort
+		}
 	}
 	return localLRPNames
+}
+
+// crPortLRPName returns the name of the distributed Logical_Router_Port that a
+// chassisredirect Port_Binding redirects for.
+//
+// ovn-northd records the answer in options:distributed-port — that is the
+// schema-backed join, and it is what this reads. The "cr-<LRP>" name form is
+// only an ovn-northd/Neutron naming convention, not a schema guarantee, so it
+// is kept as a warned fallback for rows that predate (or diverge from) the
+// option. A row with neither yields "" and is skipped by the caller rather than
+// silently mapping to a bogus LRP.
+func crPortLRPName(pb SBPortBinding) string {
+	if lrp := pb.Options["distributed-port"]; lrp != "" {
+		return lrp
+	}
+	if strings.HasPrefix(pb.LogicalPort, "cr-") {
+		lrp := strings.TrimPrefix(pb.LogicalPort, "cr-")
+		slog.Warn("chassisredirect port has no options:distributed-port, falling back to the cr- name convention",
+			"logical_port", pb.LogicalPort, "lrp", lrp)
+		return lrp
+	}
+	slog.Warn("cannot resolve the LRP of a chassisredirect port: no options:distributed-port and no cr- prefix, skipping",
+		"logical_port", pb.LogicalPort)
+	return ""
 }
 
 // segmentsByLRP resolves each local LRP's localnet segment. A gateway LRP's
