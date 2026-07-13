@@ -1,0 +1,33 @@
+name: govulncheck
+
+# govulncheck scans the pinned dependency graph for known vulnerabilities.
+# It runs on pull requests (the primary gate) and also on push to main and
+# a weekly schedule: a CVE published against a pinned dependency during a
+# quiet period with no PR activity must still surface within a week (issue
+# #161). It lives in its own workflow so it can carry these non-PR triggers
+# without event-gating the rest of the lint jobs. The cron is staggered off
+# the test suite's `30 5 * * 1` and codeql/scorecard's `0 6 * * 1`.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs only for PRs; push/schedule runs on main are
+  # the green-main signal and must never cancel each other mid-history.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-version-file: go.mod

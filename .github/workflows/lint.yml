@@ -13,6 +13,9 @@ concurrency:
   # the green-main signal and must never cancel each other mid-history.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The golangci-lint, vet, gofmt, and docs-gen job ids are required
+# status-check contexts in .github/rulesets/main.json — renaming any of
+# them requires a matching ruleset update, or the check goes missing.
 jobs:
   golangci-lint:
     runs-on: ubuntu-latest
@@ -56,13 +59,6 @@ jobs:
             echo "Run 'gofmt -w .' or 'make fmt' to fix."
             exit 1
           fi
-
-  govulncheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
-        with:
-          go-version-file: go.mod
 
   docs-gen:
     runs-on: ubuntu-latest
