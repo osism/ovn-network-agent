@@ -208,6 +208,46 @@ func TestGetStateIncludesAllChassisNames(t *testing.T) {
 	}
 }
 
+// TestWaitRefreshLoopStoppedNilSafe covers the port-forward-only / never-
+// connected path: with loopDone unset the wait must return immediately rather
+// than block the shutdown sequence forever.
+func TestWaitRefreshLoopStoppedNilSafe(t *testing.T) {
+	c := NewOVNClient(Config{}, nil)
+	done := make(chan struct{})
+	go func() {
+		c.waitRefreshLoopStopped()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("waitRefreshLoopStopped blocked with a nil loopDone")
+	}
+}
+
+// TestWaitRefreshLoopStoppedWaitsForInFlight pins the shutdown-ordering
+// contract: the wait must not return until the refresh loop has fully exited,
+// modelling a loop still finishing one in-flight refreshState after ctx was
+// cancelled. If it returned early the shutdown path's post-drain refresh would
+// interleave with that final loop refresh.
+func TestWaitRefreshLoopStoppedWaitsForInFlight(t *testing.T) {
+	c := NewOVNClient(Config{}, nil)
+	c.loopDone = make(chan struct{})
+
+	var loopExited atomic.Bool
+	go func() {
+		// Model the in-flight refresh completing before the loop returns.
+		time.Sleep(20 * time.Millisecond)
+		loopExited.Store(true)
+		close(c.loopDone)
+	}()
+
+	c.waitRefreshLoopStopped()
+	if !loopExited.Load() {
+		t.Fatal("waitRefreshLoopStopped returned before the refresh loop exited")
+	}
+}
+
 func TestHostnamesEqual(t *testing.T) {
 	tests := []struct {
 		name string
