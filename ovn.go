@@ -517,7 +517,10 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 	for _, ch := range chassis {
 		chassisHostname[ch.UUID] = ch.Hostname
 		chassisHostname[ch.Name] = ch.Hostname
-		allChassisNames[ch.Hostname] = true
+		// cleanupStaleChassis looks these keys up by the short chassis name
+		// stamped on managed-route external_ids, so normalise FQDN SB
+		// hostnames to the same leading label.
+		allChassisNames[shortHostname(ch.Hostname)] = true
 	}
 
 	localChassisName := o.state.LocalChassisName
@@ -535,7 +538,7 @@ func (o *OVNClient) refreshState(ctx context.Context) {
 			continue
 		}
 		hostname := chassisHostname[*pb.Chassis]
-		if hostname == localChassisName {
+		if hostnamesEqual(hostname, localChassisName) {
 			lrpName := strings.TrimPrefix(pb.LogicalPort, "cr-")
 			localLRPNames[lrpName] = pb.LogicalPort
 		}
@@ -1081,8 +1084,26 @@ func getHostname() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return shortHostname(h), nil
+}
+
+// shortHostname returns the leading DNS label of a hostname. SB Chassis
+// hostnames are often FQDNs while the agent's own hostname (getHostname) is
+// domain-stripped, so any comparison between the two must first reduce both to
+// this label. Casing is preserved: both sides ultimately derive from the same
+// OS hostname, so a naive strip keeps them comparable while hostnamesEqual
+// still guards against incidental case drift.
+func shortHostname(h string) string {
 	if idx := strings.IndexByte(h, '.'); idx != -1 {
 		h = h[:idx]
 	}
-	return h, nil
+	return h
+}
+
+// hostnamesEqual reports whether two chassis hostnames name the same host. It
+// compares only the leading DNS label, case-insensitively, so an FQDN SB
+// hostname matches the agent's domain-stripped local hostname regardless of
+// case. This is the single seam for chassis-hostname matching.
+func hostnamesEqual(a, b string) bool {
+	return strings.EqualFold(shortHostname(a), shortHostname(b))
 }

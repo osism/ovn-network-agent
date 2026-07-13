@@ -1252,7 +1252,7 @@ func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName stri
 			continue
 		}
 		hostname := chassisHostname[*pb.Chassis]
-		if strings.EqualFold(hostname, localChassisName) {
+		if hostnamesEqual(hostname, localChassisName) {
 			count++
 		}
 	}
