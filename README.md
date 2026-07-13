@@ -5,6 +5,15 @@ daemon that watches OVN databases directly via the OVSDB protocol to
 synchronize Floating IP routes and optionally forward traffic from anycast
 VIPs to internal backends.
 
+## Requirements
+
+- **OVN 24.09 or newer** — 24.09 is the floor the checked-in OVSDB schemas are
+  generated from; CI additionally tests against OVN 25.09. See
+  [OVSDB models and the supported OVN range](https://osism.github.io/ovn-network-agent/contributing/ovsdb-models).
+- **FRR 8.0 or newer** — the agent reads routes and prefix-lists via `vtysh`'s
+  JSON output (`show ip route … json`, `show ip prefix-list … json`).
+- **Linux** with `nftables` and Open vSwitch on the gateway node.
+
 ## Documentation
 
 Full documentation is published at
@@ -34,6 +43,7 @@ Full documentation is published at
 - Contributing:
   - [Integration tests](https://osism.github.io/ovn-network-agent/contributing/integration-tests)
   - [Containerlab E2E harness](https://osism.github.io/ovn-network-agent/contributing/e2e-tests)
+  - [OVSDB models and the supported OVN range](https://osism.github.io/ovn-network-agent/contributing/ovsdb-models)
 
 To build the docs locally:
 

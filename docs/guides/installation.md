@@ -5,6 +5,23 @@ the [GitHub Releases](https://github.com/osism/ovn-network-agent/releases) page.
 
 Pick the method that matches how you manage software on the target host.
 
+## Prerequisites
+
+| Component | Version | Why |
+|-----------|---------|-----|
+| OVN | **24.09 or newer** (tested against 25.09) | The agent's NAT model uses the `match` and `priority` columns added in OVN 24.09. libovsdb validates the client model against the server schema at connect time, so an older Northbound is rejected outright. |
+| FRR | **8.0 or newer** | Routes and prefix-lists are read as JSON (`show ip route vrf … static json`, `show ip prefix-list … json`) rather than by scraping the human-readable tables. |
+| Open vSwitch | Any version matching your OVN | Hairpin flows are programmed with `ovs-ofctl`. |
+| nftables | Any recent version | Required only when port forwarding (DNAT) is enabled. |
+
+The checked-in OVSDB schemas are the 24.09 floor, so the generated models
+connect to any OVN 24.09 or newer (including the 25.09 CI tests against) without
+regeneration. See
+[OVSDB models and the supported OVN range](../contributing/ovsdb-models).
+
+FRR is a soft dependency: the agent starts without it, but every route
+announcement is logged and retried until `vtysh` becomes reachable.
+
 ## Debian package
 
 ```bash
