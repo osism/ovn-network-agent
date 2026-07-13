@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -69,7 +70,14 @@ func virtualGatewayIP(lrpNetworks []string) (net.IP, error) {
 // macForLRP maps each router's LRP name to its segment interface MAC. A
 // router whose MAC is unknown (empty or absent) is skipped entirely — route
 // and binding — preserving the "no MAC → no write" contract per router.
+//
+// A per-router write failure does not abort the pass: the remaining routers
+// are still reconciled and every write failure is joined into the returned
+// error so the caller can log a genuine outcome instead of an always-nil
+// return. A missing MAC or an IPv6-only router (no IPv4 gateway to program) is
+// an intentional skip, not a failure, and is not joined.
 func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []LocalRouterInfo, macForLRP map[string]string) error {
+	var errs []error
 	for _, lr := range localRouters {
 		mac := macForLRP[lr.LRPName]
 		if mac == "" {
@@ -86,13 +94,15 @@ func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []Loc
 
 		if err := o.ensureDefaultRoute(ctx, lr, vgwStr); err != nil {
 			slog.Error("failed to ensure default route", "router", lr.RouterName, "vgw", vgwStr, "error", err)
+			errs = append(errs, fmt.Errorf("router %s: default route: %w", lr.RouterName, err))
 			continue
 		}
 		if err := o.ensureStaticMACBinding(ctx, lr.LRPName, vgwStr, mac); err != nil {
 			slog.Error("failed to ensure static MAC binding", "router", lr.RouterName, "lrp", lr.LRPName, "error", err)
+			errs = append(errs, fmt.Errorf("router %s: static MAC binding: %w", lr.RouterName, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // minActivePriority is the minimum priority the active chassis should
