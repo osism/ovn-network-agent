@@ -181,6 +181,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Wait for the OVN refresh loop (which shares the now-cancelled
+			// ctx) to fully exit before the shutdown path touches o.state, so
+			// a still-in-flight loop refresh cannot interleave with the
+			// post-drain refresh below. This makes the shutdown path the sole
+			// writer of o.state.
+			if !a.cfg.PortForwardOnly {
+				a.ovn.waitRefreshLoopStopped()
+			}
 			// Drain must happen BEFORE cleanup and BEFORE OVN connection close.
 			// Use a fresh context since the parent ctx is already cancelled.
 			// Drain is OVN-specific and is skipped in port-forward-only mode.

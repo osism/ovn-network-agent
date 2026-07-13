@@ -419,10 +419,20 @@ func (o *OVNClient) Close() {
 	// Stop new event handlers from signalling so closeClients can run
 	// without further channel sends from cache callbacks.
 	o.ready.Store(false)
+	o.waitRefreshLoopStopped()
+	o.closeClients()
+}
+
+// waitRefreshLoopStopped blocks until the refresh loop started by Connect has
+// fully exited. After ctx is cancelled the loop may still be finishing one
+// in-flight refreshState; the shutdown path calls this before its own
+// post-drain refreshState so it becomes the sole writer of o.state and the two
+// refreshes cannot interleave. It is a nil-safe receive on loopDone — safe when
+// the loop was never started (port-forward-only mode) or has already exited.
+func (o *OVNClient) waitRefreshLoopStopped() {
 	if o.loopDone != nil {
 		<-o.loopDone
 	}
-	o.closeClients()
 }
 
 // closeClients closes both OVSDB clients (if set) and clears the references
