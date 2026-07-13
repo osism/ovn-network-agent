@@ -20,6 +20,14 @@ E2E_DRAIN       := test/e2e/scenarios/drain-hitless.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
 
+# Pinned containerlab release for CI and local installs. The sha256
+# values are the linux_{amd64,arm64}.deb lines from the upstream
+# release's checksums.txt. Bump the version and BOTH checksums together:
+#   https://github.com/srl-labs/containerlab/releases
+CONTAINERLAB_VERSION      := 0.77.0
+CONTAINERLAB_SHA256_amd64 := 675eea8bd4d05ea3abc4a98cfa859975c9886705d6a510fead4dfd8dbed8b793
+CONTAINERLAB_SHA256_arm64 := 9bfd89d1afbff87c316febc721eb960148420ec94f3e063ba54b13ef38e8ba60
+
 all: build
 
 build:
@@ -81,20 +89,44 @@ e2e-images:
 	docker build -f test/e2e/Dockerfile.central -t $(E2E_CENTRAL_TAG) .
 	docker build -f test/e2e/Dockerfile.gwnode  -t $(E2E_GWNODE_TAG)  .
 
-# Install the containerlab CLI when it is missing. Linux only: the
-# upstream project publishes Linux binaries and a one-line installer
-# (https://get.containerlab.dev) for Debian/RHEL hosts and ships no
-# darwin binary, so on macOS the recommended path is to run
-# containerlab inside a Linux VM — see
-# https://containerlab.dev/macos/. This target reports that and
-# exits with a non-zero status on macOS instead of pretending to
-# install something.
+# Install the containerlab CLI when it is missing. Linux/Debian only:
+# the pinned .deb (CONTAINERLAB_VERSION above) is downloaded and its
+# sha256 verified against the committed checksum before apt-get installs
+# it — replacing the unpinned `curl | bash` installer so CI and local
+# installs get a known, verified binary. This narrows the target to
+# dpkg-based distros (what CI and the documented dev setup use); on
+# other distros it errors with a pointer to the upstream install docs.
+# Upstream ships no darwin binary, so on macOS the recommended path is
+# to run containerlab inside a Linux VM (https://containerlab.dev/macos/)
+# and this target reports that instead of pretending to install
+# something.
 e2e-install-tools:
-	@if command -v containerlab >/dev/null 2>&1; then \
+	@set -e; \
+	if command -v containerlab >/dev/null 2>&1; then \
 		echo "containerlab already installed: $$(command -v containerlab)"; \
 	elif [ "$$(uname -s)" = "Linux" ]; then \
-		echo "installing containerlab via the upstream installer (needs sudo)"; \
-		bash -c "$$(curl -sL https://get.containerlab.dev)"; \
+		if ! command -v dpkg >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1; then \
+			echo "the pinned .deb install needs dpkg/apt-get (Debian/Ubuntu)."; \
+			echo "On other distributions install containerlab $(CONTAINERLAB_VERSION)"; \
+			echo "manually from https://containerlab.dev/install/."; \
+			exit 1; \
+		fi; \
+		arch=$$(dpkg --print-architecture); \
+		case "$$arch" in \
+			amd64) sha=$(CONTAINERLAB_SHA256_amd64) ;; \
+			arm64) sha=$(CONTAINERLAB_SHA256_arm64) ;; \
+			*) echo "no pinned containerlab .deb for dpkg architecture $$arch;"; \
+			   echo "install it manually from https://containerlab.dev/install/."; \
+			   exit 1 ;; \
+		esac; \
+		deb="containerlab_$(CONTAINERLAB_VERSION)_linux_$$arch.deb"; \
+		url="https://github.com/srl-labs/containerlab/releases/download/v$(CONTAINERLAB_VERSION)/$$deb"; \
+		tmp=$$(mktemp -d); \
+		trap 'rm -rf "$$tmp"' EXIT; \
+		echo "installing containerlab $(CONTAINERLAB_VERSION) ($$arch) from the pinned .deb (needs sudo)"; \
+		curl -fsSL -o "$$tmp/$$deb" "$$url"; \
+		echo "$$sha  $$tmp/$$deb" | sha256sum -c -; \
+		sudo apt-get install -y "$$tmp/$$deb"; \
 	elif [ "$$(uname -s)" = "Darwin" ]; then \
 		echo ""; \
 		echo "containerlab does not ship a native macOS binary."; \
