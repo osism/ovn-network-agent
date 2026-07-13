@@ -62,6 +62,7 @@ export default defineConfig({
           { text: 'CI pipeline', link: '/contributing/ci' },
           { text: 'Integration tests', link: '/contributing/integration-tests' },
           { text: 'Containerlab E2E harness', link: '/contributing/e2e-tests' },
+          { text: 'OVSDB models and OVN range', link: '/contributing/ovsdb-models' },
         ],
       },
     ],
