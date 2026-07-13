@@ -249,6 +249,10 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		recordReconcile(trigger, time.Since(start))
 	}()
 
+	// This cycle's FRR readers share one static-route document; drop the memo
+	// so the cycle re-reads fresh state rather than reusing the previous one.
+	a.routing.resetFRRRouteCache()
+
 	// In port-forward-only mode there is no OVN client; a zero-value
 	// OVNState (no local routers, no SNAT IPs, no discovered networks)
 	// drives the rest of the cycle through the port-forward-only path.
@@ -740,6 +744,9 @@ func (a *Agent) removeAllRoutes(reason string) {
 
 // cleanup removes all managed routes, OVS flows, and OVN NB entries on shutdown.
 func (a *Agent) cleanup() {
+	// Shutdown runs outside any reconcile cycle; drop the memo so removeAllRoutes
+	// reads FRR fresh rather than reusing the last cycle's document.
+	a.routing.resetFRRRouteCache()
 	a.removeAllRoutes("shutdown cleanup")
 
 	// Clean up FRR prefix-list entries.

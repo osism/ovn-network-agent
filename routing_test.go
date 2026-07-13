@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -31,6 +32,46 @@ func (rm *RouteManager) HasFRRRoute(ip string) bool {
 		return false
 	}
 	return strings.Contains(string(output), "static")
+}
+
+// frrStaticRoutesJSON renders an FRR `show ip route vrf <vrf> static json`
+// document for the given /32 IPs, all resolved via the given next-hop. It is
+// the structured stand-in for the human-readable `show ip route` table the
+// agent used to parse.
+func frrStaticRoutesJSON(nexthop string, ips ...string) string {
+	entries := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		entries = append(entries, fmt.Sprintf(
+			`%q:[{"prefix":%q,"protocol":"static","selected":true,"installed":true,`+
+				`"nexthops":[{"ip":%q,"active":true,"fib":true,"interfaceName":"veth-default"}]}]`,
+			ip+"/32", ip+"/32", nexthop))
+	}
+	return "{" + strings.Join(entries, ",") + "}"
+}
+
+// frrPrefixListDoc renders one FRR daemon's `show ip prefix-list <name> json`
+// document. FRR nests the list under the daemon's own protocol name, so the
+// shape is {"<daemon>":{"<name>":{"addressFamily":"IPv4","entries":[…]}}} with
+// one "permit <network> ge 32 le 32" entry per (seq, network) pair.
+func frrPrefixListDoc(daemon, name string, entries ...prefixListEntry) string {
+	rows := make([]string, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, fmt.Sprintf(
+			`{"sequenceNumber":%d,"type":"permit","prefix":%q,`+
+				`"minimumPrefixLength":32,"maximumPrefixLength":32}`,
+			e.Seq, e.Network))
+	}
+	return fmt.Sprintf(`{%q:{%q:{"addressFamily":"IPv4","entries":[%s]}}}`,
+		daemon, name, strings.Join(rows, ","))
+}
+
+// frrPrefixListJSON renders the full body vtysh returns for a list configured
+// through it: zebra and bgpd both store the list, so their two documents are
+// concatenated with identical entries. This is the real shape
+// ListFRRPrefixListEntries reads.
+func frrPrefixListJSON(name string, entries ...prefixListEntry) string {
+	return frrPrefixListDoc("ZEBRA", name, entries...) +
+		frrPrefixListDoc("BGP", name, entries...)
 }
 
 // vtyshRecorder captures calls to RouteManager.runVtysh for assertion. It
@@ -60,21 +101,30 @@ func (r *vtyshRecorder) hook() ovsExecFunc {
 	}
 }
 
+// TestIsNoSuchRoute pins the errno contract: the kernel reports a missing route
+// as ESRCH, and the check must recognise it through wrapping — while NOT
+// matching an error that merely renders similarly. Matching the strerror text
+// instead would break on any host that words the message differently.
 func TestIsNoSuchRoute(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 		want bool
 	}{
-		{"no such process", errors.New("no such process"), true},
-		{"wrapped no such process", errors.New("netlink: del route: no such process"), true},
-		{"other error", errors.New("permission denied"), false},
+		{"bare ESRCH", syscall.ESRCH, true},
+		{"wrapped ESRCH", fmt.Errorf("netlink: del route: %w", syscall.ESRCH), true},
+		{"doubly wrapped ESRCH", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", syscall.ESRCH)), true},
+		{"a different errno", syscall.EPERM, false},
+		{"ENOENT is a missing rule, not a missing route", syscall.ENOENT, false},
+		// A plain error whose text happens to read like the old substring
+		// match must NOT be treated as "already gone".
+		{"text-only lookalike", errors.New("no such process"), false},
+		{"unrelated error", errors.New("permission denied"), false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isNoSuchRoute(tt.err)
-			if got != tt.want {
+			if got := isNoSuchRoute(tt.err); got != tt.want {
 				t.Errorf("isNoSuchRoute(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
@@ -513,14 +563,19 @@ func TestDisabledPortForward(t *testing.T) {
 	}
 }
 
+// TestIsNoSuchRule mirrors TestIsNoSuchRoute for the rule path, where the
+// kernel reports a missing rule as ENOENT.
 func TestIsNoSuchRule(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 		want bool
 	}{
-		{"no such file or directory", errors.New("no such file or directory"), true},
-		{"wrapped no such file", errors.New("netlink: del rule: no such file or directory"), true},
+		{"bare ENOENT", syscall.ENOENT, true},
+		{"wrapped ENOENT", fmt.Errorf("netlink: del rule: %w", syscall.ENOENT), true},
+		{"a different errno", syscall.EPERM, false},
+		{"ESRCH is a missing route, not a missing rule", syscall.ESRCH, false},
+		{"text-only lookalike", errors.New("no such file or directory"), false},
 		{"unrelated error", errors.New("permission denied"), false},
 	}
 
@@ -628,37 +683,69 @@ func TestHasFRRRoute_ParsesVtyshOutput(t *testing.T) {
 	}
 }
 
+// TestListFRRRoutes_ParsesStaticRoutes pins the nexthop-scoped ownership rule
+// against the JSON document: the agent owns only the statics resolved via its
+// own veth nexthop. An operator static via a foreign nexthop must be excluded —
+// treating it as agent-owned would withdraw it on the next reconcile. A
+// non-/32 static is likewise not an agent route.
 func TestListFRRRoutes_ParsesStaticRoutes(t *testing.T) {
+	const doc = `{
+	  "198.51.100.10/32": [{"prefix":"198.51.100.10/32","protocol":"static","selected":true,"installed":true,
+	    "nexthops":[{"ip":"169.254.0.1","active":true}]}],
+	  "198.51.100.11/32": [{"prefix":"198.51.100.11/32","protocol":"static","selected":true,"installed":true,
+	    "nexthops":[{"ip":"169.254.0.1","active":true}]}],
+	  "192.0.2.99/32": [{"prefix":"192.0.2.99/32","protocol":"static","selected":true,"installed":true,
+	    "nexthops":[{"ip":"192.0.2.1","active":true}]}],
+	  "203.0.113.0/24": [{"prefix":"203.0.113.0/24","protocol":"static","selected":true,"installed":true,
+	    "nexthops":[{"ip":"169.254.0.1","active":true}]}]
+	}`
 	rec := newVtyshRecorder()
-	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-S>* 198.51.100.11/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-C>* 10.0.0.0/24 is directly connected, br-ex, 00:00:01
-S>* 203.0.113.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-S>* 192.0.2.99/32 [1/0] via 192.0.2.1, eth0, weight 1, 00:00:01
-`,
-		nil,
-	)
-	// The agent owns only statics via its own veth nexthop; an operator static
-	// via a different nexthop (192.0.2.1) must be excluded from the result.
+	rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"}, doc, nil)
 	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 
 	got, err := rm.ListFRRRoutes()
 	if err != nil {
 		t.Fatalf("ListFRRRoutes: %v", err)
 	}
-	want := []string{"198.51.100.10", "198.51.100.11", "203.0.113.10"}
+	want := []string{"198.51.100.10", "198.51.100.11"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("ListFRRRoutes() = %v, want %v (operator static via a foreign nexthop must be excluded)", got, want)
+		t.Errorf("ListFRRRoutes() = %v, want %v (foreign nexthop and non-/32 must be excluded)", got, want)
+	}
+}
+
+// TestListFRRRoutes_EmptyVRF covers FRR's empty-body answer for a VRF with no
+// static routes — it must read as "nothing configured", not as an error.
+func TestListFRRRoutes_EmptyVRF(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"}, "", nil)
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
+
+	got, err := rm.ListFRRRoutes()
+	if err != nil {
+		t.Fatalf("ListFRRRoutes on an empty VRF: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListFRRRoutes() = %v, want empty", got)
+	}
+}
+
+// TestListFRRRoutes_MalformedJSON must surface a parse failure rather than
+// silently reporting "no routes" — an empty list would withdraw every FIP.
+func TestListFRRRoutes_MalformedJSON(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"}, "{not json", nil)
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
+
+	if _, err := rm.ListFRRRoutes(); err == nil {
+		t.Fatal("expected a parse error for malformed JSON, got nil (an empty list would withdraw every FIP)")
 	}
 }
 
 func TestListFRRRoutes_PropagatesVtyshError(t *testing.T) {
 	rec := newVtyshRecorder()
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		"connection refused", errors.New("exit 1"),
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		"", errors.New("exit 1"),
 	)
 	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 	if _, err := rm.ListFRRRoutes(); err == nil {
@@ -745,6 +832,61 @@ func TestInactiveFRRRoutes(t *testing.T) {
 			t.Errorf("empty input: got (%v, %v), want (nil, nil)", got, err)
 		}
 	})
+}
+
+// TestStaticFRRRoutesMemoizedPerCycle proves the shared static-route document
+// is read from vtysh at most once per reconcile cycle. ListFRRRoutes and
+// InactiveFRRRoutes now issue the identical `show ip route ... static json`
+// query, so without the per-cycle memo a no-change cycle would fork vtysh twice
+// for the same document. resetFRRRouteCache (start of each cycle) and a route
+// mutation must each force a fresh read.
+func TestStaticFRRRoutesMemoizedPerCycle(t *testing.T) {
+	const query = "vtysh -c show ip route vrf vrf-provider static json"
+	doc := frrStaticRoutesJSON("169.254.0.1", "198.51.100.10")
+	rec := newVtyshRecorder()
+	rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"}, doc, nil)
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
+
+	countQuery := func() int {
+		n := 0
+		for _, c := range rec.calls {
+			if strings.Join(c, " ") == query {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Two readers in one cycle share a single vtysh read.
+	if _, err := rm.ListFRRRoutes(); err != nil {
+		t.Fatalf("ListFRRRoutes: %v", err)
+	}
+	if _, err := rm.InactiveFRRRoutes([]string{"198.51.100.10"}); err != nil {
+		t.Fatalf("InactiveFRRRoutes: %v", err)
+	}
+	if got := countQuery(); got != 1 {
+		t.Fatalf("static-route query ran %d times in one cycle, want 1 (readers must share the memo)", got)
+	}
+
+	// A new cycle re-reads.
+	rm.resetFRRRouteCache()
+	if _, err := rm.ListFRRRoutes(); err != nil {
+		t.Fatalf("ListFRRRoutes after reset: %v", err)
+	}
+	if got := countQuery(); got != 2 {
+		t.Fatalf("static-route query ran %d times, want 2 (resetFRRRouteCache must force a fresh read)", got)
+	}
+
+	// A route mutation invalidates the memo, so the next reader re-reads.
+	if err := rm.AddFRRRoutes([]string{"198.51.100.11"}); err != nil {
+		t.Fatalf("AddFRRRoutes: %v", err)
+	}
+	if _, err := rm.InactiveFRRRoutes([]string{"198.51.100.10"}); err != nil {
+		t.Fatalf("InactiveFRRRoutes after add: %v", err)
+	}
+	if got := countQuery(); got != 3 {
+		t.Fatalf("static-route query ran %d times, want 3 (a route mutation must invalidate the memo)", got)
+	}
 }
 
 func TestAddFRRRoutesBatchesVtyshCommands(t *testing.T) {
@@ -840,36 +982,46 @@ func TestListFRRPrefixListEntries_Parses(t *testing.T) {
 	}{
 		{
 			"valid entries",
-			`ZEBRA: ip prefix-list ANNOUNCED-NETWORKS: 2 entries
-   seq 5 permit 198.51.100.0/24 ge 32 le 32
-   seq 10 permit 203.0.113.0/24 ge 32 le 32
-`,
+			frrPrefixListJSON("ANNOUNCED-NETWORKS",
+				prefixListEntry{Seq: 5, Network: "198.51.100.0/24"},
+				prefixListEntry{Seq: 10, Network: "203.0.113.0/24"},
+			),
 			[]prefixListEntry{
 				{Seq: 5, Network: "198.51.100.0/24"},
 				{Seq: 10, Network: "203.0.113.0/24"},
 			},
 		},
 		{
-			"non-managed entries are skipped (no ge 32 le 32)",
-			`   seq 5 permit 198.51.100.0/24
-   seq 10 deny 10.0.0.0/8 ge 32 le 32
-`,
+			// Only the agent-managed shape (permit … ge 32 le 32) is ours: a
+			// deny entry, or a permit without the /32 range, belongs to the
+			// operator and must never be reported (and so never removed).
+			"non-managed entries are skipped",
+			`{"ZEBRA":{"ANNOUNCED-NETWORKS":{"addressFamily":"IPv4","entries":[
+			  {"sequenceNumber":5,"type":"permit","prefix":"198.51.100.0/24"},
+			  {"sequenceNumber":10,"type":"deny","prefix":"10.0.0.0/8","minimumPrefixLength":32,"maximumPrefixLength":32},
+			  {"sequenceNumber":15,"type":"permit","prefix":"172.16.0.0/12","minimumPrefixLength":24,"maximumPrefixLength":32}
+			]}}}`,
 			nil,
 		},
 		{"empty output", "", nil},
-		{"Can't find message returns nil", "% Can't find specified prefix-list\n", nil},
+		// A prefix-list that does not exist yet: FRR answers with an empty
+		// JSON document rather than the old "Can't find" prose.
+		{"missing list returns nil", "{}", nil},
 		{
-			"malformed seq number is skipped",
-			"   seq notanumber permit 198.51.100.0/24 ge 32 le 32\n",
+			// The document exists but describes a different list — ours is
+			// still absent.
+			"other list only returns nil",
+			frrPrefixListJSON("SOME-OTHER-LIST", prefixListEntry{Seq: 5, Network: "198.51.100.0/24"}),
 			nil,
 		},
+		{"list with no entries", `{"ZEBRA":{"ANNOUNCED-NETWORKS":{"addressFamily":"IPv4","entries":[]}}}`, nil},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rec := newVtyshRecorder()
 			rec.on(
-				[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS"},
+				[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
 				tt.output, nil,
 			)
 			rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
@@ -881,6 +1033,80 @@ func TestListFRRPrefixListEntries_Parses(t *testing.T) {
 				t.Errorf("entries = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestListFRRPrefixListEntries_MultiDaemonConcatenation covers the real vtysh
+// output: each answering daemon nests the list under its own protocol name and
+// vtysh concatenates the documents, so the body holds more than one top-level
+// object ({"ZEBRA":{…}}{"BGP":{…}}). A single json.Unmarshal rejects the second
+// with "invalid character '{' after top-level value" — the failure the
+// integration and E2E suites hit — and the entries live one level below the
+// daemon key, not at the top.
+func TestListFRRPrefixListEntries_MultiDaemonConcatenation(t *testing.T) {
+	e5 := prefixListEntry{Seq: 5, Network: "198.51.100.0/24"}
+	e10 := prefixListEntry{Seq: 10, Network: "203.0.113.0/24"}
+	want := []prefixListEntry{e5, e10}
+	tests := []struct {
+		name   string
+		output string
+		want   []prefixListEntry
+	}{
+		// zebra and bgpd both report the list with the same entries; the
+		// duplicate daemon copy must be deduplicated, not doubled.
+		{
+			"zebra and bgp agree",
+			frrPrefixListDoc("ZEBRA", "ANNOUNCED-NETWORKS", e5, e10) +
+				frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS", e5, e10),
+			want,
+		},
+		// Only one daemon carries the entries; the other reports the list empty.
+		{
+			"one daemon empty",
+			frrPrefixListDoc("ZEBRA", "ANNOUNCED-NETWORKS", e5, e10) +
+				frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS"),
+			want,
+		},
+		// The empty daemon document arrives first.
+		{
+			"empty daemon first",
+			frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS") +
+				frrPrefixListDoc("ZEBRA", "ANNOUNCED-NETWORKS", e5, e10),
+			want,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newVtyshRecorder()
+			rec.on(
+				[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+				tt.output, nil,
+			)
+			rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+			got, err := rm.ListFRRPrefixListEntries()
+			if err != nil {
+				t.Fatalf("ListFRRPrefixListEntries: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("entries = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestListFRRPrefixListEntries_MalformedJSON must surface the parse failure:
+// reporting "no entries" would make ReconcileFRRPrefixList re-add every network
+// on every cycle.
+func TestListFRRPrefixListEntries_MalformedJSON(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		"{not json", nil,
+	)
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+	if _, err := rm.ListFRRPrefixListEntries(); err == nil {
+		t.Fatal("expected a parse error for malformed JSON, got nil")
 	}
 }
 
@@ -897,10 +1123,11 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 	rec := newVtyshRecorder()
 	// Initial state has 10.0.0.0/24 (stale) and 198.51.100.0/24 (desired).
 	rec.on(
-		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS"},
-		`   seq 5 permit 10.0.0.0/24 ge 32 le 32
-   seq 10 permit 198.51.100.0/24 ge 32 le 32
-`,
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListJSON("ANNOUNCED-NETWORKS",
+			prefixListEntry{Seq: 5, Network: "10.0.0.0/24"},
+			prefixListEntry{Seq: 10, Network: "198.51.100.0/24"},
+		),
 		nil,
 	)
 

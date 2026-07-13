@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
+	"syscall"
 )
 
 // ovsExecFunc is the signature of an exec.Cmd runner. Tests inject a stub via
@@ -58,6 +59,25 @@ type RouteManager struct {
 	// execVtyshHook, when non-nil, replaces the real exec.Cmd runner used by
 	// FRR/vtysh helpers. Tests set this to capture commands without executing them.
 	execVtyshHook ovsExecFunc
+
+	// frrRouteCache memoizes FRR's static-route document for the current
+	// reconcile cycle. ListFRRRoutes and InactiveFRRRoutes now issue the
+	// identical `show ip route ... static json` query, so without this a
+	// no-change cycle would fork vtysh twice for the same document. It is safe
+	// as a plain field because the reconcile loop is single-goroutine (see
+	// Agent.Run): reconcile, its FRR readers, and shutdown cleanup never run
+	// concurrently. AddFRRRoutes/DelFRRRoutes clear it after mutating FRR, and
+	// resetFRRRouteCache clears it at the start of each reconcile and cleanup
+	// pass, so a reader after a mutation — or in a new pass — always re-reads.
+	frrRouteCache map[string][]frrRouteEntry
+}
+
+// resetFRRRouteCache drops the memoized FRR static-route document so the next
+// reader re-issues the vtysh query. Called at the start of each reconcile and
+// cleanup pass; within a pass the memo is shared and invalidated only by a
+// route mutation.
+func (rm *RouteManager) resetFRRRouteCache() {
+	rm.frrRouteCache = nil
 }
 
 // runVtysh executes a vtysh command, dispatching through execVtyshHook when set.
@@ -165,6 +185,9 @@ func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 		slog.Info("[dry-run] would add FRR routes", "count", len(valid), "vrf", rm.cfg.VRFName, "nexthop", rm.cfg.VethNexthop)
 		return nil
 	}
+	// About to mutate FRR's static routes: drop the memo so a subsequent
+	// reader in this cycle (verifyRoutes, checkFRRRouteActivity) re-reads.
+	rm.frrRouteCache = nil
 	var errs []error
 	for start := 0; start < len(valid); start += frrBatchSize {
 		end := start + frrBatchSize
@@ -205,6 +228,9 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 		slog.Info("[dry-run] would remove FRR routes", "count", len(ips), "vrf", rm.cfg.VRFName, "nexthop", rm.cfg.VethNexthop)
 		return nil
 	}
+	// About to mutate FRR's static routes: drop the memo so a subsequent
+	// reader in this cycle re-reads the post-mutation document.
+	rm.frrRouteCache = nil
 	for start := 0; start < len(ips); start += frrBatchSize {
 		end := start + frrBatchSize
 		if end > len(ips) {
@@ -225,75 +251,28 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 	return nil
 }
 
-// ListFRRRoutes returns the agent's own static /32 routes in the VRF: those
-// installed via the agent's veth nexthop. This nexthop scoping is the FRR
-// analog of the kernel protocol tag — without it, reconciliation would treat
-// operator-created statics as agent-owned and withdraw them on standby nodes.
-func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
-	if rm.cfg.DryRun {
-		return nil, nil
-	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static", rm.cfg.VRFName))
-	if err != nil {
-		return nil, fmt.Errorf("vtysh list routes: %w", err)
-	}
-
-	var ips []string
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		// Lines like: S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, ...
-		if !strings.HasPrefix(line, "S") || !strings.Contains(line, "/32") {
-			continue
-		}
-		// Only report statics installed via the agent's own nexthop.
-		if frrRouteNexthop(line) != rm.cfg.VethNexthop {
-			continue
-		}
-		for _, p := range strings.Fields(line) {
-			if strings.Contains(p, "/32") {
-				ip, _, _ := net.ParseCIDR(p)
-				if ip != nil {
-					ips = append(ips, ip.String())
-				}
-				break
-			}
-		}
-	}
-	return ips, nil
-}
-
-// frrRouteNexthop returns the nexthop address in an FRR "show ip route" line —
-// the token following "via", with any trailing comma stripped. Returns "" when
-// the line has no via clause.
-func frrRouteNexthop(line string) string {
-	fields := strings.Fields(line)
-	for i, f := range fields {
-		if f == "via" && i+1 < len(fields) {
-			return strings.TrimRight(fields[i+1], ",")
-		}
-	}
-	return ""
-}
-
 // frrRouteEntry is the subset of an FRR `show ip route ... json` route object
 // that the agent inspects. A static route is only advertised via BGP once it
 // is both selected (FRR's best route for the prefix) and installed (present in
 // the kernel FIB); FRR omits these keys when false, so the zero value is the
-// correct default.
+// correct default. Nexthops carries the resolved next-hops, which is what scopes
+// a route to this agent (see ListFRRRoutes).
 type frrRouteEntry struct {
 	Selected  bool `json:"selected"`
 	Installed bool `json:"installed"`
+	Nexthops  []struct {
+		IP string `json:"ip"`
+	} `json:"nexthops"`
 }
 
-// InactiveFRRRoutes returns, from the given /32 IPs, those whose static route
-// exists in the VRF but is not selected and installed by FRR — i.e. configured
-// but not actually advertised (typically an unresolvable next-hop). IPs with no
-// static route at all are not reported: that case is a plain "missing route"
-// handled by ensureRoutes. ListFRRRoutes cannot tell the two apart because it
-// matches any configured route, which is why this distinct check exists.
-func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
-	if rm.cfg.DryRun || len(ips) == 0 {
-		return nil, nil
+// staticFRRRoutes returns FRR's static routes for the VRF, keyed by prefix, as
+// reported by `show ip route vrf <vrf> static json`. It is the single structured
+// read shared by ListFRRRoutes and InactiveFRRRoutes: both need the same
+// document, and neither may depend on the human-readable table, whose column
+// layout FRR is free to change between releases.
+func (rm *RouteManager) staticFRRRoutes() (map[string][]frrRouteEntry, error) {
+	if rm.frrRouteCache != nil {
+		return rm.frrRouteCache, nil
 	}
 	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s static json", rm.cfg.VRFName))
 	if err != nil {
@@ -308,6 +287,73 @@ func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
 	var routes map[string][]frrRouteEntry
 	if err := json.Unmarshal([]byte(trimmed), &routes); err != nil {
 		return nil, fmt.Errorf("parse vtysh route json: %w", err)
+	}
+	rm.frrRouteCache = routes
+	return routes, nil
+}
+
+// ListFRRRoutes returns the agent's own static /32 routes in the VRF: those
+// installed via the agent's veth nexthop. This nexthop scoping is the FRR
+// analog of the kernel protocol tag — without it, reconciliation would treat
+// operator-created statics as agent-owned and withdraw them on standby nodes.
+//
+// The list feeds stale-route withdrawal, so it is read as JSON: a change to
+// FRR's human-readable `show ip route` layout would otherwise silently yield an
+// empty list and withdraw every FIP the agent advertises.
+func (rm *RouteManager) ListFRRRoutes() ([]string, error) {
+	if rm.cfg.DryRun {
+		return nil, nil
+	}
+	routes, err := rm.staticFRRRoutes()
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []string
+	for prefix, entries := range routes {
+		ip, ipNet, err := net.ParseCIDR(prefix)
+		if err != nil || ip.To4() == nil {
+			continue
+		}
+		if ones, bits := ipNet.Mask.Size(); ones != 32 || bits != 32 {
+			continue
+		}
+		// Only report statics installed via the agent's own nexthop.
+		if !entriesUseNexthop(entries, rm.cfg.VethNexthop) {
+			continue
+		}
+		ips = append(ips, ip.String())
+	}
+	sort.Strings(ips)
+	return ips, nil
+}
+
+// entriesUseNexthop reports whether any of a prefix's route entries resolves via
+// the given next-hop address.
+func entriesUseNexthop(entries []frrRouteEntry, nexthop string) bool {
+	for _, e := range entries {
+		for _, nh := range e.Nexthops {
+			if nh.IP == nexthop {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// InactiveFRRRoutes returns, from the given /32 IPs, those whose static route
+// exists in the VRF but is not selected and installed by FRR — i.e. configured
+// but not actually advertised (typically an unresolvable next-hop). IPs with no
+// static route at all are not reported: that case is a plain "missing route"
+// handled by ensureRoutes. ListFRRRoutes cannot tell the two apart because it
+// matches any configured route, which is why this distinct check exists.
+func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
+	if rm.cfg.DryRun || len(ips) == 0 {
+		return nil, nil
+	}
+	routes, err := rm.staticFRRRoutes()
+	if err != nil {
+		return nil, err
 	}
 
 	var inactive []string
@@ -356,37 +402,89 @@ type prefixListEntry struct {
 	Network string // e.g. "198.51.100.0/24"
 }
 
+// frrPrefixList is the subset of an FRR `show ip prefix-list <name> json`
+// document the agent inspects — the innermost object, holding one list's
+// entries. FRR wraps it two levels deep: each answering daemon emits
+// {"<DAEMON>":{"<name>":{…}}}, keyed first by its own protocol name (ZEBRA,
+// BGP) and then by the prefix-list name. vtysh concatenates one such document
+// per daemon, so ListFRRPrefixListEntries reads a stream of them and digs
+// through the daemon layer (see there). A list that does not exist yields an
+// empty body, the structured replacement for the old "Can't find" message.
+type frrPrefixList struct {
+	Entries []frrPrefixListEntry `json:"entries"`
+}
+
+type frrPrefixListEntry struct {
+	SequenceNumber int    `json:"sequenceNumber"`
+	Type           string `json:"type"`
+	Prefix         string `json:"prefix"`
+	MinPrefixLen   int    `json:"minimumPrefixLength"`
+	MaxPrefixLen   int    `json:"maximumPrefixLength"`
+}
+
 // ListFRRPrefixListEntries returns the current "permit ... ge 32 le 32" entries
-// in the configured FRR prefix-list. Returns nil if no prefix-list is configured.
+// in the configured FRR prefix-list. Returns nil if no prefix-list is configured
+// or the list does not exist yet.
 //
-// Safety: frrPrefixList is validated by isValidIdentifier (alphanumeric, hyphen,
-// underscore, dot) in config validation. Network strings come from net.IPNet.String().
+// Read as JSON rather than by parsing the human-readable table: the entries
+// drive add/remove of the announced-networks list, so a change to FRR's text
+// layout would silently make every entry look absent and churn the list on
+// every reconcile.
+//
+// Safety: cfg.FRRPrefixList is validated by isValidIdentifier (alphanumeric,
+// hyphen, underscore, dot) in config validation. Network strings come from
+// net.IPNet.String().
 func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 	if rm.cfg.FRRPrefixList == "" {
 		return nil, nil
 	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip prefix-list %s", rm.cfg.FRRPrefixList))
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip prefix-list %s json", rm.cfg.FRRPrefixList))
 	if err != nil {
 		return nil, fmt.Errorf("vtysh show prefix-list %s: %w (output: %s)", rm.cfg.FRRPrefixList, err, strings.TrimSpace(string(output)))
 	}
 
-	outStr := string(output)
-	if strings.Contains(outStr, "Can't find") || strings.TrimSpace(outStr) == "" {
+	// An empty body (or "{}") means the list does not exist — nothing to
+	// reconcile against, not an error.
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
 		return nil, nil
 	}
 
+	// vtysh runs the show command against every FRR daemon that answers it
+	// (zebra and bgpd both store prefix-lists) and concatenates their JSON
+	// replies, so the body is a stream of documents — one per daemon — not a
+	// single object. A plain json.Unmarshal rejects the second document with
+	// "invalid character '{' after top-level value". Each document nests the
+	// list under the daemon's own name: {"ZEBRA":{"<name>":{…}}}. Decode the
+	// documents in sequence and collect our list's entries from whichever
+	// daemons report it, deduplicating by sequence number since the daemons
+	// carry the same shared configuration.
+	seen := make(map[int]bool)
 	var entries []prefixListEntry
-	for _, line := range strings.Split(outStr, "\n") {
-		line = strings.TrimSpace(line)
-		fields := strings.Fields(line)
-		// Match: seq <N> permit <network> ge 32 le 32
-		if len(fields) >= 8 && fields[0] == "seq" && fields[2] == "permit" &&
-			fields[4] == "ge" && fields[5] == "32" && fields[6] == "le" && fields[7] == "32" {
-			seq, serr := strconv.Atoi(fields[1])
-			if serr != nil {
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	for {
+		var doc map[string]map[string]frrPrefixList
+		if err := dec.Decode(&doc); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("parse vtysh prefix-list json: %w", err)
+		}
+		for _, byName := range doc { // keyed by daemon protocol name
+			list, ok := byName[rm.cfg.FRRPrefixList]
+			if !ok {
 				continue
 			}
-			entries = append(entries, prefixListEntry{Seq: seq, Network: fields[3]})
+			for _, e := range list.Entries {
+				// Only the agent-managed shape: permit <network> ge 32 le 32.
+				if e.Type != "permit" || e.MinPrefixLen != 32 || e.MaxPrefixLen != 32 {
+					continue
+				}
+				if seen[e.SequenceNumber] {
+					continue
+				}
+				seen[e.SequenceNumber] = true
+				entries = append(entries, prefixListEntry{Seq: e.SequenceNumber, Network: e.Prefix})
+			}
 		}
 	}
 	return entries, nil
@@ -462,10 +560,20 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
 // Helpers
 // =============================================================================
 
+// isNoSuchRoute and isNoSuchRule report the "it was already gone" outcome of a
+// netlink delete, which is success for an idempotent teardown.
+//
+// The kernel answers a missing route with ESRCH and a missing rule with ENOENT,
+// and netlink surfaces them as syscall.Errno values. Match on the errno with
+// errors.Is rather than on the rendered message: the text is produced by the
+// C library's strerror table and is locale- and version-dependent, so a
+// substring check silently turns "already gone" into a hard error on any host
+// that words it differently. isFileExists (routing_linux.go) already does it
+// this way.
 func isNoSuchRoute(err error) bool {
-	return strings.Contains(err.Error(), "no such process")
+	return errors.Is(err, syscall.ESRCH)
 }
 
 func isNoSuchRule(err error) bool {
-	return strings.Contains(err.Error(), "no such file or directory")
+	return errors.Is(err, syscall.ENOENT)
 }

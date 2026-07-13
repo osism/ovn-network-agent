@@ -181,9 +181,8 @@ func TestEnsureRoutesDevMismatchDoesNotWithdrawFRR(t *testing.T) {
 	rec := newVtyshRecorder()
 	// FRR already has the desired IP.
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-`,
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.10"),
 		nil,
 	)
 	rm := &RouteManager{
@@ -221,9 +220,8 @@ func TestEnsureRoutesDevMismatchDoesNotWithdrawFRR(t *testing.T) {
 func TestEnsureRoutesStaleEntryRemovedWithItsDevice(t *testing.T) {
 	rec := newVtyshRecorder()
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-`,
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.99"),
 		nil,
 	)
 	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
@@ -251,9 +249,8 @@ func TestEnsureRoutesStaleEntryRemovedWithItsDevice(t *testing.T) {
 func TestVerifyRoutesDetectsDevMismatch(t *testing.T) {
 	rec := newVtyshRecorder()
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-`,
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.10"),
 		nil,
 	)
 	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
@@ -320,9 +317,8 @@ func TestSegmentRouteUnresolved(t *testing.T) {
 func TestVerifyRoutesLeavesUnresolvedVLANRouteInPlace(t *testing.T) {
 	rec := newVtyshRecorder()
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-`,
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.10"),
 		nil,
 	)
 	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
@@ -632,10 +628,8 @@ func TestEnsureRoutesAddsMissingAndRemovesStale(t *testing.T) {
 	rec := newVtyshRecorder()
 	// FRR currently has B (already desired) and stale-X (managed but not desired).
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.20/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-S>* 198.51.100.99/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-`,
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.20", "198.51.100.99"),
 		nil,
 	)
 
@@ -698,8 +692,8 @@ func TestEnsureRoutesReturnsAnnounceOutcome(t *testing.T) {
 		rec := newVtyshRecorder()
 		// FRR already advertises the only desired IP: nothing is added or
 		// removed, so no BGP refresh runs and the cycle still announces.
-		rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-			"S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01\n", nil)
+		rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+			frrStaticRoutesJSON("169.254.0.1", "198.51.100.10"), nil)
 		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil) {
 			t.Errorf("no-change cycle: announced = false, want true (calls: %v)", rec.calls)
 		}
@@ -821,10 +815,8 @@ func TestCheckFRRRouteActivity(t *testing.T) {
 func TestRemoveAllRoutesWithStubbedFRRList(t *testing.T) {
 	rec := newVtyshRecorder()
 	rec.on(
-		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
-		`S>* 198.51.100.10/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-S>* 198.51.100.11/32 [1/0] via 169.254.0.1, veth-default, weight 1, 00:00:01
-`,
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", "198.51.100.10", "198.51.100.11"),
 		nil,
 	)
 	rm := &RouteManager{
