@@ -1314,3 +1314,79 @@ func TestImmediateStateRefreshFollowUpRuns(t *testing.T) {
 		t.Errorf("expected exactly 2 refresh passes (in-flight + follow-up), got %d", got)
 	}
 }
+
+// TestWatchConnectionStateMirrorsConnected verifies watchConnectionState
+// tracks each client's Connected() into the ovn_connection_state gauge in
+// both directions — the drop-and-recover cycle a transient OVSDB outage
+// produces. This is the unit-level analog of the reconnect integration
+// scenario, which asserts the same 1->0->1 transition against a real server.
+func TestWatchConnectionStateMirrorsConnected(t *testing.T) {
+	m := withTestMetrics(t)
+	_, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setConnected(true)
+	nb.setConnected(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchConnectionState(ctx, sb, nb, time.Millisecond)
+	}()
+
+	waitConnGauge(t, m, "sb", 1)
+	waitConnGauge(t, m, "nb", 1)
+
+	// A transient NB outage: the gauge must drop while SB stays up.
+	nb.setConnected(false)
+	waitConnGauge(t, m, "nb", 0)
+	waitConnGauge(t, m, "sb", 1)
+
+	// Recovery: the gauge must climb back to 1.
+	nb.setConnected(true)
+	waitConnGauge(t, m, "nb", 1)
+
+	cancel()
+	<-done
+}
+
+// waitConnGauge polls the ovn_connection_state{database=db} gauge in the test
+// registry until it equals want or the timeout expires.
+func waitConnGauge(t *testing.T, m *metricsRegistry, db string, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last float64
+	var found bool
+	for time.Now().Before(deadline) {
+		last, found = connGaugeValue(t, m, db)
+		if found && last == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("ovn_connection_state{database=%q} = %v (found=%v), want %v", db, last, found, want)
+}
+
+// connGaugeValue reads the ovn_connection_state gauge for the given database
+// label from the test registry.
+func connGaugeValue(t *testing.T, m *metricsRegistry, db string) (float64, bool) {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather(): %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_ovn_connection_state" {
+			continue
+		}
+		for _, item := range mf.GetMetric() {
+			for _, l := range item.GetLabel() {
+				if l.GetName() == "database" && l.GetValue() == db {
+					return item.GetGauge().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
+}

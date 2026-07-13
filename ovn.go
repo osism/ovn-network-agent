@@ -134,6 +134,7 @@ type NBGatewayChassis struct {
 type ovsdbClient interface {
 	Connect(context.Context) error
 	Close()
+	Connected() bool
 	Cache() *cache.TableCache
 	NewMonitor(...client.MonitorOption) *client.Monitor
 	Monitor(context.Context, *client.Monitor) (client.MonitorCookie, error)
@@ -374,8 +375,44 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 		o.refreshLoop(ctx)
 	}()
 
+	// Mirror each client's live connection status into the
+	// ovn_connection_state gauge. Capture the client values now (not
+	// o.sbClient/o.nbClient) so a concurrent closeClients() nil-ing the
+	// fields cannot race the poller. The watcher shares refreshLoop's ctx,
+	// which Run cancels before Close() runs, so it never outlives the client.
+	go watchConnectionState(ctx, o.sbClient, o.nbClient, connStatePollInterval)
+
 	success = true
 	return nil
+}
+
+// connStatePollInterval is how often watchConnectionState samples each client's
+// connection status. One second is fine-grained enough to catch a transient
+// outage while adding negligible load.
+const connStatePollInterval = time.Second
+
+// watchConnectionState mirrors the live connection status of the SB and NB
+// clients into the ovn_connection_state gauge until ctx is cancelled.
+//
+// The gauge is otherwise only cleared by closeClients(), so a transient OVSDB
+// outage would never show in the metric: libovsdb's reconnect path
+// re-establishes the monitors and repopulates the cache internally and only
+// signals DisconnectNotify on a terminal (non-reconnect) close, so there is no
+// event to hook for a drop-and-recover cycle. Polling Connected() is the only
+// reliable mirror of the outage, which is what lets an operator alert on a lost
+// OVN connection and what the reconnect integration scenario asserts on.
+func watchConnectionState(ctx context.Context, sb, nb ovsdbClient, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			setOVNConnectionState("sb", sb.Connected())
+			setOVNConnectionState("nb", nb.Connected())
+		}
+	}
 }
 
 func (o *OVNClient) Close() {
