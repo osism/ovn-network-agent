@@ -310,7 +310,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 				return nil
 			}
 
-			localChassis := o.state.LocalChassisName
+			localChassis := o.state.LocalChassisName()
 
 			if route.Nexthop == vgwIP {
 				// Nexthop correct — check if chassis tag needs updating (migration or failover).
@@ -352,7 +352,7 @@ func (o *OVNClient) ensureDefaultRoute(ctx context.Context, lr LocalRouterInfo, 
 		Options:    map[string]string{},
 		ExternalIDs: map[string]string{
 			"ovn-network-agent":         "managed",
-			"ovn-network-agent-chassis": o.state.LocalChassisName,
+			"ovn-network-agent-chassis": o.state.LocalChassisName(),
 		},
 	}
 
@@ -410,7 +410,7 @@ func (o *OVNClient) MarkTakeoverReady(ctx context.Context, localRouters []LocalR
 		return err
 	}
 
-	localChassis := o.state.LocalChassisName
+	localChassis := o.state.LocalChassisName()
 	marker := localChassis
 
 	var allOps []ovsdb.Operation

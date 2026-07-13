@@ -171,7 +171,7 @@ func TestRefreshStateRecoversDroppedNATFromCache(t *testing.T) {
 		ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: "nat-snat"}, "type": "snat", "external_ip": "198.51.100.51"},
 	)
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	snap := c.GetState()
 
@@ -249,7 +249,7 @@ func TestRefreshStateRecoversStaleChassisBinding(t *testing.T) {
 	})
 	nb.setRows("NAT", &NBNAT{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"})
 
-	c.state.LocalChassisName = "host-a"
+	c.state.SetLocalChassisName("host-a")
 	c.refreshState(context.Background())
 	snap := c.GetState()
 

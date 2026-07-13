@@ -812,10 +812,12 @@ func TestRemoveManagedNBEntries_NoLocalRouters(t *testing.T) {
 func TestRemoveManagedNBEntries_DeletesManagedRouteAndMACBinding(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 
-	c.state.LocalRouters = []LocalRouterInfo{
-		{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-abc"},
-	}
-	c.state.HasLocalRouters = true
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{
+			{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-abc"},
+		},
+		HasLocalRouters: true,
+	})
 
 	nb.setRows("Logical_Router", &NBLogicalRouter{
 		UUID: "lr-1", Name: "router1", StaticRoutes: []string{"route-managed", "route-foreign"},
@@ -884,10 +886,12 @@ func TestRemoveManagedNBEntries_DeletesManagedRouteAndMACBinding(t *testing.T) {
 func TestRemoveManagedNBEntries_SkipsManagedRouteOnNonLocalRouter(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 
-	c.state.LocalRouters = []LocalRouterInfo{
-		{RouterName: "router-local", RouterUUID: "lr-local", LRPName: "lrp-local"},
-	}
-	c.state.HasLocalRouters = true
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{
+			{RouterName: "router-local", RouterUUID: "lr-local", LRPName: "lrp-local"},
+		},
+		HasLocalRouters: true,
+	})
 
 	nb.setRows("Logical_Router",
 		&NBLogicalRouter{UUID: "lr-local", Name: "router-local"},
@@ -1448,7 +1452,7 @@ func TestDrainGateways_EventSignalWakesMigrationWait(t *testing.T) {
 func TestAwaitTakeoverReady_ReturnsOnMarker(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	c.cfg.DrainSettleDelay = 50 * time.Millisecond
-	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{{RouterUUID: "lr1"}}})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
 		UUID:        "sr1",
@@ -1486,7 +1490,7 @@ func TestAwaitTakeoverReady_TimeoutFallbackWhenMarkerNeverAppears(t *testing.T) 
 	buf := captureSlog(t)
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	c.cfg.DrainSettleDelay = 50 * time.Millisecond
-	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{{RouterUUID: "lr1"}}})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
 		UUID:        "sr1",
@@ -1513,7 +1517,7 @@ func TestAwaitTakeoverReady_TimeoutFallbackWhenMarkerNeverAppears(t *testing.T) 
 func TestAwaitTakeoverReady_DisabledWhenSettleZero(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	c.cfg.DrainSettleDelay = 0
-	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{{RouterUUID: "lr1"}}})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
 		UUID:        "sr1",
@@ -1538,7 +1542,7 @@ func TestAwaitTakeoverReady_DisabledWhenSettleZero(t *testing.T) {
 func TestAwaitTakeoverReady_NoManagedRouteHoldsMarginOnly(t *testing.T) {
 	c, nb, _ := newOVNClientWithFakes(t, "host-a")
 	c.cfg.DrainSettleDelay = 60 * time.Millisecond
-	c.state.LocalRouters = []LocalRouterInfo{{RouterUUID: "lr1"}}
+	c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{{RouterUUID: "lr1"}}})
 	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
 	// Default route present but NOT agent-managed → excluded from the wait set.
 	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
