@@ -1,0 +1,45 @@
+name: Docs
+
+# Build the VitePress site on PRs that can affect it, so the dead-link
+# check fails the PR instead of the post-merge Pages deploy
+# (deploy-docs.yaml, which is push-to-main only). This workflow is
+# path-filtered and therefore MUST NOT be added to the required status
+# checks in .github/rulesets/main.json — non-docs PRs would never
+# trigger it and would wait on the required check forever.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs only for PRs; push/schedule runs on main are
+  # the green-main signal and must never cancel each other mid-history.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  docs-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `docs:build` fails on dead internal links, so this is the PR-time
+      # dead-link gate.
+      - name: Build documentation
+        run: npm run docs:build
