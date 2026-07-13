@@ -290,21 +290,76 @@ func TestScenario_DrainSettleTimeoutFallback(t *testing.T) {
 	testenv.AssertNoKernelRoute(t, "198.51.100.11", 5*time.Second)
 }
 
-// TestScenario_DrainStuckNBWrite (#59 scenario 4, optional):
+// TestScenario_DrainStuckNBWrite (#59 scenario 4 / #160):
 //
-// Pausing ovsdb-server (NB) mid-drain to verify drain_timeout is honoured
-// even when NB writes hang would catch a regression where the agent waits
-// for a transaction to complete past the deadline. Implementing this
-// cleanly on Ubuntu requires pausing only the NB DB without taking SB down
-// — ovn-ctl on Ubuntu (`ovn-ctl pause`) toggles both. Without a way to
-// pause NB in isolation the test would be flaky (paused-SB cascades into
-// ovn-controller restarting our chassis row, etc.), so we skip pending a
-// harness primitive that can pause NB alone.
+// The drain code must honour drain_timeout even when NB writes hang. On
+// shutdown, DrainGateways lowers the local Gateway_Chassis priority to 0 via
+// an NB transaction bounded by drain_timeout; if that transaction blocks
+// forever the whole Stop would block past the deadline.
+//
+// StopNBDatabase SIGSTOPs only the NB ovsdb-server, leaving SB responsive so
+// ovn-controller does not cascade (which is what previously made this scenario
+// impossible to run without flakes). With NB stalled, the priority-lower write
+// hits its 3s deadline, DrainGateways returns an error, and the agent logs
+// "drain failed" and proceeds — so Stop returns cleanly well under its ceiling.
+// We assert the "drain failed" (ctx-deadline) line rather than "drain: timeout
+// exceeded", which is only reached when the write succeeds but ports never
+// migrate.
 //
 // Future contributors: do not "fix" this by inserting time.Sleep or a
-// stop-the-world SIGSTOP loop on ovsdb-server. The drain code is supposed
-// to honour drain_timeout regardless of NB write hangs; assert via metrics
-// once the drain outcome label is exposed (#39).
+// stop-the-world SIGSTOP loop on all of ovsdb-server. The point is a stalled
+// NB write bounded by drain_timeout, which StopNBDatabase reproduces
+// deterministically.
 func TestScenario_DrainStuckNBWrite(t *testing.T) {
-	t.Skip("scenario 4: no clean way to pause NB ovsdb-server alone on the Ubuntu harness")
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "drainstuck",
+		LRPNetworks: []string{"198.51.100.11/24"},
+		GatewayChassis: []testenv.GatewayChassisEntry{
+			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+		},
+	})
+	_ = router
+
+	cfg := testenv.Defaults()
+	on := true
+	off := false
+	cfg.DrainOnShutdown = &on
+	cfg.CleanupOnShutdown = &off // keep the shutdown path off NB reads/writes it can hang on
+	cfg.DrainTimeout = "3s"
+	cfg.ReconcileInterval = "2s"
+	a := readyAgent(t, cfg)
+
+	// Route must be installed before we stall NB, so the drain has real work
+	// (a Gateway_Chassis at priority 5) to lower.
+	testenv.AssertKernelRoute(t, "198.51.100.11", 15*time.Second)
+
+	// SIGSTOP only the NB ovsdb-server. SB stays up so ovn-controller does not
+	// cascade. The agent's drain now cannot complete its priority-lower NB
+	// write and must abort it at drain_timeout (3s).
+	resume := testenv.StopNBDatabase(t)
+
+	stopStart := time.Now()
+	if err := a.Stop(30 * time.Second); err != nil {
+		t.Fatalf("agent stop with NB stalled: %v", err)
+	}
+	stopElapsed := time.Since(stopStart)
+	// Restore NB immediately so the end-of-scenario ResetOVNState cleanup (an
+	// NB write) does not itself hang; the cleanup registered by StopNBDatabase
+	// would also resume it, but doing it here keeps the ordering obvious.
+	resume()
+
+	// Bound: 3s drain-transact deadline + up to 10s post-drain refreshState +
+	// teardown, comfortably under the 30s Stop ceiling. A regression that lets
+	// an NB write block past its deadline would push Stop toward SIGKILL.
+	if stopElapsed > 25*time.Second {
+		t.Errorf("Stop took %s with NB stalled; drain_timeout was not honoured", stopElapsed)
+	}
+
+	logs := a.LogTail(100000)
+	if !strings.Contains(logs, "drain failed") {
+		t.Errorf("expected the drain-failed log line (NB write hit its deadline); last logs:\n%s", a.LogTail(40))
+	}
 }
