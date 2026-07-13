@@ -9,10 +9,10 @@ import (
 )
 
 func (rm *RouteManager) SetupPortForward() error {
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would set up port forwarding")
 		return nil
 	}
@@ -20,10 +20,10 @@ func (rm *RouteManager) SetupPortForward() error {
 }
 
 func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snatIPs []string) error {
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would reconcile port forwarding")
 		return nil
 	}
@@ -31,10 +31,10 @@ func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snat
 }
 
 func (rm *RouteManager) TeardownPortForward() error {
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would tear down port forwarding")
 		return nil
 	}

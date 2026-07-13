@@ -26,7 +26,7 @@ func (rm *RouteManager) HasFRRRoute(ip string) bool {
 	if err := validateIP(ip); err != nil {
 		return false
 	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s %s/32", rm.vrfName, ip))
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s %s/32", rm.cfg.VRFName, ip))
 	if err != nil {
 		return false
 	}
@@ -116,19 +116,19 @@ func TestNewRouteManager(t *testing.T) {
 
 	rm := NewRouteManager(cfg)
 
-	if rm.bridgeDev != "br-ex" {
-		t.Errorf("bridgeDev = %q, want %q", rm.bridgeDev, "br-ex")
+	if rm.cfg.BridgeDev != "br-ex" {
+		t.Errorf("bridgeDev = %q, want %q", rm.cfg.BridgeDev, "br-ex")
 	}
-	if rm.vrfName != "vrf-provider" {
-		t.Errorf("vrfName = %q, want %q", rm.vrfName, "vrf-provider")
+	if rm.cfg.VRFName != "vrf-provider" {
+		t.Errorf("vrfName = %q, want %q", rm.cfg.VRFName, "vrf-provider")
 	}
-	if rm.vethNexthop != "169.254.0.1" {
-		t.Errorf("vethNexthop = %q, want %q", rm.vethNexthop, "169.254.0.1")
+	if rm.cfg.VethNexthop != "169.254.0.1" {
+		t.Errorf("vethNexthop = %q, want %q", rm.cfg.VethNexthop, "169.254.0.1")
 	}
-	if rm.routeTableID != 0 {
-		t.Errorf("routeTableID = %d, want 0", rm.routeTableID)
+	if rm.cfg.RouteTableID != 0 {
+		t.Errorf("routeTableID = %d, want 0", rm.cfg.RouteTableID)
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		t.Error("dryRun should be false by default")
 	}
 }
@@ -143,16 +143,13 @@ func TestNewRouteManagerWithTableID(t *testing.T) {
 
 	rm := NewRouteManager(cfg)
 
-	if rm.routeTableID != 100 {
-		t.Errorf("routeTableID = %d, want 100", rm.routeTableID)
+	if rm.cfg.RouteTableID != 100 {
+		t.Errorf("routeTableID = %d, want 100", rm.cfg.RouteTableID)
 	}
 }
 
 func TestDryRunBridgeIP(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev: "br-ex",
-		dryRun:    true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", DryRun: true}}
 
 	if err := rm.EnsureBridgeIP("169.254.169.254"); err != nil {
 		t.Errorf("EnsureBridgeIP() in dry-run should not error, got: %v", err)
@@ -163,10 +160,7 @@ func TestDryRunBridgeIP(t *testing.T) {
 }
 
 func TestDryRunOVSFlows(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev: "br-ex",
-		dryRun:    true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", DryRun: true}}
 
 	if err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}}); err != nil {
 		t.Errorf("EnsureSegments() in dry-run should not error, got: %v", err)
@@ -186,18 +180,13 @@ func TestNewRouteManagerDryRun(t *testing.T) {
 
 	rm := NewRouteManager(cfg)
 
-	if !rm.dryRun {
+	if !rm.cfg.DryRun {
 		t.Error("dryRun should be true when config has DryRun=true")
 	}
 }
 
 func TestDryRunFRRRoutes(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 
 	if err := rm.AddFRRRoute("10.0.0.1"); err != nil {
 		t.Errorf("AddFRRRoute() in dry-run should not error, got: %v", err)
@@ -208,12 +197,7 @@ func TestDryRunFRRRoutes(t *testing.T) {
 }
 
 func TestDryRunFRRRoutesBatch(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 
 	ips := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
 	if err := rm.AddFRRRoutes(ips); err != nil {
@@ -225,11 +209,7 @@ func TestDryRunFRRRoutesBatch(t *testing.T) {
 }
 
 func TestFRRRoutesBatchEmpty(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}}
 
 	if err := rm.AddFRRRoutes(nil); err != nil {
 		t.Errorf("AddFRRRoutes(nil) should be no-op, got: %v", err)
@@ -246,22 +226,14 @@ func TestFRRRoutesBatchEmpty(t *testing.T) {
 }
 
 func TestDryRunRefreshBGP(t *testing.T) {
-	rm := &RouteManager{
-		vrfName: "vrf-provider",
-		dryRun:  true,
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", DryRun: true}}
 	if err := rm.RefreshBGP(); err != nil {
 		t.Errorf("RefreshBGP() in dry-run should not error, got: %v", err)
 	}
 }
 
 func TestFRRRoutesBatchValidation(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:   "br-ex",
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		dryRun:      true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
 
 	// AddFRRRoutes now skips invalid entries instead of rejecting the whole
 	// batch, so a mixed list applies the valid IPs and returns nil. DelFRRRoutes
@@ -285,11 +257,7 @@ func TestFRRRoutesBatchValidation(t *testing.T) {
 // (issue #158 test b, FRR half).
 func TestAddFRRRoutesSkipsInvalidAndContinues(t *testing.T) {
 	rec := newVtyshRecorder()
-	rm := &RouteManager{
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 	if err := rm.AddFRRRoutes([]string{"10.0.0.1", "not-an-ip", "10.0.0.2"}); err != nil {
 		t.Fatalf("AddFRRRoutes: unexpected error %v", err)
 	}
@@ -318,17 +286,13 @@ func TestAddFRRRoutesContinuesPastFailedChunk(t *testing.T) {
 	}
 
 	var calls int
-	rm := &RouteManager{
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		execVtyshHook: func(*exec.Cmd) ([]byte, error) {
-			calls++
-			if calls == 1 {
-				return []byte("boom"), errors.New("vtysh failed")
-			}
-			return nil, nil
-		},
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: func(*exec.Cmd) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte("boom"), errors.New("vtysh failed")
+		}
+		return nil, nil
+	}}
 	err := rm.AddFRRRoutes(ips)
 	if err == nil {
 		t.Fatal("expected an aggregated error from the failed chunk, got nil")
@@ -353,33 +317,25 @@ func TestNewRouteManagerVethLeak(t *testing.T) {
 
 	rm := NewRouteManager(cfg)
 
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		t.Error("vethLeakEnabled should be true")
 	}
-	if rm.vethProviderIP != "169.254.0.2" {
-		t.Errorf("vethProviderIP = %q, want %q", rm.vethProviderIP, "169.254.0.2")
+	if rm.cfg.VethProviderIP != "169.254.0.2" {
+		t.Errorf("vethProviderIP = %q, want %q", rm.cfg.VethProviderIP, "169.254.0.2")
 	}
-	if rm.vethLeakTableID != 200 {
-		t.Errorf("vethLeakTableID = %d, want 200", rm.vethLeakTableID)
+	if rm.cfg.VethLeakTableID != 200 {
+		t.Errorf("vethLeakTableID = %d, want 200", rm.cfg.VethLeakTableID)
 	}
-	if rm.vethLeakRulePriority != 2000 {
-		t.Errorf("vethLeakRulePriority = %d, want 2000", rm.vethLeakRulePriority)
+	if rm.cfg.VethLeakRulePriority != 2000 {
+		t.Errorf("vethLeakRulePriority = %d, want 2000", rm.cfg.VethLeakRulePriority)
 	}
-	if len(rm.networkFilters) != 1 {
-		t.Errorf("networkFilters length = %d, want 1", len(rm.networkFilters))
+	if len(rm.cfg.NetworkFilters) != 1 {
+		t.Errorf("networkFilters length = %d, want 1", len(rm.cfg.NetworkFilters))
 	}
 }
 
 func TestDryRunVethLeak(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:       "br-ex",
-		vrfName:         "vrf-provider",
-		vethNexthop:     "169.254.0.1",
-		vethLeakEnabled: true,
-		vethProviderIP:  "169.254.0.2",
-		vethLeakTableID: 200,
-		dryRun:          true,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", VethLeakEnabled: true, VethProviderIP: "169.254.0.2", VethLeakTableID: 200, DryRun: true}}
 
 	if err := rm.SetupVethLeak(); err != nil {
 		t.Errorf("SetupVethLeak() in dry-run should not error, got: %v", err)
@@ -390,12 +346,7 @@ func TestDryRunVethLeak(t *testing.T) {
 }
 
 func TestDisabledVethLeak(t *testing.T) {
-	rm := &RouteManager{
-		bridgeDev:       "br-ex",
-		vrfName:         "vrf-provider",
-		vethNexthop:     "169.254.0.1",
-		vethLeakEnabled: false,
-	}
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", VethLeakEnabled: false}}
 
 	if err := rm.SetupVethLeak(); err != nil {
 		t.Errorf("SetupVethLeak() when disabled should not error, got: %v", err)
@@ -413,13 +364,13 @@ func TestNewRouteManagerFRRPrefixList(t *testing.T) {
 		FRRPrefixList: "ANNOUNCED-NETWORKS",
 	}
 	rm := NewRouteManager(cfg)
-	if rm.frrPrefixList != "ANNOUNCED-NETWORKS" {
-		t.Errorf("frrPrefixList = %q, want %q", rm.frrPrefixList, "ANNOUNCED-NETWORKS")
+	if rm.cfg.FRRPrefixList != "ANNOUNCED-NETWORKS" {
+		t.Errorf("frrPrefixList = %q, want %q", rm.cfg.FRRPrefixList, "ANNOUNCED-NETWORKS")
 	}
 }
 
 func TestReconcileFRRPrefixListDisabled(t *testing.T) {
-	rm := &RouteManager{frrPrefixList: ""}
+	rm := &RouteManager{cfg: Config{FRRPrefixList: ""}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}); err != nil {
 		t.Errorf("ReconcileFRRPrefixList() with empty name should be no-op, got: %v", err)
@@ -427,7 +378,7 @@ func TestReconcileFRRPrefixListDisabled(t *testing.T) {
 }
 
 func TestReconcileFRRPrefixListDryRun(t *testing.T) {
-	rm := &RouteManager{frrPrefixList: "ANNOUNCED-NETWORKS", dryRun: true}
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS", DryRun: true}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}); err != nil {
 		t.Errorf("ReconcileFRRPrefixList() in dry-run should not error, got: %v", err)
@@ -435,7 +386,7 @@ func TestReconcileFRRPrefixListDryRun(t *testing.T) {
 }
 
 func TestReconcileVethLeakNetworksDisabled(t *testing.T) {
-	rm := &RouteManager{vethLeakEnabled: false}
+	rm := &RouteManager{cfg: Config{VethLeakEnabled: false}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	if err := rm.ReconcileVethLeakNetworks([]*net.IPNet{cidr}); err != nil {
 		t.Errorf("ReconcileVethLeakNetworks() when disabled should be no-op, got: %v", err)
@@ -443,7 +394,7 @@ func TestReconcileVethLeakNetworksDisabled(t *testing.T) {
 }
 
 func TestReconcileVethLeakNetworksDryRun(t *testing.T) {
-	rm := &RouteManager{vethLeakEnabled: true, dryRun: true}
+	rm := &RouteManager{cfg: Config{VethLeakEnabled: true, DryRun: true}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
 	if err := rm.ReconcileVethLeakNetworks([]*net.IPNet{cidr}); err != nil {
 		t.Errorf("ReconcileVethLeakNetworks() in dry-run should not error, got: %v", err)
@@ -470,19 +421,19 @@ func TestNewRouteManagerPortForward(t *testing.T) {
 	}
 	rm := NewRouteManager(cfg)
 
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		t.Error("portForwardEnabled should be true")
 	}
-	if rm.portForwardDev != "loopback1" {
-		t.Errorf("portForwardDev = %q, want %q", rm.portForwardDev, "loopback1")
+	if rm.cfg.PortForwardDev != "loopback1" {
+		t.Errorf("portForwardDev = %q, want %q", rm.cfg.PortForwardDev, "loopback1")
 	}
-	if rm.portForwardTableID != 202 {
-		t.Errorf("portForwardTableID = %d, want %d", rm.portForwardTableID, 202)
+	if rm.cfg.PortForwardTableID != 202 {
+		t.Errorf("portForwardTableID = %d, want %d", rm.cfg.PortForwardTableID, 202)
 	}
-	if len(rm.portForwards) != 1 {
-		t.Errorf("len(portForwards) = %d, want 1", len(rm.portForwards))
+	if len(rm.cfg.PortForwards) != 1 {
+		t.Errorf("len(portForwards) = %d, want 1", len(rm.cfg.PortForwards))
 	}
-	if rm.portForwardL3mdevAccept {
+	if rm.cfg.PortForwardL3mdevAccept {
 		t.Error("portForwardL3mdevAccept should default to false")
 	}
 }
@@ -508,7 +459,7 @@ func TestNewRouteManagerPortForwardL3mdevAccept(t *testing.T) {
 	}
 	rm := NewRouteManager(cfg)
 
-	if !rm.portForwardL3mdevAccept {
+	if !rm.cfg.PortForwardL3mdevAccept {
 		t.Error("portForwardL3mdevAccept should be true when explicitly set")
 	}
 }
@@ -583,7 +534,7 @@ func TestIsNoSuchRule(t *testing.T) {
 }
 
 func TestHasFRRRoute_InvalidIPReturnsFalse(t *testing.T) {
-	rm := &RouteManager{vrfName: "vrf-provider"}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}}
 	// Invalid IP must short-circuit before any vtysh exec.
 	if rm.HasFRRRoute("not-an-ip") {
 		t.Error("HasFRRRoute(invalid IP) should return false")
@@ -598,7 +549,7 @@ func TestHasFRRRoute_InvalidIPReturnsFalse(t *testing.T) {
 
 func TestListFRRPrefixListEntries_DisabledReturnsNil(t *testing.T) {
 	// frrPrefixList empty → function returns (nil, nil) before any exec.
-	rm := &RouteManager{frrPrefixList: ""}
+	rm := &RouteManager{cfg: Config{FRRPrefixList: ""}}
 	entries, err := rm.ListFRRPrefixListEntries()
 	if err != nil {
 		t.Fatalf("expected nil error when prefix-list is disabled, got %v", err)
@@ -666,7 +617,7 @@ func TestHasFRRRoute_ParsesVtyshOutput(t *testing.T) {
 				[]string{"vtysh", "-c", "show ip route vrf vrf-provider 198.51.100.10/32"},
 				tt.output, tt.err,
 			)
-			rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+			rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 			if got := rm.HasFRRRoute("198.51.100.10"); got != tt.want {
 				t.Errorf("HasFRRRoute() = %v, want %v", got, tt.want)
 			}
@@ -691,7 +642,7 @@ S>* 192.0.2.99/32 [1/0] via 192.0.2.1, eth0, weight 1, 00:00:01
 	)
 	// The agent owns only statics via its own veth nexthop; an operator static
 	// via a different nexthop (192.0.2.1) must be excluded from the result.
-	rm := &RouteManager{vrfName: "vrf-provider", vethNexthop: "169.254.0.1", execVtyshHook: rec.hook()}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 
 	got, err := rm.ListFRRRoutes()
 	if err != nil {
@@ -709,7 +660,7 @@ func TestListFRRRoutes_PropagatesVtyshError(t *testing.T) {
 		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static"},
 		"connection refused", errors.New("exit 1"),
 	)
-	rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 	if _, err := rm.ListFRRRoutes(); err == nil {
 		t.Fatal("expected error from ListFRRRoutes when vtysh fails, got nil")
 	}
@@ -725,7 +676,7 @@ func TestInactiveFRRRoutes(t *testing.T) {
 }`
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", cmd}, j, nil)
-		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 		got, err := rm.InactiveFRRRoutes([]string{"198.51.100.10", "198.51.100.11"})
 		if err != nil {
 			t.Fatalf("InactiveFRRRoutes: %v", err)
@@ -744,7 +695,7 @@ func TestInactiveFRRRoutes(t *testing.T) {
 }`
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", cmd}, j, nil)
-		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 		got, err := rm.InactiveFRRRoutes([]string{"198.51.100.10", "198.51.100.11", "198.51.100.12"})
 		if err != nil {
 			t.Fatalf("InactiveFRRRoutes: %v", err)
@@ -758,7 +709,7 @@ func TestInactiveFRRRoutes(t *testing.T) {
 		j := `{"198.51.100.11/32":[{"prefix":"198.51.100.11/32","protocol":"static","selected":true}]}`
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", cmd}, j, nil)
-		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 		got, _ := rm.InactiveFRRRoutes([]string{"198.51.100.11"})
 		if !reflect.DeepEqual(got, []string{"198.51.100.11"}) {
 			t.Errorf("got %v, want [198.51.100.11]", got)
@@ -768,7 +719,7 @@ func TestInactiveFRRRoutes(t *testing.T) {
 	t.Run("empty body means nothing configured", func(t *testing.T) {
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", cmd}, "", nil)
-		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 		got, err := rm.InactiveFRRRoutes([]string{"198.51.100.10"})
 		if err != nil || got != nil {
 			t.Errorf("got (%v, %v), want (nil, nil)", got, err)
@@ -778,18 +729,18 @@ func TestInactiveFRRRoutes(t *testing.T) {
 	t.Run("vtysh error propagates", func(t *testing.T) {
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", cmd}, "boom", errors.New("exit 1"))
-		rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 		if _, err := rm.InactiveFRRRoutes([]string{"198.51.100.10"}); err == nil {
 			t.Fatal("expected error when vtysh fails")
 		}
 	})
 
 	t.Run("dry-run and empty input short-circuit", func(t *testing.T) {
-		rmDry := &RouteManager{vrfName: "vrf-provider", dryRun: true}
+		rmDry := &RouteManager{cfg: Config{VRFName: "vrf-provider", DryRun: true}}
 		if got, err := rmDry.InactiveFRRRoutes([]string{"198.51.100.10"}); got != nil || err != nil {
 			t.Errorf("dry-run: got (%v, %v), want (nil, nil)", got, err)
 		}
-		rm := &RouteManager{vrfName: "vrf-provider"}
+		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}}
 		if got, err := rm.InactiveFRRRoutes(nil); got != nil || err != nil {
 			t.Errorf("empty input: got (%v, %v), want (nil, nil)", got, err)
 		}
@@ -798,11 +749,7 @@ func TestInactiveFRRRoutes(t *testing.T) {
 
 func TestAddFRRRoutesBatchesVtyshCommands(t *testing.T) {
 	rec := newVtyshRecorder()
-	rm := &RouteManager{
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 	if err := rm.AddFRRRoutes([]string{"10.0.0.1", "10.0.0.2"}); err != nil {
 		t.Fatalf("AddFRRRoutes: %v", err)
 	}
@@ -823,11 +770,7 @@ func TestAddFRRRoutesBatchesVtyshCommands(t *testing.T) {
 
 func TestAddFRRRoutes_PropagatesVtyshError(t *testing.T) {
 	rec := newVtyshRecorder()
-	rm := &RouteManager{
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 	// Override the hook with one that always errors.
 	rm.execVtyshHook = func(cmd *exec.Cmd) ([]byte, error) {
 		rec.calls = append(rec.calls, append([]string{}, cmd.Args...))
@@ -840,11 +783,7 @@ func TestAddFRRRoutes_PropagatesVtyshError(t *testing.T) {
 
 func TestDelFRRRoutesBatchesVtyshCommands(t *testing.T) {
 	rec := newVtyshRecorder()
-	rm := &RouteManager{
-		vrfName:       "vrf-provider",
-		vethNexthop:   "169.254.0.1",
-		execVtyshHook: rec.hook(),
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 	if err := rm.DelFRRRoutes([]string{"10.0.0.1", "10.0.0.2"}); err != nil {
 		t.Fatalf("DelFRRRoutes: %v", err)
 	}
@@ -861,13 +800,9 @@ func TestDelFRRRoutesBatchesVtyshCommands(t *testing.T) {
 }
 
 func TestDelFRRRoutes_PropagatesVtyshError(t *testing.T) {
-	rm := &RouteManager{
-		vrfName:     "vrf-provider",
-		vethNexthop: "169.254.0.1",
-		execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
-			return []byte("err"), errors.New("vtysh failed")
-		},
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+		return []byte("err"), errors.New("vtysh failed")
+	}}
 	if err := rm.DelFRRRoutes([]string{"10.0.0.1"}); err == nil {
 		t.Fatal("expected error when vtysh exec fails, got nil")
 	}
@@ -875,7 +810,7 @@ func TestDelFRRRoutes_PropagatesVtyshError(t *testing.T) {
 
 func TestRefreshBGPInvokesVtysh(t *testing.T) {
 	rec := newVtyshRecorder()
-	rm := &RouteManager{vrfName: "vrf-provider", execVtyshHook: rec.hook()}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
 	if err := rm.RefreshBGP(); err != nil {
 		t.Fatalf("RefreshBGP: %v", err)
 	}
@@ -889,12 +824,9 @@ func TestRefreshBGPInvokesVtysh(t *testing.T) {
 }
 
 func TestRefreshBGP_PropagatesVtyshError(t *testing.T) {
-	rm := &RouteManager{
-		vrfName: "vrf-provider",
-		execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
-			return []byte("err"), errors.New("vtysh failed")
-		},
-	}
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+		return []byte("err"), errors.New("vtysh failed")
+	}}
 	if err := rm.RefreshBGP(); err == nil {
 		t.Fatal("expected error when BGP soft-refresh fails, got nil")
 	}
@@ -940,10 +872,7 @@ func TestListFRRPrefixListEntries_Parses(t *testing.T) {
 				[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS"},
 				tt.output, nil,
 			)
-			rm := &RouteManager{
-				frrPrefixList: "ANNOUNCED-NETWORKS",
-				execVtyshHook: rec.hook(),
-			}
+			rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
 			got, err := rm.ListFRRPrefixListEntries()
 			if err != nil {
 				t.Fatalf("ListFRRPrefixListEntries: %v", err)
@@ -956,12 +885,9 @@ func TestListFRRPrefixListEntries_Parses(t *testing.T) {
 }
 
 func TestListFRRPrefixListEntries_PropagatesVtyshError(t *testing.T) {
-	rm := &RouteManager{
-		frrPrefixList: "ANNOUNCED-NETWORKS",
-		execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
-			return []byte("err"), errors.New("vtysh failed")
-		},
-	}
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+		return []byte("err"), errors.New("vtysh failed")
+	}}
 	if _, err := rm.ListFRRPrefixListEntries(); err == nil {
 		t.Fatal("expected error when vtysh fails, got nil")
 	}
@@ -978,7 +904,7 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 		nil,
 	)
 
-	rm := &RouteManager{frrPrefixList: "ANNOUNCED-NETWORKS", execVtyshHook: rec.hook()}
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
 
 	_, desired1, _ := net.ParseCIDR("198.51.100.0/24")
 	_, desired2, _ := net.ParseCIDR("203.0.113.0/24") // new
@@ -1014,17 +940,14 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 
 func TestReconcileFRRPrefixList_AddFailureBailsOut(t *testing.T) {
 	calls := 0
-	rm := &RouteManager{
-		frrPrefixList: "ANNOUNCED-NETWORKS",
-		execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
-			calls++
-			joined := strings.Join(cmd.Args, " ")
-			if strings.Contains(joined, "show ip prefix-list") {
-				return nil, nil
-			}
-			return []byte("error output"), errors.New("vtysh add failed")
-		},
-	}
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
+		calls++
+		joined := strings.Join(cmd.Args, " ")
+		if strings.Contains(joined, "show ip prefix-list") {
+			return nil, nil
+		}
+		return []byte("error output"), errors.New("vtysh add failed")
+	}}
 	_, n, _ := net.ParseCIDR("198.51.100.0/24")
 	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n}); err == nil {
 		t.Fatal("expected error when add command fails, got nil")

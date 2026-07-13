@@ -9,32 +9,32 @@ import (
 )
 
 func (rm *RouteManager) CheckBridgeDevice() error {
-	if rm.dryRun {
-		slog.Info("[dry-run] skipping bridge device check", "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] skipping bridge device check", "dev", rm.cfg.BridgeDev)
 		return nil
 	}
 	return fmt.Errorf("kernel route management is only supported on Linux")
 }
 
 func (rm *RouteManager) EnsureBridgeIP(ip string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would add bridge IP", "ip", ip, "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would add bridge IP", "ip", ip, "dev", rm.cfg.BridgeDev)
 		return nil
 	}
 	return fmt.Errorf("bridge IP management is only supported on Linux")
 }
 
 func (rm *RouteManager) RemoveBridgeIP(ip string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would remove bridge IP", "ip", ip, "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would remove bridge IP", "ip", ip, "dev", rm.cfg.BridgeDev)
 		return nil
 	}
 	return fmt.Errorf("bridge IP management is only supported on Linux")
 }
 
 func (rm *RouteManager) EnableProxyARP() error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would enable proxy ARP", "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would enable proxy ARP", "dev", rm.cfg.BridgeDev)
 		return nil
 	}
 	return fmt.Errorf("proxy ARP is only supported on Linux")
@@ -49,7 +49,7 @@ func (rm *RouteManager) EnsureSegmentInterface(tag int) (string, string, error) 
 }
 
 func (rm *RouteManager) PruneSegmentInterfaces(keepTags map[int]bool) error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would prune stale segment interfaces", "keep", len(keepTags))
 		return nil
 	}
@@ -57,7 +57,7 @@ func (rm *RouteManager) PruneSegmentInterfaces(keepTags map[int]bool) error {
 }
 
 func (rm *RouteManager) TeardownSegmentInterfaces() error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would remove agent-created segment interfaces")
 		return nil
 	}
@@ -65,7 +65,7 @@ func (rm *RouteManager) TeardownSegmentInterfaces() error {
 }
 
 func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", dev)
 		return nil
 	}
@@ -73,7 +73,7 @@ func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 }
 
 func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would remove kernel route", "ip", ip, "dev", dev)
 		return nil
 	}
@@ -81,25 +81,25 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 }
 
 func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		return nil, nil
 	}
 	return nil, fmt.Errorf("kernel route management is only supported on Linux")
 }
 
 func (rm *RouteManager) CleanupRoutingTable() error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would flush routing table", "table", rm.routeTableID)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would flush routing table", "table", rm.cfg.RouteTableID)
 		return nil
 	}
 	return fmt.Errorf("routing table management is only supported on Linux")
 }
 
 func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would reconcile veth leak networks", "desired", len(desired))
 		return nil
 	}
@@ -107,10 +107,10 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 }
 
 func (rm *RouteManager) SetupVethLeak() error {
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would set up veth VRF leak")
 		return nil
 	}
@@ -118,10 +118,10 @@ func (rm *RouteManager) SetupVethLeak() error {
 }
 
 func (rm *RouteManager) TeardownVethLeak() error {
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would tear down veth VRF leak")
 		return nil
 	}

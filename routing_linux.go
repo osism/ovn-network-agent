@@ -24,35 +24,35 @@ const rtProtoOVNNetworkAgent = 44
 // has sufficient privileges (root or CAP_NET_ADMIN) for route management.
 // If the device exists but is not up, it will be brought up automatically.
 func (rm *RouteManager) CheckBridgeDevice() error {
-	if rm.dryRun {
-		slog.Info("[dry-run] skipping bridge device check", "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] skipping bridge device check", "dev", rm.cfg.BridgeDev)
 		return nil
 	}
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("agent must run as root (current euid: %d)", os.Geteuid())
 	}
-	link, err := netlink.LinkByName(rm.bridgeDev)
+	link, err := netlink.LinkByName(rm.cfg.BridgeDev)
 	if err != nil {
-		return fmt.Errorf("bridge device %s not found: %w", rm.bridgeDev, err)
+		return fmt.Errorf("bridge device %s not found: %w", rm.cfg.BridgeDev, err)
 	}
 	if link.Attrs().Flags&net.FlagUp == 0 {
-		slog.Info("bridge device is not up, bringing it up", "dev", rm.bridgeDev)
+		slog.Info("bridge device is not up, bringing it up", "dev", rm.cfg.BridgeDev)
 		if err := netlink.LinkSetUp(link); err != nil {
-			return fmt.Errorf("failed to bring up bridge device %s: %w", rm.bridgeDev, err)
+			return fmt.Errorf("failed to bring up bridge device %s: %w", rm.cfg.BridgeDev, err)
 		}
 	}
-	slog.Info("bridge device is up", "dev", rm.bridgeDev)
+	slog.Info("bridge device is up", "dev", rm.cfg.BridgeDev)
 	return nil
 }
 
 // EnsureBridgeIP adds a /32 IP address to the bridge device if not already present.
 // This gives the kernel a source IP for ARP resolution on the bridge.
 func (rm *RouteManager) EnsureBridgeIP(ip string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would add bridge IP", "ip", ip, "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would add bridge IP", "ip", ip, "dev", rm.cfg.BridgeDev)
 		return nil
 	}
-	return rm.ensureIPOnDev(ip, rm.bridgeDev)
+	return rm.ensureIPOnDev(ip, rm.cfg.BridgeDev)
 }
 
 // ensureIPOnDev adds a /32 IP address to the named device if not already
@@ -93,8 +93,8 @@ func (rm *RouteManager) ensureIPOnDev(ip, dev string) error {
 
 // RemoveBridgeIP removes the /32 IP address from the bridge device.
 func (rm *RouteManager) RemoveBridgeIP(ip string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would remove bridge IP", "ip", ip, "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would remove bridge IP", "ip", ip, "dev", rm.cfg.BridgeDev)
 		return nil
 	}
 	parsedIP := net.ParseIP(ip)
@@ -102,9 +102,9 @@ func (rm *RouteManager) RemoveBridgeIP(ip string) error {
 		return fmt.Errorf("invalid IP: %s", ip)
 	}
 
-	link, err := netlink.LinkByName(rm.bridgeDev)
+	link, err := netlink.LinkByName(rm.cfg.BridgeDev)
 	if err != nil {
-		return fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return fmt.Errorf("find bridge %s: %w", rm.cfg.BridgeDev, err)
 	}
 
 	addr := &netlink.Addr{
@@ -112,20 +112,20 @@ func (rm *RouteManager) RemoveBridgeIP(ip string) error {
 	}
 
 	if err := netlink.AddrDel(link, addr); err != nil {
-		return fmt.Errorf("remove IP %s/32 from %s: %w", ip, rm.bridgeDev, err)
+		return fmt.Errorf("remove IP %s/32 from %s: %w", ip, rm.cfg.BridgeDev, err)
 	}
-	slog.Info("bridge IP removed", "ip", ip, "dev", rm.bridgeDev)
+	slog.Info("bridge IP removed", "ip", ip, "dev", rm.cfg.BridgeDev)
 	return nil
 }
 
 // EnableProxyARP enables proxy ARP on the bridge device so the kernel responds
 // to ARP requests for any IP it has a route for on that interface.
 func (rm *RouteManager) EnableProxyARP() error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would enable proxy ARP", "dev", rm.bridgeDev)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would enable proxy ARP", "dev", rm.cfg.BridgeDev)
 		return nil
 	}
-	return rm.enableProxyARPOnDev(rm.bridgeDev)
+	return rm.enableProxyARPOnDev(rm.cfg.BridgeDev)
 }
 
 // enableProxyARPOnDev enables proxy ARP on the named device. Shared by the
@@ -141,9 +141,9 @@ func (rm *RouteManager) enableProxyARPOnDev(dev string) error {
 
 // GetBridgeMAC returns the hardware MAC address of the bridge device.
 func (rm *RouteManager) GetBridgeMAC() (net.HardwareAddr, error) {
-	link, err := netlink.LinkByName(rm.bridgeDev)
+	link, err := netlink.LinkByName(rm.cfg.BridgeDev)
 	if err != nil {
-		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return nil, fmt.Errorf("find bridge %s: %w", rm.cfg.BridgeDev, err)
 	}
 	return link.Attrs().HardwareAddr, nil
 }
@@ -180,14 +180,14 @@ func segmentIfaceName(bridgeDev string, tag int) (string, error) {
 // with the agent's link alias so pruning and teardown only ever touch links
 // the agent owns. Returns the interface name and its MAC address.
 func (rm *RouteManager) EnsureSegmentInterface(tag int) (string, string, error) {
-	name, err := segmentIfaceName(rm.bridgeDev, tag)
+	name, err := segmentIfaceName(rm.cfg.BridgeDev, tag)
 	if err != nil {
 		return "", "", err
 	}
 
-	parent, err := netlink.LinkByName(rm.bridgeDev)
+	parent, err := netlink.LinkByName(rm.cfg.BridgeDev)
 	if err != nil {
-		return "", "", fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return "", "", fmt.Errorf("find bridge %s: %w", rm.cfg.BridgeDev, err)
 	}
 
 	link, err := netlink.LinkByName(name)
@@ -224,8 +224,8 @@ func (rm *RouteManager) EnsureSegmentInterface(tag int) (string, string, error) 
 			return "", "", fmt.Errorf("bring up %s: %w", name, err)
 		}
 	}
-	if rm.bridgeIP != "" {
-		if err := rm.ensureIPOnDev(rm.bridgeIP, name); err != nil {
+	if rm.cfg.BridgeIP != "" {
+		if err := rm.ensureIPOnDev(rm.cfg.BridgeIP, name); err != nil {
 			return "", "", fmt.Errorf("ensure bridge IP on %s: %w", name, err)
 		}
 	}
@@ -259,7 +259,7 @@ func verifyAdoptedSegmentLink(link netlink.Link, tag, parentIndex int) error {
 // provider bridge whose tag is not in keepTags. Links without the agent's
 // ownership alias (operator-provisioned) are never touched.
 func (rm *RouteManager) PruneSegmentInterfaces(keepTags map[int]bool) error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would prune stale segment interfaces", "keep", len(keepTags))
 		return nil
 	}
@@ -283,7 +283,7 @@ func (rm *RouteManager) PruneSegmentInterfaces(keepTags map[int]bool) error {
 // TeardownSegmentInterfaces removes all agent-created VLAN interfaces on the
 // provider bridge. Called on shutdown cleanup.
 func (rm *RouteManager) TeardownSegmentInterfaces() error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would remove agent-created segment interfaces")
 		return nil
 	}
@@ -294,9 +294,9 @@ func (rm *RouteManager) TeardownSegmentInterfaces() error {
 // the agent's ownership alias. Adopted (operator-provisioned) links are
 // deliberately excluded so they are never deleted.
 func (rm *RouteManager) agentSegmentLinks() ([]*netlink.Vlan, error) {
-	parent, err := netlink.LinkByName(rm.bridgeDev)
+	parent, err := netlink.LinkByName(rm.cfg.BridgeDev)
 	if err != nil {
-		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return nil, fmt.Errorf("find bridge %s: %w", rm.cfg.BridgeDev, err)
 	}
 	links, err := netlink.LinkList()
 	if err != nil {
@@ -324,8 +324,8 @@ func (rm *RouteManager) agentSegmentLinks() ([]*netlink.Vlan, error) {
 // =============================================================================
 
 func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
-	if rm.dryRun {
-		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", dev, "table", rm.routeTableID)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would add kernel route", "ip", ip, "dev", dev, "table", rm.cfg.RouteTableID)
 		return nil
 	}
 	link, err := netlink.LinkByName(dev)
@@ -349,8 +349,8 @@ func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 		// routes the agent installed and never reaps operator-created ones.
 		Protocol: rtProtoOVNNetworkAgent,
 	}
-	if rm.routeTableID > 0 {
-		route.Table = rm.routeTableID
+	if rm.cfg.RouteTableID > 0 {
+		route.Table = rm.cfg.RouteTableID
 	}
 
 	if err := netlink.RouteReplace(route); err != nil {
@@ -359,19 +359,19 @@ func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 
 	// Add ip rule when using a dedicated routing table.
 	// If the rule fails, remove the route to avoid an orphaned route without a matching rule.
-	if rm.routeTableID > 0 {
+	if rm.cfg.RouteTableID > 0 {
 		if err := rm.ensureIPRule(dst); err != nil {
 			_ = netlink.RouteDel(route)
 			return fmt.Errorf("add ip rule for %s (route rolled back): %w", ip, err)
 		}
 	}
 
-	slog.Info("kernel route ensured", "ip", ip, "dev", dev, "table", rm.routeTableID)
+	slog.Info("kernel route ensured", "ip", ip, "dev", dev, "table", rm.cfg.RouteTableID)
 	return nil
 }
 
 func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would remove kernel route", "ip", ip, "dev", dev)
 		return nil
 	}
@@ -389,7 +389,7 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 	}
 
 	// Remove ip rule first (stop steering traffic before removing route).
-	if rm.routeTableID > 0 {
+	if rm.cfg.RouteTableID > 0 {
 		rm.removeIPRule(dst)
 	}
 
@@ -402,8 +402,8 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 		// can never remove an operator-created route for the same IP.
 		Protocol: rtProtoOVNNetworkAgent,
 	}
-	if rm.routeTableID > 0 {
-		route.Table = rm.routeTableID
+	if rm.cfg.RouteTableID > 0 {
+		route.Table = rm.cfg.RouteTableID
 	}
 
 	if err := netlink.RouteDel(route); err != nil {
@@ -425,15 +425,15 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 // any interface — so per-segment leftovers survive an agent restart; otherwise
 // routes on the bridge device and its VLAN subinterfaces are listed.
 func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		return nil, nil
 	}
 
-	if rm.routeTableID > 0 {
-		filter := &netlink.Route{Table: rm.routeTableID, Protocol: rtProtoOVNNetworkAgent}
+	if rm.cfg.RouteTableID > 0 {
+		filter := &netlink.Route{Table: rm.cfg.RouteTableID, Protocol: rtProtoOVNNetworkAgent}
 		routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PROTOCOL)
 		if err != nil {
-			return nil, fmt.Errorf("list routes in table %d: %w", rm.routeTableID, err)
+			return nil, fmt.Errorf("list routes in table %d: %w", rm.cfg.RouteTableID, err)
 		}
 		devByIndex := make(map[int]string)
 		var entries []kernelRouteEntry
@@ -490,9 +490,9 @@ func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
 // subinterface parented on it — agent-created or operator-provisioned —
 // i.e. all interfaces that may carry agent-managed /32 routes.
 func (rm *RouteManager) segmentCandidateLinks() ([]netlink.Link, error) {
-	parent, err := netlink.LinkByName(rm.bridgeDev)
+	parent, err := netlink.LinkByName(rm.cfg.BridgeDev)
 	if err != nil {
-		return nil, fmt.Errorf("find bridge %s: %w", rm.bridgeDev, err)
+		return nil, fmt.Errorf("find bridge %s: %w", rm.cfg.BridgeDev, err)
 	}
 	links, err := netlink.LinkList()
 	if err != nil {
@@ -515,7 +515,7 @@ func (rm *RouteManager) segmentCandidateLinks() ([]netlink.Link, error) {
 func (rm *RouteManager) ensureIPRule(dst *net.IPNet) error {
 	rule := netlink.NewRule()
 	rule.Dst = dst
-	rule.Table = rm.routeTableID
+	rule.Table = rm.cfg.RouteTableID
 	rule.Priority = 1000
 
 	if err := netlink.RuleAdd(rule); err != nil {
@@ -531,7 +531,7 @@ func (rm *RouteManager) ensureIPRule(dst *net.IPNet) error {
 func (rm *RouteManager) removeIPRule(dst *net.IPNet) {
 	rule := netlink.NewRule()
 	rule.Dst = dst
-	rule.Table = rm.routeTableID
+	rule.Table = rm.cfg.RouteTableID
 	rule.Priority = 1000
 
 	if err := netlink.RuleDel(rule); err != nil {
@@ -541,11 +541,11 @@ func (rm *RouteManager) removeIPRule(dst *net.IPNet) {
 
 // CleanupRoutingTable removes all routes and ip rules from the dedicated routing table.
 func (rm *RouteManager) CleanupRoutingTable() error {
-	if rm.routeTableID == 0 {
+	if rm.cfg.RouteTableID == 0 {
 		return nil
 	}
-	if rm.dryRun {
-		slog.Info("[dry-run] would flush routing table", "table", rm.routeTableID)
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would flush routing table", "table", rm.cfg.RouteTableID)
 		return nil
 	}
 
@@ -555,7 +555,7 @@ func (rm *RouteManager) CleanupRoutingTable() error {
 		return fmt.Errorf("list ip rules: %w", err)
 	}
 	for _, r := range rules {
-		if r.Table == rm.routeTableID {
+		if r.Table == rm.cfg.RouteTableID {
 			if err := netlink.RuleDel(&r); err != nil {
 				slog.Warn("failed to remove ip rule", "rule", r, "error", err)
 			}
@@ -563,10 +563,10 @@ func (rm *RouteManager) CleanupRoutingTable() error {
 	}
 
 	// Remove all routes in the table.
-	filter := &netlink.Route{Table: rm.routeTableID}
+	filter := &netlink.Route{Table: rm.cfg.RouteTableID}
 	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
 	if err != nil {
-		return fmt.Errorf("list routes in table %d: %w", rm.routeTableID, err)
+		return fmt.Errorf("list routes in table %d: %w", rm.cfg.RouteTableID, err)
 	}
 	for _, r := range routes {
 		if err := netlink.RouteDel(&r); err != nil {
@@ -574,7 +574,7 @@ func (rm *RouteManager) CleanupRoutingTable() error {
 		}
 	}
 
-	slog.Info("routing table flushed", "table", rm.routeTableID)
+	slog.Info("routing table flushed", "table", rm.cfg.RouteTableID)
 	return nil
 }
 
@@ -592,25 +592,25 @@ const vethPrefixLen = 30
 // SetupVethLeak creates a veth pair for selective route leaking between the
 // default VRF and the provider VRF.  The method is idempotent.
 func (rm *RouteManager) SetupVethLeak() error {
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		slog.Debug("veth VRF leak disabled, skipping setup")
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would set up veth VRF leak",
 			"veth_default", vethDefaultName,
 			"veth_provider", vethProviderName,
-			"nexthop", rm.vethNexthop,
-			"provider_ip", rm.vethProviderIP,
-			"table", rm.vethLeakTableID,
-			"priority", rm.vethLeakRulePriority,
-			"networks", rm.networkFilters,
+			"nexthop", rm.cfg.VethNexthop,
+			"provider_ip", rm.cfg.VethProviderIP,
+			"table", rm.cfg.VethLeakTableID,
+			"priority", rm.cfg.VethLeakRulePriority,
+			"networks", rm.cfg.NetworkFilters,
 		)
 		return nil
 	}
 
-	nexthopIP := net.ParseIP(rm.vethNexthop)
-	providerIP := net.ParseIP(rm.vethProviderIP)
+	nexthopIP := net.ParseIP(rm.cfg.VethNexthop)
+	providerIP := net.ParseIP(rm.cfg.VethProviderIP)
 
 	// 1. Create veth pair (or reuse existing)
 	var vethDefault, vethProvider netlink.Link
@@ -639,12 +639,12 @@ func (rm *RouteManager) SetupVethLeak() error {
 	}
 
 	// 2. Place veth-provider into VRF
-	vrfLink, err := netlink.LinkByName(rm.vrfName)
+	vrfLink, err := netlink.LinkByName(rm.cfg.VRFName)
 	if err != nil {
-		return fmt.Errorf("find VRF %s: %w", rm.vrfName, err)
+		return fmt.Errorf("find VRF %s: %w", rm.cfg.VRFName, err)
 	}
 	if err := netlink.LinkSetMaster(vethProvider, vrfLink); err != nil {
-		return fmt.Errorf("set %s master to %s: %w", vethProviderName, rm.vrfName, err)
+		return fmt.Errorf("set %s master to %s: %w", vethProviderName, rm.cfg.VRFName, err)
 	}
 
 	// 3. Assign IPs (AddrReplace for idempotency)
@@ -705,25 +705,25 @@ func (rm *RouteManager) SetupVethLeak() error {
 	if err := netlink.RouteReplace(&netlink.Route{
 		LinkIndex: vethDefault.Attrs().Index,
 		Gw:        providerIP,
-		Table:     rm.vethLeakTableID,
+		Table:     rm.cfg.VethLeakTableID,
 	}); err != nil {
-		return fmt.Errorf("add default route in table %d: %w", rm.vethLeakTableID, err)
+		return fmt.Errorf("add default route in table %d: %w", rm.cfg.VethLeakTableID, err)
 	}
 
 	// Per-network routes and policy rules are managed dynamically by
 	// ReconcileVethLeakNetworks() during each reconciliation cycle.
 	// If static network_cidr is configured, set up initial per-network
 	// routes now for backwards compatibility.
-	if len(rm.networkFilters) > 0 {
-		if err := rm.ReconcileVethLeakNetworks(rm.networkFilters); err != nil {
+	if len(rm.cfg.NetworkFilters) > 0 {
+		if err := rm.ReconcileVethLeakNetworks(rm.cfg.NetworkFilters); err != nil {
 			return fmt.Errorf("initial veth leak network setup: %w", err)
 		}
 	}
 
 	slog.Info("veth VRF leak setup complete",
-		"nexthop", rm.vethNexthop,
-		"provider_ip", rm.vethProviderIP,
-		"table", rm.vethLeakTableID,
+		"nexthop", rm.cfg.VethNexthop,
+		"provider_ip", rm.cfg.VethProviderIP,
+		"table", rm.cfg.VethLeakTableID,
 	)
 	return nil
 }
@@ -731,16 +731,16 @@ func (rm *RouteManager) SetupVethLeak() error {
 // TeardownVethLeak removes all veth leak resources. Errors on missing resources
 // are silently ignored so the method is safe to call even if setup was partial.
 func (rm *RouteManager) TeardownVethLeak() error {
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		slog.Debug("veth VRF leak disabled, skipping teardown")
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would tear down veth VRF leak")
 		return nil
 	}
 
-	providerIP := net.ParseIP(rm.vethProviderIP)
+	providerIP := net.ParseIP(rm.cfg.VethProviderIP)
 
 	// Steps 1-3 explicitly remove rules/routes before step 4 deletes the veth pair.
 	// The kernel would garbage-collect connected routes on link deletion, but explicit
@@ -751,7 +751,7 @@ func (rm *RouteManager) TeardownVethLeak() error {
 	rules, err := netlink.RuleList(netlink.FAMILY_V4)
 	if err == nil {
 		for _, r := range rules {
-			if r.Table == rm.vethLeakTableID && r.Priority == rm.vethLeakRulePriority {
+			if r.Table == rm.cfg.VethLeakTableID && r.Priority == rm.cfg.VethLeakRulePriority {
 				if err := netlink.RuleDel(&r); err != nil {
 					slog.Warn("failed to remove veth leak policy rule", "src", r.Src, "error", err)
 				} else {
@@ -767,7 +767,7 @@ func (rm *RouteManager) TeardownVethLeak() error {
 		if err := netlink.RouteDel(&netlink.Route{
 			LinkIndex: vethDefault.Attrs().Index,
 			Gw:        providerIP,
-			Table:     rm.vethLeakTableID,
+			Table:     rm.cfg.VethLeakTableID,
 		}); err != nil {
 			if isNoSuchRoute(err) {
 				slog.Debug("veth leak default route already absent")
@@ -818,15 +818,15 @@ func (rm *RouteManager) TeardownVethLeak() error {
 // ReconcileVethLeakNetworks ensures per-network VRF routes and policy rules
 // match the desired set of networks. Pass nil to remove all per-network state.
 func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
-	if !rm.vethLeakEnabled {
+	if !rm.cfg.VethLeakEnabled {
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would reconcile veth leak networks", "desired", len(desired))
 		return nil
 	}
 
-	nexthopIP := net.ParseIP(rm.vethNexthop)
+	nexthopIP := net.ParseIP(rm.cfg.VethNexthop)
 
 	vethProvider, err := netlink.LinkByName(vethProviderName)
 	if err != nil {
@@ -879,7 +879,7 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 	}
 	currentRules := make(map[string]bool, len(allRules))
 	for _, r := range allRules {
-		if r.Table != rm.vethLeakTableID || r.Priority != rm.vethLeakRulePriority || r.Src == nil {
+		if r.Table != rm.cfg.VethLeakTableID || r.Priority != rm.cfg.VethLeakRulePriority || r.Src == nil {
 			continue
 		}
 		currentRules[r.Src.String()] = true
@@ -911,8 +911,8 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 		}
 		rule := netlink.NewRule()
 		rule.Src = network
-		rule.Table = rm.vethLeakTableID
-		rule.Priority = rm.vethLeakRulePriority
+		rule.Table = rm.cfg.VethLeakTableID
+		rule.Priority = rm.cfg.VethLeakRulePriority
 		if err := netlink.RuleAdd(rule); err != nil {
 			if !isFileExists(err) {
 				return fmt.Errorf("add policy rule for %s: %w", network, err)
@@ -951,7 +951,7 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 		slog.Warn("failed to list policy rules for reconciliation", "error", err)
 	} else {
 		for _, r := range rules {
-			if r.Table != rm.vethLeakTableID || r.Priority != rm.vethLeakRulePriority || r.Src == nil {
+			if r.Table != rm.cfg.VethLeakTableID || r.Priority != rm.cfg.VethLeakRulePriority || r.Src == nil {
 				continue
 			}
 			if _, wanted := desiredSet[r.Src.String()]; !wanted {
@@ -971,13 +971,13 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 
 // getVRFTableID returns the routing table ID associated with the VRF.
 func (rm *RouteManager) getVRFTableID() (int, error) {
-	link, err := netlink.LinkByName(rm.vrfName)
+	link, err := netlink.LinkByName(rm.cfg.VRFName)
 	if err != nil {
-		return 0, fmt.Errorf("find VRF %s: %w", rm.vrfName, err)
+		return 0, fmt.Errorf("find VRF %s: %w", rm.cfg.VRFName, err)
 	}
 	vrf, ok := link.(*netlink.Vrf)
 	if !ok {
-		return 0, fmt.Errorf("%s is not a VRF device", rm.vrfName)
+		return 0, fmt.Errorf("%s is not a VRF device", rm.cfg.VRFName)
 	}
 	return int(vrf.Table), nil
 }

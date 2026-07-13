@@ -21,15 +21,15 @@ func nftCmd(args ...string) ([]byte, error) {
 // SetupPortForward performs the initial port forwarding setup.
 // Must be called after SetupVethLeak (requires the veth pair to exist).
 func (rm *RouteManager) SetupPortForward() error {
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		slog.Debug("port forwarding disabled, skipping setup")
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would set up port forwarding",
-			"dev", rm.portForwardDev,
-			"table", rm.portForwardTableID,
-			"vips", len(rm.portForwards),
+			"dev", rm.cfg.PortForwardDev,
+			"table", rm.cfg.PortForwardTableID,
+			"vips", len(rm.cfg.PortForwards),
 		)
 		return nil
 	}
@@ -61,9 +61,9 @@ func (rm *RouteManager) SetupPortForward() error {
 	}
 
 	slog.Info("port forwarding setup complete",
-		"dev", rm.portForwardDev,
-		"table", rm.portForwardTableID,
-		"vips", len(rm.portForwards),
+		"dev", rm.cfg.PortForwardDev,
+		"table", rm.cfg.PortForwardTableID,
+		"vips", len(rm.cfg.PortForwards),
 	)
 	return nil
 }
@@ -74,11 +74,11 @@ func (rm *RouteManager) SetupPortForward() error {
 // snatIPs are the router SNAT external IPs from OVN state, used for
 // router_masquerade rules.
 func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snatIPs []string) error {
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		return nil
 	}
-	if rm.dryRun {
-		slog.Info("[dry-run] would reconcile port forwarding", "vips", len(rm.portForwards))
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would reconcile port forwarding", "vips", len(rm.cfg.PortForwards))
 		return nil
 	}
 
@@ -98,11 +98,11 @@ func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snat
 // Must be called before TeardownVethLeak. Best-effort: attempts all
 // cleanup steps and returns the first error encountered.
 func (rm *RouteManager) TeardownPortForward() error {
-	if !rm.portForwardEnabled {
+	if !rm.cfg.PortForwardEnabled {
 		slog.Debug("port forwarding disabled, skipping teardown")
 		return nil
 	}
-	if rm.dryRun {
+	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would tear down port forwarding")
 		return nil
 	}
@@ -129,9 +129,9 @@ func (rm *RouteManager) TeardownPortForward() error {
 	rm.cleanupDNATRouting()
 
 	// 3. Remove managed VIP addresses.
-	link, err := netlink.LinkByName(rm.portForwardDev)
+	link, err := netlink.LinkByName(rm.cfg.PortForwardDev)
 	if err == nil {
-		for _, pf := range rm.portForwards {
+		for _, pf := range rm.cfg.PortForwards {
 			if !pf.ManageVIP {
 				continue
 			}
@@ -143,7 +143,7 @@ func (rm *RouteManager) TeardownPortForward() error {
 				slog.Warn("failed to remove VIP address", "vip", pf.VIP, "error", err)
 				recordErr(fmt.Errorf("remove VIP %s: %w", pf.VIP, err))
 			} else {
-				slog.Info("VIP address removed", "vip", pf.VIP, "dev", rm.portForwardDev)
+				slog.Info("VIP address removed", "vip", pf.VIP, "dev", rm.cfg.PortForwardDev)
 			}
 		}
 	}
@@ -187,11 +187,11 @@ func (rm *RouteManager) ensureDNATRouting() error {
 	replyRule := netlink.NewRule()
 	replyRule.Mark = dnatReplyFwmark
 	replyRule.Mask = &replyMask
-	replyRule.Table = rm.portForwardTableID
+	replyRule.Table = rm.cfg.PortForwardTableID
 	replyRule.Priority = dnatReplyPriority
 	if err := netlink.RuleAdd(replyRule); err != nil {
 		if !isFileExists(err) {
-			return fmt.Errorf("add ip rule fwmark 0x%x lookup %d: %w", dnatReplyFwmark, rm.portForwardTableID, err)
+			return fmt.Errorf("add ip rule fwmark 0x%x lookup %d: %w", dnatReplyFwmark, rm.cfg.PortForwardTableID, err)
 		}
 	}
 
@@ -202,19 +202,19 @@ func (rm *RouteManager) ensureDNATRouting() error {
 	if err != nil {
 		return fmt.Errorf("find %s for DNAT reply route: %w", vethDefaultName, err)
 	}
-	providerIP := net.ParseIP(rm.vethProviderIP)
+	providerIP := net.ParseIP(rm.cfg.VethProviderIP)
 	if err := netlink.RouteReplace(&netlink.Route{
 		Dst:       &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
 		LinkIndex: vethLink.Attrs().Index,
 		Gw:        providerIP,
-		Table:     rm.portForwardTableID,
+		Table:     rm.cfg.PortForwardTableID,
 	}); err != nil {
-		return fmt.Errorf("add default route via %s table %d: %w", vethDefaultName, rm.portForwardTableID, err)
+		return fmt.Errorf("add default route via %s table %d: %w", vethDefaultName, rm.cfg.PortForwardTableID, err)
 	}
 
 	slog.Debug("DNAT policy routing ensured",
 		"fwd_table", "main",
-		"reply_table", rm.portForwardTableID,
+		"reply_table", rm.cfg.PortForwardTableID,
 		"reply_via", vethDefaultName,
 	)
 	return nil
@@ -241,7 +241,7 @@ func (rm *RouteManager) cleanupDNATRouting() {
 	replyRule := netlink.NewRule()
 	replyRule.Mark = dnatReplyFwmark
 	replyRule.Mask = &replyMask
-	replyRule.Table = rm.portForwardTableID
+	replyRule.Table = rm.cfg.PortForwardTableID
 	replyRule.Priority = dnatReplyPriority
 	if err := netlink.RuleDel(replyRule); err != nil {
 		slog.Debug("DNAT reply ip rule already absent", "error", err)
@@ -250,7 +250,7 @@ func (rm *RouteManager) cleanupDNATRouting() {
 	}
 
 	// Flush routes from the port-forward reply table.
-	filter := &netlink.Route{Table: rm.portForwardTableID}
+	filter := &netlink.Route{Table: rm.cfg.PortForwardTableID}
 	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
 	if err == nil {
 		for _, r := range routes {
@@ -262,12 +262,12 @@ func (rm *RouteManager) cleanupDNATRouting() {
 // reconcilePortForwardVIPs ensures managed VIP /32 addresses are present on the
 // loopback device. Uses AddrReplace for idempotency.
 func (rm *RouteManager) reconcilePortForwardVIPs() error {
-	link, err := netlink.LinkByName(rm.portForwardDev)
+	link, err := netlink.LinkByName(rm.cfg.PortForwardDev)
 	if err != nil {
-		return fmt.Errorf("find device %s: %w", rm.portForwardDev, err)
+		return fmt.Errorf("find device %s: %w", rm.cfg.PortForwardDev, err)
 	}
 
-	for _, pf := range rm.portForwards {
+	for _, pf := range rm.cfg.PortForwards {
 		if !pf.ManageVIP {
 			continue
 		}
@@ -276,9 +276,9 @@ func (rm *RouteManager) reconcilePortForwardVIPs() error {
 			IPNet: &net.IPNet{IP: vipIP, Mask: net.CIDRMask(32, 32)},
 		}
 		if err := netlink.AddrReplace(link, addr); err != nil {
-			return fmt.Errorf("add VIP %s/32 to %s: %w", pf.VIP, rm.portForwardDev, err)
+			return fmt.Errorf("add VIP %s/32 to %s: %w", pf.VIP, rm.cfg.PortForwardDev, err)
 		}
-		slog.Debug("VIP address ensured", "vip", pf.VIP, "dev", rm.portForwardDev)
+		slog.Debug("VIP address ensured", "vip", pf.VIP, "dev", rm.cfg.PortForwardDev)
 	}
 	return nil
 }
@@ -287,7 +287,7 @@ func (rm *RouteManager) reconcilePortForwardVIPs() error {
 // The delete + create is submitted as a single nft -f input to avoid a window
 // where no rules exist.
 func (rm *RouteManager) applyNftRuleset(providerNetworks []*net.IPNet, snatIPs []string) error {
-	ruleset := buildNftRuleset(rm.portForwards, providerNetworks, snatIPs, rm.portForwardCTZone)
+	ruleset := buildNftRuleset(rm.cfg.PortForwards, providerNetworks, snatIPs, rm.cfg.PortForwardCTZone)
 
 	// Combine delete (if exists) and create into a single atomic nft load.
 	// The delete may fail on first run (table doesn't exist yet), so we
@@ -331,12 +331,12 @@ func (rm *RouteManager) ensureVethForwarding() error {
 			return fmt.Errorf("enable forwarding on %s: %w", dev, err)
 		}
 	}
-	if rm.portForwardEnabled {
+	if rm.cfg.PortForwardEnabled {
 		path := filepath.Join("/proc/sys/net/ipv4/conf", vethProviderName, "accept_local")
 		if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
 			return fmt.Errorf("enable accept_local on %s: %w", vethProviderName, err)
 		}
-		if rm.portForwardL3mdevAccept {
+		if rm.cfg.PortForwardL3mdevAccept {
 			for _, sysctl := range []string{
 				"/proc/sys/net/ipv4/udp_l3mdev_accept",
 				"/proc/sys/net/ipv4/tcp_l3mdev_accept",
