@@ -208,6 +208,68 @@ func TestGetStateIncludesAllChassisNames(t *testing.T) {
 	}
 }
 
+func TestHostnamesEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"identical short", "host-a", "host-a", true},
+		{"fqdn vs short", "host-a.example.com", "host-a", true},
+		{"both fqdn", "host-a.example.com", "host-a.internal", true},
+		{"case insensitive label", "HOST-A.example.com", "host-a", true},
+		{"different host", "host-a.example.com", "host-b", false},
+		{"different host both fqdn", "host-a.example.com", "host-b.example.com", false},
+		{"empty vs short", "", "host-a", false},
+		{"both empty", "", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hostnamesEqual(tc.a, tc.b); got != tc.want {
+				t.Errorf("hostnamesEqual(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefreshStateMatchesFQDNChassisHostname pins the domain-strip fix: SB
+// Chassis.hostname is an FQDN while the agent's local chassis name is the
+// short form. An exact-match comparison would treat the local router as
+// remote and drop it; the shortHostname join must recognise it as local and
+// normalise the AllChassisNames set to the short label cleanupStaleChassis
+// expects.
+func TestRefreshStateMatchesFQDNChassisHostname(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+
+	sb.setRows("Chassis",
+		&SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a.example.com"},
+	)
+	chA := "ch-a"
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-1", LogicalPort: "cr-lrp-local", Type: "chassisredirect", Chassis: &chA,
+	})
+	nb.setRows("Logical_Router_Port", &NBLogicalRouterPort{
+		UUID: "lrp-uuid-local", Name: "lrp-local",
+		MAC: "fa:16:3e:aa:aa:aa", Networks: []string{"198.51.100.1/24"},
+	})
+	nb.setRows("Logical_Router", &NBLogicalRouter{
+		UUID: "lr-local", Name: "router-local",
+		Ports: []string{"lrp-uuid-local"}, Nat: []string{"nat-fip"},
+	})
+	nb.setRows("NAT", &NBNAT{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"})
+
+	c.state.LocalChassisName = "host-a"
+	c.refreshState(context.Background())
+	snap := c.GetState()
+
+	if !snap.HasLocalRouters {
+		t.Fatal("HasLocalRouters = false — FQDN chassis hostname not matched to short local name")
+	}
+	if !snap.AllChassisNames["host-a"] {
+		t.Errorf("AllChassisNames = %v, want normalized short key host-a", snap.AllChassisNames)
+	}
+}
+
 func TestParseNatAddressIPs(t *testing.T) {
 	tests := []struct {
 		name    string
