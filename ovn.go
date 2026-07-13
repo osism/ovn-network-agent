@@ -93,10 +93,14 @@ type NBLogicalRouter struct {
 }
 
 type NBLogicalRouterPort struct {
-	UUID     string   `ovsdb:"_uuid"`
-	Name     string   `ovsdb:"name"`
-	MAC      string   `ovsdb:"mac"`
-	Networks []string `ovsdb:"networks"`
+	UUID string `ovsdb:"_uuid"`
+	Name string `ovsdb:"name"`
+	MAC  string `ovsdb:"mac"`
+	// GatewayChassis holds the UUIDs of this port's Gateway_Chassis rows.
+	// It is the schema-backed LRP↔HA-group join EnsureActivePriorityLead
+	// relies on, in place of parsing the Gateway_Chassis name.
+	GatewayChassis []string `ovsdb:"gateway_chassis"`
+	Networks       []string `ovsdb:"networks"`
 }
 
 type NBLogicalRouterStaticRoute struct {
@@ -164,6 +168,10 @@ type LocalRouterInfo struct {
 	LRPNetworks []string         // NB Logical_Router_Port networks (e.g. ["198.51.100.11/24"])
 	CRPort      string           // SB chassisredirect logical_port (e.g. "cr-lrp-abc123")
 	Segment     *LocalnetSegment // localnet segment of the external network; nil = unresolved
+	// GatewayChassisUUIDs are the LRP's Gateway_Chassis row UUIDs, carried
+	// straight from the NB reference column so EnsureActivePriorityLead can
+	// group HA rows by LRP without parsing their names.
+	GatewayChassisUUIDs []string
 }
 
 // segmentName returns the localnet port name of a router's segment, or ""
@@ -724,14 +732,15 @@ func collectLocalRouters(
 		}
 		segment := segmentByLRP[matchedLRP.Name]
 		localRouters = append(localRouters, LocalRouterInfo{
-			RouterName:  router.Name,
-			RouterUUID:  router.UUID,
-			LRPName:     matchedLRP.Name,
-			LRPUUID:     matchedLRP.UUID,
-			LRPMAC:      matchedLRP.MAC,
-			LRPNetworks: matchedLRP.Networks,
-			CRPort:      localLRPNames[matchedLRP.Name],
-			Segment:     segment,
+			RouterName:          router.Name,
+			RouterUUID:          router.UUID,
+			LRPName:             matchedLRP.Name,
+			LRPUUID:             matchedLRP.UUID,
+			LRPMAC:              matchedLRP.MAC,
+			LRPNetworks:         matchedLRP.Networks,
+			CRPort:              localLRPNames[matchedLRP.Name],
+			Segment:             segment,
+			GatewayChassisUUIDs: matchedLRP.GatewayChassis,
 		})
 		for _, natUUID := range router.Nat {
 			if matchedLRP.MAC != "" {

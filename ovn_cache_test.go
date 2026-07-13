@@ -337,6 +337,45 @@ func TestKeyOfSBPortBindingIncludesSegmentColumns(t *testing.T) {
 	}
 }
 
+// TestKeyOfNBLogicalRouterPortIncludesGatewayChassis guards the LRP↔HA-group
+// join: EnsureActivePriorityLead now groups Gateway_Chassis rows by the LRP's
+// gateway_chassis reference column, so a dropped UPDATE to it must register as
+// content drift — otherwise a stale cache would silently skip the
+// anti-flapping priority boost.
+func TestKeyOfNBLogicalRouterPortIncludesGatewayChassis(t *testing.T) {
+	base := NBLogicalRouterPort{
+		UUID: "lrp-1", Name: "lrp-a", MAC: "fa:16:3e:aa:aa:aa",
+		Networks:       []string{"198.51.100.1/24"},
+		GatewayChassis: []string{"g1", "g2"},
+	}
+	variants := map[string]NBLogicalRouterPort{
+		"gateway_chassis member changed": func() NBLogicalRouterPort {
+			v := base
+			v.GatewayChassis = []string{"g1", "g3"}
+			return v
+		}(),
+		"gateway_chassis cleared": func() NBLogicalRouterPort {
+			v := base
+			v.GatewayChassis = nil
+			return v
+		}(),
+	}
+
+	baseKey := keyOfNBLogicalRouterPort(base)
+	for name, v := range variants {
+		if keyOfNBLogicalRouterPort(v) == baseKey {
+			t.Errorf("%s: content key did not change", name)
+		}
+	}
+
+	// OVSDB sets are unordered: a reordered set is not drift.
+	reordered := base
+	reordered.GatewayChassis = []string{"g2", "g1"}
+	if keyOfNBLogicalRouterPort(reordered) != baseKey {
+		t.Error("reordered gateway_chassis set must not register as drift")
+	}
+}
+
 // TestKeyOfSBPortBindingIncludesExternalIDs guards the SB-NAT filter input:
 // step 5b keys the router-gateway address off Port_Binding.external_ids
 // (neutron:device_owner), so a dropped UPDATE to that map must register as

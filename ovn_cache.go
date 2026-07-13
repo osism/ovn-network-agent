@@ -51,7 +51,7 @@ var (
 	pbCheckColumns   = []string{"_uuid", "type", "chassis", "nat_addresses", "datapath", "tag", "options", "external_ids"}
 	chCheckColumns   = []string{"_uuid", "hostname"}
 	lrCheckColumns   = []string{"_uuid", "ports", "nat", "static_routes"}
-	lrpCheckColumns  = []string{"_uuid", "mac", "networks"}
+	lrpCheckColumns  = []string{"_uuid", "mac", "networks", "gateway_chassis"}
 	natCheckColumns  = []string{"_uuid", "type", "external_ip"}
 	lrsrCheckColumns = []string{"_uuid", "ip_prefix", "nexthop", "output_port", "external_ids"}
 	smbCheckColumns  = []string{"_uuid", "logical_port", "ip", "mac"}
@@ -81,7 +81,7 @@ func keyOfNBLogicalRouter(r NBLogicalRouter) string {
 }
 
 func keyOfNBLogicalRouterPort(p NBLogicalRouterPort) string {
-	return contentKey(p.UUID, p.MAC, sortedJoin(p.Networks))
+	return contentKey(p.UUID, p.MAC, sortedJoin(p.Networks), sortedJoin(p.GatewayChassis))
 }
 
 func keyOfNBNAT(n NBNAT) string {
@@ -310,10 +310,11 @@ func decodeNBLogicalRouter(row ovsdb.Row) NBLogicalRouter {
 
 func decodeNBLogicalRouterPort(row ovsdb.Row) NBLogicalRouterPort {
 	return NBLogicalRouterPort{
-		UUID:     rowUUID(row),
-		Name:     rowString(row, "name"),
-		MAC:      rowString(row, "mac"),
-		Networks: rowStringSet(row, "networks"),
+		UUID:           rowUUID(row),
+		Name:           rowString(row, "name"),
+		MAC:            rowString(row, "mac"),
+		GatewayChassis: rowStringSet(row, "gateway_chassis"),
+		Networks:       rowStringSet(row, "networks"),
 	}
 }
 
