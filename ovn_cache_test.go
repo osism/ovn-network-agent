@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 )
@@ -94,6 +95,50 @@ func TestAuthoritativeListServerSelectErrorTrustsCache(t *testing.T) {
 		keyOfSBChassis, decodeSBChassis)
 	if !reflect.DeepEqual(got, cached) {
 		t.Errorf("got %+v, want cache snapshot %+v on select error", got, cached)
+	}
+}
+
+// blockingTransactClient models an OVSDB server that is reachable at the TCP
+// level but never answers — a SIGSTOP'd ovsdb-server or a blackholed network.
+// Under client.WithReconnect a real Transact blocks on its context in exactly
+// this way instead of returning an error.
+type blockingTransactClient struct {
+	*fakeOVSDBClient
+}
+
+func (b *blockingTransactClient) Transact(ctx context.Context, _ ...ovsdb.Operation) ([]ovsdb.OperationResult, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestAuthoritativeListBoundsStuckServerSelect: a select against an
+// unresponsive server must degrade to the monitor cache within
+// consistencySelectTimeout instead of blocking on the caller's context. An
+// unbounded select stalls reconciliation for the whole outage, and — because
+// a blocked Transact holds the libovsdb client mutex read-side — blocks the
+// inactivity probe's Disconnect, so the client can never start reconnecting.
+// TestScenario_OVNReconnectAfterLongOutage pins the full path in CI.
+func TestAuthoritativeListBoundsStuckServerSelect(t *testing.T) {
+	_, _, sb := newOVNClientWithFakes(t, "host-a")
+	blocked := &blockingTransactClient{fakeOVSDBClient: sb}
+
+	old := consistencySelectTimeout
+	consistencySelectTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { consistencySelectTimeout = old })
+
+	cached := []SBChassis{{UUID: "ch-1", Name: "ch-1", Hostname: "host-a"}}
+	done := make(chan []SBChassis, 1)
+	go func() {
+		done <- authoritativeList(context.Background(), blocked, "Chassis", chCheckColumns,
+			cached, keyOfSBChassis, decodeSBChassis)
+	}()
+	select {
+	case got := <-done:
+		if !reflect.DeepEqual(got, cached) {
+			t.Errorf("got %+v, want cache snapshot %+v on stuck select", got, cached)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("authoritativeList still blocked after 5s: the consistency select is not bounded")
 	}
 }
 
