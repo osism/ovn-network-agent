@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"slices"
@@ -48,6 +49,36 @@ const (
 //
 // Safety: all interpolated values (VIPs, protocols, dest addresses) must be
 // pre-validated by validateConfig before reaching this function.
+// nftTablesDoc is the subset of an `nft -j list tables` document the agent
+// inspects. nft emits one object per element, of which only the "table" ones
+// carry a family/name pair.
+type nftTablesDoc struct {
+	Nftables []struct {
+		Table *struct {
+			Family string `json:"family"`
+			Name   string `json:"name"`
+		} `json:"table"`
+	} `json:"nftables"`
+}
+
+// nftHasTable reports whether an `nft -j list tables` document lists the given
+// table. This is the structured existence check that replaces deleting blindly
+// and pattern-matching the wording of the resulting error: "No such file" is
+// nft's phrasing, not a contract, so a reworded message would turn a clean
+// teardown into a reported failure — or, worse, mask a real one.
+func nftHasTable(data []byte, family, name string) (bool, error) {
+	var doc nftTablesDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return false, fmt.Errorf("parse nft json: %w", err)
+	}
+	for _, e := range doc.Nftables {
+		if e.Table != nil && e.Table.Family == family && e.Table.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // snatEntry describes one backend destination that needs SNAT. Per-rule
 // granularity is essential when a VIP has both local and remote backends: local
 // backends must NOT be masqueraded (the reply originates locally and is handled
