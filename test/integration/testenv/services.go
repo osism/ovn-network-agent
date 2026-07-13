@@ -5,6 +5,7 @@ package testenv
 import (
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -149,23 +150,89 @@ func isNorthdUnreachable(out string) bool {
 		strings.Contains(out, "cannot connect")
 }
 
+// stopMatchingProcs SIGSTOPs the processes matched by the pkill args in
+// stopArgs and returns a resume func that SIGCONTs them via contArgs. The
+// resume is idempotent (a sync.Once) and is also registered via t.Cleanup, so
+// a test failure or panic between stop and resume can never leave a process
+// suspended. When pkill matches nothing (exit code 1) the test is skipped: the
+// outage contract cannot be exercised without the target process, and a
+// packaging change that renames it degrades to a skip rather than a red gate.
+// desc is used in the log/skip/fatal messages.
+func stopMatchingProcs(t *testing.T, desc string, stopArgs, contArgs []string) func() {
+	t.Helper()
+
+	if _, err := exec.LookPath("pkill"); err != nil {
+		t.Skipf("pkill not found in PATH: %v", err)
+	}
+
+	t.Logf("%s (SIGSTOP)", desc)
+	if out, err := exec.Command("pkill", stopArgs...).CombinedOutput(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			t.Skipf("%s: no matching process found; cannot exercise the outage contract", desc)
+		}
+		t.Fatalf("%s: %v (output: %s)", desc, err, strings.TrimSpace(string(out)))
+	}
+
+	var once sync.Once
+	resume := func() {
+		once.Do(func() {
+			t.Logf("%s (SIGCONT / resume)", desc)
+			if out, err := exec.Command("pkill", contArgs...).CombinedOutput(); err != nil {
+				t.Logf("%s: SIGCONT failed: %v (output: %s)", desc, err, strings.TrimSpace(string(out)))
+			}
+		})
+	}
+	t.Cleanup(resume)
+	return resume
+}
+
+// StopOVNDatabases suspends every ovsdb-server process with SIGSTOP and returns
+// a resume func that SIGCONTs them. Unlike PauseOVNDatabases it does not block,
+// so a scenario can hold the outage open — long enough to trip libovsdb's 30s
+// inactivity probe — while it scrapes metrics or asserts the agent stays alive,
+// then call resume when it is ready. If no ovsdb-server process is found the
+// test is skipped.
+func StopOVNDatabases(t *testing.T) (resume func()) {
+	t.Helper()
+	return stopMatchingProcs(t, "SIGSTOP all ovsdb-server processes",
+		[]string{"-STOP", "-x", "ovsdb-server"},
+		[]string{"-CONT", "-x", "ovsdb-server"})
+}
+
+// StopNBDatabase suspends only the NB ovsdb-server with SIGSTOP, leaving the SB
+// server responsive so ovn-controller does not cascade (clearing our hand-set
+// Port_Binding.chassis) while the agent's NB writes hang. Returns a resume func.
+//
+// ovn-ctl names the NB server's pid/sock/ctl/db files ovnnb_db.*, so
+// `pkill -f ovnnb_db` matches its argv — and not the SB ovsdb-server, whose
+// files are ovnsb_db.*. It also matches ovn-northd (which references the same
+// ovnnb_db socket); that is harmless for callers, which pause northd's
+// processing loop via PauseOVNNorthd beforehand. If nothing matches, the test
+// is skipped rather than failed.
+func StopNBDatabase(t *testing.T) (resume func()) {
+	t.Helper()
+	return stopMatchingProcs(t, "SIGSTOP the NB ovsdb-server (pkill -f ovnnb_db)",
+		[]string{"-STOP", "-f", "ovnnb_db"},
+		[]string{"-CONT", "-f", "ovnnb_db"})
+}
+
 // PauseOVNDatabases suspends every ovsdb-server process via SIGSTOP for the
 // duration d, then SIGCONTs them. This simulates a transient OVN disconnect:
 // the TCP socket stays open but reads stall, which is the same shape a
 // production-side network blip or a paused remote presents to libovsdb.
 //
 // Ubuntu's ovn-ctl runs the NB ovsdb-server, the SB ovsdb-server, and
-// ovn-northd under the single ovn-central unit. There is no clean way to
-// pause only the NB server without taking the SB server down with it (see
-// the comment on TestScenario_DrainStuckNBWrite in scenario_drain_edges_test.go),
-// so this helper pauses both. The contract being tested by callers is "the
-// agent does NOT exit when its only DB endpoint becomes unresponsive" —
-// pausing both DBs is a strictly harder version of the scenario than the
-// single-DB pause described in #64, so the test still proves the contract.
+// ovn-northd under the single ovn-central unit, so this helper pauses both
+// databases. The contract being tested by callers is "the agent does NOT exit
+// when its DB endpoints become unresponsive" — pausing both DBs is a strictly
+// harder version of the single-DB pause described in #64, so the test still
+// proves the contract. (StopNBDatabase pauses the NB server alone when a
+// scenario needs SB to stay responsive.)
 //
 // The function blocks for d while the DBs are paused. Tests should keep d
 // well under libovsdb's inactivity timeout (production: 30s) so reconnect
-// logic does not kick in mid-pause — that is a separate scenario.
+// logic does not kick in mid-pause — that path is covered by
+// TestScenario_OVNReconnectAfterLongOutage via StopOVNDatabases.
 //
 // PauseOVNDatabases is a synchronous primitive on purpose: scenarios that
 // run direct OVSDB transactions against the test driver's NB/SB clients
@@ -173,38 +240,9 @@ func isNorthdUnreachable(out string) bool {
 // call and all post-resume assertions after it.
 func PauseOVNDatabases(t *testing.T, d time.Duration) {
 	t.Helper()
-
-	if _, err := exec.LookPath("pkill"); err != nil {
-		t.Skipf("pkill not found in PATH: %v", err)
-	}
-
-	t.Logf("SIGSTOP all ovsdb-server processes for %s", d)
-	if out, err := exec.Command("pkill", "-STOP", "-x", "ovsdb-server").CombinedOutput(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			t.Skip("PauseOVNDatabases: no ovsdb-server process found; cannot exercise reconnect contract")
-			return
-		}
-		t.Fatalf("SIGSTOP ovsdb-server: %v (output: %s)", err, strings.TrimSpace(string(out)))
-	}
-	// Resume is registered as a cleanup before we sleep, so a test failure
-	// or panic inside the sleep window does not leave ovsdb-server stopped.
-	resumed := false
-	t.Cleanup(func() {
-		if resumed {
-			return
-		}
-		if out, err := exec.Command("pkill", "-CONT", "-x", "ovsdb-server").CombinedOutput(); err != nil {
-			t.Logf("cleanup SIGCONT ovsdb-server: %v (output: %s)", err, strings.TrimSpace(string(out)))
-		}
-	})
-
+	resume := StopOVNDatabases(t)
 	time.Sleep(d)
-
-	t.Logf("SIGCONT all ovsdb-server processes (resume)")
-	if out, err := exec.Command("pkill", "-CONT", "-x", "ovsdb-server").CombinedOutput(); err != nil {
-		t.Fatalf("SIGCONT ovsdb-server: %v (output: %s)", err, strings.TrimSpace(string(out)))
-	}
-	resumed = true
+	resume()
 }
 
 // PauseOVNController suspends ovn-controller's main processing loop for the
