@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -17,6 +17,7 @@ E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
 E2E_DRAIN       := test/e2e/scenarios/drain-hitless.sh
+E2E_CHAOS       := go run ./test/e2e/chaos
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
 
@@ -278,3 +279,27 @@ e2e-stale-chassis:
 # developer run leaves the lab baseline-green.
 e2e-drain-hitless:
 	$(E2E_DRAIN)
+
+# Run a seeded chaos session (issue #176) against a lab that is already
+# up. Layers the hairpin, multi-VLAN and port-forward scenario setups on
+# the bootstrap baseline, then drives the lab through a randomized fault
+# sequence: every tick waits a random interval, picks a weighted action
+# (controller-restart, gateway-kill, agent-terminate, gateway-restart),
+# checks its guardrails and executes it, while a continuous probe from
+# client-1 measures every FIP and the port-forward VIP. Defaults: seed
+# 42, 10 minutes, 10–30 s between decisions.
+#
+# Reproducibility is the contract: the seed, the duration, the tick
+# bounds and the action weights are the only inputs, and every decision
+# derives from the seed — so two runs with the same flags replay the
+# identical action sequence. Pass flags through CHAOS_FLAGS:
+#
+#   make e2e-chaos CHAOS_FLAGS="-duration 3m -seed 7 -out /tmp/chaos-a"
+#
+# The journal (every decision) and the run summary (actions, probe loss
+# over time, recovery durations, violations) land under -out; a run that
+# recorded a violation exits 1 and dumps the lab state via
+# collect-artifacts.sh, exactly like the scenario jobs do.
+CHAOS_FLAGS ?=
+e2e-chaos:
+	$(E2E_CHAOS) $(CHAOS_FLAGS)

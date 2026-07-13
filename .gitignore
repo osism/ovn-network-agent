@@ -1,6 +1,9 @@
 # Binary
 ovn-network-agent
 
+# Default -out directory of the E2E chaos runner (make e2e-chaos)
+chaos-artifacts/
+
 # Documentation site (VitePress)
 node_modules/
 docs/.vitepress/cache/
