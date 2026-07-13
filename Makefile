@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -85,6 +85,24 @@ docs-gen-check: docs-gen
 	@git diff --exit-code -- docs/reference/ || ( \
 		echo ""; \
 		echo "docs/reference/ is out of date — run 'make docs-gen' and commit the result."; \
+		exit 1; \
+	)
+
+# Regenerate the OVSDB models from the OVN schemas checked in under
+# schemas/. Run this after bumping a schema; see
+# docs/contributing/ovsdb-models.md.
+models-gen:
+	go run github.com/ovn-kubernetes/libovsdb/cmd/modelgen -p nbdb -o internal/nbdb schemas/ovn-nb.ovsschema
+	go run github.com/ovn-kubernetes/libovsdb/cmd/modelgen -p sbdb -o internal/sbdb schemas/ovn-sb.ovsschema
+	gofmt -w internal/nbdb internal/sbdb
+
+# Fail if the generated models are out of date with respect to the
+# checked-in schemas. Used in CI so a schema bump without a regen — or a
+# hand-edit of generated code — is caught before merge.
+models-gen-check: models-gen
+	@git diff --exit-code -- internal/nbdb internal/sbdb || ( \
+		echo ""; \
+		echo "internal/nbdb or internal/sbdb is out of date — run 'make models-gen' and commit the result."; \
 		exit 1; \
 	)
 
