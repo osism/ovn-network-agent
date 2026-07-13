@@ -164,11 +164,6 @@ func validateIP(ip string) error {
 // FRR routes via vtysh
 // =============================================================================
 
-// AddFRRRoute is a convenience wrapper for AddFRRRoutes with a single IP.
-func (rm *RouteManager) AddFRRRoute(ip string) error {
-	return rm.AddFRRRoutes([]string{ip})
-}
-
 // frrBatchSize is the maximum number of route operations per vtysh call.
 // This avoids hitting the OS ARG_MAX limit (~2 MB on Linux) when managing
 // thousands of FIPs at startup.
@@ -229,11 +224,6 @@ func (rm *RouteManager) AddFRRRoutes(ips []string) error {
 	return errors.Join(errs...)
 }
 
-// DelFRRRoute is a convenience wrapper for DelFRRRoutes with a single IP.
-func (rm *RouteManager) DelFRRRoute(ip string) error {
-	return rm.DelFRRRoutes([]string{ip})
-}
-
 // DelFRRRoutes removes static /32 routes for all given IPs via vtysh.
 // IPs are validated before any commands are executed.  The list is chunked
 // into batches of frrBatchSize to stay within OS argument-list limits.
@@ -268,18 +258,6 @@ func (rm *RouteManager) DelFRRRoutes(ips []string) error {
 		slog.Info("FRR routes removed", "count", len(chunk), "vrf", rm.vrfName)
 	}
 	return nil
-}
-
-// HasFRRRoute checks if a static route for the IP exists in the VRF.
-func (rm *RouteManager) HasFRRRoute(ip string) bool {
-	if err := validateIP(ip); err != nil {
-		return false
-	}
-	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s %s/32", rm.vrfName, ip))
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(output), "static")
 }
 
 // ListFRRRoutes returns the agent's own static /32 routes in the VRF: those

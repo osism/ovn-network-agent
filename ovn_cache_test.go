@@ -175,11 +175,11 @@ func TestRefreshStateRecoversDroppedNATFromCache(t *testing.T) {
 	c.refreshState(context.Background())
 	snap := c.GetState()
 
-	if got := snap.FIPs; len(got) != 1 || got[0] != "198.51.100.50" {
-		t.Fatalf("FIPs = %v, want [198.51.100.50] — dropped NAT row not recovered", got)
-	}
+	// The FIP's presence in NATIPToRouterMAC proves the dropped NAT row was
+	// recovered from the direct select (a missing row would leave the key
+	// absent, yielding the empty string).
 	if snap.NATIPToRouterMAC["198.51.100.50"] != "fa:16:3e:aa:aa:aa" {
-		t.Errorf("NATIPToRouterMAC[FIP] = %q, want fa:16:3e:aa:aa:aa",
+		t.Fatalf("NATIPToRouterMAC[FIP] = %q, want fa:16:3e:aa:aa:aa — dropped NAT row not recovered",
 			snap.NATIPToRouterMAC["198.51.100.50"])
 	}
 }
@@ -256,8 +256,8 @@ func TestRefreshStateRecoversStaleChassisBinding(t *testing.T) {
 	if !snap.HasLocalRouters {
 		t.Fatal("HasLocalRouters = false — stale chassisredirect binding not recovered")
 	}
-	if got := snap.FIPs; len(got) != 1 || got[0] != "198.51.100.50" {
-		t.Fatalf("FIPs = %v, want [198.51.100.50]", got)
+	if _, ok := snap.NATIPToRouterMAC["198.51.100.50"]; !ok {
+		t.Fatalf("NATIPToRouterMAC = %v, missing FIP 198.51.100.50", snap.NATIPToRouterMAC)
 	}
 }
 

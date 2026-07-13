@@ -12,9 +12,8 @@ const (
 	nftTableName       = "ovn-network-agent"
 	dnatFwmark         = 0x100 // fwmark on original-direction DNAT'd packets → lookup main
 	dnatReplyFwmark    = 0x200 // fwmark on reply-direction DNAT'd packets → lookup VRF
-	dnatFwmarkPriority = 150   // ip rule priority; must be < 1000 (l3mdev VRF rule)
-	dnatReplyPriority  = 151   // ip rule priority for reply return path
-	dnatCTZoneDefault  = 64000 // conntrack zone shared by both directions of DNAT'd flows
+	dnatFwmarkPriority = 150 // ip rule priority; must be < 1000 (l3mdev VRF rule)
+	dnatReplyPriority  = 151 // ip rule priority for reply return path
 )
 
 // buildNftRuleset generates the complete nftables ruleset for port forwarding.

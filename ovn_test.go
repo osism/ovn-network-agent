@@ -85,8 +85,7 @@ func TestGetStateSnapshot(t *testing.T) {
 		{RouterName: "router2", RouterUUID: "uuid2", LRPName: "lrp-def", LRPUUID: "lrp-uuid2", LRPNetworks: []string{"172.16.0.1/16"}, CRPort: "cr-lrp-def"},
 	}
 	c.state.HasLocalRouters = true
-	c.state.FIPs = []string{"10.0.0.1", "10.0.0.2"}
-	c.state.SNATIPs = []string{"10.0.0.100"}
+	c.state.SNATIPs = []string{"10.0.0.100", "10.0.0.101"}
 
 	snap := c.GetState()
 
@@ -102,17 +101,14 @@ func TestGetStateSnapshot(t *testing.T) {
 	if snap.LocalRouters[0].RouterName != "router1" {
 		t.Errorf("LocalRouters[0].RouterName = %q, want %q", snap.LocalRouters[0].RouterName, "router1")
 	}
-	if len(snap.FIPs) != 2 {
-		t.Errorf("FIPs length = %d, want 2", len(snap.FIPs))
-	}
-	if len(snap.SNATIPs) != 1 {
-		t.Errorf("SNATIPs length = %d, want 1", len(snap.SNATIPs))
+	if len(snap.SNATIPs) != 2 {
+		t.Errorf("SNATIPs length = %d, want 2", len(snap.SNATIPs))
 	}
 
 	// Verify snapshot is a copy (modifying snap doesn't affect original).
-	snap.FIPs[0] = "modified"
-	if c.state.FIPs[0] == "modified" {
-		t.Error("GetState should return a copy of FIPs, not a reference")
+	snap.SNATIPs[0] = "modified"
+	if c.state.SNATIPs[0] == "modified" {
+		t.Error("GetState should return a copy of SNATIPs, not a reference")
 	}
 
 	snap.LocalRouters[0].RouterName = "modified"
@@ -981,9 +977,10 @@ func TestRefreshStatePopulatesLocalRoutersAndNATs(t *testing.T) {
 			snap.LocalRouters[0].RouterName, "router-local")
 	}
 
-	// FIP and SNAT should both be present for the local router.
-	if got := snap.FIPs; len(got) != 1 || got[0] != "198.51.100.50" {
-		t.Errorf("FIPs = %v, want [198.51.100.50]", got)
+	// The FIP (dnat_and_snat external IP) must be tracked in the
+	// IP→router-MAC map, which carries every NAT external IP.
+	if _, ok := snap.NATIPToRouterMAC["198.51.100.50"]; !ok {
+		t.Errorf("NATIPToRouterMAC = %v, missing FIP 198.51.100.50", snap.NATIPToRouterMAC)
 	}
 	// SB-derived SNAT (198.51.100.60) and NB-derived SNAT (198.51.100.51).
 	wantSNATs := map[string]bool{"198.51.100.51": true, "198.51.100.60": true}
@@ -1067,8 +1064,8 @@ func TestRefreshStateDropsMalformedNATExternalIP(t *testing.T) {
 	if len(snap.DiscoveredNetworks) != 0 {
 		t.Fatalf("expected empty DiscoveredNetworks, got %v", snap.DiscoveredNetworks)
 	}
-	if got := snap.FIPs; !reflect.DeepEqual(got, []string{"198.51.100.50"}) {
-		t.Errorf("FIPs = %v, want [198.51.100.50]", got)
+	if _, ok := snap.NATIPToRouterMAC["198.51.100.50"]; !ok {
+		t.Errorf("NATIPToRouterMAC = %v, missing FIP 198.51.100.50", snap.NATIPToRouterMAC)
 	}
 	if got := snap.SNATIPs; !reflect.DeepEqual(got, []string{"198.51.100.51"}) {
 		t.Errorf("SNATIPs = %v, want [198.51.100.51] (malformed row must be dropped)", got)
@@ -1094,15 +1091,15 @@ func TestRefreshStateKeepsV6ForHairpinButNotSNATIPs(t *testing.T) {
 	if got := snap.SNATIPs; !reflect.DeepEqual(got, []string{"198.51.100.51"}) {
 		t.Errorf("SNATIPs = %v, want [198.51.100.51] (v6 must be excluded)", got)
 	}
-	// The v6 addresses remain available for the family-aware OVS hairpin plane.
+	// The v6 addresses remain available for the family-aware OVS hairpin
+	// plane — including the v6 FIP (dnat_and_snat), which the dual-stack
+	// NATIPToRouterMAC map tracks even though it never enters the IPv4-only
+	// SNATIPs set.
 	for _, ip := range []string{"2001:db8::51", "2001:db8::50"} {
 		if snap.NATIPToRouterMAC[ip] != "fa:16:3e:aa:aa:aa" {
 			t.Errorf("NATIPToRouterMAC[%s] = %q, want the LRP MAC (v6 kept for hairpin)",
 				ip, snap.NATIPToRouterMAC[ip])
 		}
-	}
-	if got := snap.FIPs; !reflect.DeepEqual(got, []string{"2001:db8::50"}) {
-		t.Errorf("FIPs = %v, want [2001:db8::50] (FIP list stays dual-stack)", got)
 	}
 }
 
