@@ -1,0 +1,36 @@
+name: E2E lab setup
+description: >-
+  Install the pinned containerlab release and load the kernel modules the
+  containerlab topology needs. Requires the repository to be checked out.
+
+runs:
+  using: composite
+  steps:
+    # Version + checksums are pinned in the Makefile (single source of
+    # truth shared with local development): the .deb is downloaded and
+    # its sha256 verified before install, replacing the unpinned
+    # `curl | bash` installer.
+    - name: Install containerlab
+      shell: bash
+      run: make e2e-install-tools
+
+    # The gwnode image uses kernel OVS so OVN's BFD-driven cr-lrp
+    # election over geneve tunnels actually converges, and the entrypoint
+    # creates a vrf-provider kernel VRF for the agent's veth-leak design.
+    # The gwnode containers only inherit CAP_NET_ADMIN (no CAP_SYS_MODULE),
+    # so the modules must be loaded on the host before lab-up. The Azure
+    # kernel on `ubuntu-latest` ships `openvswitch` in the base modules
+    # set but `vrf` only in `linux-modules-extra-<uname>` — install it on
+    # demand. Without `vrf`, gwnode-entrypoint.sh crash-loops on
+    # `ip link add vrf-provider type vrf table 100` with "Unknown device
+    # type".
+    - name: Load required kernel modules
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo modprobe openvswitch
+        if ! sudo modprobe vrf 2>/dev/null; then
+          sudo apt-get update -qq
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe vrf
+        fi

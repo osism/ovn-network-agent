@@ -51,13 +51,22 @@ test/e2e/
 
 - A Linux host with Docker (privileged mode is required for the
   containerlab containers).
-- [containerlab](https://containerlab.dev/install/) ≥ 0.55.
+- [containerlab](https://containerlab.dev/install/). CI and
+  `make e2e-install-tools` install the pinned version (`0.77.0`); any
+  release ≥ 0.55 works locally.
 - `make`, `docker buildx`, and a Go toolchain matching `go.mod` — the
   gwnode image builds the agent from source.
 
-`make e2e-install-tools` bootstraps containerlab on Linux via the
-upstream installer (`get.containerlab.dev`). It is a no-op when
-`containerlab` is already on `PATH`.
+On Debian/Ubuntu, `make e2e-install-tools` downloads the pinned
+containerlab `.deb`, verifies its sha256 against the checksum committed
+in the `Makefile`, and installs it with `apt-get` — a known, verified
+binary instead of piping the upstream `get.containerlab.dev` installer
+into a shell. It is a no-op when `containerlab` is already on `PATH`. To
+bump the version, update `CONTAINERLAB_VERSION` and **both**
+`CONTAINERLAB_SHA256_*` values in the `Makefile` from the upstream
+release's `checksums.txt`. On non-Debian distributions the target stops
+with a pointer to the [upstream install docs](https://containerlab.dev/install/);
+install containerlab there manually.
 
 ::: warning macOS is not a supported containerlab host
 Upstream ships no darwin binary for containerlab. The supported macOS
