@@ -1550,3 +1550,316 @@ func connGaugeValue(t *testing.T, m *metricsRegistry, db string) (float64, bool)
 	}
 	return 0, false
 }
+
+// =============================================================================
+// refreshState step helpers
+// =============================================================================
+//
+// These exercise the pure joins directly, without a client. Each covers at
+// least one rejection path — the filters and guards that decide whether a row
+// reaches the desired-IP set are exactly where a silent regression would
+// withdraw a live FIP.
+
+func TestChassisIndex(t *testing.T) {
+	hostByRef, all := chassisIndex([]SBChassis{
+		{UUID: "ch-a-uuid", Name: "ch-a", Hostname: "host-a.example.com"},
+		{UUID: "ch-b-uuid", Name: "ch-b", Hostname: "host-b"},
+	})
+
+	// A Port_Binding.chassis reference may carry either the UUID or the name.
+	for ref, want := range map[string]string{
+		"ch-a-uuid": "host-a.example.com",
+		"ch-a":      "host-a.example.com",
+		"ch-b-uuid": "host-b",
+		"ch-b":      "host-b",
+	} {
+		if got := hostByRef[ref]; got != want {
+			t.Errorf("hostnameByRef[%q] = %q, want %q", ref, got, want)
+		}
+	}
+	// The stale-chassis set is keyed by the short label, not the FQDN.
+	if !all["host-a"] || !all["host-b"] {
+		t.Errorf("allChassisNames = %v, want short keys host-a and host-b", all)
+	}
+	if all["host-a.example.com"] {
+		t.Errorf("allChassisNames must not keep the FQDN form: %v", all)
+	}
+}
+
+func TestLocalCRPorts(t *testing.T) {
+	chA, chB, empty := "ch-a", "ch-b", ""
+	hostByRef := map[string]string{"ch-a": "host-a.example.com", "ch-b": "host-b"}
+
+	bindings := []SBPortBinding{
+		{UUID: "pb-1", LogicalPort: "cr-lrp-local", Type: "chassisredirect", Chassis: &chA},
+		// Bound to a peer chassis — must not count as local.
+		{UUID: "pb-2", LogicalPort: "cr-lrp-remote", Type: "chassisredirect", Chassis: &chB},
+		// Unbound (election in progress) — no chassis to match.
+		{UUID: "pb-3", LogicalPort: "cr-lrp-unbound", Type: "chassisredirect", Chassis: nil},
+		// Bound to the empty string — same as unbound.
+		{UUID: "pb-4", LogicalPort: "cr-lrp-blank", Type: "chassisredirect", Chassis: &empty},
+		// Not a chassisredirect port at all.
+		{UUID: "pb-5", LogicalPort: "some-patch", Type: "patch", Chassis: &chA},
+	}
+
+	t.Run("matches only local chassisredirect ports", func(t *testing.T) {
+		// The SB hostname is an FQDN, the local name is short — they must match.
+		got := localCRPorts(bindings, hostByRef, "host-a", "")
+		want := map[string]string{"lrp-local": "cr-lrp-local"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("localCRPorts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("gateway_port restricts to a single port", func(t *testing.T) {
+		// Same local chassis, but a gateway_port naming a different port:
+		// the local CR port must drop out entirely.
+		if got := localCRPorts(bindings, hostByRef, "host-a", "cr-lrp-other"); len(got) != 0 {
+			t.Errorf("localCRPorts() = %v, want empty when gateway_port names another port", got)
+		}
+		got := localCRPorts(bindings, hostByRef, "host-a", "cr-lrp-local")
+		if len(got) != 1 || got["lrp-local"] != "cr-lrp-local" {
+			t.Errorf("localCRPorts() = %v, want the configured gateway port only", got)
+		}
+	})
+
+	t.Run("unknown chassis reference yields no local ports", func(t *testing.T) {
+		if got := localCRPorts(bindings, map[string]string{}, "host-a", ""); len(got) != 0 {
+			t.Errorf("localCRPorts() = %v, want empty when the chassis ref cannot be resolved", got)
+		}
+	})
+}
+
+func TestSegmentsByLRP(t *testing.T) {
+	tag := 101
+	bindings := []SBPortBinding{
+		// Tagged localnet on datapath dp-1.
+		{UUID: "ln-1", LogicalPort: "physnet1-port", Type: "localnet", Datapath: "dp-1",
+			Tag: &tag, Options: map[string]string{"network_name": "physnet1"}},
+		// Flat localnet (no tag) on datapath dp-2.
+		{UUID: "ln-2", LogicalPort: "physnet2-port", Type: "localnet", Datapath: "dp-2",
+			Options: map[string]string{"network_name": "physnet2"}},
+		// Patch rows joining LRPs to those datapaths.
+		{UUID: "pt-1", Type: "patch", Datapath: "dp-1", Options: map[string]string{"peer": "lrp-local"}},
+		{UUID: "pt-2", Type: "patch", Datapath: "dp-2", Options: map[string]string{"peer": "lrp-flat"}},
+		// Patch for a router that is NOT local — must be ignored.
+		{UUID: "pt-3", Type: "patch", Datapath: "dp-1", Options: map[string]string{"peer": "lrp-remote"}},
+		// Patch whose datapath carries no localnet row — segment unresolvable.
+		{UUID: "pt-4", Type: "patch", Datapath: "dp-orphan", Options: map[string]string{"peer": "lrp-orphan"}},
+		// Patch with no peer option at all.
+		{UUID: "pt-5", Type: "patch", Datapath: "dp-1", Options: map[string]string{}},
+	}
+	local := map[string]string{
+		"lrp-local":  "cr-lrp-local",
+		"lrp-flat":   "cr-lrp-flat",
+		"lrp-orphan": "cr-lrp-orphan",
+	}
+
+	got := segmentsByLRP(bindings, local)
+
+	seg, ok := got["lrp-local"]
+	if !ok {
+		t.Fatal("lrp-local has no segment")
+	}
+	if seg.LocalnetPort != "physnet1-port" || seg.NetworkName != "physnet1" {
+		t.Errorf("lrp-local segment = %+v", seg)
+	}
+	if seg.VLANTag == nil || *seg.VLANTag != 101 {
+		t.Errorf("lrp-local VLANTag = %v, want 101", seg.VLANTag)
+	}
+	if flat := got["lrp-flat"]; flat == nil || flat.VLANTag != nil {
+		t.Errorf("lrp-flat segment = %+v, want a flat (nil-tag) segment", flat)
+	}
+	// A patch whose datapath has no localnet row leaves the LRP unresolved
+	// (the "" fallback segment), rather than inventing an empty segment.
+	if _, ok := got["lrp-orphan"]; ok {
+		t.Errorf("lrp-orphan must stay unresolved, got %+v", got["lrp-orphan"])
+	}
+	// A non-local router's patch row must never produce a segment.
+	if _, ok := got["lrp-remote"]; ok {
+		t.Error("segmentsByLRP resolved a segment for a non-local LRP")
+	}
+}
+
+func TestIndexLRPsAndLocalLRPUUIDSet(t *testing.T) {
+	idx := indexLRPs([]NBLogicalRouterPort{
+		{UUID: "u1", Name: "lrp-1", MAC: "aa:aa:aa:aa:aa:01"},
+		{UUID: "u2", Name: "lrp-2", MAC: "aa:aa:aa:aa:aa:02"},
+	})
+	if idx.byName["lrp-1"].UUID != "u1" || idx.byName["lrp-2"].MAC != "aa:aa:aa:aa:aa:02" {
+		t.Fatalf("indexLRPs = %+v", idx)
+	}
+
+	// An LRP name with no matching NB row (e.g. a chassisredirect port whose
+	// LRP was just deleted) must be dropped, not resolved to an empty UUID.
+	got := localLRPUUIDSet(map[string]string{"lrp-1": "cr-lrp-1", "lrp-gone": "cr-lrp-gone"}, idx)
+	want := map[string]bool{"u1": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("localLRPUUIDSet() = %v, want %v", got, want)
+	}
+}
+
+func TestCollectLocalRouters(t *testing.T) {
+	idx := indexLRPs([]NBLogicalRouterPort{
+		{UUID: "u1", Name: "lrp-1", MAC: "aa:aa:aa:aa:aa:01", Networks: []string{"198.51.100.1/24"}},
+		{UUID: "u2", Name: "lrp-2", MAC: "", Networks: []string{"203.0.113.1/24"}}, // no MAC
+		{UUID: "u9", Name: "lrp-remote", MAC: "aa:aa:aa:aa:aa:09"},
+	})
+	seg := &LocalnetSegment{LocalnetPort: "physnet1-port", NetworkName: "physnet1"}
+	segByLRP := map[string]*LocalnetSegment{"lrp-1": seg}
+	localNames := map[string]string{"lrp-1": "cr-lrp-1", "lrp-2": "cr-lrp-2"}
+	localUUIDs := map[string]bool{"u1": true, "u2": true}
+
+	routers := []NBLogicalRouter{
+		{UUID: "lr-1", Name: "router1", Ports: []string{"u1"}, Nat: []string{"nat-1"}},
+		{UUID: "lr-2", Name: "router2", Ports: []string{"u2"}, Nat: []string{"nat-2"}},
+		// Owns only a remote LRP — must not be collected.
+		{UUID: "lr-9", Name: "router-remote", Ports: []string{"u9"}, Nat: []string{"nat-9"}},
+	}
+
+	local, natToMAC, natToSeg := collectLocalRouters(routers, idx, localUUIDs, localNames, segByLRP)
+
+	if len(local) != 2 {
+		t.Fatalf("collectLocalRouters returned %d routers, want 2: %+v", len(local), local)
+	}
+	if local[0].RouterName != "router1" || local[0].CRPort != "cr-lrp-1" || local[0].Segment != seg {
+		t.Errorf("router1 = %+v", local[0])
+	}
+	// A router whose LRP has no MAC must not enter the NAT→MAC index: hairpin
+	// flows cannot set a dl_dst they do not know.
+	if _, ok := natToMAC["nat-2"]; ok {
+		t.Errorf("nat-2 must be absent from natUUIDToRouterMAC (its LRP has no MAC): %v", natToMAC)
+	}
+	if natToMAC["nat-1"] != "aa:aa:aa:aa:aa:01" {
+		t.Errorf("natUUIDToRouterMAC[nat-1] = %q", natToMAC["nat-1"])
+	}
+	// A router with an unresolved segment must not enter the NAT→segment index.
+	if _, ok := natToSeg["nat-2"]; ok {
+		t.Errorf("nat-2 must be absent from natUUIDToSegment (unresolved segment): %v", natToSeg)
+	}
+	if natToSeg["nat-1"] != "physnet1-port" {
+		t.Errorf("natUUIDToSegment[nat-1] = %q", natToSeg["nat-1"])
+	}
+	// The remote router's NATs must never be indexed.
+	if _, ok := natToMAC["nat-9"]; ok {
+		t.Error("a non-local router's NAT leaked into natUUIDToRouterMAC")
+	}
+}
+
+func TestDiscoverLRPNetworks(t *testing.T) {
+	got := discoverLRPNetworks([]LocalRouterInfo{
+		{RouterName: "r1", LRPNetworks: []string{"198.51.100.1/24", "not-a-cidr"}},
+		// Duplicate of r1's network — must be deduplicated.
+		{RouterName: "r2", LRPNetworks: []string{"198.51.100.5/24", "203.0.113.1/24"}},
+	})
+
+	var strs []string
+	for _, n := range got {
+		strs = append(strs, n.String())
+	}
+	want := []string{"198.51.100.0/24", "203.0.113.0/24"}
+	if !reflect.DeepEqual(strs, want) {
+		t.Errorf("discoverLRPNetworks() = %v, want %v (malformed CIDR dropped, duplicates merged)", strs, want)
+	}
+}
+
+func TestNATCollectionAddNBNATs(t *testing.T) {
+	_, filter, _ := net.ParseCIDR("198.51.100.0/24")
+	natToMAC := map[string]string{
+		"nat-fip": "aa:aa:aa:aa:aa:01", "nat-snat": "aa:aa:aa:aa:aa:01",
+		"nat-bad": "aa:aa:aa:aa:aa:01", "nat-out": "aa:aa:aa:aa:aa:01",
+		"nat-v6": "aa:aa:aa:aa:aa:01",
+	}
+	natToSeg := map[string]string{"nat-fip": "physnet1-port"}
+
+	nc := newNATCollection()
+	nc.addNBNATs([]NBNAT{
+		{UUID: "nat-fip", Type: "dnat_and_snat", ExternalIP: "198.51.100.50"},
+		{UUID: "nat-snat", Type: "snat", ExternalIP: "198.51.100.51"},
+		// Malformed external IP — must die at ingest, never reach a command payload.
+		{UUID: "nat-bad", Type: "snat", ExternalIP: "not-an-ip"},
+		// Outside the effective filter.
+		{UUID: "nat-out", Type: "snat", ExternalIP: "203.0.113.9"},
+		// IPv6 SNAT: kept for the hairpin plane, excluded from the v4-only nft set.
+		{UUID: "nat-v6", Type: "snat", ExternalIP: "2001:db8::51"},
+		// Not owned by any local router.
+		{UUID: "nat-foreign", Type: "snat", ExternalIP: "198.51.100.99"},
+	}, natToMAC, natToSeg, []*net.IPNet{filter})
+
+	if nc.FIPCount != 1 {
+		t.Errorf("FIPCount = %d, want 1", nc.FIPCount)
+	}
+	if !reflect.DeepEqual(nc.SNATIPs, []string{"198.51.100.51"}) {
+		t.Errorf("SNATIPs = %v, want [198.51.100.51]", nc.SNATIPs)
+	}
+	for _, ip := range []string{"not-an-ip", "203.0.113.9", "198.51.100.99"} {
+		if _, ok := nc.IPToRouterMAC[ip]; ok {
+			t.Errorf("%s must not be tracked (invalid, filtered, or foreign): %v", ip, nc.IPToRouterMAC)
+		}
+	}
+	// The v6 SNAT is filtered out of the filter CIDR (v4-only), so it never
+	// arrives at all — assert the v4 FIP's segment attribution instead.
+	if nc.IPToSegment["198.51.100.50"] != "physnet1-port" {
+		t.Errorf("IPToSegment[FIP] = %q, want physnet1-port", nc.IPToSegment["198.51.100.50"])
+	}
+}
+
+// TestNATCollectionAddNBNATsKeepsV6ForHairpin drives the family gate with no
+// filter in effect: a v6 SNAT stays in the dual-stack IP→MAC map (the OVS
+// hairpin plane) but must never enter the IPv4-only nft masquerade set.
+func TestNATCollectionAddNBNATsKeepsV6ForHairpin(t *testing.T) {
+	nc := newNATCollection()
+	nc.addNBNATs([]NBNAT{
+		{UUID: "nat-v6", Type: "snat", ExternalIP: "2001:db8::51"},
+	}, map[string]string{"nat-v6": "aa:aa:aa:aa:aa:01"}, nil, nil)
+
+	if len(nc.SNATIPs) != 0 {
+		t.Errorf("SNATIPs = %v, want empty (IPv6 excluded from the nft set)", nc.SNATIPs)
+	}
+	if nc.IPToRouterMAC["2001:db8::51"] != "aa:aa:aa:aa:aa:01" {
+		t.Errorf("IPToRouterMAC = %v, want the v6 address kept for hairpin", nc.IPToRouterMAC)
+	}
+}
+
+func TestNATCollectionAddSBGatewayNATAddresses(t *testing.T) {
+	idx := indexLRPs([]NBLogicalRouterPort{
+		{UUID: "u1", Name: "lrp-local", MAC: "aa:aa:aa:aa:aa:01"},
+	})
+	segByLRP := map[string]*LocalnetSegment{"lrp-local": {LocalnetPort: "physnet1-port"}}
+	local := map[string]string{"lrp-local": "cr-lrp-local"}
+
+	bindings := []SBPortBinding{
+		{UUID: "pb-1", Type: "patch",
+			Options:      map[string]string{"peer": "lrp-local"},
+			ExternalIDs:  map[string]string{"neutron:device_owner": "network:router_gateway"},
+			NatAddresses: []string{"fa:16:3e:11:22:33 198.51.100.60"}},
+		// Right peer, but not a router-gateway port — step 5b must skip it.
+		{UUID: "pb-2", Type: "patch",
+			Options:      map[string]string{"peer": "lrp-local"},
+			ExternalIDs:  map[string]string{"neutron:device_owner": "network:floatingip"},
+			NatAddresses: []string{"fa:16:3e:11:22:44 198.51.100.61"}},
+		// Router-gateway port of a NON-local router — must be skipped.
+		{UUID: "pb-3", Type: "patch",
+			Options:      map[string]string{"peer": "lrp-remote"},
+			ExternalIDs:  map[string]string{"neutron:device_owner": "network:router_gateway"},
+			NatAddresses: []string{"fa:16:3e:11:22:55 203.0.113.60"}},
+	}
+
+	nc := newNATCollection()
+	nc.addSBGatewayNATAddresses(bindings, local, idx, segByLRP, nil)
+
+	if !reflect.DeepEqual(nc.SNATIPs, []string{"198.51.100.60"}) {
+		t.Errorf("SNATIPs = %v, want only the local router-gateway address", nc.SNATIPs)
+	}
+	if nc.IPToRouterMAC["198.51.100.60"] != "aa:aa:aa:aa:aa:01" {
+		t.Errorf("IPToRouterMAC = %v", nc.IPToRouterMAC)
+	}
+	if nc.IPToSegment["198.51.100.60"] != "physnet1-port" {
+		t.Errorf("IPToSegment = %v", nc.IPToSegment)
+	}
+	for _, ip := range []string{"198.51.100.61", "203.0.113.60"} {
+		if _, ok := nc.IPToRouterMAC[ip]; ok {
+			t.Errorf("%s leaked in despite the device_owner / locality filter", ip)
+		}
+	}
+}
