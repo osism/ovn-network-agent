@@ -48,7 +48,7 @@ import (
 // selects exactly these — keeping the common in-sync round-trip cheap — and
 // the matching keyOf* helper must read only the model fields they back.
 var (
-	pbCheckColumns   = []string{"_uuid", "type", "chassis", "nat_addresses", "datapath", "tag", "options"}
+	pbCheckColumns   = []string{"_uuid", "type", "chassis", "nat_addresses", "datapath", "tag", "options", "external_ids"}
 	chCheckColumns   = []string{"_uuid", "hostname"}
 	lrCheckColumns   = []string{"_uuid", "ports", "nat", "static_routes"}
 	lrpCheckColumns  = []string{"_uuid", "mac", "networks"}
@@ -68,7 +68,8 @@ func keyOfSBPortBinding(p SBPortBinding) string {
 	}
 	// fmt %v renders a map with its keys sorted, so the key stays stable.
 	return contentKey(p.UUID, p.Type, chassis, sortedJoin(p.NatAddresses),
-		p.Datapath, tag, fmt.Sprintf("%v", p.Options))
+		p.Datapath, tag, fmt.Sprintf("%v", p.Options),
+		fmt.Sprintf("%v", p.ExternalIDs))
 }
 
 func keyOfSBChassis(c SBChassis) string {
