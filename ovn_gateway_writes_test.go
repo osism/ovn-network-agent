@@ -342,6 +342,40 @@ func TestEnsureGatewayRouting_ProcessesEachRouter(t *testing.T) {
 	}
 }
 
+// TestEnsureGatewayRouting_SurfacesWriteFailure pins the fix for the
+// always-nil return: when a router's OVSDB write fails, the failure is joined
+// into a non-nil error so the caller's error log becomes reachable. The pass
+// still processes both routers rather than aborting on the first failure.
+func TestEnsureGatewayRouting_SurfacesWriteFailure(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-1", Name: "router1"},
+		&NBLogicalRouter{UUID: "lr-2", Name: "router2"},
+	)
+	nb.transactErr = errors.New("connection refused")
+
+	routers := []LocalRouterInfo{
+		{RouterName: "router1", RouterUUID: "lr-1", LRPName: "lrp-1", LRPNetworks: []string{"198.51.100.11/24"}},
+		{RouterName: "router2", RouterUUID: "lr-2", LRPName: "lrp-2", LRPNetworks: []string{"203.0.113.1/24"}},
+	}
+	macs := map[string]string{
+		"lrp-1": "aa:bb:cc:dd:ee:ff",
+		"lrp-2": "aa:bb:cc:dd:ee:ff",
+	}
+	err := c.EnsureGatewayRouting(context.Background(), routers, macs)
+	if err == nil {
+		t.Fatal("EnsureGatewayRouting returned nil despite failing writes")
+	}
+	// Both routers should be named in the joined error, proving the pass did
+	// not abort on the first failure.
+	for _, want := range []string{"router1", "router2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("joined error %q does not mention %s", err, want)
+		}
+	}
+}
+
 // TestEnsureGatewayRouting_UsesPerRouterMAC verifies that each router's
 // static MAC binding is written with that router's own segment interface
 // MAC — two routers on different VLAN segments get two distinct bindings.
