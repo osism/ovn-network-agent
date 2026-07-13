@@ -181,10 +181,17 @@ func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters [
 		gwChassisList = append(gwChassisList, serverList...)
 	}
 
-	// Build set of locally-active LRP names.
+	// Build the LRP↔HA-group join. The authoritative source is the NB
+	// Logical_Router_Port.gateway_chassis reference column, carried on each
+	// LocalRouterInfo: it maps a Gateway_Chassis row UUID to the LRP that
+	// owns it, with no dependence on how the row happens to be named.
 	activeLRPs := make(map[string]bool, len(localRouters))
+	lrpByGatewayChassisUUID := make(map[string]string)
 	for _, lr := range localRouters {
 		activeLRPs[lr.LRPName] = true
+		for _, gwcUUID := range lr.GatewayChassisUUIDs {
+			lrpByGatewayChassisUUID[gwcUUID] = lr.LRPName
+		}
 	}
 
 	// Group Gateway_Chassis entries by LRP, tracking local entry and max peer priority.
@@ -196,9 +203,8 @@ func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters [
 
 	for i := range gwChassisList {
 		gwc := &gwChassisList[i]
-		// Gateway_Chassis name format: {lrp_name}_{chassis_name}
-		lrpName := strings.TrimSuffix(gwc.Name, "_"+gwc.ChassisName)
-		if !activeLRPs[lrpName] {
+		lrpName := gwChassisLRPName(gwc, lrpByGatewayChassisUUID, activeLRPs)
+		if lrpName == "" {
 			continue
 		}
 
@@ -263,6 +269,36 @@ func (o *OVNClient) EnsureActivePriorityLead(ctx context.Context, localRouters [
 		return nil
 	}
 	return o.transactOps(ctx, allOps)
+}
+
+// gwChassisLRPName resolves the locally-active Logical_Router_Port that a
+// Gateway_Chassis row belongs to, or "" when the row is not part of a
+// locally-active LRP's HA group (and must therefore be ignored).
+//
+// The join is by UUID: Logical_Router_Port.gateway_chassis lists exactly the
+// rows of that port's HA group, so lrpByUUID is schema-backed and exact. The
+// "{lrp}_{chassis}" name form is only an ovn-nbctl/Neutron convention — a row
+// named otherwise used to fall out of the grouping entirely, silently skipping
+// the anti-flapping boost for its router. It survives here as a warned fallback
+// for rows the reference column does not cover (e.g. an NB cache that dropped
+// the LRP's gateway_chassis update), and only when the parsed name is in fact a
+// locally-active LRP. Rows belonging to other LRPs are skipped silently, as
+// before.
+func gwChassisLRPName(
+	gwc *NBGatewayChassis,
+	lrpByUUID map[string]string,
+	activeLRPs map[string]bool,
+) string {
+	if lrpName, ok := lrpByUUID[gwc.UUID]; ok {
+		return lrpName
+	}
+	parsed := strings.TrimSuffix(gwc.Name, "_"+gwc.ChassisName)
+	if !activeLRPs[parsed] {
+		return ""
+	}
+	slog.Warn("active-lead: Gateway_Chassis row is not referenced by its LRP's gateway_chassis column, falling back to the name convention",
+		"gateway_chassis", gwc.Name, "chassis", gwc.ChassisName, "lrp", parsed)
+	return parsed
 }
 
 // ensureDefaultRoute adds 0.0.0.0/0 via <vgwIP> on the router if not already present.

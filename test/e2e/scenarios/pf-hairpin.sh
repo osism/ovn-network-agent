@@ -414,17 +414,42 @@ restart_master() {
     return 1
 }
 
+# Raise ${MASTER}'s Gateway_Chassis priority above every row in the NB
+# so ovn-northd re-elects it — the same move an operator makes to
+# migrate a gateway deliberately. Skipped once ${MASTER} already holds
+# the group's unique peak, so the polling caller stays idempotent.
+# Best-effort: wait_for_master_chassis owns the pass/fail signal.
+reassert_master_priority() {
+    local mine peak
+    mine="$(nbctl --bare --columns=priority find Gateway_Chassis \
+        "chassis_name=${MASTER}" 2>/dev/null | head -1 || true)"
+    peak="$(nbctl --bare --columns=priority list Gateway_Chassis 2>/dev/null \
+        | sort -n | tail -1 || true)"
+    [ -n "${peak}" ] || return 0
+    if [ -n "${mine}" ] && [ "${mine}" -eq "${peak}" ]; then
+        return 0 # already leads; ovn-northd just has not moved the port yet
+    fi
+    nbctl lrp-set-gateway-chassis "${LR_PUBLIC_PORT}" "${MASTER}" \
+        "$(( peak + 10 ))" || true
+}
+
 # Wait until cr-lr0-public is bound to ${MASTER} again. The container
-# restart drops the priority-30 chassis from the HA election, OVN
-# fails over to gateway-2, and only when gateway-1 re-registers and
-# wins the election does the FIP path land back on ${MASTER}. Probing
-# before this happens would test gateway-2's nftables (where we have
-# not configured port_forwards), so this gate is essential.
+# restart drops the priority-30 chassis from the HA election and OVN
+# fails over to gateway-2 — whose agent then boosts its own
+# Gateway_Chassis priority above ${MASTER}'s configured 30
+# (EnsureActivePriorityLead, the anti-flapping guard), so OVN's
+# election alone never fails back. Each poll re-asserts ${MASTER}'s
+# priority above the group's current max until the SB shows the port
+# on ${MASTER}; this converges because once the port moves, the peers
+# are no longer active and their boost is skipped. Probing before the
+# rebind would test gateway-2's nftables (where we have not configured
+# port_forwards), so this gate is essential.
 wait_for_master_chassis() {
     local deadline
     deadline=$(( $(date +%s) + RECONCILE_TIMEOUT ))
     log "waiting up to ${RECONCILE_TIMEOUT}s for ${CR_PORT} to bind back to ${MASTER}"
     while (( $(date +%s) < deadline )); do
+        reassert_master_priority
         # Port_Binding.chassis is a UUID reference; resolve it via a
         # second lookup against the Chassis table (same shape as
         # failover.sh's current_master helper).

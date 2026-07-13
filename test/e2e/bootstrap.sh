@@ -575,6 +575,58 @@ ip -n "${WORKLOAD_NETNS}" route replace default via "${WORKLOAD_GW}"
 EOSH
 }
 
+# Converge the HA election onto the configured master (the first
+# GATEWAYS row). The agent's anti-flapping boost
+# (EnsureActivePriorityLead) permanently locks cr-${LR_PUBLIC_PORT}
+# onto whichever chassis transiently claimed it while the gateways'
+# BFD sessions were still settling: the claimer raises its own
+# Gateway_Chassis priority above the configured maximum within one
+# reconcile (~1s), and OVN's election alone never fails back. Without
+# this step a fresh lab is a coin flip between the configured master
+# and whichever peer won the bring-up race — while every scenario
+# assumes the GATEWAYS table's master. Re-assert the master's priority
+# above the group's current max until the SB binding agrees; this
+# converges because once the port moves, the peers are no longer
+# active and their boost is skipped. On an already-converged lab the
+# first poll returns before any write, keeping bootstrap idempotent.
+converge_master_chassis() {
+    local master _priority cr_port
+    read -r master _priority <<<"${GATEWAYS[0]}"
+    cr_port="cr-${LR_PUBLIC_PORT}"
+
+    log "converging ${cr_port} onto ${master} (HA master per the GATEWAYS table)"
+    for _ in $(seq 1 30); do
+        local chassis_uuid chassis_name
+        chassis_uuid="$(docker exec "${OVN_CENTRAL}" ovn-sbctl --timeout=2 \
+            --bare --columns=chassis find Port_Binding \
+            logical_port="${cr_port}" 2>/dev/null || true)"
+        if [ -n "${chassis_uuid}" ]; then
+            chassis_name="$(docker exec "${OVN_CENTRAL}" ovn-sbctl --timeout=2 \
+                --bare --columns=name list Chassis "${chassis_uuid}" \
+                2>/dev/null || true)"
+            if [ "${chassis_name}" = "${master}" ]; then
+                log "${cr_port} bound to ${master}"
+                return 0
+            fi
+        fi
+        local mine peak
+        mine="$(nbctl --bare --columns=priority find Gateway_Chassis \
+            "chassis_name=${master}" 2>/dev/null | head -1 || true)"
+        peak="$(nbctl --bare --columns=priority list Gateway_Chassis \
+            2>/dev/null | sort -n | tail -1 || true)"
+        if [ -n "${peak}" ] && { [ -z "${mine}" ] || [ "${mine}" -ne "${peak}" ]; }; then
+            nbctl lrp-set-gateway-chassis "${LR_PUBLIC_PORT}" "${master}" \
+                "$(( peak + 10 ))" || true
+        fi
+        sleep 2
+    done
+    echo "${cr_port} did not converge onto ${master} within 60s" >&2
+    nbctl list Gateway_Chassis >&2 || true
+    docker exec "${OVN_CENTRAL}" ovn-sbctl find Port_Binding \
+        logical_port="${cr_port}" >&2 || true
+    exit 1
+}
+
 main() {
     log "OVN_NBCTL = ${OVN_NBCTL}"
     wait_for_nb
@@ -614,6 +666,10 @@ main() {
     # Workload (kernel netns + LSP binding) last so ovn-controller sees
     # the SB Port_Binding row and the OVS port at the same time.
     ensure_workload_netns
+
+    # Last, because the agents (running since container start) may have
+    # already locked the election onto a bring-up-race winner.
+    converge_master_chassis
     log "bootstrap complete"
 }
 

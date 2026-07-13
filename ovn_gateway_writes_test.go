@@ -602,6 +602,38 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 			localRouters: []LocalRouterInfo{{LRPName: "tenant_a_router"}},
 			wantBoosts:   map[string]int{"tenant_a_router": 6},
 		},
+		// The bug the gateway_chassis reference join fixes: rows whose Name
+		// does not follow the {lrp}_{chassis} convention used to fall out of
+		// the grouping entirely, so the anti-flapping boost silently never
+		// happened. Joined by UUID they resolve regardless of their name.
+		{
+			name: "non-conventional Gateway_Chassis names resolve via the reference column",
+			entries: []*NBGatewayChassis{
+				{UUID: "g1", Name: "ha-group-7", ChassisName: "host-a", Priority: 1},
+				{UUID: "g2", Name: "ha-group-8", ChassisName: "host-b", Priority: 5},
+			},
+			localRouters: []LocalRouterInfo{
+				{LRPName: "lrp-a", GatewayChassisUUIDs: []string{"g1", "g2"}},
+			},
+			wantBoosts: map[string]int{"lrp-a": 6},
+		},
+		{
+			// A referenced row belonging to another LRP must not be pulled
+			// into this LRP's HA group by the reference join.
+			name: "reference join keeps HA groups separate",
+			entries: []*NBGatewayChassis{
+				{UUID: "g1", Name: "ha-group-7", ChassisName: "host-a", Priority: 1},
+				{UUID: "g2", Name: "ha-group-8", ChassisName: "host-b", Priority: 5},
+				{UUID: "g3", Name: "ha-group-9", ChassisName: "host-b", Priority: 9},
+			},
+			localRouters: []LocalRouterInfo{
+				{LRPName: "lrp-a", GatewayChassisUUIDs: []string{"g1", "g2"}},
+				{LRPName: "lrp-b", GatewayChassisUUIDs: []string{"g3"}},
+			},
+			// lrp-a boosts past its own peer (5), not past lrp-b's peer (9).
+			// lrp-b has no local row, so it is a no-op.
+			wantBoosts: map[string]int{"lrp-a": 6},
+		},
 	}
 
 	for _, tt := range tests {
@@ -639,13 +671,24 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 				t.Fatalf("expected %d update ops, got %d: %+v", len(tt.wantBoosts), len(updates), updates)
 			}
 			// Map each local UUID back to its LRP so we can assert the
-			// computed priority for each update op.
+			// computed priority for each update op. Mirror the production
+			// join: prefer the LRP's gateway_chassis references, fall back to
+			// the {lrp}_{chassis} name form.
+			lrpByGWC := map[string]string{}
+			for _, lr := range tt.localRouters {
+				for _, u := range lr.GatewayChassisUUIDs {
+					lrpByGWC[u] = lr.LRPName
+				}
+			}
 			lrpByLocalUUID := make(map[string]string, len(tt.wantBoosts))
 			for _, e := range tt.entries {
 				if e.ChassisName != "host-a" {
 					continue
 				}
-				lrp := e.Name[:len(e.Name)-len("_"+e.ChassisName)]
+				lrp, ok := lrpByGWC[e.UUID]
+				if !ok {
+					lrp = strings.TrimSuffix(e.Name, "_"+e.ChassisName)
+				}
 				if _, want := tt.wantBoosts[lrp]; want {
 					lrpByLocalUUID[e.UUID] = lrp
 				}
@@ -670,6 +713,43 @@ func TestEnsureActivePriorityLead(t *testing.T) {
 				t.Errorf("expected updates for local UUIDs %v but they were not issued", lrpByLocalUUID)
 			}
 		})
+	}
+}
+
+// TestEnsureActivePriorityLead_WarnsOnNameConventionFallback pins the fallback
+// path of the gateway_chassis reference join: when the LRP carries no
+// gateway_chassis references (e.g. the NB cache dropped that column's update),
+// the {lrp}_{chassis} name form is still used to group the row — but loudly, so
+// an operator can see the schema join degraded to a naming convention.
+func TestEnsureActivePriorityLead_WarnsOnNameConventionFallback(t *testing.T) {
+	buf := captureSlog(t)
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 1},
+		&NBGatewayChassis{UUID: "g2", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 5},
+	)
+
+	// No GatewayChassisUUIDs — the reference join cannot cover these rows.
+	routers := []LocalRouterInfo{{LRPName: "lrp-a"}}
+	if err := c.EnsureActivePriorityLead(context.Background(), routers, "host-a"); err != nil {
+		t.Fatalf("EnsureActivePriorityLead: %v", err)
+	}
+
+	// The boost must still happen — the fallback is a degradation, not a drop.
+	var boosted bool
+	for _, batch := range nb.recordedTransacts() {
+		for _, op := range batch {
+			if op.Op == ovsdb.OperationUpdate && op.Table == "Gateway_Chassis" && op.UUID == "g1" {
+				boosted = true
+			}
+		}
+	}
+	if !boosted {
+		t.Error("expected the boost to still be issued via the name-convention fallback")
+	}
+	if !strings.Contains(buf.String(), "not referenced by its LRP's gateway_chassis column") {
+		t.Errorf("expected a fallback warning, got:\n%s", buf.String())
 	}
 }
 
