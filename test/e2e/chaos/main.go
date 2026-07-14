@@ -202,7 +202,7 @@ func drive(ctx context.Context, l *lab, actions []*action, jrnl *journal, rec *r
 	sideCtx, stopSide := context.WithCancel(ctx)
 	defer stopSide()
 
-	probes := newProber(l, probeTargets, jrnl, time.Now)
+	probes := newProber(l, defaultProbes, jrnl, time.Now)
 	probes.start(sideCtx)
 
 	e := newEngine(l, actions, probes, jrnl, rec)

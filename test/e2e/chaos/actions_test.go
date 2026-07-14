@@ -346,12 +346,12 @@ func TestVLANLayerReportsANBFailure(t *testing.T) {
 // it. Probing it would be red for the whole run and every recovery gate
 // would time out, so it must stay out of the probe set.
 func TestProbeTargetsExcludeTheBackendlessFIP(t *testing.T) {
-	for _, target := range probeTargets {
+	for _, target := range defaultProbes {
 		if strings.Contains(target.addr, "192.0.2.11") {
 			t.Fatalf("probe target %q has no responder behind it", target.name)
 		}
 	}
-	if len(probeTargets) != 5 {
-		t.Fatalf("probe set = %v, want the four FIPs plus the port-forward VIP", probeTargets)
+	if len(defaultProbes) != 5 {
+		t.Fatalf("probe set = %v, want the four FIPs plus the port-forward VIP", defaultProbes)
 	}
 }

@@ -32,19 +32,6 @@ import (
 // would report every later fault as a false violation.
 const startStateTimeout = 120 * time.Second
 
-// probeTargets is what the run measures continuously from client-1.
-//
-// The baseline lab's second FIP, 192.0.2.11, is deliberately absent:
-// bootstrap.sh seeds its NAT row but nothing answers behind
-// 192.168.10.11, so probing it would be red for the whole run.
-var probeTargets = []probeTarget{
-	{"fip-vm1", probePing, "192.0.2.10"},
-	{"fip-vm2", probePing, "192.0.2.12"},
-	{"fip-vlan101", probePing, "198.51.100.10"},
-	{"fip-vlan102", probePing, "203.0.113.10"},
-	{"pf-vip", probeHTTP, vipURL},
-}
-
 // vlanNetwork is one row of multi-vlan.sh's NETWORKS table.
 type vlanNetwork struct {
 	tag    string
@@ -317,7 +304,7 @@ func waitStartStateGreen(ctx context.Context, l *lab) error {
 
 func redStartTargets(ctx context.Context, l *lab) []string {
 	var red []string
-	for _, t := range probeTargets {
+	for _, t := range defaultProbes {
 		var err error
 		switch t.kind {
 		case probeHTTP:
