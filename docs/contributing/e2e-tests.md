@@ -763,30 +763,85 @@ with `if: always()`, so a third `containerlab deploy` would only eat
 into the job's time budget and, on the failure path, destroy the
 lab state the artifact collector is about to dump.
 
-The assertion: the graceful arm's outage at most
-`GRACEFUL_MAX_OUTAGE_MS` (default **500 ms**), and `graceful_loss`
-strictly less than `hardkill_loss`. The second half is what makes the
-comparison meaningful — both arms hit the same lab and the same FIP,
-so the delta between them *is* the hitless gain.
+The scenario asserts three things:
 
-Issue #113 phrased its ceiling as "at most one lost packet" (100 ms at
-the default probe spacing), but that number predates any measurement.
-The first run on the CI runner class measured a 200 ms outage: the two
-lost packets sat 96–200 ms after the priority-0 write, inside OVN's
-northd/ovn-controller flow-reprogramming window that follows the
-Port_Binding migration, while BGP make-before-break held (`upstream`
-carried both nexthops until `gateway-1` withdrew). Nothing in the
-agent bounds that window: `DrainGateways` returns as soon as SB
-reports the chassisredirect port gone, and the agent (PID 1) exits
-right after. The 500 ms default gives headroom over that measured
-floor so the job passes consistently, while staying well under the
-hard-kill control's measured 2800 ms — a broken drain path still trips
-the assertion. The scenario keeps the duration primary and derives the
-packet ceiling from `PROBE_INTERVAL` so overriding the spacing cannot
-silently move the budget — at the 0.2 s unprivileged `iputils` floor,
-a packet ceiling would otherwise silently double. Raise
-`GRACEFUL_MAX_OUTAGE_MS` only to triage a lab whose reconvergence is
-slower; the delta is asserted either way.
+1. the graceful arm's outage is at most `GRACEFUL_MAX_OUTAGE_MS`
+   (default **1500 ms**) — the hitless claim;
+2. `graceful_loss` is strictly less than `hardkill_loss` — what makes
+   the comparison meaningful, since both arms hit the same lab and the
+   same FIP, so the delta between them *is* the hitless gain;
+3. the budget in (1) is itself strictly below `hardkill_loss` — a
+   budget a hard kill would pass cannot tell a broken drain from a
+   working one, so the scenario refuses to assert it.
+
+**Where the budget comes from.** Issue #113 phrased its ceiling as "at
+most one lost packet" (100 ms at the default probe spacing) before any
+measurement existed, and the first calibration replaced that with 500 ms
+off a single 200 ms sample. One sample is not a distribution: 500 ms
+derives a ceiling of 5 packets, healthy runs routinely measured exactly
+5, and ordinary runner noise then failed unrelated pull requests
+([#182](https://github.com/osism/ovn-network-agent/issues/182)).
+
+The 1500 ms default rests on the graceful-arm loss of **20 CI runs** —
+every drain-hitless run carrying the drain takeover handshake
+([#129](https://github.com/osism/ovn-network-agent/issues/129), on
+`main` since 2026-07-11):
+
+| Graceful loss | Outage | Runs |
+| --- | --- | --- |
+| 2 packets | 200 ms | 3 |
+| 3 packets | 300 ms | 5 |
+| 4 packets | 400 ms | 2 |
+| 5 packets | 500 ms | 6 |
+| 6 packets | 600 ms | 3 |
+| 11 packets | 1100 ms | 1 |
+
+(n=20, min 200 ms, median 450 ms, p90 600 ms, max 1100 ms.)
+
+1500 ms clears the worst of those by 1.36×. The ceiling is bounded from
+above as well, and that half is what keeps the scenario honest: the
+hard-kill control — same lab, same probe, a chassis that dies without
+draining — measured 23–30 packets (2300–3000 ms) across the same runs,
+in a much tighter band. 1500 ms sits at 65 % of the tightest control
+run, so a shutdown that fails to drain still overshoots the budget by at
+least 8 packets. Assertion 3 re-checks that on every run instead of
+trusting today's numbers to hold: raising `GRACEFUL_MAX_OUTAGE_MS` until
+it can no longer discriminate now *fails* the scenario rather than
+quietly hollowing it out. If the budget starts failing again, re-derive
+it from ~20 runs (every run prints its loss and bundles it into
+`summary.txt`) rather than nudging it past the last red run.
+
+**What the budget bounds.** The lost packets sit in OVN's
+northd/ovn-controller flow-reprogramming window after the
+`Port_Binding` migration: between `cr-lr0-public` moving to `gateway-2`
+and the gateways' flows converging on the new owner, `upstream` still
+ECMPs part of the traffic at a chassis that no longer owns the port.
+The agent bounds its own half of that window — the #129 drain takeover
+handshake makes `DrainGateways` wait for the takeover chassis to stamp
+its NB readiness marker (its word that it has announced the FIP routes)
+and then hold `drain_settle_delay` before cleanup withdraws the leaving
+node's routes, all bounded by `drain_timeout`. That handshake is why the
+numbers above look the way they do: before it landed the arm was
+bimodal, three of five runs measuring 48–49 packets (~4.9 s); across the
+twenty runs since, nothing has exceeded 11. What remains inside the
+budget is OVN's reprogramming on the *takeover* chassis, which the agent
+does not control.
+
+That 48–49-packet mode is also the concrete regression the budget has to
+keep catching — a drain that still *runs* (the log says `drain:
+complete`, so the drain-log gate is satisfied) but no longer *delivers* a
+hitless failover. At 15 packets the ceiling catches it more than three
+times over. What it will not catch, stated plainly: a degradation inside
+the budget, say the median moving from 450 ms to 1000 ms. The arm's own
+spread on this runner class (200–1100 ms) is wider than such a shift, so
+no ceiling separates the two without failing on the tail. The scenario
+resolves gross regressions, not gradual ones — watch the
+`graceful_outage_ms` trend in `summary.txt` for those.
+
+The scenario keeps the duration primary and derives the packet ceiling
+from `PROBE_INTERVAL` so overriding the spacing cannot silently move the
+budget — at the 0.2 s unprivileged `iputils` floor, a packet ceiling
+would otherwise silently double.
 
 **Overrides for triage:** `MASTER`, `FIP`, `UPSTREAM`,
 `PROBE_INTERVAL`, `PROBE_COUNT`, `PROBE_PRELUDE`, `FAILOVER_TIMEOUT`,
@@ -970,7 +1025,7 @@ writes:
   drain-hitless/hardkill-transition-timeline.txt — per-second SB chassis + upstream BGP nexthop across the hard kill (drain-hitless only)
   drain-hitless/hardkill-port-binding-before.txt — cr-lr0-public Port_Binding snapshot before the hard kill (drain-hitless only)
   drain-hitless/hardkill-port-binding-after.txt  — cr-lr0-public Port_Binding snapshot after the hard kill (drain-hitless only)
-  drain-hitless/summary.txt                      — both loss counts, the configured threshold, and the hitless gain (drain-hitless only)
+  drain-hitless/summary.txt                      — both loss counts, the configured threshold, the hitless gain, and the budget's headroom over the control arm (drain-hitless only)
 ```
 
 You can reproduce the same dump on a local lab with:
