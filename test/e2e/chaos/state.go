@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -231,9 +233,8 @@ func applyPortForwardLayer(ctx context.Context, l *lab) error {
 // pf-external.sh. Any previous instance is killed first, so this doubles
 // as the restore path after gateway-3 has been recycled.
 func startPFBackend(ctx context.Context, l *lab) error {
-	if _, err := l.sh(ctx, workloadHost,
-		"pkill -f "+pfBackendLog+" || true; : >"+pfBackendLog); err != nil {
-		return fmt.Errorf("reset pf-backend on %s: %w", workloadHost, err)
+	if err := resetResponder(ctx, l, workloadHost, pfBackendLog); err != nil {
+		return err
 	}
 	if _, err := l.docker(ctx, "exec", "-d", l.node(workloadHost),
 		"ip", "netns", "exec", "vm1", "/usr/local/bin/pf-backend",
@@ -255,9 +256,8 @@ func startPFBackend(ctx context.Context, l *lab) error {
 // while the VIP traffic ingresses vrf-provider.
 func startAPIBackend(ctx context.Context, l *lab, gw string) error {
 	addr := fmt.Sprintf(":%d", apiVIPPort)
-	if _, err := l.sh(ctx, gw,
-		"pkill -f "+apiBackendLog+" || true; : >"+apiBackendLog); err != nil {
-		return fmt.Errorf("reset the API backend on %s: %w", gw, err)
+	if err := resetResponder(ctx, l, gw, apiBackendLog); err != nil {
+		return err
 	}
 	if _, err := l.docker(ctx, "exec", "-d", l.node(gw),
 		"/usr/local/bin/pf-backend", "-addr", addr, "-log", apiBackendLog); err != nil {
@@ -266,6 +266,28 @@ func startAPIBackend(ctx context.Context, l *lab, gw string) error {
 	if err := waitListening(ctx, l, gw,
 		fmt.Sprintf("ss -ltn 'sport = %s' | grep -q LISTEN", addr)); err != nil {
 		return fmt.Errorf("the API backend on %s: %w", gw, err)
+	}
+	return nil
+}
+
+// resetResponder stops the responder logging to logPath and truncates its
+// log, so a (re)start never races a previous instance for the port.
+//
+// pkill runs as its own `docker exec`, the way pf-external.sh runs it, and
+// not inside `sh -c`: `pkill -f` matches every process whose command line
+// carries the pattern — including the shell that is running the pkill,
+// whose argv carries it too — and that shell would die before it got to
+// the rest of the line. Exit 1 means nothing matched, which is the normal
+// case on a first start.
+func resetResponder(ctx context.Context, l *lab, node, logPath string) error {
+	if _, err := l.exec(ctx, node, "pkill", "-f", logPath); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return fmt.Errorf("stop the responder logging to %s on %s: %w", logPath, node, err)
+		}
+	}
+	if _, err := l.sh(ctx, node, ": >"+logPath); err != nil {
+		return fmt.Errorf("truncate %s on %s: %w", logPath, node, err)
 	}
 	return nil
 }
