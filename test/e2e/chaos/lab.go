@@ -101,6 +101,15 @@ const (
 	workloadHost = "gateway-3"
 	crPort       = "cr-lr0-public"
 
+	// The agent as the gwnode image ships it: the binary, the config file
+	// the entrypoint execs it with, and the two paths the chaos runner
+	// owns next to it — the staged config it validates before swapping,
+	// and the marker that tells the entrypoint a profile owns the file.
+	agentBinary         = "/usr/local/bin/ovn-network-agent"
+	agentConfigPath     = "/etc/ovn-network-agent/config.yaml"
+	agentConfigNextPath = "/etc/ovn-network-agent/config.next.yaml"
+	profileMarkerPath   = "/etc/ovn-network-agent/chaos-profile"
+
 	// The port-forward VIP from pf-external.sh. The agent does not
 	// propagate Load_Balancer VIPs into the underlay, so the runner
 	// keeps the two routes pointed at the current master itself — see
@@ -269,7 +278,7 @@ func (l *lab) containerHealth(ctx context.Context, gw string) string {
 // runner into an agent-down violation and fail the run over a lab that
 // was fine, so they are returned as an error.
 func (l *lab) agentAlive(ctx context.Context, gw string) (bool, error) {
-	out, err := l.exec(ctx, gw, "pgrep", "-f", "/usr/local/bin/ovn-network-agent")
+	out, err := l.exec(ctx, gw, "pgrep", "-f", agentBinary)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
@@ -278,6 +287,74 @@ func (l *lab) agentAlive(ctx context.Context, gw string) (bool, error) {
 		return false, err
 	}
 	return strings.TrimSpace(out) != "", nil
+}
+
+// writeFile writes content to a path inside a container. The content is a
+// rendered agent config, so it goes through the same argv-level quoting
+// configureGatewayBGP already uses for its vtysh block.
+func (l *lab) writeFile(ctx context.Context, node, path, content string) error {
+	if _, err := l.sh(ctx, node, "printf '%s' "+shellQuote(content)+" > "+path); err != nil {
+		return fmt.Errorf("write %s on %s: %w", path, node, err)
+	}
+	return nil
+}
+
+func (l *lab) readFile(ctx context.Context, node, path string) (string, error) {
+	out, err := l.exec(ctx, node, "cat", path)
+	if err != nil {
+		return "", fmt.Errorf("read %s on %s: %w", path, node, err)
+	}
+	return out, nil
+}
+
+func (l *lab) moveFile(ctx context.Context, node, from, to string) error {
+	if _, err := l.exec(ctx, node, "mv", from, to); err != nil {
+		return fmt.Errorf("move %s to %s on %s: %w", from, to, node, err)
+	}
+	return nil
+}
+
+func (l *lab) removeFile(ctx context.Context, node, path string) error {
+	if _, err := l.exec(ctx, node, "rm", "-f", path); err != nil {
+		return fmt.Errorf("remove %s on %s: %w", path, node, err)
+	}
+	return nil
+}
+
+// mgmtIP is the gateway's address on the containerlab management network,
+// derived exactly the way the gwnode entrypoint derives its geneve encap
+// IP. It is where the API VIP's DNAT backend listens.
+func (l *lab) mgmtIP(ctx context.Context, gw string) (string, error) {
+	out, err := l.sh(ctx, gw, "ip -o -4 addr show eth0 | awk '{print $4}' | cut -d/ -f1")
+	if err != nil {
+		return "", fmt.Errorf("read the management address of %s: %w", gw, err)
+	}
+	ip := strings.TrimSpace(out)
+	if ip == "" {
+		return "", fmt.Errorf("%s has no address on the management network", gw)
+	}
+	return ip, nil
+}
+
+// checkConfig hands a staged config file to the agent's own validator.
+//
+// Exit 1 is the answer the gate is asking for — the config is invalid —
+// and comes back as (false, why, nil). Every other failure means the
+// question could not be asked at all: a docker daemon under load, a
+// container that is gone, the 30s cmdTimeout expiring. Folding those into
+// "invalid" would be the milder mistake; folding them into "valid" would
+// swap a live agent config on the strength of a check that never ran, so
+// they are returned as an error — the same split agentAlive makes.
+func (l *lab) checkConfig(ctx context.Context, gw, path string) (bool, string, error) {
+	out, err := l.exec(ctx, gw, agentBinary, "--check-config", "--config", path)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, err.Error(), nil
+		}
+		return false, "", fmt.Errorf("validate %s on %s: %w", path, gw, err)
+	}
+	return true, strings.TrimSpace(out), nil
 }
 
 // chassisInSB reports whether gw still has (or has re-registered) its

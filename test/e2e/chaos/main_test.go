@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 func TestRunRejectsInvalidInputs(t *testing.T) {
 	tests := []struct {
 		name     string
+		profile  string
 		duration time.Duration
 		tickMin  time.Duration
 		tickMax  time.Duration
@@ -61,21 +64,38 @@ func TestRunRejectsInvalidInputs(t *testing.T) {
 			weights:  "gateway-melt=1",
 			wantErr:  "unknown action",
 		},
+		// The profile decides the topology the run drives and the
+		// configuration every agent in it runs — a run that cannot name
+		// one cannot be replayed either.
+		{
+			name:     "unknown profile",
+			profile:  "everything-off",
+			duration: time.Minute,
+			tickMin:  10 * time.Second,
+			tickMax:  30 * time.Second,
+			wantErr:  "unknown profile",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			out := t.TempDir()
 
+			profile := tc.profile
+			if profile == "" {
+				profile = defaultProfileName
+			}
 			code, err := run(config{
-				seed:       42,
-				duration:   tc.duration,
-				tickMin:    tc.tickMin,
-				tickMax:    tc.tickMax,
-				weightSpec: tc.weights,
-				labName:    "ovn-e2e",
-				outDir:     out,
-				collect:    "/nonexistent",
+				seed:         42,
+				profile:      profile,
+				duration:     tc.duration,
+				tickMin:      tc.tickMin,
+				tickMax:      tc.tickMax,
+				weightSpec:   tc.weights,
+				labName:      "ovn-e2e",
+				outDir:       out,
+				collect:      "/nonexistent",
+				gwnodeConfig: "../gwnode-config.yaml",
 			})
 
 			if code != exitFatal {
@@ -92,10 +112,72 @@ func TestRunRejectsInvalidInputs(t *testing.T) {
 	}
 }
 
+// A run whose profile never lands is abandoned: the lab never reached the
+// state the run measures against, so every fault after it would report a
+// violation the lab did not cause. The abandoned run still has to say what
+// went wrong — in its exit code, in its summary and in its journal —
+// rather than report a "pass" over a lab it never configured.
+func TestDriveAbandonsARunWhoseProfileNeverLands(t *testing.T) {
+	tests := []struct {
+		name    string
+		respond func(argv []string) (string, error)
+	}{
+		// Every gateway's config carries that gateway's own management
+		// address, so a run that cannot read one cannot render a config at
+		// all.
+		{
+			name: "the management address the config needs cannot be read",
+			respond: func(argv []string) (string, error) {
+				if strings.Contains(strings.Join(argv, " "), "ip -o -4 addr show eth0") {
+					return "", errBoom
+				}
+				return labWithConfig("stale config\n")(argv)
+			},
+		},
+		{
+			name: "the agent rejects the profile's configuration",
+			respond: func(argv []string) (string, error) {
+				if strings.Contains(strings.Join(argv, " "), "--check-config") {
+					return "", errExit(t, 1)
+				}
+				return labWithConfig("stale config\n")(argv)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := newFakeClock()
+			l := newTestLab(&fakeCommander{respond: tc.respond}, clock)
+			p := testProfile(t, "pf-only")
+			ap := newApplier(l, p, baseConfig(t))
+			var buf bytes.Buffer
+			ap.jrnl = newJournal(&buf, clock.now)
+			rec := &runRecord{ActionsByName: map[string]int{}}
+
+			code := drive(context.Background(), l, ap, allActions(p, ap), ap.jrnl, rec)
+
+			if code != exitFatal {
+				t.Fatalf("exit code = %d, want %d", code, exitFatal)
+			}
+			rec.finalize(clock.now())
+			if rec.Result != resultFail || len(rec.Violations) != 1 ||
+				rec.Violations[0].Kind != violationProfileApply {
+				t.Fatalf("the summary of an abandoned run does not say what went wrong: %+v", rec)
+			}
+			if ev := lastEventOf(t, buf.String(), evViolation); ev.Kind != violationProfileApply {
+				t.Fatalf("journaled %+v, want the violation the run was abandoned on", ev)
+			}
+		})
+	}
+}
+
 func TestWriteRecordProducesTheRunSummary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), summaryFile)
 	rec := &runRecord{
-		Inputs:     runInputs{Seed: 42, Lab: "ovn-e2e", Weights: map[string]int{"gateway-kill": 1}},
+		Inputs: runInputs{
+			Seed: 42, Profile: "pf-only", Lab: "ovn-e2e",
+			Weights: map[string]int{"gateway-kill": 1},
+		},
 		Violations: []violationRecord{{Kind: violationRecoveryTimeout, Target: "gateway-2", Detail: "budget"}},
 	}
 	rec.finalize(time.Now())
@@ -118,7 +200,10 @@ func TestWriteRecordProducesTheRunSummary(t *testing.T) {
 	if decoded.Result != resultFail {
 		t.Fatalf("result = %q, want %q — the run recorded a violation", decoded.Result, resultFail)
 	}
-	if decoded.Inputs.Seed != 42 || decoded.Inputs.Weights["gateway-kill"] != 1 {
+	// The profile is part of the reproducibility contract: a seed alone
+	// does not identify a run, so the record has to carry both.
+	if decoded.Inputs.Seed != 42 || decoded.Inputs.Profile != "pf-only" ||
+		decoded.Inputs.Weights["gateway-kill"] != 1 {
 		t.Fatalf("the record did not echo its inputs: %+v", decoded.Inputs)
 	}
 }

@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// The combined start state layers the setups of three existing scenarios
-// on top of the bootstrap baseline, so one chaos run exercises all of
-// them at once:
+// The start state layers the setups of three existing scenarios on top of
+// the bootstrap baseline, so one chaos run can exercise all of them at
+// once:
 //
 //   - hairpin.sh      — a second FIP (192.0.2.12) with a vm2 responder,
 //     so the master carries two FIPs and the hairpin flow is live.
@@ -17,6 +17,11 @@ import (
 //     with a router pinned to gateway-1 and a FIP behind a responder.
 //   - pf-external.sh  — a Load_Balancer VIP (192.0.2.50:80) in front of
 //     the vm1 backend, plus the two routes the agent does not manage.
+//
+// Which of them a run puts up is the profile's call (profiles.go): a
+// profile that configures its gateways without OVN has no use for a
+// Load_Balancer VIP, and one that measures the agent's own DNAT path
+// brings its own backend instead.
 //
 // The bootstrap baseline itself (HA router, FIP 192.0.2.10, the vm1
 // workload) is assumed — the runner drives a lab that `make e2e-up`
@@ -31,6 +36,20 @@ import (
 // before the run is abandoned — a start state that never went green
 // would report every later fault as a false violation.
 const startStateTimeout = 120 * time.Second
+
+// backendBindTimeout is how long an HTTP responder gets to bind its
+// listener before the layering gives up on it. A backend that never bound
+// would leave its VIP probe red for the whole run.
+const backendBindTimeout = 10 * time.Second
+
+// The two responders' log files. They are the same binary, and on the
+// workload host both run in the same PID namespace, so the log path is
+// what a `pkill -f` pattern keys on: `pkill -f /usr/local/bin/pf-backend`
+// would take the other one down with it.
+const (
+	pfBackendLog  = "/tmp/pf-backend.log"
+	apiBackendLog = "/tmp/api-backend.log"
+)
 
 // vlanNetwork is one row of multi-vlan.sh's NETWORKS table.
 type vlanNetwork struct {
@@ -56,48 +75,61 @@ type netns struct {
 	gw   string
 }
 
-// responders is every netns the start state needs on gateway-3 — the
-// bootstrap vm1 plus the ones the three layers add. reprovisionNode
-// re-creates all of them after gateway-3 has been through a container
-// lifecycle event, which destroys its network namespace.
-func responders() []netns {
-	all := []netns{
-		// bootstrap.sh:ensure_workload_netns
-		{"vm1", "ls0-vm1", "02:00:00:00:0a:0a", "192.168.10.10/24", "192.168.10.1"},
+// responders is every netns the profile's start state needs on gateway-3
+// — the bootstrap vm1 plus the ones the layers it puts up add.
+// reprovisionNode re-creates all of them after gateway-3 has been through
+// a container lifecycle event, which destroys its network namespace.
+func responders(p *profile) []netns {
+	// bootstrap.sh:ensure_workload_netns
+	all := []netns{{"vm1", "ls0-vm1", "02:00:00:00:0a:0a", "192.168.10.10/24", "192.168.10.1"}}
+	if p.hairpin {
 		// hairpin.sh:ensure_fip_b_responder
-		{"vm2", "ls0-vm2", "02:00:00:00:0a:0b", "192.168.10.12/24", "192.168.10.1"},
+		all = append(all, netns{"vm2", "ls0-vm2", "02:00:00:00:0a:0b", "192.168.10.12/24", "192.168.10.1"})
 	}
-	// multi-vlan.sh:ensure_responder
-	for _, n := range vlanNetworks {
-		all = append(all, netns{
-			name: "vm" + n.tag,
-			lsp:  "vm" + n.tag,
-			mac:  "02:00:00:" + n.hex + ":0a:0a",
-			cidr: n.tenant + ".10/24",
-			gw:   n.tenant + ".1",
-		})
+	if p.vlans {
+		// multi-vlan.sh:ensure_responder
+		for _, n := range vlanNetworks {
+			all = append(all, netns{
+				name: "vm" + n.tag,
+				lsp:  "vm" + n.tag,
+				mac:  "02:00:00:" + n.hex + ":0a:0a",
+				cidr: n.tenant + ".10/24",
+				gw:   n.tenant + ".1",
+			})
+		}
 	}
 	return all
 }
 
-// applyStartState layers the three scenario setups onto the baseline and
-// waits for every probe target to answer.
-func applyStartState(ctx context.Context, l *lab) error {
-	if err := applyHairpinLayer(ctx, l); err != nil {
-		return err
-	}
-	for _, n := range vlanNetworks {
-		if err := applyVLANLayer(ctx, l, n); err != nil {
+// applyStartState layers the profile's scenario setups onto the baseline
+// and waits for every probe target the profile measures to answer.
+func applyStartState(ctx context.Context, l *lab, p *profile) error {
+	if p.hairpin {
+		if err := applyHairpinLayer(ctx, l); err != nil {
 			return err
 		}
 	}
-	if err := ensureResponders(ctx, l); err != nil {
+	if p.vlans {
+		for _, n := range vlanNetworks {
+			if err := applyVLANLayer(ctx, l, n); err != nil {
+				return err
+			}
+		}
+	}
+	if err := ensureResponders(ctx, l, p); err != nil {
 		return err
 	}
-	if err := applyPortForwardLayer(ctx, l); err != nil {
-		return err
+	if p.ovnLB {
+		if err := applyPortForwardLayer(ctx, l); err != nil {
+			return err
+		}
 	}
-	return waitStartStateGreen(ctx, l)
+	for _, gw := range p.apiVIPGateways() {
+		if err := startAPIBackend(ctx, l, gw); err != nil {
+			return err
+		}
+	}
+	return waitStartStateGreen(ctx, l, p)
 }
 
 // applyHairpinLayer mirrors ensure_fip_b_lsp / ensure_fip_b_nat in
@@ -194,36 +226,69 @@ func applyPortForwardLayer(ctx context.Context, l *lab) error {
 	return nil
 }
 
-// startPFBackend (re)starts the HTTP responder behind the VIP in the vm1
-// netns and waits for it to bind — start_backend in pf-external.sh. Any
-// previous instance is killed first, so this doubles as the restore path
-// after gateway-3 has been recycled.
+// startPFBackend (re)starts the HTTP responder behind the Load_Balancer
+// VIP in the vm1 netns and waits for it to bind — start_backend in
+// pf-external.sh. Any previous instance is killed first, so this doubles
+// as the restore path after gateway-3 has been recycled.
 func startPFBackend(ctx context.Context, l *lab) error {
 	if _, err := l.sh(ctx, workloadHost,
-		"pkill -f /usr/local/bin/pf-backend || true; : >/tmp/pf-backend.log"); err != nil {
+		"pkill -f "+pfBackendLog+" || true; : >"+pfBackendLog); err != nil {
 		return fmt.Errorf("reset pf-backend on %s: %w", workloadHost, err)
 	}
 	if _, err := l.docker(ctx, "exec", "-d", l.node(workloadHost),
 		"ip", "netns", "exec", "vm1", "/usr/local/bin/pf-backend",
-		"-addr", ":8080", "-log", "/tmp/pf-backend.log"); err != nil {
+		"-addr", ":8080", "-log", pfBackendLog); err != nil {
 		return fmt.Errorf("start pf-backend on %s: %w", workloadHost, err)
 	}
-	deadline := l.now().Add(10 * time.Second)
+	if err := waitListening(ctx, l, workloadHost,
+		"ip netns exec vm1 ss -ltn 'sport = :8080' | grep -q LISTEN"); err != nil {
+		return fmt.Errorf("pf-backend on %s: %w", workloadHost, err)
+	}
+	return nil
+}
+
+// startAPIBackend (re)starts the responder behind the API VIP. Unlike the
+// Load_Balancer VIP's backend it runs in the gateway's *default* network
+// namespace, because that is where the VIP's port_forwards rule DNATs to:
+// the gateway's own management address. It is the reason those gateways
+// need port_forward_l3mdev_accept — the socket is in the default VRF
+// while the VIP traffic ingresses vrf-provider.
+func startAPIBackend(ctx context.Context, l *lab, gw string) error {
+	addr := fmt.Sprintf(":%d", apiVIPPort)
+	if _, err := l.sh(ctx, gw,
+		"pkill -f "+apiBackendLog+" || true; : >"+apiBackendLog); err != nil {
+		return fmt.Errorf("reset the API backend on %s: %w", gw, err)
+	}
+	if _, err := l.docker(ctx, "exec", "-d", l.node(gw),
+		"/usr/local/bin/pf-backend", "-addr", addr, "-log", apiBackendLog); err != nil {
+		return fmt.Errorf("start the API backend on %s: %w", gw, err)
+	}
+	if err := waitListening(ctx, l, gw,
+		fmt.Sprintf("ss -ltn 'sport = %s' | grep -q LISTEN", addr)); err != nil {
+		return fmt.Errorf("the API backend on %s: %w", gw, err)
+	}
+	return nil
+}
+
+// waitListening polls a responder's listener until it is up. A backend
+// that never bound must fail the layering rather than leave its VIP probe
+// red — and every recovery gate behind it timing out — for the whole run.
+func waitListening(ctx context.Context, l *lab, node, probe string) error {
+	deadline := l.now().Add(backendBindTimeout)
 	for l.now().Before(deadline) {
-		if _, err := l.sh(ctx, workloadHost,
-			"ip netns exec vm1 ss -ltn 'sport = :8080' | grep -q LISTEN"); err == nil {
+		if _, err := l.sh(ctx, node, probe); err == nil {
 			return nil
 		}
 		l.sleep(time.Second)
 	}
-	return fmt.Errorf("pf-backend did not bind on :8080 within 10s")
+	return fmt.Errorf("did not bind within %s", backendBindTimeout)
 }
 
 // ensureResponders (re)creates every kernel-side responder on the
 // workload host. Idempotent, and the shape is lifted verbatim from
 // ensure_workload_netns in bootstrap.sh.
-func ensureResponders(ctx context.Context, l *lab) error {
-	for _, n := range responders() {
+func ensureResponders(ctx context.Context, l *lab, p *profile) error {
+	for _, n := range responders(p) {
 		hostVeth := n.name + "-host"
 		nsVeth := n.name + "-eth0"
 		script := strings.Join([]string{
@@ -260,51 +325,60 @@ func ensureResponders(ctx context.Context, l *lab) error {
 // container up or recycle the whole lab. A chaos run has to put the node
 // back, because the guardrails only re-target a node that has returned
 // and converged.
-func restoreNode(ctx context.Context, l *lab, gw string) error {
+func restoreNode(ctx context.Context, l *lab, p *profile, gw string) error {
 	if err := l.rewireUnderlay(ctx, gw); err != nil {
 		return err
 	}
-	return reprovisionNode(ctx, l, gw)
+	return reprovisionNode(ctx, l, p, gw)
 }
 
 // reprovisionNode re-creates the node-local state a container restart
-// wiped. Only the workload host carries any — the VIP's scope-link route
-// is re-applied by ensureVIPRouting during convergence, wherever the
-// master happens to be by then.
-func reprovisionNode(ctx context.Context, l *lab, gw string) error {
-	if gw != workloadHost {
+// wiped: the workload host's netns responders and the Load_Balancer VIP's
+// backend, and — on any gateway whose profile configures the API VIP —
+// the responder that VIP forwards to. The Load_Balancer VIP's scope-link
+// route is not re-applied here: ensureVIPRouting does it during
+// convergence, wherever the master happens to be by then.
+func reprovisionNode(ctx context.Context, l *lab, p *profile, gw string) error {
+	if gw == workloadHost {
+		if err := l.waitReady(ctx, gw, "ovs-vsctl br-exists br-int"); err != nil {
+			return fmt.Errorf("wait for br-int on %s: %w", gw, err)
+		}
+		if err := ensureResponders(ctx, l, p); err != nil {
+			return err
+		}
+		if p.ovnLB {
+			if err := startPFBackend(ctx, l); err != nil {
+				return err
+			}
+		}
+	}
+	if !p.gwConfig(gw).apiVIP {
 		return nil
 	}
-	if err := l.waitReady(ctx, gw, "ovs-vsctl br-exists br-int"); err != nil {
-		return fmt.Errorf("wait for br-int on %s: %w", gw, err)
-	}
-	if err := ensureResponders(ctx, l); err != nil {
-		return err
-	}
-	return startPFBackend(ctx, l)
+	return startAPIBackend(ctx, l, gw)
 }
 
 // waitStartStateGreen holds the run until every probe target answers, so
 // a fault is never injected into a lab that was not green to begin with.
-func waitStartStateGreen(ctx context.Context, l *lab) error {
+func waitStartStateGreen(ctx context.Context, l *lab, p *profile) error {
 	deadline := l.now().Add(startStateTimeout)
 	for l.now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		red := redStartTargets(ctx, l)
+		red := redStartTargets(ctx, l, p)
 		if len(red) == 0 {
 			return nil
 		}
 		l.sleep(2 * time.Second)
 	}
 	return fmt.Errorf("start state not green within %s: %s",
-		startStateTimeout, strings.Join(redStartTargets(ctx, l), ", "))
+		startStateTimeout, strings.Join(redStartTargets(ctx, l, p), ", "))
 }
 
-func redStartTargets(ctx context.Context, l *lab) []string {
+func redStartTargets(ctx context.Context, l *lab, p *profile) []string {
 	var red []string
-	for _, t := range defaultProbes {
+	for _, t := range p.probes {
 		var err error
 		switch t.kind {
 		case probeHTTP:

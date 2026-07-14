@@ -13,7 +13,7 @@ func TestApplyStartStateLayersEveryScenarioSetup(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
 
-	if err := applyStartState(context.Background(), l); err != nil {
+	if err := applyStartState(context.Background(), l, defaultTestProfile(t)); err != nil {
 		t.Fatalf("applyStartState: %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestApplyStartStateFailsWhenTheLabNeverGoesGreen(t *testing.T) {
 	}}
 	l := newTestLab(cmd, newFakeClock())
 
-	err := applyStartState(context.Background(), l)
+	err := applyStartState(context.Background(), l, defaultTestProfile(t))
 	if err == nil {
 		t.Fatal("a start state with a dead FIP was accepted")
 	}
@@ -90,7 +90,7 @@ func TestRestoreNodeRewiresBeforeReprovisioning(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
 
-	if err := restoreNode(context.Background(), l, workloadHost); err != nil {
+	if err := restoreNode(context.Background(), l, defaultTestProfile(t), workloadHost); err != nil {
 		t.Fatalf("restoreNode: %v", err)
 	}
 
@@ -113,7 +113,7 @@ func TestRestoreNodeReportsAFailedRewire(t *testing.T) {
 	}}
 	l := newTestLab(cmd, newFakeClock())
 
-	err := restoreNode(context.Background(), l, "gateway-2")
+	err := restoreNode(context.Background(), l, defaultTestProfile(t), "gateway-2")
 	if err == nil {
 		t.Fatal("a failed veth re-create was reported as a successful restore")
 	}
@@ -127,12 +127,116 @@ func TestRestoreNodeReportsAFailedRewire(t *testing.T) {
 // stay red after its host is recycled and fail the next recovery gate.
 func TestEveryProbedFIPHasARestoredResponder(t *testing.T) {
 	lsps := map[string]bool{}
-	for _, n := range responders() {
+	for _, n := range responders(defaultTestProfile(t)) {
 		lsps[n.lsp] = true
 	}
 	for _, want := range []string{"ls0-vm1", "ls0-vm2", "vm101", "vm102"} {
 		if !lsps[want] {
 			t.Fatalf("responder for %s is not rebuilt after its host is recycled", want)
 		}
+	}
+}
+
+// A profile that puts up no VLAN networks must not layer them anyway: the
+// point of flat-minimal is a lab whose agents have less to reconcile, and
+// a stray VLAN network would leave residue no probe measures.
+func TestApplyStartStateOnlyLayersTheProfilesOwnScenarios(t *testing.T) {
+	cmd := &fakeCommander{respond: healthyLabResponses}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := applyStartState(context.Background(), l, testProfile(t, "flat-minimal")); err != nil {
+		t.Fatalf("applyStartState: %v", err)
+	}
+
+	for _, unwanted := range []string{
+		"ln-vlan101", // multi-vlan.sh
+		"lr-nat-add lr0 dnat_and_snat 192.0.2.12", // hairpin.sh
+		"lb-add pf-external",                      // pf-external.sh
+		"external_ids:iface-id=ls0-vm2",
+		"/usr/local/bin/pf-backend",
+	} {
+		if cmd.called(unwanted) {
+			t.Fatalf("flat-minimal layered %q, which none of its probes measure: %v", unwanted, cmd.lines())
+		}
+	}
+	// The bootstrap responder behind the one FIP it does probe is still
+	// ensured — it is the restore path too.
+	if !cmd.called("external_ids:iface-id=ls0-vm1") {
+		t.Fatalf("the workload behind the probed FIP was not ensured: %v", cmd.lines())
+	}
+}
+
+// The API VIP's backend runs in the gateway's default namespace, and only
+// on the gateways whose configuration carries the VIP. It is the same
+// binary as the Load_Balancer VIP's backend, so the two kill patterns must
+// not overlap: resetting one on gateway-3 would otherwise take the other
+// one down with it.
+func TestStartStateStartsTheAPIBackendOnlyOnItsGateways(t *testing.T) {
+	cmd := &fakeCommander{respond: healthyLabResponses}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := applyStartState(context.Background(), l, testProfile(t, "heterogeneous")); err != nil {
+		t.Fatalf("applyStartState: %v", err)
+	}
+
+	if !cmd.called("exec -d clab-ovn-e2e-gateway-2 /usr/local/bin/pf-backend -addr :8080 -log " + apiBackendLog) {
+		t.Fatalf("the API backend was not started on the gateway that announces the VIP: %v", cmd.lines())
+	}
+	if cmd.called("exec -d clab-ovn-e2e-gateway-1 /usr/local/bin/pf-backend") {
+		t.Fatalf("the API backend was started on a gateway whose config has no VIP: %v", cmd.lines())
+	}
+	if cmd.count("pkill -f "+apiBackendLog) != 1 {
+		t.Fatalf("the API backend was reset on more than its own gateway: %v", cmd.lines())
+	}
+	for _, line := range cmd.lines() {
+		if strings.Contains(line, "pkill") && strings.Contains(line, "/usr/local/bin/pf-backend") {
+			t.Fatalf("a kill pattern matches both responders and would take the other one down: %q", line)
+		}
+	}
+}
+
+// A gateway that comes back from a container lifecycle event needs the
+// responder behind its API VIP back too — nothing else restarts it, and
+// the VIP probe would stay red for the rest of the run.
+func TestReprovisionRestartsTheAPIBackendOnItsGateways(t *testing.T) {
+	p := testProfile(t, "heterogeneous")
+	cmd := &fakeCommander{respond: healthyLabResponses}
+
+	if err := reprovisionNode(context.Background(), newTestLab(cmd, newFakeClock()), p, "gateway-2"); err != nil {
+		t.Fatalf("reprovision gateway-2: %v", err)
+	}
+	if !cmd.called("exec -d clab-ovn-e2e-gateway-2 /usr/local/bin/pf-backend") {
+		t.Fatalf("the API backend was not restarted after the lifecycle event: %v", cmd.lines())
+	}
+
+	// A gateway with neither node-local workloads nor an API VIP has
+	// nothing to reprovision.
+	peer := &fakeCommander{respond: healthyLabResponses}
+	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()), p, "gateway-1"); err != nil {
+		t.Fatalf("reprovision gateway-1: %v", err)
+	}
+	if len(peer.lines()) != 0 {
+		t.Fatalf("reprovision touched a gateway that carries nothing: %v", peer.lines())
+	}
+}
+
+// A backend that never binds must fail the layering rather than leave the
+// API VIP probe red — and every recovery gate behind it timing out — for
+// the whole run.
+func TestStartAPIBackendFailsWhenTheListenerNeverBinds(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "sport = :8080") {
+			return "", errBoom
+		}
+		return "", nil
+	}}
+
+	err := startAPIBackend(context.Background(), newTestLab(cmd, newFakeClock()), "gateway-2")
+
+	if err == nil {
+		t.Fatal("an API backend that never bound was accepted")
+	}
+	if !strings.Contains(err.Error(), "did not bind") {
+		t.Fatalf("error %q does not say the listener never came up", err)
 	}
 }

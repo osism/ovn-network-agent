@@ -25,6 +25,7 @@ const (
 // Journal event names.
 const (
 	evRunStart        = "run-start"
+	evProfileApply    = "profile-apply"
 	evStateApplied    = "state-applied"
 	evDecision        = "decision"
 	evInject          = "inject"
@@ -66,8 +67,13 @@ type event struct {
 // runInputs is the reproducibility contract: identical inputs replay the
 // identical decision sequence. It is echoed into the `run-start` event
 // and into the run record.
+//
+// The profile is one of them: it decides both the topology the run drives
+// and the configuration every agent in it runs, so a seed without a
+// profile does not identify a run.
 type runInputs struct {
 	Seed       int64          `json:"seed"`
+	Profile    string         `json:"profile"`
 	DurationMS int64          `json:"duration_ms"`
 	TickMinMS  int64          `json:"tick_min_ms"`
 	TickMaxMS  int64          `json:"tick_max_ms"`

@@ -36,6 +36,7 @@ const (
 	violationActionFailed    = "action-failed"
 	violationAgentDown       = "agent-down"
 	violationDualClaim       = "dual-claim"
+	violationProfileApply    = "profile-not-applied"
 	violationStartState      = "start-state-not-green"
 	violationChecksNeverRan  = "checks-never-ran"
 )
@@ -82,6 +83,7 @@ type probeSource interface {
 type engine struct {
 	rng      *rand.Rand
 	lab      *lab
+	profile  *profile
 	actions  []*action
 	probes   probeSource
 	jrnl     *journal
@@ -109,10 +111,11 @@ type engine struct {
 	vipOwner string
 }
 
-func newEngine(l *lab, actions []*action, probes probeSource, jrnl *journal, rec *runRecord) *engine {
+func newEngine(l *lab, p *profile, actions []*action, probes probeSource, jrnl *journal, rec *runRecord) *engine {
 	e := &engine{
 		rng:      rand.New(rand.NewPCG(uint64(rec.Inputs.Seed), 0)),
 		lab:      l,
+		profile:  p,
 		actions:  actions,
 		probes:   probes,
 		jrnl:     jrnl,
@@ -463,7 +466,14 @@ func (e *engine) converged(ctx context.Context, gw string) bool {
 // whole point of the fault set, and the agent does not manage
 // Load_Balancer VIP routes — so without this the VIP probe would stay
 // red for the rest of the run after the first migration.
+//
+// A profile without the port-forward layer has no Load_Balancer VIP at
+// all: there are no routes to re-point, and issuing them would plumb a
+// VIP the run never put up.
 func (e *engine) followMaster(ctx context.Context) {
+	if !e.profile.ovnLB {
+		return
+	}
 	master := e.lab.currentMaster(ctx)
 	if master == "" || master == e.vipOwner {
 		return

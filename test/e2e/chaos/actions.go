@@ -7,7 +7,13 @@ import (
 
 // agentExitTimeout is how long a SIGTERM'ed agent gets to take its
 // container down before agent-terminate gives up on the graceful path.
-const agentExitTimeout = 30 * time.Second
+//
+// It is generous because a profile (or a drain-toggle flip) can put a
+// gateway on drain_on_shutdown, and a draining agent holds its SIGTERM
+// for up to drain_timeout — 60s by default — plus the settle delay and
+// the cleanup before PID 1 finally exits. The wait returns as soon as the
+// container is down, so the larger budget costs a no-drain run nothing.
+const agentExitTimeout = 120 * time.Second
 
 // starterActions is the action registry, in the order the weighted pick
 // walks it. Both the order and the weights are part of the replay
@@ -24,7 +30,18 @@ const agentExitTimeout = 30 * time.Second
 // The recovery budgets differ because the faults differ: stopping
 // ovn-controller costs a re-election, while any container lifecycle
 // event costs a full daemon bring-up plus the underlay re-wire.
-func starterActions() []*action {
+//
+// The profile is bound into the restores because what a returning gateway
+// needs put back depends on which layers the profile put up — and, for a
+// gateway whose configuration carries the API VIP, on the responder
+// behind it.
+func starterActions(p *profile) []*action {
+	restore := func(ctx context.Context, l *lab, gw string) error {
+		return restoreNode(ctx, l, p, gw)
+	}
+	startAndRestore := func(ctx context.Context, l *lab, gw string) error {
+		return startAndRestoreGateway(ctx, l, p, gw)
+	}
 	return []*action{
 		{
 			name:           "controller-restart",
@@ -46,7 +63,7 @@ func starterActions() []*action {
 			holdMax:        45 * time.Second,
 			recoveryBudget: 180 * time.Second,
 			inject:         injectGatewayKill,
-			restore:        startAndRestoreGateway,
+			restore:        startAndRestore,
 		},
 		{
 			name:           "agent-terminate",
@@ -55,7 +72,7 @@ func starterActions() []*action {
 			holdMax:        30 * time.Second,
 			recoveryBudget: 180 * time.Second,
 			inject:         injectAgentTerminate,
-			restore:        startAndRestoreGateway,
+			restore:        startAndRestore,
 		},
 		{
 			name:   "gateway-restart",
@@ -67,7 +84,7 @@ func starterActions() []*action {
 			inject: func(ctx context.Context, l *lab, gw string) error {
 				return l.restartGateway(ctx, gw)
 			},
-			restore: restoreNode,
+			restore: restore,
 		},
 	}
 }
@@ -103,7 +120,7 @@ func injectAgentTerminate(ctx context.Context, l *lab, gw string) error {
 // The policy is put back even when the start failed: the inject pinned it
 // to "no" so docker would not revive the node mid-fault, and leaving it
 // there hands the lab a gateway docker will never bring back up.
-func startAndRestoreGateway(ctx context.Context, l *lab, gw string) error {
+func startAndRestoreGateway(ctx context.Context, l *lab, p *profile, gw string) error {
 	startErr := l.startGateway(ctx, gw)
 	policyErr := l.setRestartPolicy(ctx, gw, "always")
 	if startErr != nil {
@@ -112,5 +129,5 @@ func startAndRestoreGateway(ctx context.Context, l *lab, gw string) error {
 	if policyErr != nil {
 		return policyErr
 	}
-	return restoreNode(ctx, l, gw)
+	return restoreNode(ctx, l, p, gw)
 }
