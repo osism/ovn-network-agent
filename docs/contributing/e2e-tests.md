@@ -226,7 +226,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | Scenario | `make` target | What it asserts | Issue |
 | --- | --- | --- | --- |
 | [Baseline](#baseline) | `e2e-baseline` | An external client reaches a FIP once the agent reconciles. | [#45](https://github.com/osism/ovn-network-agent/issues/45) |
-| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence the agents stay alive, reachability recovers within budget, and no gateway port is claimed twice. | [#176](https://github.com/osism/ovn-network-agent/issues/176) |
+| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of six agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, and no gateway port is claimed twice. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177) |
 | [Drain-hitless](#drain-hitless) | `e2e-drain-hitless` | A graceful `SIGTERM` drain loses fewer packets than a hard `docker kill` of the same chassis. | [#113](https://github.com/osism/ovn-network-agent/issues/113) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
 | [Hairpin](#hairpin) | `e2e-hairpin` | The `cookie=0x998` hairpin flow reflects FIP-to-FIP traffic on `br-ex`. | [#108](https://github.com/osism/ovn-network-agent/issues/108) |
@@ -864,13 +864,17 @@ would otherwise silently double.
 ```sh
 make e2e-chaos
 make e2e-chaos CHAOS_FLAGS="-duration 3m -seed 7 -out /tmp/chaos-a"
+make e2e-chaos CHAOS_FLAGS="-profile pf-only -duration 3m"
 ```
 
 [`chaos/`](https://github.com/osism/ovn-network-agent/tree/main/test/e2e/chaos)
 is not a scenario but a driver. The eight scenarios each prove one fault
-in isolation; production faults overlap and repeat. The runner drives the
-same lab through a *randomized* fault sequence for a bounded duration and
-leaves a journal you can triage from — and replay.
+in isolation, in one agent configuration; production faults overlap and
+repeat, and the configuration is not the same on every gateway or on
+every day. The runner drives the same lab through a *randomized* fault
+sequence, in a named [configuration profile](#configuration-profiles),
+for a bounded duration — and leaves a journal you can triage from, and
+replay.
 
 It is a Go `main` package rather than another bash script for two
 reasons: `$RANDOM` is not stable across bash versions, which would break
@@ -878,22 +882,28 @@ the replay contract outright, and the run needs concurrent probing plus
 structured artifacts. Its unit tests run under `make test` on any
 platform (they drive the real engine against a fake `docker`).
 
-**Inputs — and the replay contract.** The seed, the duration, the tick
-bounds and the action weights are the *only* inputs, and every decision
-the engine makes is drawn from a PCG stream seeded by `-seed` alone:
+**Inputs — and the replay contract.** The profile, the seed, the
+duration, the tick bounds and the action weights are the *only* inputs,
+and every decision the engine makes is drawn from a PCG stream seeded by
+`-seed` alone:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-seed` | `42` | Seeds every decision: the tick interval, the action, the target, the hold. |
+| `-seed` | `42` | Seeds every decision: the tick interval, the action, the target, the hold, the flip. |
+| `-profile` | `everything-on` | The [configuration profile](#configuration-profiles): the start topology and the agent configuration each gateway runs. An unknown name is rejected. |
 | `-duration` | `10m` | How long to keep injecting faults. Must be at least `1s`. |
 | `-tick-min` / `-tick-max` | `10s` / `30s` | Bounds of the interval between decisions. `-tick-min` must be at least `100ms`: a tick interval near zero spins the loop and grows the journal without bound, on a run where no fault fits between two ticks. |
 | `-weights` | registry defaults | `name=n,…`; an unknown action name is rejected. `-weights gateway-kill=0` disables a fault. |
 | `-lab` | `ovn-e2e` | containerlab lab name. |
 | `-out` | `chaos-artifacts` | Where the journal, the run record and the lab-state dump land. |
 | `-collect` | `test/e2e/scenarios/collect-artifacts.sh` | The lab-state collector, run into `<out>/lab-state` when the run does not pass. The default is repo-relative, so run the binary from the repo root (`make e2e-chaos` does). |
+| `-gwnode-config` | `test/e2e/gwnode-config.yaml` | The baked gateway agent config a profile's overlays are layered over. Also repo-relative. |
 
 Two runs with identical inputs against identically-behaving labs replay
-the identical action sequence. Diff them:
+the identical action sequence. **Profile and seed together** identify a
+run: the same seed under a different profile is a different run, and both
+are recorded in `journal.jsonl`'s `run-start` event and in
+`summary.json`. Diff two runs:
 
 ```sh
 make e2e-up && make e2e-chaos CHAOS_FLAGS="-duration 3m -out /tmp/chaos-a"
@@ -901,47 +911,143 @@ make e2e-down && make e2e-up
 make e2e-chaos CHAOS_FLAGS="-duration 3m -out /tmp/chaos-b"
 
 diff \
-  <(jq -c 'select(.event=="decision") | {tick,action,target,interval_ms,hold_ms}' /tmp/chaos-a/journal.jsonl) \
-  <(jq -c 'select(.event=="decision") | {tick,action,target,interval_ms,hold_ms}' /tmp/chaos-b/journal.jsonl)
+  <(jq -c 'select(.event=="decision") | {tick,action,target,interval_ms,hold_ms,flip}' /tmp/chaos-a/journal.jsonl) \
+  <(jq -c 'select(.event=="decision") | {tick,action,target,interval_ms,hold_ms,flip}' /tmp/chaos-b/journal.jsonl)
 ```
 
-Each tick draws exactly four values — interval, action, target, hold —
-**before** the guardrails are consulted, so a guardrail skip cannot shift
-the stream: the run that skipped a decision draws the same values
-afterwards as the run that executed it. Wall clock only bounds *how many*
-ticks fit in `-duration`, so a slower lab truncates the tail of the
-sequence rather than changing it.
+Each tick draws exactly five values — interval, action, target, hold,
+flip — **before** the guardrails are consulted, so a guardrail skip
+cannot shift the stream: the run that skipped a decision draws the same
+values afterwards as the run that executed it. The flip is drawn on every
+tick even though only `config-flip` reads it, for that same reason. Wall
+clock only bounds *how many* ticks fit in `-duration`, so a slower lab
+truncates the tail of the sequence rather than changing it.
 
-**Combined start state.** The runner layers the existing scenarios'
-setups onto the bootstrap baseline, so one run exercises all of them at
-once: `hairpin.sh`'s second FIP (`192.0.2.12` with a `vm2` responder),
+::: warning Sequences are versioned by the build, not by the seed alone
+A recorded seed replays the sequence it recorded only against the same
+runner. Adding an action to the registry, or a flip to the whitelist,
+changes the weighted pick and the number of values drawn per tick — so
+seeds from an older build replay differently. Both registries are
+append-only, which keeps the *change* mechanical; it does not make old
+sequences reproducible.
+:::
+
+**Start state.** The runner layers the existing scenarios' setups onto
+the bootstrap baseline, so one run can exercise all of them at once:
+`hairpin.sh`'s second FIP (`192.0.2.12` with a `vm2` responder),
 `multi-vlan.sh`'s two VLAN provider networks (tags 101/102, routers
 pinned to `gateway-1`), and `pf-external.sh`'s `Load_Balancer` VIP
-(`192.0.2.50:80` in front of the `vm1` backend). The layering is
-idempotent, which is what makes it reusable as the post-fault restore
-path. If the start state is not green within 120 s the run aborts with
-exit code 2 — a fault injected into a lab that was not green to begin
-with would report false violations for the rest of the run.
+(`192.0.2.50:80` in front of the `vm1` backend). Which of them a run puts
+up is the profile's call. The layering is idempotent, which is what makes
+it reusable as the post-fault restore path. If the start state is not
+green within 120 s the run aborts with exit code 2 — a fault injected
+into a lab that was not green to begin with would report false violations
+for the rest of the run.
 
 **Probes.** A goroutine per target samples reachability from `client-1`
 once a second for the whole run, so loss *during* a fault hold is
-recorded even while the engine is blocked:
+recorded even while the engine is blocked. The profile decides which
+targets a run measures — a target behind a layer the profile did not put
+up has no responder and would be red for the whole run:
 
-| Probe | Target |
-| --- | --- |
-| `fip-vm1` | `ping 192.0.2.10` |
-| `fip-vm2` | `ping 192.0.2.12` |
-| `fip-vlan101` | `ping 198.51.100.10` |
-| `fip-vlan102` | `ping 203.0.113.10` |
-| `pf-vip` | `curl http://192.0.2.50:80/` |
+| Probe | Target | Put up by |
+| --- | --- | --- |
+| `fip-vm1` | `ping 192.0.2.10` | the bootstrap baseline |
+| `fip-vm2` | `ping 192.0.2.12` | the hairpin layer |
+| `fip-vlan101` | `ping 198.51.100.10` | the VLAN layers |
+| `fip-vlan102` | `ping 203.0.113.10` | the VLAN layers |
+| `pf-vip` | `curl http://192.0.2.50:80/` | the port-forward layer (an OVN `Load_Balancer`) |
+| `api-vip` | `curl http://192.0.2.80:8080/` | the **agent's own** DNAT (`port_forwards`), on the gateways a profile configures it on |
 
 The baseline lab's second FIP, `192.0.2.11`, is deliberately **not**
 probed: `bootstrap.sh` seeds its NAT row but nothing answers behind
 `192.168.10.11`, so it would be red for the whole run.
 
+### Configuration profiles
+
+A profile is the run's *configuration* input (issue
+[#177](https://github.com/osism/ovn-network-agent/issues/177)): it names
+both the start topology and the agent configuration each gateway runs, as
+an overlay on the config the gwnode image bakes in
+(`test/e2e/gwnode-config.yaml`). The agent has six behaviour-changing
+configuration dimensions, and several of them change what it has to do
+entirely — port-forward-only mode skips all OVN work, a CIDR filter must
+*exclude* routes rather than add them — so a single-configuration chaos
+run leaves whole codepaths untested under fault load.
+
+The set is curated, not combinatorial:
+
+| `-profile` | Start topology | Agent configuration | Probes |
+| --- | --- | --- | --- |
+| `everything-on` (default) | hairpin + VLAN + port-forward | the baked lab config, unchanged | the four FIPs + `pf-vip` |
+| `flat-minimal` | baseline only | `cleanup_on_shutdown: true` | `fip-vm1` |
+| `flat-dnat` | hairpin + port-forward | the API VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip` |
+| `vlan-no-dnat` | hairpin + VLAN | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs |
+| `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
+| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` baked, `gateway-2` API VIP + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` |
+
+The **API VIP** (`192.0.2.80:8080`) is the agent's own DNAT path, as
+opposed to `pf-vip`, which is an OVN `Load_Balancer`. Its backend is a
+`pf-backend` responder in the gateway's *default* network namespace,
+reached via the gateway's own management address — which is why those
+gateways get `port_forward_l3mdev_accept` (the socket is in the default
+VRF while the VIP traffic ingresses `vrf-provider`). It lives inside
+`192.0.2.0/24` because the agent reconciles the FRR prefix-list to
+exactly the effective networks: a VIP outside every covered prefix is
+never announced. In `pf-only` that filter has to be set by hand
+(`network_cidr`) — without OVN there is nothing to discover it from.
+
+Under `heterogeneous`, `api-vip` is announced by `gateway-2` alone, so it
+is legitimately dark while `gateway-2` is held down — the same
+pinned-resource semantics the VLAN FIPs already have on `gateway-1`.
+
+**How a profile is applied.** No image rebuild, no redeploy: the config
+file is the only thing that changes, and the gwnode entrypoint `exec`s
+the agent, so `docker restart` is the reload.
+
+1. Render each gateway's config — the profile's overlay, key by key, over
+   the baked one.
+2. Write it to `/etc/ovn-network-agent/config.next.yaml` and validate it
+   with the agent's **own** `--check-config`, on *every* gateway, before a
+   single live file is touched. A rejected config aborts the run (exit
+   code 2) with the agent's reason and the live configs untouched.
+3. Roll the gateways one at a time: write the profile marker, `mv` the
+   staged config over the live one, `docker restart`, re-wire the node
+   (the same `restoreNode` the faults use), then gate on the container
+   being healthy and the chassis back in SB before the next gateway is
+   touched.
+
+A gateway already running the rendered config is **skipped** — no
+restart, no gate. On a fresh lab that is exactly what `everything-on`
+does: it renders the baked bytes verbatim and restarts nothing.
+
+::: details Why a marker file, and what it does to the drain
+`topology.clab.yml` sets `OVN_NETWORK_DRAIN_ON_SHUTDOWN` on every
+gateway, and the agent's environment layer beats its config file — so a
+profile that turns the drain *on* would never see it take effect. When a
+profile owns a gateway's config, the applier drops
+`/etc/ovn-network-agent/chaos-profile` next to it, and the entrypoint
+unsets the variable when it finds it. No marker, no change: every
+existing scenario, `drain-hitless` included, keeps the deploy-time
+switch. A gateway the profile leaves on the baked config has the marker
+removed.
+
+Chaos assumes the default deploy (`E2E_DRAIN_ON_SHUTDOWN` unset). Against
+a lab deployed with the drain forced on, the applier's view of a gateway
+that it has not reconfigured is wrong until the first flip writes the
+marker.
+:::
+
+::: warning Profiles add OVN topology, they never remove it
+Applying `flat-minimal` to a lab that already ran `everything-on` leaves
+the VLAN networks in the NB DB — unprobed, but present. Start each
+profile run from a fresh `make e2e-up` for exact semantics.
+:::
+
 **Actions.** The starter set reuses the fault mechanics the scenarios
-already prove. The registry order and the weights are part of the replay
-contract — a new action is appended, never inserted.
+already prove; `config-flip` reconfigures a gateway mid-run. The registry
+order and the weights are part of the replay contract — a new action is
+appended, never inserted.
 
 | Action | Weight | Hold | Recovery budget | Mechanic |
 | --- | --- | --- | --- | --- |
@@ -949,21 +1055,56 @@ contract — a new action is appended, never inserted.
 | `gateway-kill` | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
 | `agent-terminate` | 2 | 10–30 s | 180 s | `kill -TERM 1` — the agent is PID 1 ([drain-hitless](#drain-hitless)) |
 | `gateway-restart` | 2 | — | 180 s | `docker restart` ([pf-hairpin](#port-forward-hairpin-masquerade)) |
+| `config-flip` | 2 | — | 180 s | rewrite one gateway's config and restart it onto it — see below |
 
 Every action that kills a container first runs `docker update
 --restart=no`, exactly as `drain-hitless.sh` does — containerlab deploys
 with `restart: always`, so without it docker revives the node before the
 fault is observable at all. The policy is restored on the way back.
 
-`agent-terminate` only exercises the agent's *drain* path when the lab
-was deployed with `E2E_DRAIN_ON_SHUTDOWN=true` (see
-[Drain-hitless](#drain-hitless)); otherwise the SIGTERM is just a
-graceful exit. The fault is the same either way — the drain only changes
-how much the run loses.
+`agent-terminate` exercises the agent's *drain* path whenever the target
+is running a config with `drain_on_shutdown` on — a profile that sets it,
+a `drain-toggle` flip that turned it on, or a lab deployed with
+`E2E_DRAIN_ON_SHUTDOWN=true` (see [Drain-hitless](#drain-hitless)).
+Otherwise the SIGTERM is just a graceful exit. The fault is the same
+either way — the drain only changes how much the run loses.
+
+**The `config-flip` action.** Rollouts, tuning changes and emergency flag
+flips happen on live gateways, under load, one node at a time. The action
+draws one of the whitelisted toggles below, applies it to the target's
+current config, validates the result with `--check-config`, swaps it in
+and restarts the node onto it — the same path the profile apply uses.
+
+| Flip | What it toggles | Applicable when |
+| --- | --- | --- |
+| `drain-toggle` | `drain_on_shutdown` | always |
+| `masquerade-toggle` | `hairpin_masquerade` on the API VIP | the gateway's config carries the API VIP |
+| `cidr-toggle` | `network_cidr` between the profile's value and the manual filter (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) | the profile did not already configure that filter |
+| `cadence-toggle` | `reconcile_interval` between `5s` and `15s` | always |
+| `pf-rule-toggle` | adds/removes an unprobed port-forward VIP (`192.0.2.99:8081`) | always |
+
+Each is a *toggle*: applied twice it puts the gateway back on the config
+the profile gave it, so a long run cannot drift away from the
+configuration it says it is testing. The whitelist is append-only for the
+same reason the action registry is — the engine draws a flip by index.
+
+A config the agent **rejects** is journaled (`config-flip` with
+`rejected: true` and the agent's reason) and dropped: the gateway keeps
+running what it was running, and the run does not fail. That is the
+answer a rejected rollout gives an operator, and the whitelist is
+deliberately free to draw a combination the agent must refuse. Disable
+the action entirely with `-weights config-flip=0`.
+
+A flip on a gateway with `drain_on_shutdown` on can have its drain
+truncated: `docker restart`'s 10 s stop-grace SIGKILLs an agent that is
+still draining. That is legitimate chaos — the run only asserts that the
+node recovers — but it is worth knowing when reading a journal.
 
 **Guardrails** keep a run meaningful. A decision is skipped (and
 journaled with its `skip_reason`) when the target has not returned and
-converged since it was last hit, or when it is the last healthy gateway.
+converged since it was last hit, when it is the last healthy gateway, or
+— for `config-flip` — when the drawn flip means nothing on what the
+target is currently running (`flip-not-applicable`).
 
 **Convergence and recovery budgets.** After each restore the runner polls
 the node back to health: the container healthy, its chassis back in SB,
@@ -1031,9 +1172,13 @@ bootstrap master.
   lab-state/      — collect-artifacts.sh dump, on a non-zero exit only
 ```
 
-`journal.jsonl` carries `run-start` (the echoed inputs), `state-applied`,
-one `decision` per tick (with the drawn values and either `executed` or a
-`skip_reason`), `inject` / `restore` / `converged`, `node-state`,
+`journal.jsonl` carries `run-start` (the echoed inputs, profile included),
+one `profile-apply` per gateway (with `executed` telling a gateway that
+was restarted onto the profile from one that was already on it),
+`state-applied`, one `decision` per tick (with the drawn values — the
+flip among them — and either `executed` or a `skip_reason`), `inject` /
+`restore` / `converged`, `config-flip` (the flip, the values it moved
+between, and `rejected` when the agent refused it), `node-state`,
 `probe-transition`, `vip-repoint`, `violation` and `run-end`.
 `summary.json` aggregates the run: inputs, tick and decision counts,
 actions by name, how many baseline sweeps ran and how many of them
@@ -1041,15 +1186,18 @@ evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
 loss buckets, the per-action recovery durations, and every violation.
 
 **Exit codes:** `0` the run passed, `1` the run recorded a violation,
-`2` the runner could not set the run up (bad flags, a start state that
-never went green). On any non-zero exit the lab's existing
-`collect-artifacts.sh` bundle is dumped into `<out>/lab-state`.
+`2` the runner could not set the run up (bad flags, an unknown profile, a
+configuration the agent rejected, a start state that never went green).
+On any non-zero exit the lab's existing `collect-artifacts.sh` bundle is
+dumped into `<out>/lab-state`.
 
 **In CI.** The runner has its own workflow,
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
 which runs on `workflow_dispatch` only and uploads the journal, the
 summary and the lab-state dump on every outcome. The seed and duration
-are dispatch inputs defaulting to `-seed 42 -duration 3m`. It is
+are dispatch inputs defaulting to `-seed 42 -duration 3m`; the run uses
+the default profile (a profile matrix is
+[#180](https://github.com/osism/ovn-network-agent/issues/180)). It is
 deliberately not part of `e2e.yml`'s PR path: the scenarios there each
 assert one fault and leave the lab baseline-green, while a chaos run is
 a randomized sequence that deliberately leaves the master wherever the
