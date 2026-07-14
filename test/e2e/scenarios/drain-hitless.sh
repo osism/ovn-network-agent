@@ -94,35 +94,99 @@
 # lined up against the kill timestamp. That capture can never fail an
 # arm: the assertion below reads ping's summary.
 #
-# Assertion (issue #113 acceptance criteria):
-#   graceful outage <= GRACEFUL_MAX_OUTAGE_MS AND graceful_loss < hardkill_loss
+# Assertion (issue #113's acceptance criteria; the budget re-derived
+# per issue #182):
 #
-# The first half is the "hitless" claim; the second is the delta
-# that makes the comparison meaningful (a no-op script that returned
-# `0 < 0` would trivially fail). Issue #113 stated "at most one lost
-# packet" (a 100 ms budget at the default spacing), but that number
-# was written before any measurement existed. The first run on the CI
-# runner class (run 29086884545) measured 200 ms: the two lost packets
-# sat 96–200 ms after the priority-0 write, inside OVN's
-# northd/ovn-controller flow-reprogramming window that follows the
-# Port_Binding migration — while BGP make-before-break held (upstream
-# carried both nexthops until gateway-1 withdrew). The default budget
-# is therefore 500 ms: enough headroom over the observed OVN
-# propagation floor to pass consistently (AC 1), while staying well
-# under the hard-kill control's measured 2800 ms so a broken drain
-# path still trips the assertion. The scenario keeps the duration
-# primary and derives the packet ceiling from `PROBE_INTERVAL`, so
-# overriding the spacing cannot silently move the budget.
+#   1. graceful outage <= GRACEFUL_MAX_OUTAGE_MS — the "hitless" claim.
+#   2. graceful_loss    <  hardkill_loss — the delta that makes the
+#      comparison meaningful (a no-op script returning `0 < 0` would
+#      trivially fail).
+#   3. GRACEFUL_MAX_LOSS <  hardkill_loss — the budget asserted in (1)
+#      has to be one that a shutdown which did NOT drain would trip.
+#      See assert_hitless() for why this third one exists.
 #
-# Nothing in the agent bounds that reprogramming window.
-# `DrainGateways` returns as soon as SB reports no chassisredirect
-# port left on this chassis and agent.go exits right after; the agent
-# is PID 1, so its exit tears down the container netns, FRR, and the
-# `gateway-1 ↔ upstream` veth. Between `cr-lr0-public` migrating to
-# gateway-2 and the gateways' flows converging on the new owner,
-# packets still land on a chassis that no longer owns the port.
-# GRACEFUL_MAX_OUTAGE_MS is the budget this scenario holds that
-# window to; it is not a delay the agent implements.
+# Where the budget comes from (issue #182)
+# ----------------------------------------
+# Issue #113 asked for "at most one lost packet" (a 100 ms budget at the
+# default spacing) before any measurement existed, and the first
+# calibration replaced that with 500 ms off a single 200 ms sample. One
+# sample cannot establish a distribution: 500 ms derives a ceiling of 5
+# packets, healthy runs routinely measured exactly 5, and the assertion
+# passed with zero margin until ordinary runner noise failed unrelated
+# pull requests.
+#
+# The 1500 ms default rests instead on the graceful-arm loss of every
+# drain-hitless CI run carrying the drain takeover handshake (issue #129,
+# agent commit 87ead87, on main since 2026-07-11) — n=20, runs
+# 29141110469 through 29289492625, each run's
+# `graceful arm: measured packet loss` line:
+#
+#      2 packets ( 200 ms)  ###
+#      3 packets ( 300 ms)  #####
+#      4 packets ( 400 ms)  ##
+#      5 packets ( 500 ms)  ######
+#      6 packets ( 600 ms)  ###
+#     11 packets (1100 ms)  #
+#
+#     n=20   min 200 ms   median 450 ms   p90 600 ms   max 1100 ms
+#
+# 1500 ms clears the worst of those twenty by 1.36x. The ceiling is
+# bounded from above too, and that is the half that keeps the scenario
+# honest: the hard-kill control — same lab, same probe, a chassis that
+# dies without draining — measured 23-30 packets (2300-3000 ms) across
+# the same runs, in a far tighter band than the graceful arm's. 1500 ms
+# sits at 65% of the tightest control run, so a shutdown that fails to
+# drain still overshoots the budget by at least 8 packets. Assertion 3
+# re-checks that on every run rather than trusting today's numbers to
+# hold: raising GRACEFUL_MAX_OUTAGE_MS until it can no longer tell a
+# broken drain from a working one now fails the scenario instead of
+# quietly hollowing it out.
+#
+# If this budget starts failing again, re-derive it — collect the
+# graceful loss across ~20 runs (every run prints it and bundles it into
+# summary.txt) and set it from that distribution, recording the sample
+# size here. Do not nudge it up to whatever the last red run produced.
+#
+# What the budget bounds
+# ----------------------
+# The lost packets sit in OVN's northd/ovn-controller flow-reprogramming
+# window that follows the `Port_Binding` migration: between
+# `cr-lr0-public` moving to gateway-2 and the gateways' flows converging
+# on the new owner, `upstream` still ECMPs part of the traffic at a
+# chassis that no longer owns the port.
+#
+# The agent bounds its own half of that window. Issue #129 added the
+# drain takeover handshake: `DrainGateways` waits for the takeover
+# chassis to stamp its NB readiness marker — its word that it has
+# announced the FIP routes — and then holds `drain_settle_delay` before
+# cleanup withdraws the leaving node's routes, the whole wait bounded by
+# `drain_timeout`. That handshake is why the numbers above look the way
+# they do. Before it landed, the arm was bimodal: three of the five
+# pre-handshake runs (29104810149 on main, 29111714177, 29123397062)
+# measured 48-49 packets — a ~4.9 s outage — while the other two
+# measured 2-3. Across the twenty runs since, nothing has exceeded 11.
+# What remains inside the budget is OVN's reprogramming on the takeover
+# chassis, which the agent does not control; GRACEFUL_MAX_OUTAGE_MS is
+# the budget this scenario holds that residue to, not a delay the agent
+# implements.
+#
+# That 48-49-packet mode is also the concrete regression this budget has
+# to keep catching, and the reason the ceiling is not simply parked below
+# the control arm: a drain path that still runs — the log says
+# `drain: complete`, capture_drain_log() is satisfied — but no longer
+# delivers a hitless failover is exactly what assertion 1 is for. At 15
+# packets it catches that recorded regression more than three times over.
+#
+# What it will NOT catch, stated plainly: a degradation inside the
+# budget, say the median moving from 450 ms to 1000 ms. The arm's own
+# spread on this runner class (200-1100 ms) is wider than such a shift,
+# so no ceiling can separate the two without failing on the tail. The
+# scenario resolves gross regressions, not gradual ones; watch the
+# `graceful_outage_ms` trend in summary.txt for the latter.
+#
+# The scenario keeps the duration primary and derives the packet ceiling
+# from `PROBE_INTERVAL`, so overriding the spacing cannot silently move
+# the budget.
 #
 # Both arms must additionally end with `cr-lr0-public` migrated off
 # the master within FAILOVER_TIMEOUT of the kill — the same RTO #105
@@ -165,15 +229,14 @@
 #   FAILOVER_TIMEOUT seconds after the kill for the port to migrate AND
 #                    reachability to return (default 30 — the RTO #105 asserts)
 #   GRACEFUL_MAX_OUTAGE_MS data-plane outage budget for the graceful arm
-#                    (default 500 — calibrated to the ~200 ms OVN
-#                    flow-reprogramming floor measured on the CI runner class,
-#                    see the assertion block comment above; issue #113's
-#                    original "at most one lost packet" predates that
-#                    measurement). The packet ceiling GRACEFUL_MAX_LOSS is
-#                    derived from it and PROBE_INTERVAL. Raise it only to
-#                    triage a lab whose reconvergence is slower than the
-#                    budget; the hitless gain (graceful_loss < hardkill_loss)
-#                    is asserted either way.
+#                    (default 1500 — derived from the graceful-arm loss of 20
+#                    CI runs, see the assertion block comment above). The
+#                    packet ceiling GRACEFUL_MAX_LOSS is derived from it and
+#                    PROBE_INTERVAL. Raising it to triage a slow lab is fine
+#                    up to a point: a value the hard-kill control arm would
+#                    itself pass fails the run by design, because a budget
+#                    that cannot tell a broken drain from a working one
+#                    asserts nothing.
 #   ARTIFACTS_DIR    directory to write the per-arm artifacts into (default empty = skip)
 #   SANITY_GATE      run baseline.sh first when 1 (default 1)
 #   SKIP_RECYCLE     skip `make e2e-down && make e2e-up` between arms / on teardown when 1 (default 0)
@@ -195,7 +258,7 @@ PROBE_INTERVAL="${PROBE_INTERVAL:-0.1}"
 PROBE_COUNT="${PROBE_COUNT:-200}"
 PROBE_PRELUDE="${PROBE_PRELUDE:-3}"
 FAILOVER_TIMEOUT="${FAILOVER_TIMEOUT:-30}"
-GRACEFUL_MAX_OUTAGE_MS="${GRACEFUL_MAX_OUTAGE_MS:-500}"
+GRACEFUL_MAX_OUTAGE_MS="${GRACEFUL_MAX_OUTAGE_MS:-1500}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
 SANITY_GATE="${SANITY_GATE:-1}"
 SKIP_RECYCLE="${SKIP_RECYCLE:-0}"
@@ -912,9 +975,13 @@ arm_hardkill() {
 assert_hitless() {
     local graceful="$1"
     local hardkill="$2"
-    local graceful_ms hardkill_ms
+    local graceful_ms hardkill_ms budget_headroom
     graceful_ms="$(outage_ms "${graceful}")"
     hardkill_ms="$(outage_ms "${hardkill}")"
+    # How far the ceiling sits below what a shutdown that did not drain
+    # costs on this very lab, in packets. Negative or zero means the
+    # budget has stopped discriminating — see the guard below.
+    budget_headroom=$(( hardkill - GRACEFUL_MAX_LOSS ))
     {
         printf '# drain-hitless summary\n'
         printf 'probe_interval=%s\n' "${PROBE_INTERVAL}"
@@ -925,11 +992,45 @@ assert_hitless() {
         printf 'graceful_max_outage_ms=%s\n' "${GRACEFUL_MAX_OUTAGE_MS}"
         printf 'graceful_max_loss=%s\n' "${GRACEFUL_MAX_LOSS}"
         printf 'hitless_gain_packets=%s\n' "$(( hardkill - graceful ))"
+        printf 'budget_headroom_packets=%s\n' "${budget_headroom}"
     } | write_artifact "summary.txt"
+
+    # Guard the budget itself, before judging the arm against it.
+    #
+    # The hard-kill arm is this scenario's own negative control: it is what
+    # a shutdown that does not drain costs, measured on the same lab, the
+    # same probe and the same run. So the budget is only worth asserting
+    # while a hard kill would still trip it — the moment
+    # GRACEFUL_MAX_LOSS reaches hardkill_loss, a completely broken drain
+    # path passes assertion 1 and the "hitless" claim means nothing.
+    #
+    # That is the failure mode issue #182 warned about: raising
+    # GRACEFUL_MAX_OUTAGE_MS until the red goes away deletes the property
+    # the scenario exists to hold, and it does so silently, because the
+    # run turns green. Checking it here makes the weakening loud. It also
+    # cannot be satisfied by tuning: hardkill_loss is measured, not
+    # configured.
+    #
+    # No invented safety factor on top. `GRACEFUL_MAX_LOSS < hardkill_loss`
+    # is exactly the condition "a non-draining shutdown fails this
+    # scenario", and a factor above it would be a second budget nobody
+    # measured — the margin that IS measured lives in the derivation of
+    # GRACEFUL_MAX_OUTAGE_MS (see the assertion block at the top).
+    if ! (( GRACEFUL_MAX_LOSS < hardkill )); then
+        log "ASSERTION FAILED: the graceful budget cannot discriminate a broken drain on this lab"
+        log "    the budget is ${GRACEFUL_MAX_OUTAGE_MS} ms = ${GRACEFUL_MAX_LOSS} packets at -i ${PROBE_INTERVAL}, but this run's"
+        log "    hard-kill control — a chassis that died WITHOUT draining — lost only ${hardkill} packets (~${hardkill_ms} ms)."
+        log "    A budget that a hard kill itself would pass asserts nothing about the drain path."
+        log "    Either the budget was raised too far, or the control arm reconverged unusually fast; do not"
+        log "    raise GRACEFUL_MAX_OUTAGE_MS to clear this — re-derive it from a multi-run distribution (issue #182)."
+        return 1
+    fi
 
     if ! (( graceful <= GRACEFUL_MAX_LOSS )); then
         log "ASSERTION FAILED: the graceful arm lost ${graceful} packets (~${graceful_ms} ms of outage), over the ${GRACEFUL_MAX_OUTAGE_MS} ms budget"
         log "    at -i ${PROBE_INTERVAL} that budget allows at most ${GRACEFUL_MAX_LOSS} lost packet(s)"
+        log "    the budget rests on a 20-run distribution (200-1100 ms); a single run above it is a real regression,"
+        log "    not noise to tune away — the hard-kill control on this run lost ${hardkill} packets (~${hardkill_ms} ms) for comparison"
         return 1
     fi
     if ! (( graceful < hardkill )); then
@@ -938,6 +1039,7 @@ assert_hitless() {
         return 1
     fi
     log "ASSERT OK: graceful outage ~${graceful_ms} ms <= ${GRACEFUL_MAX_OUTAGE_MS} ms AND graceful_loss=${graceful} < hardkill_loss=${hardkill}"
+    log "    budget headroom: the ${GRACEFUL_MAX_LOSS}-packet ceiling sits ${budget_headroom} packets below this run's hard-kill control (${hardkill})"
 }
 
 main() {
