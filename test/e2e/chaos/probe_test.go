@@ -14,9 +14,9 @@ import (
 func TestProbesAreSourcedFromTheClient(t *testing.T) {
 	cmd := &fakeCommander{}
 	l := newTestLab(cmd, newFakeClock())
-	p := newProber(l, probeTargets, newJournal(&bytes.Buffer{}, newFakeClock().now), newFakeClock().now)
+	p := newProber(l, defaultProbes, newJournal(&bytes.Buffer{}, newFakeClock().now), newFakeClock().now)
 
-	for _, target := range probeTargets {
+	for _, target := range defaultProbes {
 		p.sample(context.Background(), target)
 	}
 
@@ -106,7 +106,7 @@ func TestSampleIgnoresACancelledProbe(t *testing.T) {
 func TestProberStopsWithItsContext(t *testing.T) {
 	cmd := &fakeCommander{}
 	clock := newFakeClock()
-	p := newProber(newTestLab(cmd, clock), probeTargets,
+	p := newProber(newTestLab(cmd, clock), defaultProbes,
 		newJournal(&bytes.Buffer{}, clock.now), clock.now)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -125,7 +125,7 @@ func TestProberStopsWithItsContext(t *testing.T) {
 	}
 
 	// Every target was sampled at least once before the shutdown.
-	for _, target := range probeTargets {
+	for _, target := range defaultProbes {
 		if !cmd.called(target.addr) && !cmd.called(strings.TrimPrefix(target.addr, "http://")) {
 			t.Fatalf("target %s was never probed: %v", target.name, cmd.lines())
 		}
