@@ -8,7 +8,7 @@ import (
 
 func actionNamed(t *testing.T, name string) *action {
 	t.Helper()
-	for _, a := range starterActions() {
+	for _, a := range starterActions(defaultTestProfile(t)) {
 		if a.name == name {
 			return a
 		}
@@ -24,7 +24,7 @@ func TestStarterRegistryOrderIsStable(t *testing.T) {
 	want := []string{"controller-restart", "gateway-kill", "agent-terminate", "gateway-restart"}
 
 	var got []string
-	for _, a := range starterActions() {
+	for _, a := range starterActions(defaultTestProfile(t)) {
 		got = append(got, a.name)
 		if a.weight <= 0 {
 			t.Fatalf("action %s ships with weight %d", a.name, a.weight)
@@ -194,7 +194,7 @@ func TestStartAndRestoreGatewayRestoresThePolicyWhenTheStartFails(t *testing.T) 
 	}}
 	l := newTestLab(cmd, newFakeClock())
 
-	err := startAndRestoreGateway(context.Background(), l, "gateway-2")
+	err := startAndRestoreGateway(context.Background(), l, defaultTestProfile(t), "gateway-2")
 
 	if err == nil {
 		t.Fatal("a container that could not be started was reported as restored")
@@ -244,7 +244,7 @@ func TestReprovisionRebuildsTheWorkloadHostOnly(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
 
-	if err := reprovisionNode(context.Background(), l, workloadHost); err != nil {
+	if err := reprovisionNode(context.Background(), l, defaultTestProfile(t), workloadHost); err != nil {
 		t.Fatalf("reprovision %s: %v", workloadHost, err)
 	}
 
@@ -261,7 +261,8 @@ func TestReprovisionRebuildsTheWorkloadHostOnly(t *testing.T) {
 	}
 
 	peer := &fakeCommander{respond: healthyLabResponses}
-	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()), "gateway-2"); err != nil {
+	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()),
+		defaultTestProfile(t), "gateway-2"); err != nil {
 		t.Fatalf("reprovision gateway-2: %v", err)
 	}
 	if len(peer.lines()) != 0 {
@@ -279,7 +280,7 @@ func TestStartPFBackendReplacesAnyRunningInstance(t *testing.T) {
 		t.Fatalf("startPFBackend: %v", err)
 	}
 
-	kill := cmd.indexOf("pkill -f /usr/local/bin/pf-backend")
+	kill := cmd.indexOf("pkill -f " + pfBackendLog)
 	start := cmd.indexOf("exec -d clab-ovn-e2e-gateway-3")
 	listen := cmd.indexOf("sport = :8080")
 	if kill < 0 || start < 0 || listen < 0 {

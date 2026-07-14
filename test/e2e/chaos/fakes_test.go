@@ -169,6 +169,20 @@ func (redProbes) recoverySince(time.Time) map[string]int64 {
 	return map[string]int64{"fip-vm1": 0}
 }
 
+// testProfile resolves a profile the tests drive the runner with. Most of
+// them want the default one — every layer up, every gateway on the baked
+// config — which is what the runner did before profiles existed.
+func testProfile(t *testing.T, name string) *profile {
+	t.Helper()
+	p, err := profileByName(name)
+	if err != nil {
+		t.Fatalf("profileByName(%q): %v", name, err)
+	}
+	return p
+}
+
+func defaultTestProfile(t *testing.T) *profile { return testProfile(t, defaultProfileName) }
+
 // newTestLab wires a lab against the fake commander and the fake clock.
 func newTestLab(cmd commander, clock *fakeClock) *lab {
 	return &lab{name: "ovn-e2e", cmd: cmd, sleep: clock.sleep, now: clock.now}

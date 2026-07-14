@@ -434,3 +434,62 @@ func TestWaitReadyGivesUpOnADeadContext(t *testing.T) {
 		t.Fatalf("waitReady probed the node on a dead context: %v", cmd.lines())
 	}
 }
+
+// The config the runner writes is a YAML document with quotes, hashes and
+// newlines in it. It reaches the container through `sh -euc`, so it has to
+// survive the shell in one piece — an unquoted `#` or `'` would truncate
+// the file or break the command outright.
+func TestWriteFileSurvivesTheShell(t *testing.T) {
+	cmd := &fakeCommander{}
+	l := newTestLab(cmd, newFakeClock())
+	content := "log_level: 'info' # a $comment\nnetwork_cidr:\n  - 192.0.2.0/24\n"
+
+	if err := l.writeFile(context.Background(), "gateway-1", agentConfigNextPath, content); err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+
+	want := "printf '%s' 'log_level: '\\''info'\\'' # a $comment\nnetwork_cidr:\n  - 192.0.2.0/24\n' > " +
+		agentConfigNextPath
+	got := cmd.lines()[0]
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("wrote\n\t%q\nwant it to end in\n\t%q", got, want)
+	}
+}
+
+// The agent exits 1 on a config it rejects — that is the answer the gate
+// is asking for. Every other failure means the question could not be asked
+// at all, and reading it as "valid" would swap a live config on the
+// strength of a check that never ran.
+func TestCheckConfigSeparatesARejectionFromAnUnaskedQuestion(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantValid bool
+		wantErr   bool
+	}{
+		{name: "the agent accepts the config", err: nil, wantValid: true},
+		{name: "the agent rejects the config", err: errExit(t, 1), wantValid: false},
+		{name: "the check could not run at all", err: errBoom, wantValid: false, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cmd := &fakeCommander{respond: func([]string) (string, error) {
+				return "configuration OK\n", tc.err
+			}}
+			l := newTestLab(cmd, newFakeClock())
+
+			valid, _, err := l.checkConfig(context.Background(), "gateway-1", agentConfigNextPath)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("checkConfig error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if valid != tc.wantValid {
+				t.Fatalf("checkConfig valid = %v, want %v", valid, tc.wantValid)
+			}
+			if !cmd.called("--check-config --config " + agentConfigNextPath) {
+				t.Fatalf("the staged config was not the one validated: %v", cmd.lines())
+			}
+		})
+	}
+}

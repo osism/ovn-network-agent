@@ -11,11 +11,12 @@ import (
 // newTestChecks wires the baseline checks against a fake lab and an
 // engine whose node states the test controls, and hands back the run
 // record and the journal both write into.
-func newTestChecks(cmd commander, nodes map[string]string) (*baselineChecks, *runRecord, *bytes.Buffer) {
+func newTestChecks(t *testing.T, cmd commander, nodes map[string]string) (*baselineChecks, *runRecord, *bytes.Buffer) {
+	t.Helper()
 	clock := newFakeClock()
 	rec := &runRecord{ActionsByName: map[string]int{}}
 	buf := &bytes.Buffer{}
-	e := newEngine(newTestLab(cmd, clock), nil, greenProbes{}, newJournal(buf, clock.now), rec)
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), nil, greenProbes{}, newJournal(buf, clock.now), rec)
 	e.now = clock.now
 	if nodes != nil {
 		e.nodes = nodes
@@ -38,7 +39,7 @@ func TestCheckAgentsAliveFlagsAHealthyNodeWithNoAgent(t *testing.T) {
 		}
 		return healthyLabResponses(argv)
 	}}
-	checks, rec, _ := newTestChecks(cmd, nil)
+	checks, rec, _ := newTestChecks(t, cmd, nil)
 
 	checks.checkAgentsAlive(context.Background())
 
@@ -65,7 +66,7 @@ func TestCheckAgentsAliveDoesNotReadAFailedProbeAsADeadAgent(t *testing.T) {
 		}
 		return healthyLabResponses(argv)
 	}}
-	checks, rec, buf := newTestChecks(cmd, nil)
+	checks, rec, buf := newTestChecks(t, cmd, nil)
 
 	checks.checkAgentsAlive(context.Background())
 
@@ -97,7 +98,7 @@ func TestCheckAgentsAliveSkipsNodesUnderFault(t *testing.T) {
 		}
 		return healthyLabResponses(argv)
 	}}
-	checks, rec, _ := newTestChecks(cmd, map[string]string{
+	checks, rec, _ := newTestChecks(t, cmd, map[string]string{
 		"gateway-1": nodeDisrupted,
 		"gateway-2": nodeConverging,
 		"gateway-3": nodeUnconverged,
@@ -130,7 +131,7 @@ func TestCheckNoDualClaimFlagsASplitGatewayPort(t *testing.T) {
 		}
 		return "", nil
 	}}
-	checks, rec, _ := newTestChecks(cmd, nil)
+	checks, rec, _ := newTestChecks(t, cmd, nil)
 
 	checks.checkNoDualClaim(context.Background())
 
@@ -153,7 +154,7 @@ func TestCheckNoDualClaimAcceptsASinglyClaimedPort(t *testing.T) {
 		return `{"headings":["logical_port","chassis","additional_chassis"],
 		         "data":[["cr-lr0-public",["uuid","uuid-a"],["set",[]]]]}`, nil
 	}}
-	checks, rec, _ := newTestChecks(cmd, nil)
+	checks, rec, _ := newTestChecks(t, cmd, nil)
 
 	checks.checkNoDualClaim(context.Background())
 
@@ -170,7 +171,7 @@ func TestCheckNoDualClaimAcceptsASinglyClaimedPort(t *testing.T) {
 // journal rather than pass silently.
 func TestCheckNoDualClaimJournalsALookupFailure(t *testing.T) {
 	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
-	checks, rec, buf := newTestChecks(cmd, nil)
+	checks, rec, buf := newTestChecks(t, cmd, nil)
 
 	checks.checkNoDualClaim(context.Background())
 
@@ -203,7 +204,7 @@ func TestARunThatNeverEvaluatedTheDualClaimDoesNotPass(t *testing.T) {
 		}
 		return healthyLabResponses(argv)
 	}}
-	checks, rec, _ := newTestChecks(cmd, nil)
+	checks, rec, _ := newTestChecks(t, cmd, nil)
 
 	checks.sweep(context.Background())
 	checks.sweep(context.Background())
@@ -232,7 +233,7 @@ func TestARunThatEvaluatedTheDualClaimPasses(t *testing.T) {
 		}
 		return healthyLabResponses(argv)
 	}}
-	checks, rec, _ := newTestChecks(cmd, nil)
+	checks, rec, _ := newTestChecks(t, cmd, nil)
 
 	checks.sweep(context.Background())
 	checks.finalize()
@@ -250,7 +251,7 @@ func TestARunThatEvaluatedTheDualClaimPasses(t *testing.T) {
 // did not return on ctx.Done() would hang the runner forever, after the
 // engine has already finished.
 func TestChecksStopWithTheirContext(t *testing.T) {
-	checks, _, _ := newTestChecks(&fakeCommander{respond: healthyLabResponses}, nil)
+	checks, _, _ := newTestChecks(t, &fakeCommander{respond: healthyLabResponses}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -270,7 +271,7 @@ func TestChecksStopWithTheirContext(t *testing.T) {
 // The sweep runs both checks.
 func TestSweepRunsBothChecks(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
-	checks, _, _ := newTestChecks(cmd, nil)
+	checks, _, _ := newTestChecks(t, cmd, nil)
 
 	checks.sweep(context.Background())
 

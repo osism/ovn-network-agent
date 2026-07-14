@@ -29,7 +29,7 @@ func runEngine(t *testing.T, seed int64, duration time.Duration,
 		},
 		ActionsByName: map[string]int{},
 	}
-	e := newEngine(newTestLab(cmd, clock), actions, greenProbes{}, jrnl, rec)
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), actions, greenProbes{}, jrnl, rec)
 	e.wait = clock.wait
 	e.now = clock.now
 	if mutate != nil {
@@ -183,7 +183,7 @@ func TestGuardrailsBlockUnhealthyTargetAndLastGateway(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			clock := newFakeClock()
-			e := newEngine(newTestLab(&fakeCommander{}, clock), []*action{act},
+			e := newEngine(newTestLab(&fakeCommander{}, clock), defaultTestProfile(t), []*action{act},
 				greenProbes{}, newJournal(&bytes.Buffer{}, clock.now),
 				&runRecord{ActionsByName: map[string]int{}})
 			e.nodes = tc.nodes
@@ -213,7 +213,7 @@ func TestRunStopsAtDuration(t *testing.T) {
 		ActionsByName: map[string]int{},
 	}
 	e := newEngine(newTestLab(&fakeCommander{respond: healthyLabResponses}, clock),
-		actions, greenProbes{}, newJournal(&buf, clock.now), rec)
+		defaultTestProfile(t), actions, greenProbes{}, newJournal(&buf, clock.now), rec)
 	e.wait, e.now = clock.wait, clock.now
 	// The action holds for 0s so only the tick interval advances the clock.
 	actions[0].holdMin, actions[0].holdMax = 0, 0
@@ -298,7 +298,7 @@ func TestCancelledRunRestoresTheFaultItIsHolding(t *testing.T) {
 	}
 
 	e := newEngine(newTestLab(&fakeCommander{respond: healthyLabResponses}, clock),
-		actions, greenProbes{}, newJournal(&bytes.Buffer{}, clock.now), rec)
+		defaultTestProfile(t), actions, greenProbes{}, newJournal(&bytes.Buffer{}, clock.now), rec)
 	e.wait, e.now = clock.wait, clock.now
 
 	e.run(ctx)
@@ -344,7 +344,7 @@ func TestCancelDuringTheRestoreDoesNotKillIt(t *testing.T) {
 	}
 
 	e := newEngine(newTestLab(&fakeCommander{respond: healthyLabResponses}, clock),
-		actions, greenProbes{}, newJournal(&bytes.Buffer{}, clock.now), rec)
+		defaultTestProfile(t), actions, greenProbes{}, newJournal(&bytes.Buffer{}, clock.now), rec)
 	e.wait, e.now = clock.wait, clock.now
 
 	e.run(ctx)
@@ -484,7 +484,7 @@ func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 	}}
 	clock := newFakeClock()
 	var buf bytes.Buffer
-	e := newEngine(newTestLab(cmd, clock), nil, greenProbes{},
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), nil, greenProbes{},
 		newJournal(&buf, clock.now), &runRecord{ActionsByName: map[string]int{}})
 	e.now = clock.now
 
@@ -643,7 +643,7 @@ func TestAFailedAgentTerminateHandsTheRestartPolicyBack(t *testing.T) {
 		},
 		ActionsByName: map[string]int{},
 	}
-	e := newEngine(newTestLab(cmd, clock), []*action{actionNamed(t, "agent-terminate")},
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), []*action{actionNamed(t, "agent-terminate")},
 		greenProbes{}, newJournal(&bytes.Buffer{}, clock.now), rec)
 	e.wait, e.now = clock.wait, clock.now
 
@@ -679,7 +679,7 @@ func TestACancelledRunDoesNotWaitOutItsTickInterval(t *testing.T) {
 	// The engine keeps its real clock: what is under test is that the wait
 	// itself is interruptible, not that a fake one can be advanced past it.
 	e := newEngine(newLab("ovn-e2e", &fakeCommander{respond: healthyLabResponses}),
-		noopActions("controller-restart"), greenProbes{},
+		defaultTestProfile(t), noopActions("controller-restart"), greenProbes{},
 		newJournal(&bytes.Buffer{}, time.Now), rec)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -725,7 +725,8 @@ func TestRecoveryBudgetExpiryIsAViolation(t *testing.T) {
 		}
 		return healthyLabResponses(argv)
 	}}
-	e := newEngine(newTestLab(cmd, clock), actions, greenProbes{}, newJournal(&buf, clock.now), rec)
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), actions, greenProbes{},
+		newJournal(&buf, clock.now), rec)
 	e.wait, e.now = clock.wait, clock.now
 
 	e.run(context.Background())

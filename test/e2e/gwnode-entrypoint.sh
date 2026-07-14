@@ -288,6 +288,19 @@ configure_frr() {
     exit 1
 }
 
+# A chaos configuration profile (test/e2e/chaos, issue #177) rewrites the
+# whole agent config file and drops this marker next to it. topology.clab.yml
+# sets OVN_NETWORK_DRAIN_ON_SHUTDOWN on every gateway, and the agent's
+# environment layer beats its config file — so without stepping the override
+# aside, a profile could never turn the drain on. No marker, no change: every
+# existing scenario (drain-hitless included) keeps the deploy-time switch.
+yield_config_to_chaos_profile() {
+    local marker=/etc/ovn-network-agent/chaos-profile
+    [[ -f "${marker}" ]] || return 0
+    log "chaos profile '$(cat "${marker}")' owns the config file: unsetting OVN_NETWORK_DRAIN_ON_SHUTDOWN"
+    unset OVN_NETWORK_DRAIN_ON_SHUTDOWN
+}
+
 main() {
     start_ovs
     resolve_sb_remote
@@ -297,6 +310,7 @@ main() {
     setup_loopback
     start_frr
     configure_frr
+    yield_config_to_chaos_profile
 
     log "exec ovn-network-agent"
     exec /usr/local/bin/ovn-network-agent \

@@ -2,22 +2,25 @@
 // #176). It drives an already-deployed lab through a randomized fault
 // sequence for a bounded duration and reports what it did.
 //
-// One run: layer the existing scenarios' setups (hairpin, multi-VLAN,
-// port-forward) on top of the bootstrap baseline, start a continuous
-// reachability probe from client-1, then tick until the duration
-// expires — wait a randomized interval, pick a weighted action, check
-// its guardrails, execute it, wait for the node to converge, record it.
+// One run: apply the named configuration profile (issue #177) — the
+// agent configuration every gateway runs, validated and rolled out
+// without an image rebuild — layer the profile's scenario setups on top
+// of the bootstrap baseline, start a continuous reachability probe from
+// client-1, then tick until the duration expires: wait a randomized
+// interval, pick a weighted action, check its guardrails, execute it,
+// wait for the node to converge, record it.
 //
-// Reproducibility is the contract: the seed, the duration, the tick
-// bounds and the action weights are the only inputs, and every decision
-// the engine makes is drawn from a PCG stream seeded by -seed alone. Two
-// runs with identical inputs replay the identical decision sequence —
-// diff the `decision` lines of their journals to see it.
+// Reproducibility is the contract: the profile, the seed, the duration,
+// the tick bounds and the action weights are the only inputs, and every
+// decision the engine makes is drawn from a PCG stream seeded by -seed
+// alone. Two runs with identical inputs replay the identical decision
+// sequence — diff the `decision` lines of their journals to see it.
 //
 // Usage (against a lab that is already up — `make e2e-up`):
 //
 //	go run ./test/e2e/chaos [flags]
 //	make e2e-chaos CHAOS_FLAGS="-duration 3m -seed 7"
+//	make e2e-chaos CHAOS_FLAGS="-profile pf-only"
 //
 // Exit codes: 0 the run passed, 1 the run recorded a violation, 2 the
 // runner could not set the run up. On a non-zero exit the lab's existing
@@ -59,19 +62,23 @@ const collectTimeout = 2 * time.Minute
 
 // config is one run's inputs, as parsed from the flags.
 type config struct {
-	seed       int64
-	duration   time.Duration
-	tickMin    time.Duration
-	tickMax    time.Duration
-	weightSpec string
-	labName    string
-	outDir     string
-	collect    string
+	seed         int64
+	profile      string
+	duration     time.Duration
+	tickMin      time.Duration
+	tickMax      time.Duration
+	weightSpec   string
+	labName      string
+	outDir       string
+	collect      string
+	gwnodeConfig string
 }
 
 func main() {
 	var cfg config
 	flag.Int64Var(&cfg.seed, "seed", 42, "seed for every decision the engine makes")
+	flag.StringVar(&cfg.profile, "profile", defaultProfileName,
+		"configuration profile: the start topology and the agent configuration each gateway runs")
 	flag.DurationVar(&cfg.duration, "duration", 10*time.Minute, "how long to keep injecting faults")
 	flag.DurationVar(&cfg.tickMin, "tick-min", 10*time.Second, "lower bound of the interval between decisions")
 	flag.DurationVar(&cfg.tickMax, "tick-max", 30*time.Second, "upper bound of the interval between decisions")
@@ -80,6 +87,8 @@ func main() {
 	flag.StringVar(&cfg.outDir, "out", "chaos-artifacts", "directory for the journal, the run record and the lab-state dump")
 	flag.StringVar(&cfg.collect, "collect", "test/e2e/scenarios/collect-artifacts.sh",
 		"lab-state collector, run into <out>/lab-state when the run does not pass")
+	flag.StringVar(&cfg.gwnodeConfig, "gwnode-config", "test/e2e/gwnode-config.yaml",
+		"the baked gateway agent config a profile's overlays are layered over")
 	flag.Parse()
 
 	code, err := run(cfg)
@@ -100,7 +109,20 @@ func run(cfg config) (int, error) {
 		return exitFatal, fmt.Errorf("-duration %s is below the %s floor", cfg.duration, minDuration)
 	}
 
-	actions := starterActions()
+	// The profile and the config it is layered over are resolved before a
+	// single artifact is created: an unknown profile, like a bad weight,
+	// is a contradiction in the inputs, and a run built on one cannot be
+	// replayed and is not worth a lab.
+	p, err := profileByName(cfg.profile)
+	if err != nil {
+		return exitFatal, err
+	}
+	base, err := os.ReadFile(cfg.gwnodeConfig)
+	if err != nil {
+		return exitFatal, fmt.Errorf("read the baked gateway config: %w", err)
+	}
+
+	actions := starterActions(p)
 	weights, err := parseWeights(cfg.weightSpec, actions)
 	if err != nil {
 		return exitFatal, err
@@ -139,6 +161,7 @@ func run(cfg config) (int, error) {
 	rec := &runRecord{
 		Inputs: runInputs{
 			Seed:       cfg.seed,
+			Profile:    p.name,
 			DurationMS: cfg.duration.Milliseconds(),
 			TickMinMS:  cfg.tickMin.Milliseconds(),
 			TickMaxMS:  cfg.tickMax.Milliseconds(),
@@ -150,7 +173,7 @@ func run(cfg config) (int, error) {
 	}
 	jrnl.emit(event{Event: evRunStart, Inputs: &rec.Inputs})
 
-	code := drive(ctx, l, actions, jrnl, rec)
+	code := drive(ctx, l, newApplier(l, p, base), actions, jrnl, rec)
 
 	// The run is over and the engine has undone whatever it injected, so
 	// the signals go back to their default disposition: everything below
@@ -178,22 +201,23 @@ func run(cfg config) (int, error) {
 	return code, nil
 }
 
-// drive builds the start state, starts the prober and the baseline
-// checks, and runs the engine to completion. It returns the exit code
-// for a failure the run record cannot express (a start state that never
-// came up green).
-func drive(ctx context.Context, l *lab, actions []*action, jrnl *journal, rec *runRecord) int {
-	if err := applyStartState(ctx, l); err != nil {
-		rec.Violations = append(rec.Violations, violationRecord{
-			TS:     time.Now().UTC().Format(time.RFC3339Nano),
-			Kind:   violationStartState,
-			Detail: err.Error(),
-		})
-		jrnl.emit(event{Event: evViolation, Kind: violationStartState, Detail: err.Error()})
-		fmt.Fprintf(os.Stderr, "[chaos] start state: %v\n", err)
-		return exitFatal
+// drive puts the profile's configuration on the gateways, builds the
+// start state, starts the prober and the baseline checks, and runs the
+// engine to completion. It returns the exit code for a failure the run
+// record cannot express (a configuration the agent rejected, a start
+// state that never came up green).
+func drive(ctx context.Context, l *lab, ap *applier, actions []*action, jrnl *journal, rec *runRecord) int {
+	p := ap.profile
+	if err := ap.discover(ctx); err != nil {
+		return abandon(jrnl, rec, violationProfileApply, err)
 	}
-	jrnl.emit(event{Event: evStateApplied, Detail: "hairpin + multi-vlan + port-forward layered on the bootstrap baseline"})
+	if err := ap.applyProfile(ctx, jrnl); err != nil {
+		return abandon(jrnl, rec, violationProfileApply, err)
+	}
+	if err := applyStartState(ctx, l, p); err != nil {
+		return abandon(jrnl, rec, violationStartState, err)
+	}
+	jrnl.emit(event{Event: evStateApplied, Detail: p.layers()})
 
 	// The prober and the baseline checks run for the whole run, alongside
 	// the engine. Both are cancelled and then *waited for* before the run
@@ -202,10 +226,10 @@ func drive(ctx context.Context, l *lab, actions []*action, jrnl *journal, rec *r
 	sideCtx, stopSide := context.WithCancel(ctx)
 	defer stopSide()
 
-	probes := newProber(l, defaultProbes, jrnl, time.Now)
+	probes := newProber(l, p.probes, jrnl, time.Now)
 	probes.start(sideCtx)
 
-	e := newEngine(l, actions, probes, jrnl, rec)
+	e := newEngine(l, p, actions, probes, jrnl, rec)
 	e.followMaster(ctx)
 
 	checks := &baselineChecks{lab: l, engine: e}
@@ -223,6 +247,22 @@ func drive(ctx context.Context, l *lab, actions []*action, jrnl *journal, rec *r
 	checks.finalize()
 	rec.Probes = probes.summary()
 	return exitPass
+}
+
+// abandon gives up on a run that could not be set up: the lab never
+// reached the state the run measures against, so every fault after it
+// would report a violation the lab did not cause. The failure is recorded
+// and journaled like any other, so the summary of an abandoned run still
+// says what went wrong.
+func abandon(jrnl *journal, rec *runRecord, kind string, err error) int {
+	rec.Violations = append(rec.Violations, violationRecord{
+		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+		Kind:   kind,
+		Detail: err.Error(),
+	})
+	jrnl.emit(event{Event: evViolation, Kind: kind, Detail: err.Error()})
+	fmt.Fprintf(os.Stderr, "[chaos] %s: %v\n", kind, err)
+	return exitFatal
 }
 
 func writeRecord(rec *runRecord, path string) error {
