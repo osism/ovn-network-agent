@@ -199,7 +199,7 @@ func noopActions(names ...string) []*action {
 			holdMin:        5 * time.Second,
 			holdMax:        5 * time.Second,
 			recoveryBudget: 60 * time.Second,
-			inject:         func(context.Context, *lab, string) error { return nil },
+			inject:         func(context.Context, *lab, string, int) error { return nil },
 			restore:        func(context.Context, *lab, string) error { return nil },
 		})
 	}
@@ -227,6 +227,7 @@ func decisionsIn(t *testing.T, journal string) []string {
 			e.Action, e.Target,
 			time.Duration(e.IntervalMS).String(),
 			time.Duration(e.HoldMS).String(),
+			e.Flip,
 		}, "|"))
 	}
 	return out

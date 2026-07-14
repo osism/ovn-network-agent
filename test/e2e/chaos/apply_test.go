@@ -9,10 +9,12 @@ import (
 
 // newTestApplier wires an applier against the fake commander, with the
 // management addresses already discovered — every test below is about
-// what it does with them.
+// what it does with them. Its journal goes nowhere; a test that reads what
+// was journaled points a.jrnl at a buffer of its own.
 func newTestApplier(t *testing.T, cmd commander, name string) *applier {
 	t.Helper()
 	a := newApplier(newTestLab(cmd, newFakeClock()), testProfile(t, name), baseConfig(t))
+	a.jrnl = newJournal(&bytes.Buffer{}, newFakeClock().now)
 	if err := a.discover(context.Background()); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -47,7 +49,7 @@ func TestApplyProfileValidatesEveryGatewayBeforeItSwapsAnything(t *testing.T) {
 	cmd := &fakeCommander{respond: labWithConfig("stale config\n")}
 	a := newTestApplier(t, cmd, "flat-dnat")
 
-	if err := a.applyProfile(context.Background(), newJournal(&bytes.Buffer{}, newFakeClock().now)); err != nil {
+	if err := a.applyProfile(context.Background()); err != nil {
 		t.Fatalf("applyProfile: %v", err)
 	}
 
@@ -79,7 +81,7 @@ func TestApplyProfileAbortsWhenTheAgentRejectsTheConfig(t *testing.T) {
 	}}
 	a := newTestApplier(t, cmd, "pf-only")
 
-	err := a.applyProfile(context.Background(), newJournal(&bytes.Buffer{}, newFakeClock().now))
+	err := a.applyProfile(context.Background())
 
 	if err == nil {
 		t.Fatal("a configuration the agent rejected was rolled out anyway")
@@ -104,7 +106,7 @@ func TestApplyProfileAbortsWhenTheCheckCannotRun(t *testing.T) {
 	}}
 	a := newTestApplier(t, cmd, "flat-minimal")
 
-	if err := a.applyProfile(context.Background(), newJournal(&bytes.Buffer{}, newFakeClock().now)); err == nil {
+	if err := a.applyProfile(context.Background()); err == nil {
 		t.Fatal("a config whose validation never ran was rolled out anyway")
 	}
 	if cmd.called(restartCmd) {
@@ -119,8 +121,9 @@ func TestApplyProfileSkipsGatewaysThatAreAlreadyOnTheConfig(t *testing.T) {
 	cmd := &fakeCommander{respond: labWithConfig(string(baseConfig(t)))}
 	a := newTestApplier(t, cmd, defaultProfileName)
 	var buf bytes.Buffer
+	a.jrnl = newJournal(&buf, newFakeClock().now)
 
-	if err := a.applyProfile(context.Background(), newJournal(&buf, newFakeClock().now)); err != nil {
+	if err := a.applyProfile(context.Background()); err != nil {
 		t.Fatalf("applyProfile: %v", err)
 	}
 
@@ -154,7 +157,7 @@ func TestApplyProfileRollsTheGatewaysOneAtATime(t *testing.T) {
 	}}
 	a := newTestApplier(t, cmd, "heterogeneous")
 
-	if err := a.applyProfile(context.Background(), newJournal(&bytes.Buffer{}, newFakeClock().now)); err != nil {
+	if err := a.applyProfile(context.Background()); err != nil {
 		t.Fatalf("applyProfile: %v", err)
 	}
 
@@ -199,7 +202,7 @@ func TestApplyProfileRendersEachGatewaysOwnBackendAddress(t *testing.T) {
 	}}
 	a := newTestApplier(t, cmd, "flat-dnat")
 
-	if err := a.applyProfile(context.Background(), newJournal(&bytes.Buffer{}, newFakeClock().now)); err != nil {
+	if err := a.applyProfile(context.Background()); err != nil {
 		t.Fatalf("applyProfile: %v", err)
 	}
 
@@ -229,7 +232,7 @@ func TestApplyProfileFailsWhenAGatewayNeverComesBack(t *testing.T) {
 	}}
 	a := newTestApplier(t, cmd, "flat-minimal")
 
-	err := a.applyProfile(context.Background(), newJournal(&bytes.Buffer{}, newFakeClock().now))
+	err := a.applyProfile(context.Background())
 
 	if err == nil {
 		t.Fatal("a gateway that never came back was reported as reconfigured")
@@ -240,4 +243,129 @@ func TestApplyProfileFailsWhenAGatewayNeverComesBack(t *testing.T) {
 	if got := cmd.count(restartCmd); got != 1 {
 		t.Fatalf("restarted %d gateways, want the roll to stop at the one that never came back", got)
 	}
+}
+
+// A flip is a rolling reconfiguration: the new configuration is validated
+// with the agent's own checker, then swapped in, then the node is
+// restarted onto it. Doing any of that in the other order would restart a
+// gateway onto a config it cannot start with.
+func TestFlipValidatesThenSwapsThenRestarts(t *testing.T) {
+	cmd := &fakeCommander{respond: labWithConfig(string(baseConfig(t)))}
+	a := newTestApplier(t, cmd, defaultProfileName)
+	var buf bytes.Buffer
+	a.jrnl = newJournal(&buf, newFakeClock().now)
+	if err := a.applyProfile(context.Background()); err != nil {
+		t.Fatalf("applyProfile: %v", err)
+	}
+	before := len(cmd.lines())
+
+	if err := a.flip(context.Background(), "gateway-2", flipIndex(t, "drain-toggle")); err != nil {
+		t.Fatalf("flip: %v", err)
+	}
+
+	// The profile apply already staged and validated every gateway, so the
+	// flip's own steps are the ones after it.
+	steps := []string{
+		"--check-config",
+		"printf '%s' 'everything-on' > " + profileMarkerPath, // the file now owns the drain
+		"mv " + agentConfigNextPath,
+		"docker restart clab-ovn-e2e-gateway-2",
+	}
+	flipped := cmd.lines()[before:]
+	last := -1
+	for _, step := range steps {
+		at := -1
+		for i, line := range flipped {
+			if i > last && strings.Contains(line, step) {
+				at = i
+				break
+			}
+		}
+		if at < 0 {
+			t.Fatalf("the flip never issued %q, or issued it out of order — validate, swap, restart: %v",
+				step, flipped)
+		}
+		last = at
+	}
+	if a.current["gateway-2"]["drain_on_shutdown"] != true {
+		t.Fatalf("the tracker did not follow the flip: %v", a.current["gateway-2"])
+	}
+
+	ev := lastEventOf(t, buf.String(), evConfigFlip)
+	if ev.Flip != "drain-toggle" || ev.From != "false" || ev.To != "true" {
+		t.Fatalf("journaled %+v, want the drain flip and the values it moved between", ev)
+	}
+	if ev.Rejected == nil || *ev.Rejected {
+		t.Fatalf("an applied flip was journaled as rejected: %+v", ev)
+	}
+}
+
+// The whitelist is free to draw a configuration the agent refuses. That is
+// not a failure of the run — it is the answer an operator gets from a
+// rejected rollout — so the gateway keeps running what it was running, and
+// the tracker goes back to it rather than drifting away from the lab.
+func TestFlipRejectedByTheAgentLeavesTheGatewayUntouched(t *testing.T) {
+	staged := false
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		// Only the flip's own validation fails: the profile has to land
+		// first, or there would be nothing to flip.
+		if staged && strings.Contains(line, "--check-config") {
+			return "", errExit(t, 1)
+		}
+		return labWithConfig(string(baseConfig(t)))(argv)
+	}}
+	a := newTestApplier(t, cmd, defaultProfileName)
+	var buf bytes.Buffer
+	a.jrnl = newJournal(&buf, newFakeClock().now)
+	if err := a.applyProfile(context.Background()); err != nil {
+		t.Fatalf("applyProfile: %v", err)
+	}
+	staged = true
+	before := len(cmd.lines())
+
+	if err := a.flip(context.Background(), "gateway-1", flipIndex(t, "cadence-toggle")); err != nil {
+		t.Fatalf("a rejected flip failed the run: %v", err)
+	}
+
+	for _, line := range cmd.lines()[before:] {
+		if strings.Contains(line, "mv "+agentConfigNextPath) || strings.Contains(line, restartCmd) {
+			t.Fatalf("a rejected config was swapped in anyway: %q", line)
+		}
+	}
+	if got := a.current["gateway-1"]["reconcile_interval"]; got != fastCadence {
+		t.Fatalf("the tracker kept a config the gateway rejected: reconcile_interval = %v", got)
+	}
+	rejected := lastEventOf(t, buf.String(), evConfigFlip)
+	if rejected.Rejected == nil || !*rejected.Rejected {
+		t.Fatalf("journaled %+v, want the flip recorded as rejected", rejected)
+	}
+	if rejected.Detail == "" {
+		t.Fatalf("the rejected flip was journaled without the agent's reason: %+v", rejected)
+	}
+}
+
+func flipIndex(t *testing.T, name string) int {
+	t.Helper()
+	for i, f := range flips() {
+		if f.name == name {
+			return i
+		}
+	}
+	t.Fatalf("no flip named %q in the whitelist", name)
+	return -1
+}
+
+func lastEventOf(t *testing.T, journal, name string) event {
+	t.Helper()
+	var found event
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == name {
+			found = ev
+		}
+	}
+	if found.Event == "" {
+		t.Fatalf("no %s event was journaled: %s", name, journal)
+	}
+	return found
 }

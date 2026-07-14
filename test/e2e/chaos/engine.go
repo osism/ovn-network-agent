@@ -25,9 +25,10 @@ const (
 
 // Guardrail skip reasons, journaled on the decision they blocked.
 const (
-	skipTargetNotHealthy = "target-not-healthy"
-	skipNoHealthyPeer    = "no-healthy-peer"
-	skipNoWeightedAction = "no-weighted-action"
+	skipTargetNotHealthy  = "target-not-healthy"
+	skipNoHealthyPeer     = "no-healthy-peer"
+	skipNoWeightedAction  = "no-weighted-action"
+	skipFlipNotApplicable = "flip-not-applicable"
 )
 
 // Violation kinds.
@@ -66,8 +67,16 @@ type action struct {
 	holdMin        time.Duration
 	holdMax        time.Duration
 	recoveryBudget time.Duration
-	inject         func(ctx context.Context, l *lab, target string) error
+	inject         func(ctx context.Context, l *lab, target string, flip int) error
 	restore        func(ctx context.Context, l *lab, target string) error
+
+	// applicable binds an action to the flip index every decision draws —
+	// the fifth value taken from the stream, which only config-flip reads.
+	// It is the guardrail that skips a flip meaning nothing on the drawn
+	// target's current configuration, and it is nil on every action whose
+	// behaviour does not depend on the flip — so it is also what tells the
+	// engine whether the drawn flip is worth naming in the journal.
+	applicable func(target string, flip int) bool
 }
 
 // probeSource is the slice of the prober the engine consumes.
@@ -202,13 +211,16 @@ type decision struct {
 	action   *action
 	target   string
 	hold     time.Duration
+	flip     int
 }
 
-// draw takes exactly four values from the stream, in a fixed order:
-// interval, action, target, hold. The count is fixed so that a guardrail
-// skip cannot shift the stream — the run that skips a decision draws the
-// same values afterwards as the run that executed it, which is what
-// makes a replay comparable across labs that behaved differently.
+// draw takes exactly five values from the stream, in a fixed order:
+// interval, action, target, hold, flip. The count is fixed so that a
+// guardrail skip cannot shift the stream — the run that skips a decision
+// draws the same values afterwards as the run that executed it, which is
+// what makes a replay comparable across labs that behaved differently.
+// The flip is drawn on every tick even though only config-flip reads it,
+// for the same reason.
 func (e *engine) draw(tick int) decision {
 	d := decision{tick: tick}
 	d.interval = e.drawDuration(e.tickMin, e.tickMax)
@@ -218,8 +230,8 @@ func (e *engine) draw(tick int) decision {
 		total += a.weight
 	}
 	if total == 0 {
-		// Probe-and-check-only run: no action to pick, so no target and
-		// no hold to draw either.
+		// Probe-and-check-only run: no action to pick, so no target, hold
+		// or flip to draw either.
 		return d
 	}
 	pick := e.rng.IntN(total)
@@ -233,6 +245,7 @@ func (e *engine) draw(tick int) decision {
 	gateways := gatewayNames()
 	d.target = gateways[e.rng.IntN(len(gateways))]
 	d.hold = e.drawDuration(d.action.holdMin, d.action.holdMax)
+	d.flip = e.rng.IntN(len(flips()))
 	return d
 }
 
@@ -256,6 +269,12 @@ func (e *engine) guardrails(d decision) string {
 	}
 	if e.nodeState(d.target) != nodeHealthy {
 		return skipTargetNotHealthy
+	}
+	// A flip that means nothing on what the target is currently running —
+	// a masquerade variant on a gateway with no VIP — would rewrite the
+	// same configuration and restart the node for nothing.
+	if d.action.applicable != nil && !d.action.applicable(d.target, d.flip) {
+		return skipFlipNotApplicable
 	}
 	for _, gw := range e.healthyNodes() {
 		if gw != d.target {
@@ -290,6 +309,11 @@ func (e *engine) run(ctx context.Context) {
 			ev.Action = d.action.name
 			ev.Target = d.target
 			ev.HoldMS = d.hold.Milliseconds()
+			// A flip-aware action names the drawn flip, so a decision that
+			// was skipped still says which one it would have been.
+			if d.action.applicable != nil {
+				ev.Flip = flipName(d.flip)
+			}
 		}
 		e.jrnl.emit(ev)
 
@@ -313,7 +337,7 @@ func (e *engine) execute(ctx context.Context, d decision) {
 
 	injectedAt := e.now()
 	e.jrnl.emit(event{Event: evInject, Tick: d.tick, Action: d.action.name, Target: d.target})
-	if err := d.action.inject(ctx, e.lab, d.target); err != nil {
+	if err := d.action.inject(ctx, e.lab, d.target, d.flip); err != nil {
 		e.undo(ctx, d, err)
 		return
 	}

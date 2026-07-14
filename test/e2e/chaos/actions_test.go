@@ -53,7 +53,7 @@ func TestGatewayKillDisablesTheRestartPolicyBeforeTheKill(t *testing.T) {
 	cmd := &fakeCommander{}
 	l := newTestLab(cmd, newFakeClock())
 
-	if err := actionNamed(t, "gateway-kill").inject(context.Background(), l, "gateway-2"); err != nil {
+	if err := actionNamed(t, "gateway-kill").inject(context.Background(), l, "gateway-2", 0); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
 
@@ -121,7 +121,7 @@ func TestControllerRestartUsesOvnCtlAndTouchesNoContainer(t *testing.T) {
 	l := newTestLab(cmd, newFakeClock())
 	act := actionNamed(t, "controller-restart")
 
-	if err := act.inject(context.Background(), l, "gateway-1"); err != nil {
+	if err := act.inject(context.Background(), l, "gateway-1", 0); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
 	if err := act.restore(context.Background(), l, "gateway-1"); err != nil {
@@ -149,7 +149,7 @@ func TestAgentTerminateSignalsPID1AndWaitsForTheExit(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
 
-	if err := actionNamed(t, "agent-terminate").inject(context.Background(), l, "gateway-3"); err != nil {
+	if err := actionNamed(t, "agent-terminate").inject(context.Background(), l, "gateway-3", 0); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
 
@@ -172,7 +172,7 @@ func TestAgentTerminateFailsWhenTheContainerStaysUp(t *testing.T) {
 	}}
 	l := newTestLab(cmd, newFakeClock())
 
-	err := actionNamed(t, "agent-terminate").inject(context.Background(), l, "gateway-3")
+	err := actionNamed(t, "agent-terminate").inject(context.Background(), l, "gateway-3", 0)
 	if err == nil {
 		t.Fatal("a container that never exited was reported as a clean termination")
 	}
@@ -213,7 +213,7 @@ func TestGatewayRestartRecyclesTheContainerAndRestoresTheNode(t *testing.T) {
 	l := newTestLab(cmd, newFakeClock())
 	act := actionNamed(t, "gateway-restart")
 
-	if err := act.inject(context.Background(), l, workloadHost); err != nil {
+	if err := act.inject(context.Background(), l, workloadHost, 0); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
 	if err := act.restore(context.Background(), l, workloadHost); err != nil {
@@ -354,5 +354,53 @@ func TestProbeTargetsExcludeTheBackendlessFIP(t *testing.T) {
 	}
 	if len(defaultProbes) != 5 {
 		t.Fatalf("probe set = %v, want the four FIPs plus the port-forward VIP", defaultProbes)
+	}
+}
+
+// config-flip is appended to the starter set, never inserted: the weighted
+// pick walks the registry in order, so an insertion would replay every
+// recorded seed as a different run.
+func TestConfigFlipIsAppendedToTheRegistry(t *testing.T) {
+	p := defaultTestProfile(t)
+	actions := allActions(p, newApplier(nil, p, nil))
+
+	want := []string{
+		"controller-restart", "gateway-kill", "agent-terminate",
+		"gateway-restart", "config-flip",
+	}
+	for i, a := range actions {
+		if i >= len(want) || a.name != want[i] {
+			t.Fatalf("registry = %v, want %v", actionNames(actions), want)
+		}
+	}
+	if len(actions) != len(want) {
+		t.Fatalf("registry = %v, want %v", actionNames(actions), want)
+	}
+
+	flip := actions[len(actions)-1]
+	if flip.weight <= 0 {
+		t.Fatalf("config-flip ships with weight %d — the weighted pick would never draw it", flip.weight)
+	}
+	if flip.applicable == nil {
+		t.Fatal("config-flip does not read the flip index the engine draws for it")
+	}
+	if flip.holdMin != 0 || flip.holdMax != 0 {
+		t.Fatalf("config-flip holds its fault for %s–%s — the restart onto the new config is its own undo",
+			flip.holdMin, flip.holdMax)
+	}
+}
+
+// The guardrail is consulted before the fault is injected, and an applier
+// that has not put a profile on the lab yet tracks no configuration — so
+// it reports every flip as inapplicable rather than flipping a
+// configuration it has never read. (run() applies the profile before the
+// engine draws anything.)
+func TestAnApplierWithoutAProfileSkipsEveryFlip(t *testing.T) {
+	ap := newApplier(nil, defaultTestProfile(t), nil)
+
+	for i := range flips() {
+		if ap.applicable("gateway-1", i) {
+			t.Fatalf("flip %s was applicable before the profile was applied", flipName(i))
+		}
 	}
 }

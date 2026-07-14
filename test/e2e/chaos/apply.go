@@ -30,6 +30,13 @@ type applier struct {
 	lab     *lab
 	profile *profile
 
+	// jrnl records every configuration the applier puts on a gateway. It is
+	// set once the run has earned an artifact directory: the applier itself
+	// is built earlier, because the action registry binds config-flip to it
+	// and the -weights check runs against that registry — ahead of
+	// everything that creates a file.
+	jrnl *journal
+
 	// base is the host-side gwnode config — the document every overlay is
 	// layered over, and byte-for-byte what a fresh gateway already has.
 	base []byte
@@ -75,7 +82,7 @@ func (a *applier) discover(ctx context.Context) error {
 // completion before the first live file is swapped: a profile the agent
 // rejects on one gateway must not leave the lab half-reconfigured, with
 // two gateways rolled onto it and the third refusing to start.
-func (a *applier) applyProfile(ctx context.Context, jrnl *journal) error {
+func (a *applier) applyProfile(ctx context.Context) error {
 	rendered := make(map[string][]byte, len(gatewayNames()))
 	for _, gw := range gatewayNames() {
 		raw, err := renderConfig(a.base, a.profile.gwConfig(gw), a.mgmtIP[gw])
@@ -112,7 +119,7 @@ func (a *applier) applyProfile(ctx context.Context, jrnl *journal) error {
 		if applied {
 			detail = fmt.Sprintf("restarted onto the %s configuration", a.profile.name)
 		}
-		jrnl.emit(event{
+		a.jrnl.emit(event{
 			Event: evProfileApply, Target: gw,
 			Executed: boolPtr(applied), Detail: detail,
 		})
@@ -190,4 +197,82 @@ func (a *applier) waitBack(ctx context.Context, gw string) error {
 	}
 	return fmt.Errorf("%s did not come back within %s after its configuration was swapped",
 		gw, profileApplyTimeout)
+}
+
+// applicable reports whether a drawn flip means anything on a gateway's
+// current configuration — the masquerade flip needs a VIP to flip it on,
+// the CIDR flip a baseline to toggle back to. The engine's guardrails
+// consult it, so an inapplicable flip is a journaled skip rather than a
+// rewrite and a restart that change nothing.
+func (a *applier) applicable(gw string, idx int) bool {
+	c, ok := a.flipCtx(gw)
+	return ok && flips()[idx].applicable(c)
+}
+
+// flip rewrites one gateway's configuration mid-run: toggle a whitelisted
+// option, validate the result the way applyProfile does, and only then
+// swap the file and restart the node onto it — a rolling reconfiguration
+// under fault load.
+//
+// A configuration the agent rejects is journaled and dropped, and the
+// tracker goes back to what the gateway is still running. That is not a
+// failure of the run: it is the answer an operator gets from a rejected
+// rollout, and the whitelist is deliberately free to draw a combination
+// the agent must refuse rather than accept.
+func (a *applier) flip(ctx context.Context, gw string, idx int) error {
+	f := flips()[idx]
+	c, ok := a.flipCtx(gw)
+	if !ok {
+		return fmt.Errorf("no configuration is tracked for %s", gw)
+	}
+
+	before, err := marshalConfig(c.doc)
+	if err != nil {
+		return err
+	}
+	from, to := f.apply(c)
+	raw, err := marshalConfig(c.doc)
+	if err != nil {
+		return err
+	}
+
+	valid, detail, err := a.stage(ctx, gw, raw)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		reverted, err := parseConfig(before)
+		if err != nil {
+			return err
+		}
+		a.current[gw] = reverted
+		a.jrnl.emit(event{
+			Event: evConfigFlip, Target: gw, Flip: f.name, From: from, To: to,
+			Rejected: boolPtr(true), Detail: detail,
+		})
+		return nil
+	}
+
+	// The marker goes down before the restart: from here on the file is
+	// authoritative, and the deploy-time drain override must not beat a
+	// drain the flip has just written into it.
+	if err := a.mark(ctx, gw, true); err != nil {
+		return err
+	}
+	if err := a.lab.moveFile(ctx, gw, agentConfigNextPath, agentConfigPath); err != nil {
+		return err
+	}
+	a.jrnl.emit(event{
+		Event: evConfigFlip, Target: gw, Flip: f.name, From: from, To: to,
+		Rejected: boolPtr(false),
+	})
+	return a.lab.restartGateway(ctx, gw)
+}
+
+func (a *applier) flipCtx(gw string) (flipCtx, bool) {
+	doc, ok := a.current[gw]
+	if !ok {
+		return flipCtx{}, false
+	}
+	return flipCtx{doc: doc, baseline: a.baseline[gw], mgmtIP: a.mgmtIP[gw]}, true
 }
