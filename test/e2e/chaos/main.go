@@ -122,7 +122,14 @@ func run(cfg config) (int, error) {
 		return exitFatal, fmt.Errorf("read the baked gateway config: %w", err)
 	}
 
-	actions := starterActions(p)
+	// The lab and the applier the config-flip action binds to are plain
+	// values — nothing is touched, and no artifact created, until the run
+	// is under way. So the registry is built here, which keeps the
+	// -weights check — and its "a rejected run leaves no artifacts"
+	// contract — ahead of everything that creates one.
+	l := newLab(cfg.labName, execCommander{})
+	ap := newApplier(l, p, base)
+	actions := allActions(p, ap)
 	weights, err := parseWeights(cfg.weightSpec, actions)
 	if err != nil {
 		return exitFatal, err
@@ -157,7 +164,7 @@ func run(cfg config) (int, error) {
 
 	started := time.Now()
 	jrnl := newJournal(jf, time.Now)
-	l := newLab(cfg.labName, execCommander{})
+	ap.jrnl = jrnl
 	rec := &runRecord{
 		Inputs: runInputs{
 			Seed:       cfg.seed,
@@ -173,7 +180,7 @@ func run(cfg config) (int, error) {
 	}
 	jrnl.emit(event{Event: evRunStart, Inputs: &rec.Inputs})
 
-	code := drive(ctx, l, newApplier(l, p, base), actions, jrnl, rec)
+	code := drive(ctx, l, ap, actions, jrnl, rec)
 
 	// The run is over and the engine has undone whatever it injected, so
 	// the signals go back to their default disposition: everything below
@@ -211,7 +218,7 @@ func drive(ctx context.Context, l *lab, ap *applier, actions []*action, jrnl *jo
 	if err := ap.discover(ctx); err != nil {
 		return abandon(jrnl, rec, violationProfileApply, err)
 	}
-	if err := ap.applyProfile(ctx, jrnl); err != nil {
+	if err := ap.applyProfile(ctx); err != nil {
 		return abandon(jrnl, rec, violationProfileApply, err)
 	}
 	if err := applyStartState(ctx, l, p); err != nil {

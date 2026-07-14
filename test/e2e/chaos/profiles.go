@@ -305,11 +305,15 @@ func applyOverlay(doc map[string]any, c gwConfig, mgmtIP string) {
 // masquerade is off on purpose: the backend runs on the same host, and
 // SNAT-ing traffic to a same-host backend breaks the reply path (the
 // OUTPUT chains handle the replies, see docs/explanation/port-forwarding.md).
+// hairpin_masquerade is spelled out rather than left to its default
+// because the masquerade flip toggles it: with the key present, toggling
+// it twice puts the gateway back on exactly the profile's configuration.
 func apiVIPBlock(mgmtIP string) map[string]any {
 	return map[string]any{
-		"vip":        apiVIPAddr,
-		"manage_vip": true,
-		"masquerade": false,
+		"vip":                apiVIPAddr,
+		"manage_vip":         true,
+		"masquerade":         false,
+		"hairpin_masquerade": false,
 		"rules": []any{map[string]any{
 			"proto":     "tcp",
 			"port":      apiVIPPort,

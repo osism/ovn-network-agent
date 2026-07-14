@@ -49,7 +49,7 @@ func starterActions(p *profile) []*action {
 			holdMin:        10 * time.Second,
 			holdMax:        30 * time.Second,
 			recoveryBudget: 90 * time.Second,
-			inject: func(ctx context.Context, l *lab, gw string) error {
+			inject: func(ctx context.Context, l *lab, gw string, _ int) error {
 				return l.stopController(ctx, gw)
 			},
 			restore: func(ctx context.Context, l *lab, gw string) error {
@@ -81,7 +81,7 @@ func starterActions(p *profile) []*action {
 			holdMin:        0,
 			holdMax:        0,
 			recoveryBudget: 180 * time.Second,
-			inject: func(ctx context.Context, l *lab, gw string) error {
+			inject: func(ctx context.Context, l *lab, gw string, _ int) error {
 				return l.restartGateway(ctx, gw)
 			},
 			restore: restore,
@@ -89,10 +89,37 @@ func starterActions(p *profile) []*action {
 	}
 }
 
+// allActions is the registry the runner drives: the starter faults plus
+// the configuration change, appended — never inserted — so a recorded
+// seed still replays the sequence it recorded.
+//
+// config-flip is the operational fault the other four cannot express: a
+// gateway is reconfigured and restarted onto the new configuration while
+// the lab is under load, the way a rollout, a tuning change or an
+// emergency flag flip actually reaches production. Its restart is the
+// fault and its own undo, so like gateway-restart it holds nothing and
+// pays the full container-lifecycle recovery budget.
+func allActions(p *profile, ap *applier) []*action {
+	return append(starterActions(p), &action{
+		name:           "config-flip",
+		weight:         2,
+		holdMin:        0,
+		holdMax:        0,
+		recoveryBudget: 180 * time.Second,
+		applicable:     ap.applicable,
+		inject: func(ctx context.Context, _ *lab, gw string, flip int) error {
+			return ap.flip(ctx, gw, flip)
+		},
+		restore: func(ctx context.Context, l *lab, gw string) error {
+			return restoreNode(ctx, l, p, gw)
+		},
+	})
+}
+
 // injectGatewayKill hard-kills the container. containerlab deploys with
 // `restart: always`, so the policy is flipped off first — otherwise
 // docker revives the node before the fault is observable at all.
-func injectGatewayKill(ctx context.Context, l *lab, gw string) error {
+func injectGatewayKill(ctx context.Context, l *lab, gw string, _ int) error {
 	if err := l.setRestartPolicy(ctx, gw, "no"); err != nil {
 		return err
 	}
@@ -103,7 +130,7 @@ func injectGatewayKill(ctx context.Context, l *lab, gw string) error {
 // to follow it down. Whether the agent drains its gateway chassis before
 // exiting depends on how the lab was deployed — the fault is the same
 // either way, and the drain only changes how much the run loses.
-func injectAgentTerminate(ctx context.Context, l *lab, gw string) error {
+func injectAgentTerminate(ctx context.Context, l *lab, gw string, _ int) error {
 	if err := l.setRestartPolicy(ctx, gw, "no"); err != nil {
 		return err
 	}

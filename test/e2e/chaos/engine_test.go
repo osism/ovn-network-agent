@@ -285,7 +285,7 @@ func TestCancelledRunRestoresTheFaultItIsHolding(t *testing.T) {
 
 	actions := noopActions("gateway-kill")
 	// The operator hits Ctrl-C while the fault is held.
-	actions[0].inject = func(context.Context, *lab, string) error {
+	actions[0].inject = func(context.Context, *lab, string, int) error {
 		cancel()
 		return nil
 	}
@@ -550,7 +550,7 @@ func parkedIn(t *testing.T, journal, gw string) bool {
 // fails.
 func TestFailedInjectParksTheNodeAndFailsTheRun(t *testing.T) {
 	actions := noopActions("controller-restart")
-	actions[0].inject = func(context.Context, *lab, string) error {
+	actions[0].inject = func(context.Context, *lab, string, int) error {
 		return errBoom
 	}
 
@@ -574,7 +574,7 @@ func TestFailedInjectParksTheNodeAndFailsTheRun(t *testing.T) {
 // when it is the inject that failed.
 func TestAFailedInjectIsUndone(t *testing.T) {
 	actions := noopActions("agent-terminate")
-	actions[0].inject = func(context.Context, *lab, string) error { return errBoom }
+	actions[0].inject = func(context.Context, *lab, string, int) error { return errBoom }
 	var restores int
 	var restoreCtxErr error
 	var bounded bool
@@ -815,4 +815,96 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// The flip index is the fifth value every tick draws, and it is drawn
+// whether or not the action that was picked reads it. Two runs with the
+// same seed must therefore agree on the flips as well as on the actions —
+// the profile and the seed together are what a replay reproduces.
+func TestSameSeedReplaysTheSameFlips(t *testing.T) {
+	actions := func() []*action {
+		acts := noopActions("gateway-kill")
+		acts[0].applicable = func(string, int) bool { return true }
+		return acts
+	}
+	first, _ := runEngine(t, 7, 20*time.Minute, actions(), nil)
+	second, _ := runEngine(t, 7, 20*time.Minute, actions(), nil)
+
+	a, b := decisionsIn(t, first), decisionsIn(t, second)
+	if len(a) == 0 {
+		t.Fatal("the run made no decisions at all")
+	}
+	if len(a) != len(b) || !slicesEqual(a, b) {
+		t.Fatalf("the same seed drew different flips:\n%v\n%v", a, b)
+	}
+
+	drawn := map[string]bool{}
+	for _, ev := range eventsIn(t, first) {
+		if ev.Event == evDecision && ev.Flip != "" {
+			drawn[ev.Flip] = true
+		}
+	}
+	if len(drawn) < 2 {
+		t.Fatalf("a 20-minute run drew only %v — the flip is not being drawn per tick", drawn)
+	}
+}
+
+// A flip that means nothing on the target's current configuration — a
+// masquerade variant on a gateway with no VIP — is a guardrail skip. Like
+// every other skip it must not shift the stream: the run that skipped
+// draws the same values afterwards as the run that executed.
+func TestAnInapplicableFlipIsSkippedWithoutShiftingTheStream(t *testing.T) {
+	flippable := noopActions("config-flip")
+	flippable[0].applicable = func(string, int) bool { return true }
+
+	applied := noopActions("config-flip")
+	// gateway-2's configuration has nothing the drawn flip can change.
+	applied[0].applicable = func(gw string, _ int) bool { return gw != "gateway-2" }
+
+	open, _ := runEngine(t, 42, 20*time.Minute, flippable, nil)
+	guarded, rec := runEngine(t, 42, 20*time.Minute, applied, nil)
+
+	a, b := decisionsIn(t, open), decisionsIn(t, guarded)
+	for i := range a {
+		if i < len(b) && a[i] != b[i] {
+			t.Fatalf("decision %d diverged after an inapplicable flip was skipped: %q vs %q", i+1, a[i], b[i])
+		}
+	}
+	if rec.Decisions.Skipped == 0 {
+		t.Fatal("no decision was skipped even though every gateway-2 flip was inapplicable")
+	}
+	var skipped event
+	for _, ev := range eventsIn(t, guarded) {
+		if ev.Event == evDecision && ev.SkipReason == skipFlipNotApplicable {
+			skipped = ev
+		}
+	}
+	if skipped.Target != "gateway-2" {
+		t.Fatalf("journaled %+v, want a %s skip on gateway-2", skipped, skipFlipNotApplicable)
+	}
+	// A skipped decision still says which flip it would have been —
+	// otherwise the journal cannot explain why it was skipped.
+	if skipped.Flip == "" {
+		t.Fatalf("the skipped decision does not name the flip it drew: %+v", skipped)
+	}
+}
+
+// A profile without the port-forward layer has no Load_Balancer VIP: there
+// are no hand-plumbed routes to follow the master with, and issuing them
+// would plumb a VIP the run never put up.
+func TestFollowMasterDoesNothingWithoutTheLoadBalancerVIP(t *testing.T) {
+	cmd := &fakeCommander{respond: healthyLabResponses}
+	clock := newFakeClock()
+	e := newEngine(newTestLab(cmd, clock), testProfile(t, "pf-only"), nil, greenProbes{},
+		newJournal(&bytes.Buffer{}, clock.now), &runRecord{ActionsByName: map[string]int{}})
+	e.now = clock.now
+
+	e.followMaster(context.Background())
+
+	if len(cmd.lines()) != 0 {
+		t.Fatalf("a profile without the port-forward layer still plumbed the VIP: %v", cmd.lines())
+	}
+	if e.vipOwner != "" {
+		t.Fatalf("vipOwner = %q on a run with no Load_Balancer VIP", e.vipOwner)
+	}
 }

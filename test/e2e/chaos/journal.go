@@ -26,6 +26,7 @@ const (
 const (
 	evRunStart        = "run-start"
 	evProfileApply    = "profile-apply"
+	evConfigFlip      = "config-flip"
 	evStateApplied    = "state-applied"
 	evDecision        = "decision"
 	evInject          = "inject"
@@ -53,6 +54,10 @@ type event struct {
 	HoldMS     int64            `json:"hold_ms,omitempty"`
 	Executed   *bool            `json:"executed,omitempty"`
 	SkipReason string           `json:"skip_reason,omitempty"`
+	Flip       string           `json:"flip,omitempty"`
+	From       string           `json:"from,omitempty"`
+	To         string           `json:"to,omitempty"`
+	Rejected   *bool            `json:"rejected,omitempty"`
 	Probe      string           `json:"probe,omitempty"`
 	Up         *bool            `json:"up,omitempty"`
 	State      string           `json:"state,omitempty"`

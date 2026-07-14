@@ -158,3 +158,36 @@ func TestProberReportsRedTargets(t *testing.T) {
 		t.Fatalf("redTargets = %v, want [fip-vm1]", red)
 	}
 }
+
+// The flip fields describe a configuration change, and nothing else: on
+// every other event they must stay out of the line entirely, or a journal
+// reader cannot tell a decision that flipped a config from one that did
+// not.
+func TestFlipFieldsAreJournaledOnlyWhereTheyBelong(t *testing.T) {
+	var buf bytes.Buffer
+	j := newJournal(&buf, newFakeClock().now)
+
+	j.emit(event{
+		Event: evConfigFlip, Target: "gateway-2", Flip: "drain-toggle",
+		From: "false", To: "true", Rejected: boolPtr(false),
+	})
+	j.emit(event{Event: evInject, Tick: 3, Action: "gateway-kill", Target: "gateway-1"})
+
+	lines := eventsIn(t, buf.String())
+	flip := lines[0]
+	if flip.Flip != "drain-toggle" || flip.From != "false" || flip.To != "true" {
+		t.Fatalf("the config-flip event lost its values: %+v", flip)
+	}
+	if flip.Rejected == nil || *flip.Rejected {
+		t.Fatalf("an applied flip was journaled as rejected: %+v", flip)
+	}
+	raw := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if !strings.Contains(raw[0], `"rejected":false`) {
+		t.Fatalf("an applied flip does not say so explicitly: %s", raw[0])
+	}
+	for _, field := range []string{"flip", "from", "to", "rejected"} {
+		if strings.Contains(raw[1], `"`+field+`"`) {
+			t.Fatalf("the %s field leaked into an event that never flipped anything: %s", field, raw[1])
+		}
+	}
+}
