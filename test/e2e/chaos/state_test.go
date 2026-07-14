@@ -240,3 +240,38 @@ func TestStartAPIBackendFailsWhenTheListenerNeverBinds(t *testing.T) {
 		t.Fatalf("error %q does not say the listener never came up", err)
 	}
 }
+
+// pkill exits 1 when nothing matched, which is the normal case the first
+// time a responder is started. Reading that as a failure would abort the
+// run before it began.
+func TestStartingAResponderWithNothingToKillIsNotAFailure(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "pkill") {
+			return "", errExit(t, 1)
+		}
+		return healthyLabResponses(argv)
+	}}
+
+	if err := startAPIBackend(context.Background(), newTestLab(cmd, newFakeClock()), "gateway-2"); err != nil {
+		t.Fatalf("a first start with no previous instance failed: %v", err)
+	}
+	if !cmd.called("exec -d clab-ovn-e2e-gateway-2 /usr/local/bin/pf-backend") {
+		t.Fatalf("the backend was never started: %v", cmd.lines())
+	}
+
+	// A pkill that could not run at all is a different matter: the old
+	// instance may still hold the port, and the new one would never bind.
+	broken := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "pkill") {
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+	err := startAPIBackend(context.Background(), newTestLab(broken, newFakeClock()), "gateway-2")
+	if err == nil {
+		t.Fatal("a reset that could not run was reported as a clean start")
+	}
+	if broken.called("exec -d clab-ovn-e2e-gateway-2 /usr/local/bin/pf-backend") {
+		t.Fatalf("a second backend was started alongside one that may still be running: %v", broken.lines())
+	}
+}
