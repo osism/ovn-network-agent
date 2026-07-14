@@ -17,6 +17,7 @@ a week even with no PR activity.**
 | Integration | `integration.yml` | PR (skips docs-only) | **`smoke`** |
 | govulncheck | `govulncheck.yml` | PR, push `main`, weekly | no |
 | E2E | `e2e.yml` | PR (skips docs-only), dispatch | no |
+| E2E Chaos | `e2e-chaos.yml` | dispatch | no |
 | Docs | `docs.yml` | PR touching docs | no |
 | Package | `package.yml` | PR | no |
 | CodeQL | `codeql.yml` | PR, push `main`, weekly | no |

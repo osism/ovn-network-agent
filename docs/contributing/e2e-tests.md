@@ -1045,15 +1045,16 @@ loss buckets, the per-action recovery durations, and every violation.
 never went green). On any non-zero exit the lab's existing
 `collect-artifacts.sh` bundle is dumped into `<out>/lab-state`.
 
-**In CI.** The `chaos` job in
-[`e2e.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e.yml)
-runs on `workflow_dispatch` only, with `-seed 42 -duration 3m`, and
-uploads the journal, the summary and the lab-state dump on every outcome.
-It is not on the PR path: the sibling scenarios each assert one fault and
-leave the lab baseline-green, while a chaos run is a randomized sequence
-that deliberately leaves the master wherever the last election put it.
-Dispatch it from the Actions tab when you touch the agent's failover,
-drain or chassis-cleanup paths.
+**In CI.** The runner has its own workflow,
+[`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
+which runs on `workflow_dispatch` only and uploads the journal, the
+summary and the lab-state dump on every outcome. The seed and duration
+are dispatch inputs defaulting to `-seed 42 -duration 3m`. It is
+deliberately not part of `e2e.yml`'s PR path: the scenarios there each
+assert one fault and leave the lab baseline-green, while a chaos run is
+a randomized sequence that deliberately leaves the master wherever the
+last election put it. Dispatch it from the Actions tab when you touch
+the agent's failover, drain or chassis-cleanup paths.
 
 ### Manual setup for triage
 
@@ -1110,6 +1111,10 @@ Docs-only changes are skipped with a `paths-ignore` filter (`docs/**`,
 **not** run on push to `main`: the branch ruleset requires PRs to be up
 to date, so the merged commit already passed E2E on its PR and
 re-running the ~10 min suite post-merge would only burn runner time.
+The [chaos runner](#chaos-runner) is not part of this workflow — it has
+its own dispatch-only
+[`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
+described in the chaos-runner section above.
 
 One job runs per scenario, each on its own runner so a regression in one
 scenario is reported in isolation. Every job installs containerlab and
