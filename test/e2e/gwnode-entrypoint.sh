@@ -28,6 +28,84 @@ BRIDGE_MAPPING="${BRIDGE_MAPPING:-physnet1:${BRIDGE_DEV}}"
 VRF_NAME="${VRF_NAME:-vrf-provider}"
 VRF_TABLE_ID="${VRF_TABLE_ID:-100}"
 
+# ---------------------------------------------------------------------------
+# Why no daemon start script's exit status may be fatal here
+# ---------------------------------------------------------------------------
+#
+# This script runs under `set -e` AND it is the container's PID 1 (main()
+# `exec`s the agent at the end). So an unguarded command that returns non-zero
+# does not merely abort a step: it kills PID 1, the container exits, and
+# Docker's `restart: always` policy — which containerlab applies to every node
+# — restarts it.
+#
+# That restart is what destroys the lab. containerlab wires the veths about a
+# second AFTER it creates the containers:
+#
+#     06:27:13 INFO Creating container name=gateway-1
+#     06:27:14 INFO Created link: gateway-1:eth1 ▪┄┄▪ upstream:eth1
+#
+# A restart that lands before the link is created is harmless — containerlab
+# wires eth1 into the new netns. A restart that lands after it takes eth1 down
+# with the old netns, and the interface never comes back: bootstrap.sh then
+# dies on `Cannot find device "eth1"` against a lab that can no longer be
+# repaired. That one-second window is the whole of the intermittency; the crash
+# itself is not rare at all.
+#
+# The crash is also silent. `set -e` prints nothing, and the RESTARTED
+# container comes up healthy and re-registers its chassis in SB — so
+# bootstrap's SB-registration gate passes and the real cause appears nowhere
+# in the job log.
+#
+# Every daemon start below has this shape, and each one has already been
+# observed killing PID 1 in CI:
+#
+#   * `ovs-ctl start` can return non-zero after ovsdb-server and vswitchd are
+#     both up and answering.
+#   * `frrinit.sh start` can return non-zero after watchfrr is up — its daemons
+#     race the initial vtysh connect (`zebra state -> down : initial connection
+#     attempt failed`, recovering a moment later).
+#   * `ovn-ctl start_controller` has the same shape.
+#
+# None of these exit statuses is a readiness signal, and none of them needs to
+# be: every one is already followed by a probe that polls for the state we
+# actually depend on. So the rule for this whole section is —
+#
+#     an exit status is a hint, readiness is a probe, and giving up prints why.
+#
+# start_daemon() implements the first half, await_ready() the second.
+
+# Run a daemon's start command, logging a non-zero exit instead of dying on it.
+start_daemon() {
+    local label="$1"
+    shift
+    if ! "$@"; then
+        log "WARN: ${label} returned non-zero; deferring to the readiness probe"
+    fi
+}
+
+# Poll until the daemon is actually usable. A genuine failure must still fail,
+# so a timeout exits — but it names the daemon and, when given a `diag`
+# function, dumps its state first, so the next occurrence is root-causable from
+# the container log alone.
+#
+# `diag` may be empty for daemons whose failure the probe itself makes obvious.
+await_ready() {
+    local label="$1" attempts="$2" diag="$3"
+    shift 3
+    local i
+    for (( i = 1; i <= attempts; i++ )); do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    log "ERROR: ${label} did not become ready within ${attempts}s"
+    if [ -n "${diag}" ]; then
+        "${diag}"
+    fi
+    exit 1
+}
+
 start_ovs() {
     log "starting Open vSwitch (kernel datapath)"
     mkdir -p /var/run/openvswitch /var/log/openvswitch /etc/openvswitch
@@ -44,16 +122,9 @@ start_ovs() {
     modprobe openvswitch 2>/dev/null || log "modprobe openvswitch failed (already loaded or built in?)"
     # ovs-ctl honours the existing conf.db when present and creates a new
     # one otherwise, which keeps re-runs idempotent.
-    /usr/share/openvswitch/scripts/ovs-ctl --system-id="${CHASSIS_NAME}" start
-    # Wait for ovs-vsctl to respond.
-    for _ in $(seq 1 30); do
-        if ovs-vsctl show >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-    done
-    echo "ovs-vsctl did not respond after start" >&2
-    exit 1
+    start_daemon "ovs-ctl start" \
+        /usr/share/openvswitch/scripts/ovs-ctl --system-id="${CHASSIS_NAME}" start
+    await_ready "Open vSwitch (ovs-vsctl)" 30 "" ovs-vsctl show
 }
 
 # ovn-controller resolves the SB remote's hostname with OVS's internal
@@ -101,15 +172,11 @@ configure_ovs() {
 
 start_ovn_controller() {
     log "starting ovn-controller"
-    /usr/share/ovn/scripts/ovn-ctl start_controller
-    for _ in $(seq 1 30); do
-        if ovs-vsctl br-exists br-int 2>/dev/null; then
-            return 0
-        fi
-        sleep 1
-    done
-    echo "ovn-controller did not create br-int" >&2
-    exit 1
+    start_daemon "ovn-ctl start_controller" \
+        /usr/share/ovn/scripts/ovn-ctl start_controller
+    # br-int is ovn-controller's own handiwork, so its existence — not
+    # ovn-ctl's exit status — is the signal that the daemon is really running.
+    await_ready "ovn-controller (br-int)" 30 "" ovs-vsctl br-exists br-int
 }
 
 setup_vrf() {
@@ -146,6 +213,20 @@ setup_loopback() {
     ip link set loopback1 up
 }
 
+FRR_READY_ATTEMPTS="${FRR_READY_ATTEMPTS:-30}"
+FRR_CONFIG_ATTEMPTS="${FRR_CONFIG_ATTEMPTS:-30}"
+
+# Everything we know about why FRR would not come up, on the way out.
+# Best-effort throughout: this runs on the failure path, and a missing
+# log file must not replace the real error with a shell error.
+dump_frr_diagnostics() {
+    log "--- FRR diagnostics ---"
+    /usr/lib/frr/frrinit.sh status 2>&1 | sed 's/^/[gwnode]   /' >&2 || true
+    pgrep -af 'watchfrr|zebra|bgpd|staticd' 2>/dev/null \
+        | sed 's/^/[gwnode]   /' >&2 || true
+    tail -n 40 /var/log/frr/* 2>/dev/null | sed 's/^/[gwnode]   /' >&2 || true
+}
+
 start_frr() {
     log "starting FRR"
     # watchfrr keeps state under /var/tmp/frr; stale entries from a
@@ -155,27 +236,18 @@ start_frr() {
     # /usr/lib/frr/frrinit.sh is the canonical service entrypoint shipped
     # by the FRR Debian package; it launches the daemons listed in
     # /etc/frr/daemons.
-    /usr/lib/frr/frrinit.sh start
-    for _ in $(seq 1 30); do
-        if vtysh -c 'show version' >/dev/null 2>&1; then
-            break
-        fi
-        sleep 1
-    done
-    if ! vtysh -c 'show version' >/dev/null 2>&1; then
-        echo "FRR did not become ready" >&2
-        exit 1
-    fi
+    start_daemon "frrinit.sh start" /usr/lib/frr/frrinit.sh start
+    await_ready "FRR (vtysh)" "${FRR_READY_ATTEMPTS}" dump_frr_diagnostics \
+        vtysh -c 'show version'
 }
 
-configure_frr() {
-    # Push the minimal config the agent expects: the prefix-list it
-    # writes /32 entries into and a vrf-provider BGP router with a
-    # placeholder upstream neighbour. The neighbour does not need to
-    # establish a session for the lab to come up — per issue #44 the
-    # upstream peer may stay idle.
-    log "pushing minimal FRR config (vrf ${VRF_NAME} + ANNOUNCED-NETWORKS)"
-    vtysh <<EOF
+# The config the agent expects, on stdin for vtysh: the prefix-list it
+# writes /32 entries into, and a vrf-provider BGP router with a
+# placeholder upstream neighbour. The neighbour does not need to
+# establish a session for the lab to come up — per issue #44 the upstream
+# peer may stay idle.
+frr_config() {
+    cat <<EOF
 configure terminal
 ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 0.0.0.0/0 ge 32 le 32
 vrf ${VRF_NAME}
@@ -191,6 +263,29 @@ router bgp 65000 vrf ${VRF_NAME}
  exit-address-family
 end
 EOF
+}
+
+configure_frr() {
+    log "pushing minimal FRR config (vrf ${VRF_NAME} + ANNOUNCED-NETWORKS)"
+    # `show version` answering does not mean bgpd and staticd have both
+    # finished registering with zebra, so the push is retried rather than
+    # trusted on the first try. The config is idempotent, so re-running it
+    # after a partial apply is safe. vtysh's output is captured so the last
+    # failure can be reported: it went to the container's stdout before,
+    # which the caller never saw once `set -e` had already killed PID 1.
+    local attempt out
+    for attempt in $(seq 1 "${FRR_CONFIG_ATTEMPTS}"); do
+        if out="$(frr_config | vtysh 2>&1)"; then
+            return 0
+        fi
+        log "vtysh config push failed (attempt ${attempt}/${FRR_CONFIG_ATTEMPTS}), retrying"
+        sleep 1
+    done
+    log "ERROR: vtysh never accepted the FRR config after ${FRR_CONFIG_ATTEMPTS} attempts"
+    log "last vtysh output:"
+    printf '%s\n' "${out}" | sed 's/^/[gwnode]   /' >&2
+    dump_frr_diagnostics
+    exit 1
 }
 
 main() {
