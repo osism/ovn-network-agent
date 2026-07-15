@@ -129,7 +129,7 @@ func run(cfg config) (int, error) {
 	// contract — ahead of everything that creates one.
 	l := newLab(cfg.labName, execCommander{})
 	ap := newApplier(l, p, base)
-	actions := allActions(p, ap)
+	actions := allActions(p, l, ap)
 	weights, err := parseWeights(cfg.weightSpec, actions)
 	if err != nil {
 		return exitFatal, err

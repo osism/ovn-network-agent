@@ -99,7 +99,7 @@ func starterActions(p *profile) []*action {
 // emergency flag flip actually reaches production. Its restart is the
 // fault and its own undo, so like gateway-restart it holds nothing and
 // pays the full container-lifecycle recovery budget.
-func allActions(p *profile, ap *applier) []*action {
+func allActions(p *profile, l *lab, ap *applier) []*action {
 	actions := append(starterActions(p), &action{
 		name:           "config-flip",
 		weight:         2,
@@ -119,6 +119,7 @@ func allActions(p *profile, ap *applier) []*action {
 	// recorded seed still replays the sequence it recorded.
 	actions = append(actions, controlPlaneActions(p)...)
 	actions = append(actions, impairActions()...)
+	actions = append(actions, driftActions(l)...)
 	return actions
 }
 
