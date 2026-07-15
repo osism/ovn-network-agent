@@ -151,44 +151,118 @@ func TestZeroWeightRegistryInjectsNothing(t *testing.T) {
 }
 
 func TestGuardrailsBlockUnhealthyTargetAndLastGateway(t *testing.T) {
-	act := noopActions("controller-restart")[0]
+	gatewayAct := noopActions("controller-restart")[0]
+	centralAct := &action{name: "nb-pause", scope: scopeCentral, weight: 1}
+	pairAct := &action{name: "double-failover", scope: scopeGatewayPair, weight: 1}
+	driftAct := &action{name: "kernel-route-drop", scope: scopeGateway, weight: 1,
+		applicable: func(context.Context, string, int) bool { return false }}
 
 	tests := []struct {
-		name  string
-		nodes map[string]string
-		want  string
+		name   string
+		action *action
+		target string
+		peer   string
+		nodes  map[string]string
+		want   string
 	}{
 		{
-			name:  "all nodes healthy",
-			nodes: map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
-			want:  "",
+			name:   "all nodes healthy",
+			action: gatewayAct,
+			target: "gateway-1",
+			nodes:  map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
+			want:   "",
 		},
 		{
-			name:  "target still converging from an earlier fault",
-			nodes: map[string]string{"gateway-1": nodeConverging, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
-			want:  skipTargetNotHealthy,
+			name:   "target still converging from an earlier fault",
+			action: gatewayAct,
+			target: "gateway-1",
+			nodes:  map[string]string{"gateway-1": nodeConverging, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
+			want:   skipTargetNotHealthy,
 		},
 		{
-			name:  "target never came back",
-			nodes: map[string]string{"gateway-1": nodeUnconverged, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
-			want:  skipTargetNotHealthy,
+			name:   "target never came back",
+			action: gatewayAct,
+			target: "gateway-1",
+			nodes:  map[string]string{"gateway-1": nodeUnconverged, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
+			want:   skipTargetNotHealthy,
 		},
 		{
-			name:  "target is the last healthy gateway",
-			nodes: map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeUnconverged, "gateway-3": nodeUnconverged},
-			want:  skipNoHealthyPeer,
+			// A drift-style fault whose object the target does not carry is a
+			// journaled skip, not a no-op deletion — even with every gateway
+			// healthy and a peer to fail over to.
+			name:   "drift action skipped when its object is absent",
+			action: driftAct,
+			target: "gateway-1",
+			nodes:  map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
+			want:   skipNotApplicable,
+		},
+		{
+			name:   "target is the last healthy gateway",
+			action: gatewayAct,
+			target: "gateway-1",
+			nodes:  map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeUnconverged, "gateway-3": nodeUnconverged},
+			want:   skipNoHealthyPeer,
+		},
+		{
+			// A central-scoped fault does not depend on how many gateways are
+			// up: pausing the database with only one healthy gateway is fine.
+			name:   "central action needs no healthy gateway peer",
+			action: centralAct,
+			target: centralNode,
+			nodes: map[string]string{
+				centralNode: nodeHealthy,
+				"gateway-1": nodeHealthy, "gateway-2": nodeUnconverged, "gateway-3": nodeUnconverged,
+			},
+			want: "",
+		},
+		{
+			name:   "central action skipped when central has not converged",
+			action: centralAct,
+			target: centralNode,
+			nodes: map[string]string{
+				centralNode: nodeConverging,
+				"gateway-1": nodeHealthy, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy,
+			},
+			want: skipTargetNotHealthy,
+		},
+		{
+			name:   "pair action skipped when the ring-next peer is unhealthy",
+			action: pairAct,
+			target: "gateway-1",
+			peer:   "gateway-2",
+			nodes:  map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeConverging, "gateway-3": nodeHealthy},
+			want:   skipPeerNotHealthy,
+		},
+		{
+			// A pair holds two gateways down, so it needs a third to fail
+			// over to.
+			name:   "pair action skipped when no third gateway is healthy",
+			action: pairAct,
+			target: "gateway-1",
+			peer:   "gateway-2",
+			nodes:  map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeHealthy, "gateway-3": nodeUnconverged},
+			want:   skipNoHealthyPeer,
+		},
+		{
+			name:   "pair action runs with target, peer and a third gateway healthy",
+			action: pairAct,
+			target: "gateway-1",
+			peer:   "gateway-2",
+			nodes:  map[string]string{"gateway-1": nodeHealthy, "gateway-2": nodeHealthy, "gateway-3": nodeHealthy},
+			want:   "",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			clock := newFakeClock()
-			e := newEngine(newTestLab(&fakeCommander{}, clock), defaultTestProfile(t), []*action{act},
+			e := newEngine(newTestLab(&fakeCommander{}, clock), defaultTestProfile(t), []*action{tc.action},
 				greenProbes{}, newJournal(&bytes.Buffer{}, clock.now),
 				&runRecord{ActionsByName: map[string]int{}})
 			e.nodes = tc.nodes
 
-			got := e.guardrails(decision{action: act, target: "gateway-1"})
+			got := e.guardrails(context.Background(),
+				decision{action: tc.action, target: tc.target, peer: tc.peer})
 			if got != tc.want {
 				t.Fatalf("guardrails = %q, want %q", got, tc.want)
 			}
@@ -824,7 +898,7 @@ func slicesEqual(a, b []string) bool {
 func TestSameSeedReplaysTheSameFlips(t *testing.T) {
 	actions := func() []*action {
 		acts := noopActions("gateway-kill")
-		acts[0].applicable = func(string, int) bool { return true }
+		acts[0].usesFlip = true
 		return acts
 	}
 	first, _ := runEngine(t, 7, 20*time.Minute, actions(), nil)
@@ -855,11 +929,13 @@ func TestSameSeedReplaysTheSameFlips(t *testing.T) {
 // draws the same values afterwards as the run that executed.
 func TestAnInapplicableFlipIsSkippedWithoutShiftingTheStream(t *testing.T) {
 	flippable := noopActions("config-flip")
-	flippable[0].applicable = func(string, int) bool { return true }
+	flippable[0].usesFlip = true
+	flippable[0].applicable = func(context.Context, string, int) bool { return true }
 
 	applied := noopActions("config-flip")
+	applied[0].usesFlip = true
 	// gateway-2's configuration has nothing the drawn flip can change.
-	applied[0].applicable = func(gw string, _ int) bool { return gw != "gateway-2" }
+	applied[0].applicable = func(_ context.Context, gw string, _ int) bool { return gw != "gateway-2" }
 
 	open, _ := runEngine(t, 42, 20*time.Minute, flippable, nil)
 	guarded, rec := runEngine(t, 42, 20*time.Minute, applied, nil)
@@ -907,4 +983,161 @@ func TestFollowMasterDoesNothingWithoutTheLoadBalancerVIP(t *testing.T) {
 	if e.vipOwner != "" {
 		t.Fatalf("vipOwner = %q on a run with no Load_Balancer VIP", e.vipOwner)
 	}
+}
+
+// A central-scoped action targets the shared central node and discards the
+// gateway the tick drew. The draw still happens, so the stream stays
+// aligned: a run of a central action draws the same intervals, holds and
+// flips as a run of the same action scoped to a gateway.
+func TestCentralActionKeepsTheDrawStreamAligned(t *testing.T) {
+	central := noopActions("nb-pause")
+	central[0].scope = scopeCentral
+	gateway := noopActions("nb-pause") // scopeGateway (zero value)
+
+	centralJournal, _ := runEngine(t, 42, 20*time.Minute, central, nil)
+	gatewayJournal, _ := runEngine(t, 42, 20*time.Minute, gateway, nil)
+
+	c := decisionEventsIn(t, centralJournal)
+	g := decisionEventsIn(t, gatewayJournal)
+	if len(c) == 0 || len(c) != len(g) {
+		t.Fatalf("central run drew %d decisions, gateway run %d", len(c), len(g))
+	}
+	for i := range c {
+		if c[i].IntervalMS != g[i].IntervalMS || c[i].HoldMS != g[i].HoldMS || c[i].Flip != g[i].Flip {
+			t.Fatalf("decision %d diverged: the discarded gateway draw shifted the stream", i+1)
+		}
+		if c[i].Target != centralNode {
+			t.Fatalf("central action decision %d targeted %q, want %q", i+1, c[i].Target, centralNode)
+		}
+	}
+}
+
+// A gateway-pair fault disrupts and restores both its target and the
+// ring-next peer, and its recovery record and converged event name the
+// peer so a double failover can be triaged from the artifacts.
+func TestPairActionDisruptsRestoresAndConvergesBothNodes(t *testing.T) {
+	restored := map[string]int{}
+	acts := noopActions("double-failover")
+	acts[0].scope = scopeGatewayPair
+	acts[0].holdMin, acts[0].holdMax = 0, 0
+	acts[0].restore = func(_ context.Context, _ *lab, node string) error {
+		restored[node]++
+		return nil
+	}
+
+	journal, rec := runEngine(t, 42, 5*time.Minute, acts, nil)
+
+	if rec.Decisions.Executed == 0 {
+		t.Fatal("no pair fault executed")
+	}
+	total := 0
+	for _, n := range restored {
+		total += n
+	}
+	if total != 2*rec.Decisions.Executed {
+		t.Fatalf("restored %d nodes for %d executed pair faults, want two per fault", total, rec.Decisions.Executed)
+	}
+	if len(rec.Recoveries) != rec.Decisions.Executed {
+		t.Fatalf("recorded %d recoveries for %d executions", len(rec.Recoveries), rec.Decisions.Executed)
+	}
+	for _, r := range rec.Recoveries {
+		if r.Peer == "" || r.Peer != nextGateway(r.Target) {
+			t.Fatalf("recovery %+v does not name the ring-next peer", r)
+		}
+	}
+	disrupted := map[string]bool{}
+	var peeredConverged int
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == evNodeState && ev.State == nodeDisrupted {
+			disrupted[ev.Target] = true
+		}
+		if ev.Event == evConverged && ev.Peer != "" && ev.Peer == nextGateway(ev.Target) {
+			peeredConverged++
+		}
+	}
+	if peeredConverged != rec.Decisions.Executed {
+		t.Fatalf("journaled %d converged events naming a peer, want %d", peeredConverged, rec.Decisions.Executed)
+	}
+	for _, r := range rec.Recoveries {
+		if !disrupted[r.Target] || !disrupted[r.Peer] {
+			t.Fatalf("fault on %s/%s did not mark both nodes disrupted", r.Target, r.Peer)
+		}
+	}
+}
+
+// Convergence is gated by a per-scope signal: a central node's container
+// health (both databases answering), an upstream node's bgpd. A node that
+// never returns by that signal times out and is never wrongly re-targeted.
+func TestConvergenceDispatchesPerNodeKind(t *testing.T) {
+	tests := []struct {
+		name    string
+		scope   int
+		respond func([]string) (string, error)
+	}{
+		{
+			name:  "central action never converges while central is unhealthy",
+			scope: scopeCentral,
+			respond: func(argv []string) (string, error) {
+				if strings.Contains(strings.Join(argv, " "), "{{.State.Health.Status}}") {
+					return "unhealthy\n", nil
+				}
+				return healthyLabResponses(argv)
+			},
+		},
+		{
+			name:  "upstream action never converges while bgpd is down",
+			scope: scopeUpstream,
+			respond: func(argv []string) (string, error) {
+				if strings.Contains(strings.Join(argv, " "), "pgrep -x bgpd") {
+					return "", errExit(t, 1)
+				}
+				return healthyLabResponses(argv)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			acts := noopActions("control-plane")
+			acts[0].scope = tc.scope
+			acts[0].recoveryBudget = 30 * time.Second
+			acts[0].holdMin, acts[0].holdMax = 0, 0
+
+			_, rec := runEngine(t, 42, 2*time.Minute, acts, func(e *engine) {
+				e.lab.cmd = &fakeCommander{respond: tc.respond}
+			})
+
+			if len(rec.Violations) == 0 || rec.Violations[0].Kind != violationRecoveryTimeout {
+				t.Fatalf("violations = %+v, want a %s", rec.Violations, violationRecoveryTimeout)
+			}
+		})
+	}
+}
+
+// The flip is named on a decision only for the one action that reads it —
+// config-flip, which sets usesFlip. A drift-style action reads live state
+// through applicable but never touches the flip, so its decisions must not
+// carry one.
+func TestOnlyFlipAwareActionsJournalTheFlip(t *testing.T) {
+	acts := noopActions("kernel-route-drop")
+	acts[0].applicable = func(context.Context, string, int) bool { return true }
+
+	journal, _ := runEngine(t, 42, 20*time.Minute, acts, nil)
+
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == evDecision && ev.Flip != "" {
+			t.Fatalf("a non-flip action named a flip on its decision: %+v", ev)
+		}
+	}
+}
+
+// decisionEventsIn extracts the decision events from a journal, in order.
+func decisionEventsIn(t *testing.T, journal string) []event {
+	t.Helper()
+	var out []event
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == evDecision {
+			out = append(out, ev)
+		}
+	}
+	return out
 }

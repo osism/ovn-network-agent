@@ -191,3 +191,53 @@ func TestFlipFieldsAreJournaledOnlyWhereTheyBelong(t *testing.T) {
 		}
 	}
 }
+
+// peer and object annotate the multi-node and object-touching faults. Like
+// every other optional field they must stay out of the events that do not
+// set them, so a reader can tell a pair fault from a single-node one and a
+// drift fault from a container kill.
+func TestPeerAndObjectAreJournaledOnlyWhereTheyBelong(t *testing.T) {
+	var buf bytes.Buffer
+	j := newJournal(&buf, newFakeClock().now)
+
+	j.emit(event{
+		Event: evDecision, Tick: 1, Action: "double-failover",
+		Target: "gateway-1", Peer: "gateway-2", Executed: boolPtr(true),
+	})
+	j.emit(event{
+		Event: evDecision, Tick: 2, Action: "kernel-route-drop",
+		Target: "gateway-3", Object: "192.0.2.10/32 dev br-ex", Executed: boolPtr(true),
+	})
+	j.emit(event{Event: evInject, Tick: 3, Action: "gateway-kill", Target: "gateway-1"})
+
+	events := eventsIn(t, buf.String())
+	if events[0].Peer != "gateway-2" || events[0].Object != "" {
+		t.Fatalf("the pair decision lost its peer or gained an object: %+v", events[0])
+	}
+	if events[1].Object != "192.0.2.10/32 dev br-ex" || events[1].Peer != "" {
+		t.Fatalf("the drift decision lost its object or gained a peer: %+v", events[1])
+	}
+	raw := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	for _, field := range []string{"peer", "object"} {
+		if strings.Contains(raw[2], `"`+field+`"`) {
+			t.Fatalf("the %s field leaked into an event that touched neither: %s", field, raw[2])
+		}
+	}
+}
+
+// The ovn-churn event carries what a churn touched and the values it moved
+// between, so an add/remove cycle is legible from the journal.
+func TestOVNChurnEventRoundTrips(t *testing.T) {
+	var buf bytes.Buffer
+	j := newJournal(&buf, newFakeClock().now)
+
+	j.emit(event{
+		Event: evOVNChurn, Target: centralNode, Object: "fip 192.0.2.60",
+		From: "absent", To: "192.0.2.60",
+	})
+
+	ev := eventsIn(t, buf.String())[0]
+	if ev.Event != evOVNChurn || ev.Object != "fip 192.0.2.60" || ev.From != "absent" || ev.To != "192.0.2.60" {
+		t.Fatalf("the ovn-churn event did not round-trip: %+v", ev)
+	}
+}

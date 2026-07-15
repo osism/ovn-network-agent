@@ -35,6 +35,7 @@ const (
 	evNodeState       = "node-state"
 	evProbeTransition = "probe-transition"
 	evVIPRepoint      = "vip-repoint"
+	evOVNChurn        = "ovn-churn"
 	evViolation       = "violation"
 	evCheckError      = "check-error"
 	evRunAborted      = "run-aborted"
@@ -50,6 +51,8 @@ type event struct {
 	Tick       int              `json:"tick,omitempty"`
 	Action     string           `json:"action,omitempty"`
 	Target     string           `json:"target,omitempty"`
+	Peer       string           `json:"peer,omitempty"`
+	Object     string           `json:"object,omitempty"`
 	IntervalMS int64            `json:"interval_ms,omitempty"`
 	HoldMS     int64            `json:"hold_ms,omitempty"`
 	Executed   *bool            `json:"executed,omitempty"`
@@ -149,6 +152,7 @@ type recoveryRecord struct {
 	Tick          int              `json:"tick"`
 	Action        string           `json:"action"`
 	Target        string           `json:"target"`
+	Peer          string           `json:"peer,omitempty"`
 	BudgetMS      int64            `json:"budget_ms"`
 	ConvergedMS   int64            `json:"converged_ms"`
 	FromInjectMS  map[string]int64 `json:"from_inject_ms"`
