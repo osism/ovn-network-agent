@@ -376,6 +376,8 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 		"kernel-route-drop", "frr-route-drop", "nft-flush", "ovs-flow-drop",
 		// routing flaps (issue #178)
 		"frr-restart", "upstream-bgp-restart",
+		// OVN churn (issue #178)
+		"fip-churn", "lb-vip-churn", "priority-flip", "chassis-delete",
 	}
 	got := actionOrder(actions)
 	if len(got) != len(want) {
@@ -415,7 +417,7 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 func fullRegistry(t *testing.T) []*action {
 	t.Helper()
 	p := defaultTestProfile(t)
-	return allActions(p, nil, newApplier(nil, p, nil))
+	return allActions(p, nil, newApplier(nil, p, nil), newChurner(nil))
 }
 
 func actionOrder(actions []*action) []string {
