@@ -283,11 +283,13 @@ e2e-drain-hitless:
 # Run a seeded chaos session (issue #176) against a lab that is already
 # up. Layers the hairpin, multi-VLAN and port-forward scenario setups on
 # the bootstrap baseline, then drives the lab through a randomized fault
-# sequence: every tick waits a random interval, picks a weighted action
-# (controller-restart, gateway-kill, agent-terminate, gateway-restart),
+# sequence: every tick waits a random interval, picks a weighted action,
 # checks its guardrails and executes it, while a continuous probe from
-# client-1 measures every FIP and the port-forward VIP. Defaults: seed
-# 42, 10 minutes, 10–30 s between decisions.
+# client-1 measures every FIP and the port-forward VIP. The action catalog
+# (issue #178) spans container-level starter faults and a config change,
+# control-plane outages, management-path impairment, data-plane drift,
+# routing flaps and OVN churn. Defaults: seed 42, 10 minutes, 10–30 s
+# between decisions.
 #
 # Reproducibility is the contract: the seed, the duration, the tick
 # bounds and the action weights are the only inputs, and every decision
