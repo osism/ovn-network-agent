@@ -372,6 +372,8 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 		"nb-pause", "sb-pause", "northd-pause", "double-failover",
 		// network impairment (issue #178)
 		"mgmt-loss", "mgmt-delay",
+		// data-plane drift (issue #178)
+		"kernel-route-drop", "frr-route-drop", "nft-flush", "ovs-flow-drop",
 	}
 	got := actionOrder(actions)
 	if len(got) != len(want) {
@@ -411,7 +413,7 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 func fullRegistry(t *testing.T) []*action {
 	t.Helper()
 	p := defaultTestProfile(t)
-	return allActions(p, newApplier(nil, p, nil))
+	return allActions(p, nil, newApplier(nil, p, nil))
 }
 
 func actionOrder(actions []*action) []string {
