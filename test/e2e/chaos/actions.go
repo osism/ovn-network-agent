@@ -118,6 +118,7 @@ func allActions(p *profile, ap *applier) []*action {
 	// The fault classes of issue #178, each appended — never inserted — so a
 	// recorded seed still replays the sequence it recorded.
 	actions = append(actions, controlPlaneActions(p)...)
+	actions = append(actions, impairActions()...)
 	return actions
 }
 

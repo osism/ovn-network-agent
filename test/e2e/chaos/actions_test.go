@@ -370,6 +370,8 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 		"gateway-restart", "config-flip",
 		// control-plane outages (issue #178)
 		"nb-pause", "sb-pause", "northd-pause", "double-failover",
+		// network impairment (issue #178)
+		"mgmt-loss", "mgmt-delay",
 	}
 	got := actionOrder(actions)
 	if len(got) != len(want) {

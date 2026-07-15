@@ -17,20 +17,30 @@ runs:
     # The gwnode image uses kernel OVS so OVN's BFD-driven cr-lrp
     # election over geneve tunnels actually converges, and the entrypoint
     # creates a vrf-provider kernel VRF for the agent's veth-leak design.
-    # The gwnode containers only inherit CAP_NET_ADMIN (no CAP_SYS_MODULE),
-    # so the modules must be loaded on the host before lab-up. The Azure
-    # kernel on `ubuntu-latest` ships `openvswitch` in the base modules
-    # set but `vrf` only in `linux-modules-extra-<uname>` — install it on
+    # The chaos runner's management-path impairment (issue #178) also needs
+    # `sch_netem` for its `tc netem` loss/latency qdiscs. The gwnode
+    # containers only inherit CAP_NET_ADMIN (no CAP_SYS_MODULE), so the
+    # modules must be loaded on the host before lab-up. The Azure kernel on
+    # `ubuntu-latest` ships `openvswitch` in the base modules set but `vrf`
+    # and `sch_netem` only in `linux-modules-extra-<uname>` — install it on
     # demand. Without `vrf`, gwnode-entrypoint.sh crash-loops on
     # `ip link add vrf-provider type vrf table 100` with "Unknown device
-    # type".
+    # type"; without `sch_netem` the impairment actions fail to add their
+    # qdisc.
     - name: Load required kernel modules
       shell: bash
       run: |
         set -euo pipefail
         sudo modprobe openvswitch
-        if ! sudo modprobe vrf 2>/dev/null; then
+        install_extra() {
           sudo apt-get update -qq
           sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+        }
+        if ! sudo modprobe vrf 2>/dev/null; then
+          install_extra
           sudo modprobe vrf
+        fi
+        if ! sudo modprobe sch_netem 2>/dev/null; then
+          install_extra
+          sudo modprobe sch_netem
         fi
