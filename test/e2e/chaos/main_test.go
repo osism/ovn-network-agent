@@ -154,7 +154,7 @@ func TestDriveAbandonsARunWhoseProfileNeverLands(t *testing.T) {
 			ap.jrnl = newJournal(&buf, clock.now)
 			rec := &runRecord{ActionsByName: map[string]int{}}
 
-			code := drive(context.Background(), l, ap, allActions(p, l, ap), ap.jrnl, rec)
+			code := drive(context.Background(), l, ap, allActions(p, l, ap, newChurner(l)), ap.jrnl, rec)
 
 			if code != exitFatal {
 				t.Fatalf("exit code = %d, want %d", code, exitFatal)

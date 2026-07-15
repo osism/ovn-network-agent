@@ -100,6 +100,7 @@ const (
 	clientNode   = "client-1"
 	workloadHost = "gateway-3"
 	crPort       = "cr-lr0-public"
+	lrPublicPort = "lr0-public"
 
 	// The agent as the gwnode image ships it: the binary, the config file
 	// the entrypoint execs it with, and the two paths the chaos runner

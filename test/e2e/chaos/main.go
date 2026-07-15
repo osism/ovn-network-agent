@@ -10,6 +10,11 @@
 // interval, pick a weighted action, check its guardrails, execute it,
 // wait for the node to converge, record it.
 //
+// The action catalog (issue #178) spans five fault classes: the
+// container-level starter faults and the config change, control-plane
+// outages on the central node, management-path impairment, data-plane
+// drift the agent self-heals, routing flaps, and OVN churn.
+//
 // Reproducibility is the contract: the profile, the seed, the duration,
 // the tick bounds and the action weights are the only inputs, and every
 // decision the engine makes is drawn from a PCG stream seeded by -seed
@@ -129,7 +134,8 @@ func run(cfg config) (int, error) {
 	// contract — ahead of everything that creates one.
 	l := newLab(cfg.labName, execCommander{})
 	ap := newApplier(l, p, base)
-	actions := allActions(p, l, ap)
+	ch := newChurner(l)
+	actions := allActions(p, l, ap, ch)
 	weights, err := parseWeights(cfg.weightSpec, actions)
 	if err != nil {
 		return exitFatal, err
@@ -165,6 +171,7 @@ func run(cfg config) (int, error) {
 	started := time.Now()
 	jrnl := newJournal(jf, time.Now)
 	ap.jrnl = jrnl
+	ch.jrnl = jrnl
 	rec := &runRecord{
 		Inputs: runInputs{
 			Seed:       cfg.seed,
