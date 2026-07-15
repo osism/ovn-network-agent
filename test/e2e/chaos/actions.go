@@ -120,6 +120,7 @@ func allActions(p *profile, l *lab, ap *applier) []*action {
 	actions = append(actions, controlPlaneActions(p)...)
 	actions = append(actions, impairActions()...)
 	actions = append(actions, driftActions(l)...)
+	actions = append(actions, flapActions()...)
 	return actions
 }
 
