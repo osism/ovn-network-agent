@@ -357,37 +357,78 @@ func TestProbeTargetsExcludeTheBackendlessFIP(t *testing.T) {
 	}
 }
 
-// config-flip is appended to the starter set, never inserted: the weighted
-// pick walks the registry in order, so an insertion would replay every
-// recorded seed as a different run.
-func TestConfigFlipIsAppendedToTheRegistry(t *testing.T) {
-	p := defaultTestProfile(t)
-	actions := allActions(p, newApplier(nil, p, nil))
+// The registry order and the weights are the replay contract: a new action
+// is appended, never inserted, so a recorded seed still replays the
+// sequence it recorded. This asserts the full ordered set and every
+// action's own invariants.
+func TestActionRegistryOrderIsStable(t *testing.T) {
+	actions := fullRegistry(t)
 
 	want := []string{
+		// starter faults (issue #176) and the config change (issue #177)
 		"controller-restart", "gateway-kill", "agent-terminate",
 		"gateway-restart", "config-flip",
+		// control-plane outages (issue #178)
+		"nb-pause", "sb-pause", "northd-pause", "double-failover",
 	}
-	for i, a := range actions {
-		if i >= len(want) || a.name != want[i] {
-			t.Fatalf("registry = %v, want %v", actionNames(actions), want)
+	got := actionOrder(actions)
+	if len(got) != len(want) {
+		t.Fatalf("registry = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("registry = %v, want %v", got, want)
 		}
 	}
-	if len(actions) != len(want) {
-		t.Fatalf("registry = %v, want %v", actionNames(actions), want)
+	for _, a := range actions {
+		if a.weight <= 0 {
+			t.Fatalf("action %s ships with weight %d — the weighted pick would never draw it", a.name, a.weight)
+		}
+		if a.holdMax < a.holdMin {
+			t.Fatalf("action %s has holdMax %s below holdMin %s", a.name, a.holdMax, a.holdMin)
+		}
+		if a.recoveryBudget <= 0 {
+			t.Fatalf("action %s has no recovery budget", a.name)
+		}
 	}
 
-	flip := actions[len(actions)-1]
-	if flip.weight <= 0 {
-		t.Fatalf("config-flip ships with weight %d — the weighted pick would never draw it", flip.weight)
-	}
-	if flip.applicable == nil {
+	// config-flip is the one action whose behaviour depends on the drawn
+	// flip, and its restart onto the new config is its own undo.
+	flip := actionFromRegistry(t, actions, "config-flip")
+	if !flip.usesFlip || flip.applicable == nil {
 		t.Fatal("config-flip does not read the flip index the engine draws for it")
 	}
 	if flip.holdMin != 0 || flip.holdMax != 0 {
-		t.Fatalf("config-flip holds its fault for %s–%s — the restart onto the new config is its own undo",
-			flip.holdMin, flip.holdMax)
+		t.Fatalf("config-flip holds its fault for %s–%s", flip.holdMin, flip.holdMax)
 	}
+}
+
+// fullRegistry builds the registry the runner drives, with the dependencies
+// the actions bind to. A nil lab is fine: the actions capture it but only
+// touch it at run time, and no test here executes one.
+func fullRegistry(t *testing.T) []*action {
+	t.Helper()
+	p := defaultTestProfile(t)
+	return allActions(p, newApplier(nil, p, nil))
+}
+
+func actionOrder(actions []*action) []string {
+	names := make([]string, 0, len(actions))
+	for _, a := range actions {
+		names = append(names, a.name)
+	}
+	return names
+}
+
+func actionFromRegistry(t *testing.T, actions []*action, name string) *action {
+	t.Helper()
+	for _, a := range actions {
+		if a.name == name {
+			return a
+		}
+	}
+	t.Fatalf("no action named %q in the registry: %v", name, actionOrder(actions))
+	return nil
 }
 
 // The guardrail is consulted before the fault is injected, and an applier

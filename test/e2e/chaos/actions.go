@@ -100,7 +100,7 @@ func starterActions(p *profile) []*action {
 // fault and its own undo, so like gateway-restart it holds nothing and
 // pays the full container-lifecycle recovery budget.
 func allActions(p *profile, ap *applier) []*action {
-	return append(starterActions(p), &action{
+	actions := append(starterActions(p), &action{
 		name:           "config-flip",
 		weight:         2,
 		holdMin:        0,
@@ -115,6 +115,10 @@ func allActions(p *profile, ap *applier) []*action {
 			return restoreNode(ctx, l, p, gw)
 		},
 	})
+	// The fault classes of issue #178, each appended — never inserted — so a
+	// recorded seed still replays the sequence it recorded.
+	actions = append(actions, controlPlaneActions(p)...)
+	return actions
 }
 
 // injectGatewayKill hard-kills the container. containerlab deploys with
