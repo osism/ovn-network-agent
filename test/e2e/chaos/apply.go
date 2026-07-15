@@ -203,8 +203,10 @@ func (a *applier) waitBack(ctx context.Context, gw string) error {
 // current configuration — the masquerade flip needs a VIP to flip it on,
 // the CIDR flip a baseline to toggle back to. The engine's guardrails
 // consult it, so an inapplicable flip is a journaled skip rather than a
-// rewrite and a restart that change nothing.
-func (a *applier) applicable(gw string, idx int) bool {
+// rewrite and a restart that change nothing. The ctx matches the action
+// registry's applicable signature — the flip decision reads no live lab
+// state, so it is unused here.
+func (a *applier) applicable(_ context.Context, gw string, idx int) bool {
 	c, ok := a.flipCtx(gw)
 	return ok && flips()[idx].applicable(c)
 }

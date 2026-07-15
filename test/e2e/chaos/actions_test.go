@@ -399,7 +399,7 @@ func TestAnApplierWithoutAProfileSkipsEveryFlip(t *testing.T) {
 	ap := newApplier(nil, defaultTestProfile(t), nil)
 
 	for i := range flips() {
-		if ap.applicable("gateway-1", i) {
+		if ap.applicable(context.Background(), "gateway-1", i) {
 			t.Fatalf("flip %s was applicable before the profile was applied", flipName(i))
 		}
 	}

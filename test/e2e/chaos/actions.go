@@ -106,6 +106,7 @@ func allActions(p *profile, ap *applier) []*action {
 		holdMin:        0,
 		holdMax:        0,
 		recoveryBudget: 180 * time.Second,
+		usesFlip:       true,
 		applicable:     ap.applicable,
 		inject: func(ctx context.Context, _ *lab, gw string, flip int) error {
 			return ap.flip(ctx, gw, flip)

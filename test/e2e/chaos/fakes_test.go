@@ -106,6 +106,8 @@ func healthyLabResponses(argv []string) (string, error) {
 		return "Device \"eth1\" does not exist.", errBoom
 	case strings.Contains(line, "pgrep -f /usr/local/bin/ovn-network-agent"):
 		return "1\n", nil
+	case strings.Contains(line, "pgrep -x bgpd"):
+		return "1\n", nil // a healthy upstream runs bgpd
 	case strings.Contains(line, "find Chassis name="):
 		return strings.TrimPrefix(argv[len(argv)-1], "name=") + "\n", nil
 	case strings.Contains(line, "--columns=chassis find Port_Binding"):

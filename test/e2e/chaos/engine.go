@@ -26,9 +26,23 @@ const (
 // Guardrail skip reasons, journaled on the decision they blocked.
 const (
 	skipTargetNotHealthy  = "target-not-healthy"
+	skipPeerNotHealthy    = "peer-not-healthy"
 	skipNoHealthyPeer     = "no-healthy-peer"
 	skipNoWeightedAction  = "no-weighted-action"
 	skipFlipNotApplicable = "flip-not-applicable"
+	skipNotApplicable     = "not-applicable"
+)
+
+// Target scopes. An action targets a gateway by default (the zero value);
+// the control-plane and routing-flap classes reach the shared central and
+// upstream nodes instead, and the double-failover class hits a pair of
+// gateways at once. The scope is what the engine reads to decide which
+// node states it may target and how many nodes one fault disrupts.
+const (
+	scopeGateway     = 0
+	scopeCentral     = 1
+	scopeUpstream    = 2
+	scopeGatewayPair = 3
 )
 
 // Violation kinds.
@@ -70,13 +84,29 @@ type action struct {
 	inject         func(ctx context.Context, l *lab, target string, flip int) error
 	restore        func(ctx context.Context, l *lab, target string) error
 
-	// applicable binds an action to the flip index every decision draws —
-	// the fifth value taken from the stream, which only config-flip reads.
-	// It is the guardrail that skips a flip meaning nothing on the drawn
-	// target's current configuration, and it is nil on every action whose
-	// behaviour does not depend on the flip — so it is also what tells the
-	// engine whether the drawn flip is worth naming in the journal.
-	applicable func(target string, flip int) bool
+	// scope is one of the scope* constants: which node the fault targets and
+	// how many nodes it disrupts. It is the guardrail declaration the issue
+	// asks every action to carry — the node states it may target — and the
+	// engine reads it when it draws the target, checks the guardrails,
+	// restores the fault and gates on convergence.
+	scope int
+
+	// object annotates the decision journal with what the fault touched — a
+	// route prefix, an nftables table, a database server — so a mixed-class
+	// run can be triaged from the artifacts alone. It is static per action.
+	object string
+
+	// usesFlip is set only by config-flip: it is the one action whose
+	// behaviour depends on the flip index every decision draws, and so the
+	// only one whose journal names the drawn flip.
+	usesFlip bool
+
+	// applicable reports whether the drawn fault means anything on its
+	// target's current state — the config-flip whose toggle changes nothing
+	// on the drawn gateway, the drift action whose object the gateway does
+	// not carry. An inapplicable fault is a journaled skip, not a rewrite or
+	// a no-op deletion. It is nil on every action that always applies.
+	applicable func(ctx context.Context, target string, flip int) bool
 }
 
 // probeSource is the slice of the prober the engine consumes.
@@ -139,6 +169,13 @@ func newEngine(l *lab, p *profile, actions []*action, probes probeSource, jrnl *
 	for _, gw := range gatewayNames() {
 		e.nodes[gw] = nodeHealthy
 	}
+	// The control-plane and routing-flap classes target the shared central
+	// and upstream nodes; they carry their own lifecycle in the same node
+	// map so the guardrails re-target them only once they have converged.
+	// healthyNodes() and the agent-alive baseline check iterate the gateways
+	// alone, so these entries never confuse them.
+	e.nodes[centralNode] = nodeHealthy
+	e.nodes[upstreamNode] = nodeHealthy
 	return e
 }
 
@@ -210,6 +247,7 @@ type decision struct {
 	interval time.Duration
 	action   *action
 	target   string
+	peer     string
 	hold     time.Duration
 	flip     int
 }
@@ -246,7 +284,34 @@ func (e *engine) draw(tick int) decision {
 	d.target = gateways[e.rng.IntN(len(gateways))]
 	d.hold = e.drawDuration(d.action.holdMin, d.action.holdMax)
 	d.flip = e.rng.IntN(len(flips()))
+
+	// The gateway draw is taken on every tick, whatever the scope, so the
+	// stream stays aligned across a registry mixing all the classes. A
+	// central- or upstream-scoped action then discards it and targets the
+	// shared node instead; a pair action keeps it as the primary target and
+	// derives the ring-next gateway as its peer.
+	switch d.action.scope {
+	case scopeCentral:
+		d.target = centralNode
+	case scopeUpstream:
+		d.target = upstreamNode
+	case scopeGatewayPair:
+		d.peer = nextGateway(d.target)
+	}
 	return d
+}
+
+// nextGateway is the ring-next gateway after gw, in gatewayNames() order —
+// the peer a gateway-pair fault kills while its primary target drains. It
+// resolves the peer identically for the engine and the inject.
+func nextGateway(gw string) string {
+	names := gatewayNames()
+	for i, name := range names {
+		if name == gw {
+			return names[(i+1)%len(names)]
+		}
+	}
+	return gw
 }
 
 // drawDuration takes one value from the stream even when the bounds
@@ -260,28 +325,51 @@ func (e *engine) drawDuration(low, high time.Duration) time.Duration {
 }
 
 // guardrails decides whether a drawn decision may execute. They keep a
-// run meaningful: the fault target must have returned and converged
-// since it was last hit, and at least one other gateway must stay
-// healthy so the lab always has somewhere to fail over to.
-func (e *engine) guardrails(d decision) string {
+// run meaningful: the fault target must have returned and converged since
+// it was last hit; a fault meaning nothing on the target's current state
+// is skipped rather than injected; and a gateway fault always leaves the
+// lab somewhere to fail over to. A central- or upstream-scoped fault needs
+// no healthy gateway peer — pausing the database or the upstream BGP does
+// not depend on how many gateways are up.
+func (e *engine) guardrails(ctx context.Context, d decision) string {
 	if d.action == nil {
 		return skipNoWeightedAction
 	}
 	if e.nodeState(d.target) != nodeHealthy {
 		return skipTargetNotHealthy
 	}
-	// A flip that means nothing on what the target is currently running —
-	// a masquerade variant on a gateway with no VIP — would rewrite the
-	// same configuration and restart the node for nothing.
-	if d.action.applicable != nil && !d.action.applicable(d.target, d.flip) {
-		return skipFlipNotApplicable
+	// A fault that changes nothing on what the target is currently running —
+	// a masquerade flip on a gateway with no VIP, a route drop on a gateway
+	// that carries no such route — would rewrite the same state, or delete
+	// nothing, and restart or reconcile the node for it.
+	if d.action.applicable != nil && !d.action.applicable(ctx, d.target, d.flip) {
+		if d.action.usesFlip {
+			return skipFlipNotApplicable
+		}
+		return skipNotApplicable
 	}
-	for _, gw := range e.healthyNodes() {
-		if gw != d.target {
-			return ""
+	if d.action.scope == scopeGatewayPair && e.nodeState(d.peer) != nodeHealthy {
+		return skipPeerNotHealthy
+	}
+	if d.action.scope == scopeGateway || d.action.scope == scopeGatewayPair {
+		if !e.hasHealthyPeer(d) {
+			return skipNoHealthyPeer
 		}
 	}
-	return skipNoHealthyPeer
+	return ""
+}
+
+// hasHealthyPeer reports whether a gateway besides the fault's own targets
+// is healthy, so the lab always has a chassis to fail over to. A pair
+// fault holds two gateways down, so it needs a third.
+func (e *engine) hasHealthyPeer(d decision) bool {
+	for _, gw := range e.healthyNodes() {
+		if gw == d.target || gw == d.peer {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // run is the tick loop: draw, wait, check the guardrails, execute,
@@ -297,7 +385,7 @@ func (e *engine) run(ctx context.Context) {
 
 		e.rec.Ticks = tick
 		e.rec.Decisions.Total++
-		skip := e.guardrails(d)
+		skip := e.guardrails(ctx, d)
 		ev := event{
 			Event:      evDecision,
 			Tick:       tick,
@@ -308,10 +396,12 @@ func (e *engine) run(ctx context.Context) {
 		if d.action != nil {
 			ev.Action = d.action.name
 			ev.Target = d.target
+			ev.Peer = d.peer
+			ev.Object = d.action.object
 			ev.HoldMS = d.hold.Milliseconds()
 			// A flip-aware action names the drawn flip, so a decision that
 			// was skipped still says which one it would have been.
-			if d.action.applicable != nil {
+			if d.action.usesFlip {
 				ev.Flip = flipName(d.flip)
 			}
 		}
@@ -330,13 +420,27 @@ func (e *engine) run(ctx context.Context) {
 	}
 }
 
-// execute injects the fault, holds it, restores it, then gates on
-// convergence before the node is eligible again.
+// nodesFor is the set of nodes one decision disrupts: its target, plus the
+// ring-next peer for a gateway-pair fault. It is what execute marks
+// disrupted, what the restore loop puts back, and what convergence gates
+// on — so a two-gateway fault is tracked as one unit.
+func (e *engine) nodesFor(d decision) []string {
+	if d.action.scope == scopeGatewayPair {
+		return []string{d.target, d.peer}
+	}
+	return []string{d.target}
+}
+
+// execute injects the fault, holds it, restores each node it disrupted,
+// then gates on convergence before the nodes are eligible again.
 func (e *engine) execute(ctx context.Context, d decision) {
-	e.setNodeState(d.target, nodeDisrupted)
+	nodes := e.nodesFor(d)
+	for _, n := range nodes {
+		e.setNodeState(n, nodeDisrupted)
+	}
 
 	injectedAt := e.now()
-	e.jrnl.emit(event{Event: evInject, Tick: d.tick, Action: d.action.name, Target: d.target})
+	e.jrnl.emit(event{Event: evInject, Tick: d.tick, Action: d.action.name, Target: d.target, Peer: d.peer})
 	if err := d.action.inject(ctx, e.lab, d.target, d.flip); err != nil {
 		e.undo(ctx, d, err)
 		return
@@ -349,27 +453,38 @@ func (e *engine) execute(ctx context.Context, d decision) {
 
 	// An injected fault must be undone even when the run is cancelled, or
 	// the lab is left with a dead gateway whose restart policy is off and
-	// no scenario after it can run. A cancelled ctx would kill every
-	// docker invocation on sight, and the restore is long enough to be
-	// interrupted half-way through — startAndRestoreGateway waits out two
-	// daemon bring-ups and pushes BGP — so it always runs on a context of
-	// its own, detached from the signal and bounded by restoreTimeout.
-	restoreCtx, cancelRestore := context.WithTimeout(
-		context.WithoutCancel(ctx), restoreTimeout)
-	defer cancelRestore()
-
-	e.jrnl.emit(event{Event: evRestore, Tick: d.tick, Action: d.action.name, Target: d.target})
-	if err := d.action.restore(restoreCtx, e.lab, d.target); err != nil {
-		e.failAction(d, "restore", err)
-		return
+	// no scenario after it can run. A cancelled ctx would kill every docker
+	// invocation on sight, and the restore is long enough to be interrupted
+	// half-way through — startAndRestoreGateway waits out two daemon
+	// bring-ups and pushes BGP — so every node's restore runs on a context
+	// of its own, detached from the signal and bounded by restoreTimeout.
+	// The bound is per node, not per action: a double failover restores two
+	// gateways, and one 5-minute budget shared across both would cut the
+	// second bring-up off half-way.
+	for _, n := range nodes {
+		e.jrnl.emit(event{Event: evRestore, Tick: d.tick, Action: d.action.name, Target: n})
+		if err := e.restoreNode(ctx, d, n); err != nil {
+			e.failAction(d, "restore", n, err)
+			return
+		}
 	}
 	if ctx.Err() != nil {
 		return
 	}
 	restoredAt := e.now()
-	e.setNodeState(d.target, nodeConverging)
+	for _, n := range nodes {
+		e.setNodeState(n, nodeConverging)
+	}
 
 	e.converge(ctx, d, injectedAt, restoredAt)
+}
+
+// restoreNode runs one node's restore on its own detached, bounded
+// context.
+func (e *engine) restoreNode(ctx context.Context, d decision, node string) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreTimeout)
+	defer cancel()
+	return d.action.restore(restoreCtx, e.lab, node)
 }
 
 // undo restores a fault whose inject failed half-way, then fails the
@@ -385,30 +500,29 @@ func (e *engine) execute(ctx context.Context, d decision) {
 // the held-fault restore uses, since the inject may well have failed
 // because the run was cancelled underneath it.
 func (e *engine) undo(ctx context.Context, d decision, injectErr error) {
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreTimeout)
-	defer cancel()
-
-	detail := "undo after a failed inject"
-	if err := d.action.restore(restoreCtx, e.lab, d.target); err != nil {
-		detail += ": " + err.Error()
+	for _, n := range e.nodesFor(d) {
+		detail := "undo after a failed inject"
+		if err := e.restoreNode(ctx, d, n); err != nil {
+			detail += ": " + err.Error()
+		}
+		e.jrnl.emit(event{
+			Event: evRestore, Tick: d.tick, Action: d.action.name,
+			Target: n, Detail: detail,
+		})
 	}
-	e.jrnl.emit(event{
-		Event: evRestore, Tick: d.tick, Action: d.action.name,
-		Target: d.target, Detail: detail,
-	})
-	e.failAction(d, "inject", injectErr)
+	e.failAction(d, "inject", d.target, injectErr)
 }
 
-// failAction parks the node: a fault the runner could not inject or undo
-// leaves the lab in a state it cannot reason about, so the node is never
-// targeted again and the run fails.
-func (e *engine) failAction(d decision, phase string, err error) {
+// failAction parks the failing node: a fault the runner could not inject or
+// undo leaves the lab in a state it cannot reason about, so the node is
+// never targeted again and the run fails.
+func (e *engine) failAction(d decision, phase, node string, err error) {
 	e.violate(violationRecord{
 		Kind: violationActionFailed, Tick: d.tick,
-		Action: d.action.name, Target: d.target,
+		Action: d.action.name, Target: node,
 		Detail: fmt.Sprintf("%s: %v", phase, err),
 	})
-	e.park(d.target)
+	e.park(node)
 }
 
 // park takes a node out of the run for good and stops the tick loop.
@@ -437,18 +551,22 @@ func (e *engine) park(gw string) {
 // Budget expiry is the reachability-recovery violation the run asserts
 // against.
 func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time) {
+	nodes := e.nodesFor(d)
 	deadline := restoredAt.Add(d.action.recoveryBudget)
 	for e.now().Before(deadline) {
 		if ctx.Err() != nil {
 			return
 		}
-		if e.converged(ctx, d.target) {
-			e.setNodeState(d.target, nodeHealthy)
+		if e.converged(ctx, d) {
+			for _, n := range nodes {
+				e.setNodeState(n, nodeHealthy)
+			}
 			fromRestore := e.probes.recoverySince(restoredAt)
 			e.rec.Recoveries = append(e.rec.Recoveries, recoveryRecord{
 				Tick:          d.tick,
 				Action:        d.action.name,
 				Target:        d.target,
+				Peer:          d.peer,
 				BudgetMS:      d.action.recoveryBudget.Milliseconds(),
 				ConvergedMS:   e.now().Sub(restoredAt).Milliseconds(),
 				FromInjectMS:  e.probes.recoverySince(injectedAt),
@@ -457,7 +575,7 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			})
 			e.jrnl.emit(event{
 				Event: evConverged, Tick: d.tick, Action: d.action.name,
-				Target: d.target, CROwner: e.vipOwner, RecoveryMS: fromRestore,
+				Target: d.target, Peer: d.peer, CROwner: e.vipOwner, RecoveryMS: fromRestore,
 			})
 			return
 		}
@@ -472,17 +590,44 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 	e.park(d.target)
 }
 
-// converged reports whether the restored node is back in service and the
-// data path is green again.
-func (e *engine) converged(ctx context.Context, gw string) bool {
-	if e.lab.containerHealth(ctx, gw) != "healthy" {
-		return false
-	}
-	if !e.lab.chassisInSB(ctx, gw) {
-		return false
+// converged reports whether every node the decision disrupted is back in
+// service and the data path is green again. Each node is checked by the
+// signal its scope defines — a gateway's container health and chassis, the
+// central databases answering, the upstream BGP daemon back up — and the
+// probes are consulted once, after every node has returned.
+func (e *engine) converged(ctx context.Context, d decision) bool {
+	for _, n := range e.nodesFor(d) {
+		if !e.nodeConverged(ctx, d, n) {
+			return false
+		}
 	}
 	e.followMaster(ctx)
 	return e.probes.allGreen()
+}
+
+// nodeConverged reports whether one node is back in service, by the signal
+// its scope defines.
+func (e *engine) nodeConverged(ctx context.Context, d decision, node string) bool {
+	switch d.action.scope {
+	case scopeCentral:
+		// The central image's HEALTHCHECK is `ovn-nbctl show && ovn-sbctl
+		// show`, so a healthy container is exactly both databases answering.
+		return e.lab.containerHealth(ctx, node) == "healthy"
+	case scopeUpstream:
+		return bgpdAlive(ctx, e.lab)
+	default:
+		return e.lab.containerHealth(ctx, node) == "healthy" && e.lab.chassisInSB(ctx, node)
+	}
+}
+
+// bgpdAlive reports whether the upstream BGP daemon is running — the
+// convergence signal for the routing-flap class, whose faults stop bgpd on
+// the upstream node. pgrep exits 1 when nothing matches, which is the fault
+// still in place; any other failure is a question that could not be asked,
+// and reads here as "not yet back" so convergence keeps polling.
+func bgpdAlive(ctx context.Context, l *lab) bool {
+	out, err := l.exec(ctx, upstreamNode, "pgrep", "-x", "bgpd")
+	return err == nil && strings.TrimSpace(out) != ""
 }
 
 // followMaster keeps the port-forward VIP's hand-plumbed routes pointed
