@@ -374,6 +374,8 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 		"mgmt-loss", "mgmt-delay",
 		// data-plane drift (issue #178)
 		"kernel-route-drop", "frr-route-drop", "nft-flush", "ovs-flow-drop",
+		// routing flaps (issue #178)
+		"frr-restart", "upstream-bgp-restart",
 	}
 	got := actionOrder(actions)
 	if len(got) != len(want) {
