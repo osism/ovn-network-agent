@@ -44,7 +44,12 @@ test/e2e/
   chaos/                    — seeded chaos runner, `make e2e-chaos` (issue #176)
     main.go                 — flags, wiring, exit codes, artifact collection
     engine.go               — the seeded tick loop: draw, guardrails, execute, converge
-    actions.go              — the fault registry (four starter actions)
+    actions.go              — the fault registry (starter faults + config-flip)
+    control.go              — control-plane outages: NB/SB/northd pause, double failover (#178)
+    impair.go               — management-path packet loss and latency (#178)
+    drift.go                — data-plane drift the agent self-heals (#178)
+    flaps.go                — FRR / upstream BGP restarts (#178)
+    churn.go                — OVN churn: FIP, port-forward, priority, chassis (#178)
     lab.go                  — the single seam to docker / containerlab
     state.go                — the combined start state and the node-restore path
     probe.go                — continuous reachability probe from client-1
@@ -1044,23 +1049,107 @@ the VLAN networks in the NB DB — unprobed, but present. Start each
 profile run from a fresh `make e2e-up` for exact semantics.
 :::
 
-**Actions.** The starter set reuses the fault mechanics the scenarios
-already prove; `config-flip` reconfigures a gateway mid-run. The registry
-order and the weights are part of the replay contract — a new action is
-appended, never inserted.
+**Actions.** The catalog spans five fault classes (issue
+[#178](https://github.com/osism/ovn-network-agent/issues/178)): the
+container-level starter faults and the config change, control-plane
+outages, management-path impairment, data-plane drift, routing flaps, and
+OVN churn. Each action reuses a mechanic an existing scenario — or the
+integration tier — already proves. The registry order and the weights are
+part of the replay contract: a new action is appended, never inserted.
 
-| Action | Weight | Hold | Recovery budget | Mechanic |
-| --- | --- | --- | --- | --- |
-| `controller-restart` | 3 | 10–30 s | 90 s | `ovn-ctl stop_controller` / `start_controller` ([failover](#failover)) |
-| `gateway-kill` | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
-| `agent-terminate` | 2 | 10–30 s | 180 s | `kill -TERM 1` — the agent is PID 1 ([drain-hitless](#drain-hitless)) |
-| `gateway-restart` | 2 | — | 180 s | `docker restart` ([pf-hairpin](#port-forward-hairpin-masquerade)) |
-| `config-flip` | 2 | — | 180 s | rewrite one gateway's config and restart it onto it — see below |
+| Action | Target | Weight | Hold | Budget | Mechanic |
+| --- | --- | --- | --- | --- | --- |
+| `controller-restart` | gateway | 3 | 10–30 s | 90 s | `ovn-ctl stop_controller` / `start_controller` ([failover](#failover)) |
+| `gateway-kill` | gateway | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
+| `agent-terminate` | gateway | 2 | 10–30 s | 180 s | `kill -TERM 1` — the agent is PID 1 ([drain-hitless](#drain-hitless)) |
+| `gateway-restart` | gateway | 2 | — | 180 s | `docker restart` ([pf-hairpin](#port-forward-hairpin-masquerade)) |
+| `config-flip` | gateway | 2 | — | 180 s | rewrite one gateway's config and restart it onto it — see below |
+| `nb-pause` | central | 2 | 5–90 s | 90 s | SIGSTOP/SIGCONT the NB `ovsdb-server` |
+| `sb-pause` | central | 2 | 5–90 s | 120 s | SIGSTOP/SIGCONT the SB `ovsdb-server` |
+| `northd-pause` | central | 1 | 10–60 s | 60 s | SIGSTOP/SIGCONT `ovn-northd` |
+| `double-failover` | gateway pair | 1 | 10–30 s | 240 s | SIGTERM one gateway, SIGKILL its ring-next peer while it drains |
+| `mgmt-loss` | gateway | 2 | 20–60 s | 90 s | `tc netem loss 30%` on the gateway→central path |
+| `mgmt-delay` | gateway | 2 | 20–60 s | 90 s | `tc netem delay 200ms 50ms` on the gateway→central path |
+| `kernel-route-drop` | gateway | 2 | — | 60 s | `ip route del 192.0.2.10/32 dev br-ex` |
+| `frr-route-drop` | gateway | 2 | — | 60 s | `no ip route 192.0.2.10/32 169.254.0.1` in `vrf-provider` |
+| `nft-flush` | gateway | 2 | — | 60 s | `nft flush table ip ovn-network-agent` |
+| `ovs-flow-drop` | gateway | 2 | — | 60 s | `ovs-ofctl del-flows` the hairpin (`0x998`) and MAC-tweak (`0x999`) cookies on `br-ex` |
+| `frr-restart` | gateway | 2 | — | 120 s | `frrinit.sh` stop/clear/start, then re-assert BGP |
+| `upstream-bgp-restart` | upstream | 1 | 5–20 s | 90 s | `pkill -x bgpd` on `upstream`, then start it back in place |
+| `fip-churn` | central | 2 | — | 60 s | add/remove a spare FIP (`192.0.2.60`) on `lr0` |
+| `lb-vip-churn` | central | 2 | — | 60 s | add/remove a `vips` entry (`192.0.2.50:81`) on `pf-external` |
+| `priority-flip` | gateway | 2 | — | 120 s | bump a gateway's `Gateway_Chassis` priority above the group peak |
+| `chassis-delete` | gateway | 1 | — | 90 s | `ovn-sbctl chassis-del` while its `ovn-controller` keeps running |
 
 Every action that kills a container first runs `docker update
 --restart=no`, exactly as `drain-hitless.sh` does — containerlab deploys
 with `restart: always`, so without it docker revives the node before the
 fault is observable at all. The policy is restored on the way back.
+
+**Control-plane outages** target the shared `central` node. The database
+and northd pauses SIGSTOP the `ovn-ctl` process by its pidfile under
+`/var/run/ovn` and SIGCONT it on restore, so the connection stalls — for a
+short hold, or one long enough to force every `ovn-controller` and agent
+to reconnect and resync — without tearing the container down. Convergence
+is `central`'s container health, which the image's HEALTHCHECK ties to both
+databases answering. While the SB is paused the baseline sweep's
+`ovn-sbctl --timeout=5` calls fail and are journaled as `check-error`s, not
+violations. `double-failover` SIGTERMs the drawn gateway (which begins its
+drain) and SIGKILLs the ring-next peer before it has finished — two
+gateways down at once, restored one at a time through the same
+container-lifecycle path the starter kills use.
+
+**Network impairment** degrades the management path from a gateway to
+`central` with `tc netem`, forcing the OVSDB connections to flap without
+killing anything. A `prio` qdisc keeps its default band unimpaired and a
+`u32` filter steers only the traffic bound for `central` into the netem
+band — so the gateway-to-gateway geneve tunnels on the same `eth0` stay
+clean and the data plane is not collaterally darkened. `sch_netem` must be
+loaded on the host: CI does it in
+[`e2e-lab-setup`](https://github.com/osism/ovn-network-agent/blob/main/.github/actions/e2e-lab-setup/action.yml),
+and a local run needs `sudo modprobe sch_netem` first (the container holds
+only `CAP_NET_ADMIN` and cannot load it itself).
+
+**Data-plane drift** is the fat-fingered-operator class: delete a managed
+kernel route, flush the agent's nftables table, remove a hairpin or
+MAC-rewrite OVS flow, remove an FRR static route — the exact deletions
+[`scenario_drift_test.go`](https://github.com/osism/ovn-network-agent/blob/main/test/integration/scenario_drift_test.go)
+proves the agent heals on a single host, driven here against the
+multi-node lab. The deletion is the fault; the agent's next periodic
+reconcile is the undo, so the restore is a no-op and the recovery budget
+is the worst-case cadence (15 s after a `cadence-toggle` flip) plus probe
+slack. Each action skips a gateway that does not carry the object — the
+MAC-tweak flows exist only where routers are locally active, a
+port-forward-only profile has no FIP routes — rather than record a no-op
+deletion. Removing the MAC-tweak flow darkens external probes and is
+measured; the hairpin flow's restoration is not probe-observable from
+`client-1` (asserting its presence is the config-aware oracle of
+[#179](https://github.com/osism/ovn-network-agent/issues/179)).
+
+**Routing flaps** restart the FRR/BGP daemons and let the run assert the
+announcements return — the probes from `client-1` are only reachable over
+the routes `upstream` re-learns over BGP, so a green probe set is the
+proof. `frr-restart` recycles a gateway's FRR the way the gwnode entrypoint
+does (stop, clear the stale `watchfrr` state, start) and re-asserts the
+session on restore. `upstream-bgp-restart` stops `bgpd` on `upstream` and
+starts it back **in place** — never a `docker restart` and never
+`frrinit.sh restart`, because `watchfrr` is PID 1 on that node and either
+would take the container and its five containerlab veths down (the
+exit-137 trap `bootstrap.sh` documents).
+
+**OVN churn** mutates the topology under load the way an operator or an
+orchestrator does: add and remove a floating IP and a port-forward `vips`
+entry, flip a `Gateway_Chassis` priority above the group peak externally
+(the same mechanic `bootstrap.sh` uses to converge the master), and delete
+a chassis. The churn FIP (`192.0.2.60`) and VIP (`192.0.2.50:81`) are
+deliberately **unprobed** — a resource that appears and disappears must
+never draw probe traffic — and each churn is left in place for the next
+draw to toggle back. `chassis-delete` removes the SB `Chassis` row while
+the target's `ovn-controller` keeps running, so it re-registers well inside
+the 30 s `stale_chassis_grace_period`: the surviving agents' stale cleanup
+must **not** fire, and the existing gateway convergence (chassis back in
+SB, green probes) is exactly the "returns within the grace period" gate.
+Every executed churn is journaled as an `ovn-churn` event.
 
 `agent-terminate` exercises the agent's *drain* path whenever the target
 is running a config with `drain_on_shutdown` on — a profile that sets it,
@@ -1100,11 +1189,24 @@ truncated: `docker restart`'s 10 s stop-grace SIGKILLs an agent that is
 still draining. That is legitimate chaos — the run only asserts that the
 node recovers — but it is worth knowing when reading a journal.
 
-**Guardrails** keep a run meaningful. A decision is skipped (and
-journaled with its `skip_reason`) when the target has not returned and
-converged since it was last hit, when it is the last healthy gateway, or
-— for `config-flip` — when the drawn flip means nothing on what the
-target is currently running (`flip-not-applicable`).
+**Guardrails** keep a run meaningful, and every action declares the node
+states it may target through its *scope* — gateway, central, upstream, or
+gateway pair. A decision is skipped (and journaled with its `skip_reason`)
+when the target has not returned and converged since it was last hit
+(`target-not-healthy`), when a gateway fault would leave no other healthy
+gateway to fail over to (`no-healthy-peer`), when a `double-failover`'s
+ring-next peer has not converged (`peer-not-healthy`), when the drawn
+`config-flip` means nothing on the target's current config
+(`flip-not-applicable`), or when a drift or churn action's object is absent
+(`not-applicable`). A central- or upstream-scoped fault needs **no** healthy
+gateway peer — pausing the database or restarting the upstream BGP does not
+depend on how many gateways are up. `central` and `upstream` carry their own
+lifecycle in the same node-state map, so a paused database is re-targeted
+only once it has converged; the agent-alive and dual-claim sweeps still
+iterate the gateways alone. The engine executes actions **serially** —
+inject, hold, restore, converge, inline in the tick loop — so at most one
+fault is in flight at a time, and the "how many instances may be in flight"
+guardrail is one for every action by construction.
 
 **Convergence and recovery budgets.** After each restore the runner polls
 the node back to health: the container healthy, its chassis back in SB,
@@ -1178,8 +1280,14 @@ was restarted onto the profile from one that was already on it),
 `state-applied`, one `decision` per tick (with the drawn values — the
 flip among them — and either `executed` or a `skip_reason`), `inject` /
 `restore` / `converged`, `config-flip` (the flip, the values it moved
-between, and `rejected` when the agent refused it), `node-state`,
-`probe-transition`, `vip-repoint`, `violation` and `run-end`.
+between, and `rejected` when the agent refused it), `ovn-churn` (each
+executed churn, with the `object` it touched and the `from`/`to` values it
+moved between), `node-state`, `probe-transition`, `vip-repoint`,
+`violation` and `run-end`. A `decision`, `inject` or `converged` for a
+multi-node fault carries the `peer` it also disrupted, and a decision that
+touched a named object (a route, a database server, an nftables table)
+carries it in `object` — so a run mixing all classes is triageable from the
+artifacts alone.
 `summary.json` aggregates the run: inputs, tick and decision counts,
 actions by name, how many baseline sweeps ran and how many of them
 evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
