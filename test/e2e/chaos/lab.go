@@ -200,10 +200,11 @@ func (l *lab) killGateway(ctx context.Context, gw string) error {
 	return nil
 }
 
-// terminateAgent signals the agent with SIGTERM. The gwnode entrypoint
-// execs the agent, so it is PID 1 — the same handle drain-hitless.sh
-// uses. Whether the agent drains before exiting depends on how the lab
-// was deployed (E2E_DRAIN_ON_SHUTDOWN).
+// terminateAgent signals the agent with SIGTERM through PID 1 — tini,
+// which forwards the signal to the agent it supervises and follows it
+// down (the same handle drain-hitless.sh uses). Whether the agent drains
+// before exiting depends on how the lab was deployed
+// (E2E_DRAIN_ON_SHUTDOWN).
 func (l *lab) terminateAgent(ctx context.Context, gw string) error {
 	if _, err := l.exec(ctx, gw, "kill", "-TERM", "1"); err != nil {
 		return fmt.Errorf("terminate agent on %s: %w", gw, err)
@@ -226,7 +227,7 @@ func (l *lab) restartGateway(ctx context.Context, gw string) error {
 }
 
 // containerRunning reports whether the container is up. Used to wait
-// for a SIGTERM'ed agent (PID 1) to actually take the container down. An
+// for a SIGTERM'ed agent to actually take the container down. An
 // inspect docker could not answer is not an exit — the error is handed
 // to the caller rather than folded into the verdict.
 func (l *lab) containerRunning(ctx context.Context, gw string) (bool, error) {

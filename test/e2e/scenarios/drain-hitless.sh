@@ -49,10 +49,11 @@
 # this trap). `docker kill -s KILL` is used for the hardkill arm
 # because by then we explicitly DO want the veth gone; the scenario
 # recycles the lab with `make e2e-down && make e2e-up` afterwards.
-# `kill -TERM 1` is correct because the gwnode entrypoint `exec`s the
-# agent at the end of its startup sequence (see
-# `test/e2e/gwnode-entrypoint.sh`), so the agent is PID 1 inside the
-# container — no `pgrep`/`pidof` dance needed.
+# `kill -TERM 1` is correct because PID 1 is tini (see
+# `test/e2e/Dockerfile.gwnode`), which forwards the signal to the agent
+# it supervises — the gwnode entrypoint `exec`s the agent at the end of
+# its startup sequence, so the agent is tini's only child — and exits
+# with it. No `pgrep`/`pidof` dance needed.
 #
 # Why we disable the container's restart policy before each arm:
 # containerlab applies a `restart: always` policy to its containers

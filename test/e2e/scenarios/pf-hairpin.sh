@@ -392,8 +392,8 @@ restore_agent_config() {
 
 # `docker restart` of the gateway container is the closest equivalent
 # to the issue's `systemctl restart ovn-network-agent`: the gwnode
-# image runs the agent as PID 1 (the entrypoint exec's it), so there
-# is no per-service control. Restart is heavyweight (OVS + ovn-controller
+# image runs the agent as tini's only child (the entrypoint exec's
+# it) with no service manager, so there is no per-service control. Restart is heavyweight (OVS + ovn-controller
 # + FRR re-init) — the scenario's CI budget allows for two such cycles
 # (one per phase).
 restart_master() {

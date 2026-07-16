@@ -143,8 +143,8 @@ func TestControllerRestartUsesOvnCtlAndTouchesNoContainer(t *testing.T) {
 	}
 }
 
-// The gwnode entrypoint execs the agent, so it is PID 1 — the SIGTERM
-// goes to the container's init, and the container follows it down.
+// The SIGTERM goes to the container's init — tini, which forwards it to
+// the agent it supervises — and the container follows the agent down.
 func TestAgentTerminateSignalsPID1AndWaitsForTheExit(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
@@ -154,7 +154,7 @@ func TestAgentTerminateSignalsPID1AndWaitsForTheExit(t *testing.T) {
 	}
 
 	if !cmd.called("docker exec clab-ovn-e2e-gateway-3 kill -TERM 1") {
-		t.Fatalf("the agent was not signalled as PID 1: %v", cmd.lines())
+		t.Fatalf("the agent was not signalled through PID 1: %v", cmd.lines())
 	}
 	if !cmd.called("{{.State.Running}}") {
 		t.Fatalf("the runner did not wait for the container to exit: %v", cmd.lines())

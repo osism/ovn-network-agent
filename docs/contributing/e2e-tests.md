@@ -554,7 +554,7 @@ transit.
 ::: details Why docker restart, not systemctl restart ovn-network-agent
 The gwnode image is not running systemd, so `systemctl restart
 ovn-network-agent` (which the issue body suggests) is unavailable. The
-entrypoint `exec`s the agent so it becomes PID 1; the only way to make
+entrypoint `exec`s the agent as tini's only child; the only way to make
 the agent re-read its config is to restart the whole container. This
 costs ~20 s of OVS / ovn-controller / FRR re-init per phase but stays
 inside the 7-minute CI budget for two reconciles.
@@ -679,9 +679,9 @@ compares the agent's graceful-drain code path
 against the hard-kill case (#105's mechanic, reused here as the
 control arm) and asserts the graceful path stays hitless. The
 graceful arm sends `docker exec … kill -TERM 1` on `gateway-1`
-(the gwnode entrypoint `exec`s the agent at startup, so the agent
-is PID 1 — no `pgrep` needed and the containerlab veth pair is
-not torn down between SIGTERM and the drain completing). The
+(PID 1 is tini, which forwards the signal to the agent the
+entrypoint `exec`s — no `pgrep` needed and the containerlab veth
+pair is not torn down between SIGTERM and the drain completing). The
 hardkill arm uses `docker kill -s KILL clab-${LAB}-gateway-1`.
 Both arms first run `docker update --restart=no` on the gateway
 container so that containerlab's default `restart: always` does
@@ -1069,7 +1069,7 @@ part of the replay contract: a new action is appended, never inserted.
 | --- | --- | --- | --- | --- | --- |
 | `controller-restart` | gateway | 3 | 10–30 s | 90 s | `ovn-ctl stop_controller` / `start_controller` ([failover](#failover)) |
 | `gateway-kill` | gateway | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
-| `agent-terminate` | gateway | 2 | 10–30 s | 180 s | `kill -TERM 1` — the agent is PID 1 ([drain-hitless](#drain-hitless)) |
+| `agent-terminate` | gateway | 2 | 10–30 s | 180 s | `kill -TERM 1` — tini forwards to the agent ([drain-hitless](#drain-hitless)) |
 | `gateway-restart` | gateway | 2 | — | 180 s | `docker restart` ([pf-hairpin](#port-forward-hairpin-masquerade)) |
 | `config-flip` | gateway | 2 | — | 180 s | rewrite one gateway's config and restart it onto it — see below |
 | `nb-pause` | central | 2 | 5–90 s | 90 s | SIGSTOP/SIGCONT the NB `ovsdb-server` |
@@ -1141,15 +1141,22 @@ the routes `upstream` re-learns over BGP, so a green probe set is the
 proof. `frr-restart` recycles a gateway's FRR the way the gwnode entrypoint
 does (stop, clear the stale `watchfrr` state, start) and re-asserts the
 session on restore. The recycle runs backgrounded inside the container and
-touches a completion marker the restore gates on: run synchronously, the
-stop+start can outlive the runner's 30 s command timeout on a loaded CI
-machine — the SIGKILL reaps only the `docker exec` client while FRR
-restarts anyway, and the run records an `action-failed` violation for a
-lab that is healthy seconds later. The marker wait runs on its own
-three-minute budget (`frrRecycleTimeout`), not the 60 s daemon-ready
-budget: it carries the whole stop+clear+start, which loaded runners have
-pushed past both shorter bounds while the lab-state dump showed FRR
-healthy again moments after the abort. `upstream-bgp-restart` stops `bgpd` on `upstream` and
+touches a completion marker the restore gates on: run synchronously, a
+slow stop+start rides the exec into the runner's 30 s command timeout —
+the SIGKILL reaps only the `docker exec` client while FRR restarts
+anyway, and the run records an `action-failed` violation for a lab that
+is healthy seconds later. The marker wait runs on its own three-minute
+budget (`frrRecycleTimeout`), not the 60 s daemon-ready budget: it
+carries the whole stop+clear+start. That budget is a backstop — with
+`tini` as the gwnode's PID 1 the recycle completes in seconds. The init
+matters: the FRR daemons daemonize and reparent to PID 1, and while that
+was the agent (a Go binary that never `wait()`s for children it did not
+spawn), every stopped daemon stayed an unreaped zombie that
+`frrinit.sh`'s per-phase 120 s `kill -0` stop loops waited out in full —
+a deterministic ~6-minute stop that three successive runs pushed past
+the 30 s command timeout, the 60 s daemon-ready budget and the
+three-minute marker budget in turn, each abort looking like a loaded
+runner rather than what it was. `upstream-bgp-restart` stops `bgpd` on `upstream` and
 starts it back **in place** — never a `docker restart` and never
 `frrinit.sh restart`, because `watchfrr` is PID 1 on that node and either
 would take the container and its five containerlab veths down (the

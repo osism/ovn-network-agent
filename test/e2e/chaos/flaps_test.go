@@ -80,11 +80,12 @@ func TestFRRRestartRecyclesFRRAndReassertsBGP(t *testing.T) {
 }
 
 // The completion marker carries the whole backgrounded recycle — stop,
-// clear, start — not one daemon coming ready, and a loaded CI runner has
-// taken it past the 60s daemon budget (run 29516365849) with the
-// lab-state dump showing FRR healthy moments after the abort. The restore
-// must wait it out on the recycle's own budget instead of parking the
-// node over a restart that is merely slow.
+// clear, start — not one daemon coming ready. Zombie daemons under the
+// old non-reaping PID 1 took it past the 60s daemon budget (run
+// 29516365849) with the lab-state dump showing FRR healthy moments after
+// the abort, and even with tini reaping, a loaded runner may stretch the
+// recycle. The restore must wait it out on the recycle's own budget
+// instead of parking the node over a restart that is merely slow.
 func TestFRRRestartRestoreOutwaitsARecycleSlowerThanTheDaemonBudget(t *testing.T) {
 	clock := newFakeClock()
 	markerAt := clock.now().Add(daemonReadyTimeout + 30*time.Second)
