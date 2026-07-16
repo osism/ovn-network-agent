@@ -97,6 +97,7 @@ type config struct {
 	outDir        string
 	collect       string
 	gwnodeConfig  string
+	report        string
 }
 
 func main() {
@@ -116,7 +117,21 @@ func main() {
 		"lab-state collector, run into <out>/lab-state when the run does not pass")
 	flag.StringVar(&cfg.gwnodeConfig, "gwnode-config", "test/e2e/gwnode-config.yaml",
 		"the baked gateway agent config a profile's overlays are layered over")
+	flag.StringVar(&cfg.report, "report", "",
+		"render a Markdown report for a recorded run — a run directory, a summary.json, or an Actions run URL — to stdout, then exit")
 	flag.Parse()
+
+	// -report reads a finished run instead of driving a lab, so none of
+	// the run flags apply. It exits 0 even for a run that recorded a
+	// failure: the exit code says whether the report could be produced,
+	// not what the run found — the run itself already reported that.
+	if cfg.report != "" {
+		if err := runReport(cfg.report, os.Stdout, execCommander{timeout: reportDownloadTimeout}); err != nil {
+			fmt.Fprintf(os.Stderr, "[chaos] %v\n", err)
+			os.Exit(exitFatal)
+		}
+		return
+	}
 
 	code, err := run(cfg)
 	if err != nil {

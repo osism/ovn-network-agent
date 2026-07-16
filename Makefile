@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -305,3 +305,17 @@ e2e-drain-hitless:
 CHAOS_FLAGS ?=
 e2e-chaos:
 	$(E2E_CHAOS) $(CHAOS_FLAGS)
+
+# Render a recorded chaos run as a Markdown report: the verdict, the
+# slowest recoveries against their budgets, and every probe-loss window
+# attributed to the fault it overlapped. CHAOS_RUN is the run directory
+# (or summary.json) a run wrote with -out, or a GitHub Actions run URL —
+# the URL form fetches the artifacts with `gh run download`, so `gh`
+# must be installed and authenticated. The CI workflow renders the same
+# report into each chaos job's summary.
+#
+#   make e2e-chaos-report CHAOS_RUN=/tmp/chaos-a
+#   make e2e-chaos-report CHAOS_RUN=https://github.com/osism/ovn-network-agent/actions/runs/<id>
+CHAOS_RUN ?= chaos-artifacts
+e2e-chaos-report:
+	$(E2E_CHAOS) -report $(CHAOS_RUN)
