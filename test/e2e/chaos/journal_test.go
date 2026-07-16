@@ -67,6 +67,34 @@ type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errBoom }
 
+// count() is the journal offset a violation is stamped with, so it must
+// track exactly the lines a reader can find: zero on a fresh journal, one
+// per successful emit, and left untouched by a write that never landed.
+func TestJournalCountsEmittedLines(t *testing.T) {
+	clock := newFakeClock()
+	var buf bytes.Buffer
+	j := newJournal(&buf, clock.now)
+
+	if got := j.count(); got != 0 {
+		t.Fatalf("a fresh journal counts %d lines, want 0", got)
+	}
+
+	j.emit(event{Event: evRunStart})
+	j.emit(event{Event: evDecision, Tick: 1})
+	j.emit(event{Event: evSettleStart, Tick: 1})
+	if got := j.count(); got != 3 {
+		t.Fatalf("count = %d after three emits, want 3", got)
+	}
+
+	// A write that never reached the writer must not advance the offset,
+	// or a violation would be stamped with a line no reader can find.
+	failing := newJournal(failingWriter{}, clock.now)
+	failing.emit(event{Event: evRunStart})
+	if got := failing.count(); got != 0 {
+		t.Fatalf("a failed write advanced the offset to %d, want 0", got)
+	}
+}
+
 func TestSummaryFailsOnViolation(t *testing.T) {
 	clock := newFakeClock()
 
@@ -74,6 +102,12 @@ func TestSummaryFailsOnViolation(t *testing.T) {
 	clean.finalize(clock.now())
 	if clean.Result != resultPass {
 		t.Fatalf("result = %q, want %q", clean.Result, resultPass)
+	}
+	// The settle list must be an empty slice, never nil, so it serializes
+	// as [] and a reader can tell "no settle windows ran" from "the field
+	// is missing", exactly as the recovery and violation lists do.
+	if clean.Settles == nil {
+		t.Fatal("finalize left Settles nil; the record must carry [] not null")
 	}
 
 	dirty := &runRecord{Violations: []violationRecord{{Kind: violationDualClaim, Detail: "cr-lr0-public"}}}
@@ -95,6 +129,56 @@ func TestSummaryFailsOnViolation(t *testing.T) {
 	}
 	if decoded.Result != resultFail || len(decoded.Violations) != 1 {
 		t.Fatalf("run record lost the violation: %+v", decoded)
+	}
+	if !strings.Contains(buf.String(), `"settles": []`) {
+		t.Fatalf("an empty settle list serialized as null instead of []: %s", buf.String())
+	}
+}
+
+// The journal offset points a violation at the decision line that caused
+// it. A recorded offset must serialize; a zero one is the "no offset
+// recorded" case, which omitempty keeps out of the record.
+func TestViolationRecordSerializesTheJournalOffset(t *testing.T) {
+	stamped, err := json.Marshal(violationRecord{Kind: violationDualClaim, JournalOffset: 7})
+	if err != nil {
+		t.Fatalf("marshal stamped violation: %v", err)
+	}
+	if !strings.Contains(string(stamped), `"journal_offset":7`) {
+		t.Fatalf("the violation dropped its journal offset: %s", stamped)
+	}
+
+	unstamped, err := json.Marshal(violationRecord{Kind: violationDualClaim})
+	if err != nil {
+		t.Fatalf("marshal unstamped violation: %v", err)
+	}
+	if strings.Contains(string(unstamped), "journal_offset") {
+		t.Fatalf("a zero journal offset leaked into the record: %s", unstamped)
+	}
+}
+
+// The settle-window schedule is part of the reproducibility contract, so
+// both keys must reach the run inputs verbatim — and, unlike the omitempty
+// event fields, even at zero, or a replay cannot tell "not set" from "set
+// to the value it computed".
+func TestRunInputsSerializeTheSettleSchedule(t *testing.T) {
+	set, err := json.Marshal(runInputs{SettleEveryMS: 5000, SettleTimeoutMS: 30000})
+	if err != nil {
+		t.Fatalf("marshal run inputs: %v", err)
+	}
+	for _, key := range []string{`"settle_every_ms":5000`, `"settle_timeout_ms":30000`} {
+		if !strings.Contains(string(set), key) {
+			t.Fatalf("the run inputs dropped %s: %s", key, set)
+		}
+	}
+
+	zero, err := json.Marshal(runInputs{})
+	if err != nil {
+		t.Fatalf("marshal zero run inputs: %v", err)
+	}
+	for _, key := range []string{`"settle_every_ms":0`, `"settle_timeout_ms":0`} {
+		if !strings.Contains(string(zero), key) {
+			t.Fatalf("a zero settle schedule was dropped from the contract: %s", zero)
+		}
 	}
 }
 

@@ -36,6 +36,8 @@ const (
 	evProbeTransition = "probe-transition"
 	evVIPRepoint      = "vip-repoint"
 	evOVNChurn        = "ovn-churn"
+	evSettleStart     = "settle-start"
+	evSettleResult    = "settle-result"
 	evViolation       = "violation"
 	evCheckError      = "check-error"
 	evRunAborted      = "run-aborted"
@@ -46,30 +48,31 @@ const (
 // one flat struct describes the whole event vocabulary and consumers can
 // branch on `event`.
 type event struct {
-	TS         string           `json:"ts"`
-	Event      string           `json:"event"`
-	Tick       int              `json:"tick,omitempty"`
-	Action     string           `json:"action,omitempty"`
-	Target     string           `json:"target,omitempty"`
-	Peer       string           `json:"peer,omitempty"`
-	Object     string           `json:"object,omitempty"`
-	IntervalMS int64            `json:"interval_ms,omitempty"`
-	HoldMS     int64            `json:"hold_ms,omitempty"`
-	Executed   *bool            `json:"executed,omitempty"`
-	SkipReason string           `json:"skip_reason,omitempty"`
-	Flip       string           `json:"flip,omitempty"`
-	From       string           `json:"from,omitempty"`
-	To         string           `json:"to,omitempty"`
-	Rejected   *bool            `json:"rejected,omitempty"`
-	Probe      string           `json:"probe,omitempty"`
-	Up         *bool            `json:"up,omitempty"`
-	State      string           `json:"state,omitempty"`
-	CROwner    string           `json:"cr_owner,omitempty"`
-	RecoveryMS map[string]int64 `json:"recovery_ms,omitempty"`
-	Kind       string           `json:"kind,omitempty"`
-	Detail     string           `json:"detail,omitempty"`
-	Result     string           `json:"result,omitempty"`
-	Inputs     *runInputs       `json:"inputs,omitempty"`
+	TS          string           `json:"ts"`
+	Event       string           `json:"event"`
+	Tick        int              `json:"tick,omitempty"`
+	Action      string           `json:"action,omitempty"`
+	Target      string           `json:"target,omitempty"`
+	Peer        string           `json:"peer,omitempty"`
+	Object      string           `json:"object,omitempty"`
+	IntervalMS  int64            `json:"interval_ms,omitempty"`
+	HoldMS      int64            `json:"hold_ms,omitempty"`
+	Executed    *bool            `json:"executed,omitempty"`
+	SkipReason  string           `json:"skip_reason,omitempty"`
+	Flip        string           `json:"flip,omitempty"`
+	From        string           `json:"from,omitempty"`
+	To          string           `json:"to,omitempty"`
+	Rejected    *bool            `json:"rejected,omitempty"`
+	Probe       string           `json:"probe,omitempty"`
+	Up          *bool            `json:"up,omitempty"`
+	State       string           `json:"state,omitempty"`
+	CROwner     string           `json:"cr_owner,omitempty"`
+	RecoveryMS  map[string]int64 `json:"recovery_ms,omitempty"`
+	Kind        string           `json:"kind,omitempty"`
+	Detail      string           `json:"detail,omitempty"`
+	Result      string           `json:"result,omitempty"`
+	ConvergedMS int64            `json:"converged_ms,omitempty"`
+	Inputs      *runInputs       `json:"inputs,omitempty"`
 }
 
 // runInputs is the reproducibility contract: identical inputs replay the
@@ -80,13 +83,20 @@ type event struct {
 // and the configuration every agent in it runs, so a seed without a
 // profile does not identify a run.
 type runInputs struct {
-	Seed       int64          `json:"seed"`
-	Profile    string         `json:"profile"`
-	DurationMS int64          `json:"duration_ms"`
-	TickMinMS  int64          `json:"tick_min_ms"`
-	TickMaxMS  int64          `json:"tick_max_ms"`
-	Weights    map[string]int `json:"weights"`
-	Lab        string         `json:"lab"`
+	Seed       int64  `json:"seed"`
+	Profile    string `json:"profile"`
+	DurationMS int64  `json:"duration_ms"`
+	TickMinMS  int64  `json:"tick_min_ms"`
+	TickMaxMS  int64  `json:"tick_max_ms"`
+	// SettleEveryMS/SettleTimeoutMS are the settle-window schedule the
+	// expected-state oracle runs on: how often the run pauses to let the
+	// lab converge and how long it waits before calling that a failure.
+	// They belong to the reproducibility contract because they change how
+	// often the oracle is consulted, so a replay must see the same values.
+	SettleEveryMS   int64          `json:"settle_every_ms"`
+	SettleTimeoutMS int64          `json:"settle_timeout_ms"`
+	Weights         map[string]int `json:"weights"`
+	Lab             string         `json:"lab"`
 }
 
 // journal is the append-only JSONL writer. The prober writes transitions
@@ -96,6 +106,10 @@ type journal struct {
 	w   io.Writer
 	now func() time.Time
 	err error
+	// n is the journal offset: the number of lines successfully emitted so
+	// far. A later commit stamps a violation with this value so the oracle
+	// can point at the offset of the last executed action.
+	n int
 }
 
 func newJournal(w io.Writer, now func() time.Time) *journal {
@@ -114,15 +128,30 @@ func (j *journal) emit(e event) {
 		j.err = fmt.Errorf("marshal %s event: %w", e.Event, err)
 		return
 	}
-	if _, err := fmt.Fprintf(j.w, "%s\n", line); err != nil && j.err == nil {
-		j.err = fmt.Errorf("write %s event: %w", e.Event, err)
+	if _, err := fmt.Fprintf(j.w, "%s\n", line); err != nil {
+		if j.err == nil {
+			j.err = fmt.Errorf("write %s event: %w", e.Event, err)
+		}
+		return
 	}
+	// Only a line that both marshalled and reached the writer advances the
+	// journal offset, so count() never claims a line a reader cannot find.
+	j.n++
 }
 
 func (j *journal) Err() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.err
+}
+
+// count returns the journal offset — the number of lines emitted so far.
+// A violation is stamped with this value to record which action it
+// followed. It is safe to call from any goroutine.
+func (j *journal) count() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.n
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -160,6 +189,18 @@ type recoveryRecord struct {
 	CROwnerAfter  string           `json:"cr_owner_after"`
 }
 
+// settleRecord is the verdict of one settle window: how long the lab took
+// to match the expected-state oracle, whether it matched at all, and how
+// many invariants it broke while it did not. It is the run record's
+// evidence that the lab was checked against its config, not just that no
+// probe went red.
+type settleRecord struct {
+	Tick        int   `json:"tick"`
+	ConvergedMS int64 `json:"converged_ms"`
+	Passed      bool  `json:"passed"`
+	Violations  int   `json:"violations"`
+}
+
 type violationRecord struct {
 	TS     string `json:"ts"`
 	Kind   string `json:"kind"`
@@ -167,6 +208,11 @@ type violationRecord struct {
 	Action string `json:"action,omitempty"`
 	Target string `json:"target,omitempty"`
 	Detail string `json:"detail"`
+	// JournalOffset is the journal line count at the moment the violation
+	// was recorded, i.e. the offset of the last executed action. It lets a
+	// reader jump from a violation in the run record straight to the
+	// decision in journal.jsonl that produced it.
+	JournalOffset int `json:"journal_offset,omitempty"`
 }
 
 type decisionCounts struct {
@@ -199,6 +245,7 @@ type runRecord struct {
 	ActionsByName map[string]int          `json:"actions_by_name"`
 	Probes        map[string]probeSummary `json:"probes"`
 	Recoveries    []recoveryRecord        `json:"recoveries"`
+	Settles       []settleRecord          `json:"settles"`
 	Violations    []violationRecord       `json:"violations"`
 }
 
@@ -223,6 +270,9 @@ func (r *runRecord) finalize(endedAt time.Time) {
 	}
 	if r.Recoveries == nil {
 		r.Recoveries = []recoveryRecord{}
+	}
+	if r.Settles == nil {
+		r.Settles = []settleRecord{}
 	}
 	if r.Violations == nil {
 		r.Violations = []violationRecord{}
