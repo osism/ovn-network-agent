@@ -322,6 +322,43 @@ func TestManagedEntryNamingAVanishedChassisIsAViolation(t *testing.T) {
 	}
 }
 
+// A drain question the oracle cannot ask at inject time tolerates the target's
+// priority-0 residue rather than fabricating a drain-while-disabled violation —
+// the same "could not ask" split agentAlive and checkError make.
+func TestObserveInjectToleratesAnUnanswerableDrainQuestion(t *testing.T) {
+	fx := newOracleLab(t)
+	// The marker check on gateway-2 is not exit 1 (marker absent) but a
+	// question that could not be asked at all — a docker daemon under load.
+	respond := func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		if strings.Contains(line, "clab-ovn-e2e-gateway-2") && strings.Contains(line, "test -f "+profileMarkerPath) {
+			return "", errBoom
+		}
+		return fx.respond(argv)
+	}
+	o := oracleFor(t, respond, fullModeDocs(t))
+	ctx := context.Background()
+
+	if err := o.prime(ctx); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// A fresh priority-0 row appears for gateway-2 — drain residue on its face.
+	fx.extraGC = append(fx.extraGC, gcExtra{uuid: "gc-new", name: "lr0-public-extra", chassis: "gateway-2"})
+
+	err := o.observeInject(ctx, "agent-terminate", "gateway-2")
+	if err == nil {
+		t.Fatal("observeInject swallowed the unanswerable drain question instead of surfacing it")
+	}
+	v, convergedMS := o.verify(ctx)
+	if hasViolation(v, violationDrainDisabled, "gateway-2") {
+		t.Fatalf("an unanswerable drain question fabricated a drain-while-disabled violation: %+v", v)
+	}
+	if convergedMS < 0 {
+		t.Fatalf("convergedMS = %d, want >= 0: the tolerated residue leaves the lab converged", convergedMS)
+	}
+}
+
 // A drain tolerance covers the window that follows the fault that earned it,
 // not the rest of the run: the agent restores a drained row to priority 1 on
 // startup, so once a window has consumed the tolerance the same row still at 0

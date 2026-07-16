@@ -28,10 +28,6 @@ import (
 // port-forward-only) and a metrics flap gate. Everything it reads comes through
 // observe.go; it draws nothing from the engine's rng and never touches the
 // run's decision stream.
-//
-// The engine wiring — settle scheduling, the observeInject hook, stamping the
-// returned violations with the tick and journal offset — lands in the next
-// commit.
 
 const (
 	// settlePollInterval is how often the settle loop re-observes the lab.
@@ -47,9 +43,8 @@ const (
 
 // oracle verifies one settle window against the config-aware expected state.
 type oracle struct {
-	lab  *lab
-	ap   *applier
-	jrnl *journal
+	lab *lab
+	ap  *applier
 
 	settleTimeout time.Duration
 
@@ -126,6 +121,12 @@ func (o *oracle) observeInject(ctx context.Context, action, target string) error
 
 	drain, err := o.effectiveDrain(ctx, target)
 	if err != nil {
+		// The drain question could not be asked (docker under load, the
+		// container gone mid-inject). An unanswerable question tolerates any
+		// priority-0 residue the target leaves rather than inventing a
+		// drain-while-disabled violation — the same "could not ask" split
+		// agentAlive and checkError make.
+		o.drainedLegit[target] = true
 		return err
 	}
 	o.drainedLegit[target] = drain

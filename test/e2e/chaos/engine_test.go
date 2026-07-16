@@ -1141,3 +1141,186 @@ func decisionEventsIn(t *testing.T, journal string) []event {
 	}
 	return out
 }
+
+// runEngineOracle drives a full engine run wired to a config-aware oracle over
+// the oracleLab fixture, with settle windows at the given cadence. The engine
+// and the oracle share one fake clock, so a settle consumes the run's
+// wall-clock exactly as it would in production while the whole run still
+// completes in microseconds. It returns the journal and the run record.
+func runEngineOracle(t *testing.T, seed int64, duration, settleEvery time.Duration,
+	actions []*action, fx *oracleLab) (string, *runRecord) {
+	t.Helper()
+
+	clock := newFakeClock()
+	lab := newTestLab(&fakeCommander{respond: fx.respond}, clock)
+	var buf bytes.Buffer
+	jrnl := newJournal(&buf, clock.now)
+
+	rec := &runRecord{
+		Inputs: runInputs{
+			Seed:            seed,
+			DurationMS:      duration.Milliseconds(),
+			TickMinMS:       (10 * time.Second).Milliseconds(),
+			TickMaxMS:       (30 * time.Second).Milliseconds(),
+			SettleEveryMS:   settleEvery.Milliseconds(),
+			SettleTimeoutMS: (90 * time.Second).Milliseconds(),
+			Lab:             "ovn-e2e",
+		},
+		ActionsByName: map[string]int{},
+	}
+	orc := newOracle(lab, oracleApplier(fullModeDocs(t)))
+	orc.settleTimeout = time.Duration(rec.Inputs.SettleTimeoutMS) * time.Millisecond
+	if err := orc.prime(context.Background()); err != nil {
+		t.Fatalf("prime the oracle: %v", err)
+	}
+
+	e := newEngine(lab, defaultTestProfile(t), actions, greenProbes{}, jrnl, rec)
+	e.wait, e.now = clock.wait, clock.now
+	e.oracle = orc
+	e.settleEvery = time.Duration(rec.Inputs.SettleEveryMS) * time.Millisecond
+
+	e.run(context.Background())
+	rec.finalize(clock.now())
+	return buf.String(), rec
+}
+
+// The settle windows run on the configured cadence between ticks — never
+// between an inject and its restore, where the lab is deliberately broken.
+func TestSettleWindowsRunAtTheConfiguredCadenceBetweenTicks(t *testing.T) {
+	fx := newOracleLab(t)
+	journal, rec := runEngineOracle(t, 42, 10*time.Minute, 30*time.Second,
+		noopActions("controller-restart"), fx)
+
+	evs := eventsIn(t, journal)
+	var starts, results int
+	injecting := false
+	settleAfterDecision := false
+	sawDecision := false
+	for _, ev := range evs {
+		switch ev.Event {
+		case evDecision:
+			sawDecision = true
+		case evInject:
+			injecting = true
+		case evRestore:
+			injecting = false
+		case evSettleStart:
+			starts++
+			if injecting {
+				t.Fatal("a settle window opened between an inject and its restore")
+			}
+			if sawDecision {
+				settleAfterDecision = true
+			}
+		case evSettleResult:
+			results++
+			if injecting {
+				t.Fatal("a settle result landed between an inject and its restore")
+			}
+		}
+	}
+
+	if starts == 0 {
+		t.Fatal("no settle window ran at the configured cadence")
+	}
+	if starts != results {
+		t.Fatalf("%d settle-start events but %d settle-result events", starts, results)
+	}
+	if !settleAfterDecision {
+		t.Fatal("every settle ran before the first decision, not between ticks")
+	}
+	if len(rec.Settles) != starts {
+		t.Fatalf("recorded %d settles for %d settle windows", len(rec.Settles), starts)
+	}
+	// Every settle over the green fixture converges cleanly.
+	for _, s := range rec.Settles {
+		if !s.Passed || s.ConvergedMS < 0 {
+			t.Fatalf("a settle over a converged lab did not pass: %+v", s)
+		}
+	}
+	if len(rec.Violations) != 0 {
+		t.Fatalf("a green run recorded violations: %+v", rec.Violations)
+	}
+}
+
+// Settles consume the run's wall-clock but draw nothing from the rng, so the
+// decision stream a replay reproduces is identical whether or not they run.
+func TestSettleDoesNotShiftTheDecisionStream(t *testing.T) {
+	withSettles, settledRec := runEngineOracle(t, 42, 15*time.Minute, 30*time.Second,
+		noopActions("controller-restart", "gateway-kill"), newOracleLab(t))
+	without, _ := runEngineOracle(t, 42, 15*time.Minute, 0,
+		noopActions("controller-restart", "gateway-kill"), newOracleLab(t))
+
+	if len(settledRec.Settles) == 0 {
+		t.Fatal("the settled run ran no settle windows, so it proves nothing")
+	}
+
+	a, b := decisionsIn(t, withSettles), decisionsIn(t, without)
+	if len(a) == 0 {
+		t.Fatal("the settled run made no decisions at all")
+	}
+	// Settles only consume time; they never add ticks, so the settled run
+	// fits no more decisions than the unsettled one.
+	if len(a) > len(b) {
+		t.Fatalf("the settled run fit more decisions (%d) than the unsettled one (%d)", len(a), len(b))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("decision %d diverged when settles were enabled: %q vs %q", i+1, a[i], b[i])
+		}
+	}
+}
+
+// A settle violation is stamped with the current tick and the journal offset
+// of the last executed action, so a reader jumps straight from the violation
+// in the record to the inject that preceded it in the journal.
+func TestSettleViolationsCarryTheLastActionsJournalOffset(t *testing.T) {
+	fx := newOracleLab(t)
+	fx.dropKernel["gateway-1"] = "192.0.2.10" // a kernel route missing on every poll
+
+	journal, rec := runEngineOracle(t, 42, 10*time.Minute, 30*time.Second,
+		noopActions("controller-restart"), fx)
+
+	var got *violationRecord
+	for i := range rec.Violations {
+		if r := &rec.Violations[i]; r.Kind == violationExpectedState &&
+			r.Target == "gateway-1" && strings.Contains(r.Detail, "kernel") {
+			got = r
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("the settle over the red fixture recorded no kernel violation: %+v", rec.Violations)
+	}
+	if got.Tick == 0 {
+		t.Fatalf("the settle violation was not stamped with a tick: %+v", got)
+	}
+
+	// jrnl.count() right after an emit is that line's 1-based number, so the
+	// stamped offset must be the line of the inject that preceded the first
+	// settle window.
+	evs := eventsIn(t, journal)
+	firstSettle := -1
+	for i, ev := range evs {
+		if ev.Event == evSettleStart {
+			firstSettle = i
+			break
+		}
+	}
+	if firstSettle < 0 {
+		t.Fatal("no settle window ran")
+	}
+	injectLine := -1
+	for i := 0; i < firstSettle; i++ {
+		if evs[i].Event == evInject {
+			injectLine = i + 1
+		}
+	}
+	if injectLine < 0 {
+		t.Fatal("no inject preceded the first settle window")
+	}
+	if got.JournalOffset != injectLine {
+		t.Fatalf("violation journal offset = %d, want the preceding inject's line %d",
+			got.JournalOffset, injectLine)
+	}
+}

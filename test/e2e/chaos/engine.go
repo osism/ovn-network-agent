@@ -136,6 +136,18 @@ type engine struct {
 	tickMin  time.Duration
 	tickMax  time.Duration
 
+	// oracle verifies each settle window against the config-aware expected
+	// state; settleEvery is how often the tick loop pauses for one (0 disables
+	// the scheduled settles, leaving only the final settle drive runs).
+	// lastActionOffset is the journal offset of the last executed action — the
+	// value a settle violation is stamped with. All three are late-bound in
+	// drive after the oracle has primed against the start state, matching the
+	// ap.jrnl precedent: newEngine's signature is unchanged, and a nil oracle
+	// keeps every existing engine test valid.
+	oracle           *oracle
+	settleEvery      time.Duration
+	lastActionOffset int
+
 	// wait blocks for a duration unless ctx is cancelled first. Every wait
 	// the tick loop makes goes through it, so a Ctrl-C is observed while
 	// the engine is idling out a tick interval or holding a fault instead
@@ -382,7 +394,18 @@ func (e *engine) hasHealthyPeer(d decision) bool {
 // fault is injected; an action already in flight runs to completion.
 func (e *engine) run(ctx context.Context) {
 	deadline := e.now().Add(e.duration)
+	nextSettle := e.now().Add(e.settleEvery)
 	for tick := 1; e.now().Before(deadline); tick++ {
+		// A settle window runs between ticks — after the previous action's
+		// full execute/converge cycle and before the next draw — so it never
+		// lands between an inject and its restore. It draws nothing from the
+		// rng, so the decision stream is untouched; it only consumes
+		// wall-clock, which is why it is scheduled off the clock and not the
+		// tick count.
+		if e.oracle != nil && e.settleEvery > 0 && !e.now().Before(nextSettle) {
+			e.settle(ctx)
+			nextSettle = e.now().Add(e.settleEvery)
+		}
 		d := e.draw(tick)
 		if !e.wait(ctx, d.interval) || !e.now().Before(deadline) {
 			return
@@ -425,6 +448,42 @@ func (e *engine) run(ctx context.Context) {
 	}
 }
 
+// settle runs one settle window against the config-aware oracle: it polls
+// the lab until every gateway's live data plane matches the state its
+// configuration demands or the oracle's settleTimeout expires, records the
+// verdict, and stamps each violation the oracle returns with the current
+// tick and the journal offset of the last executed action — so a reader
+// jumps from a settle violation to the fault that preceded it. drive runs
+// it once more after the last tick; the tick loop runs it on a cadence.
+func (e *engine) settle(ctx context.Context) {
+	e.jrnl.emit(event{Event: evSettleStart, Tick: e.rec.Ticks})
+
+	violations, convergedMS := e.oracle.verify(ctx)
+	for _, v := range violations {
+		v.Tick = e.rec.Ticks
+		v.JournalOffset = e.lastActionOffset
+		e.violate(v)
+	}
+	e.rec.Settles = append(e.rec.Settles, settleRecord{
+		Tick:        e.rec.Ticks,
+		ConvergedMS: convergedMS,
+		Passed:      len(violations) == 0,
+		Violations:  len(violations),
+	})
+
+	result := resultPass
+	if len(violations) > 0 {
+		result = resultFail
+	}
+	ev := event{Event: evSettleResult, Tick: e.rec.Ticks, Result: result}
+	// convergedMS is -1 on a deadline; only a real convergence time is worth
+	// recording (the field is omitempty).
+	if convergedMS >= 0 {
+		ev.ConvergedMS = convergedMS
+	}
+	e.jrnl.emit(ev)
+}
+
 // nodesFor is the set of nodes one decision disrupts: its target, plus the
 // ring-next peer for a gateway-pair fault. It is what execute marks
 // disrupted, what the restore loop puts back, and what convergence gates
@@ -446,6 +505,21 @@ func (e *engine) execute(ctx context.Context, d decision) {
 
 	injectedAt := e.now()
 	e.jrnl.emit(event{Event: evInject, Tick: d.tick, Action: d.action.name, Target: d.target, Peer: d.peer})
+	e.lastActionOffset = e.jrnl.count()
+
+	// Ask the oracle to record what this fault means for the drain
+	// classification before it lands. An error means the question could not
+	// be asked (docker under load, the container gone mid-inject); the oracle
+	// tolerates the residue rather than fabricating a violation, and here it
+	// is journaled — never fatal, mirroring checkError's "could not ask"
+	// philosophy.
+	if e.oracle != nil {
+		if err := e.oracle.observeInject(ctx, d.action.name, d.target); err != nil {
+			e.jrnl.emit(event{Event: evCheckError, Tick: d.tick, Target: d.target,
+				Detail: "oracle drain classification: " + err.Error()})
+		}
+	}
+
 	if err := d.action.inject(ctx, e.lab, d.target, d.flip); err != nil {
 		e.undo(ctx, d, err)
 		return
