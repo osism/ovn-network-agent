@@ -4,12 +4,25 @@ name: E2E Chaos
 # every job there asserts one fault and leaves the lab baseline-green,
 # while the runner injects a randomized *sequence* and deliberately
 # leaves the master wherever the last election put it, so it is not
-# something to hang off every PR. `workflow_dispatch` gives it a CI
-# path — the one place `execCommander`, the `containerlab tools veth
-# create` re-wire and the collector actually run against a real lab —
-# without adding ~15 min to the PR suite. Dispatch it from the Actions
-# tab when you touch the agent's failover, drain or chassis-cleanup
-# paths.
+# something to hang off every PR. This workflow is its CI path — the one
+# place `execCommander`, the `containerlab tools veth create` re-wire and
+# the collector actually run against a real lab — on three triggers, none
+# of them the default ~15 min PR gate:
+#
+#   - Nightly (`schedule`): accumulating seeded exploration. Each night
+#     sweeps the curated profiles as a matrix, one job per profile at the
+#     runner-default 10 minutes, with the seed set to the run id so
+#     successive nights explore different action sequences. The seed is
+#     echoed to the run log and recorded in the uploaded run record, so a
+#     failing night is replayable from its own artifacts.
+#   - Dispatch (`workflow_dispatch`): the exact replay path. Dispatching
+#     with the seed, profile and duration recorded in a failing nightly
+#     job reruns that job exactly. Also the ad-hoc path: dispatch it from
+#     the Actions tab when you touch the agent's failover, drain or
+#     chassis-cleanup paths.
+#   - PR smoke (`pull_request: labeled`): applying the `chaos-smoke` label
+#     opts a single PR into a 3-minute seed-42 `everything-on` smoke,
+#     rather than adding chaos to every PR in the suite.
 #
 # Unlike the e2e.yml jobs there is no separate baseline gate here: the
 # runner refuses to start against a lab whose combined start state (a
@@ -17,35 +30,158 @@ name: E2E Chaos
 # code 2 — distinct from a real violation (exit 1).
 on:
   workflow_dispatch:
-    # The defaults reproduce the historical CI run (`-seed 42
-    # -duration 3m`): a fixed seed keeps the action sequence
-    # reproducible, and 3 minutes of faults plus the recovery budget of
-    # whatever action was in flight stays inside the same budget as the
-    # drain-hitless job in e2e.yml.
+    # The defaults (`-seed 42 -duration 10m -profile everything-on`)
+    # match a nightly everything-on job's duration and profile, not its
+    # seed — nightly jobs seed from the run id. To replay a specific
+    # nightly job, dispatch with the seed, profile and duration read back
+    # from that job's artifacts; the fixed seed then reproduces its
+    # action sequence exactly.
     inputs:
       seed:
         description: RNG seed for the fault sequence (same seed, same sequence)
         required: false
         default: "42"
       duration:
-        description: Fault-injection duration, Go syntax (bounded by the 25-minute job timeout)
+        description: Fault-injection duration, Go syntax (bounded by the 40-minute job timeout)
         required: false
-        default: "3m"
+        default: "10m"
+      profile:
+        description: Curated chaos profile to replay (profiles listed in registry order)
+        required: false
+        type: choice
+        default: everything-on
+        options:
+          - everything-on
+          - flat-minimal
+          - flat-dnat
+          - vlan-no-dnat
+          - pf-only
+          - heterogeneous
+  # Nightly, off the hour, staggered clear of the Monday 05:00–06:00 UTC
+  # weekly-cron burst (govulncheck/test/codeql/scorecard).
+  schedule:
+    - cron: "17 3 * * *"
+  # Only the `chaos-smoke` label opts a PR in — the gate that acts on it
+  # lives on the `params` job below, so the default PR gate stays at its
+  # current cost. Applying the label needs triage permission, which is
+  # the cost gate.
+  pull_request:
+    types: [labeled]
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
-  chaos:
-    name: Seeded chaos session
+  # Resolve the three run inputs — the profile matrix, the seed and the
+  # duration — once, per trigger, so the chaos job below reads them the
+  # same way on every path. No checkout: the job only writes strings.
+  params:
+    name: Resolve run inputs
     runs-on: ubuntu-latest
-    # Same budget as e2e.yml's drain-hitless job: one bring-up, the
-    # fault window, plus the recovery budget of whatever action was in
-    # flight when the duration expired. A `timeout-minutes` cancellation
-    # is not a failure, so keeping the cap a backstop (rather than the
-    # thing that ends the run) is what lets the runner dump its own
-    # lab-state bundle on the failure path.
-    timeout-minutes: 25
+    timeout-minutes: 5
+    # Unrelated label events skip the whole run; the `chaos` job inherits
+    # the skip through `needs`. This is the PR cost gate — a PR runs
+    # chaos only once someone with triage permission applies the
+    # `chaos-smoke` label.
+    if: github.event_name != 'pull_request' || github.event.label.name == 'chaos-smoke'
+    outputs:
+      profiles: ${{ steps.resolve.outputs.profiles }}
+      seed: ${{ steps.resolve.outputs.seed }}
+      duration: ${{ steps.resolve.outputs.duration }}
+    steps:
+      - name: Resolve inputs per trigger
+        id: resolve
+        # The dispatch inputs travel through env instead of being
+        # interpolated into the script, so a dispatch payload can never
+        # inject shell syntax into it (same rule as the run step below).
+        #
+        # The nightly profile list is duplicated here and in the dispatch
+        # `choice` options above because a `choice` input's options cannot
+        # be computed. `TestChaosWorkflowSweepsEveryProfile` in
+        # test/e2e/chaos/profiles_test.go guards both lists against drift
+        # from the registry in test/e2e/chaos/profiles.go.
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_DURATION: ${{ inputs.duration }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+        run: |
+          case "${GITHUB_EVENT_NAME}" in
+          schedule)
+            # Nightly: sweep every curated profile, seed = the run id so
+            # each night is a different (recorded, replayable) sequence.
+            profiles='["everything-on","flat-minimal","flat-dnat","vlan-no-dnat","pf-only","heterogeneous"]'
+            seed="${GITHUB_RUN_ID}"
+            duration="10m"
+            ;;
+          workflow_dispatch)
+            # Replay/ad-hoc: a single chosen profile at the dispatched
+            # seed and duration.
+            profiles="[\"${INPUT_PROFILE}\"]"
+            seed="${INPUT_SEED}"
+            duration="${INPUT_DURATION}"
+            ;;
+          pull_request)
+            # PR smoke: one profile, a fixed seed, a short fault window.
+            profiles='["everything-on"]'
+            seed="42"
+            duration="3m"
+            ;;
+          esac
+          # seed and duration are written to GITHUB_OUTPUT below, and on
+          # the dispatch path they are free-form inputs. Passing them
+          # through env blocks shell injection but not GITHUB_OUTPUT
+          # injection: a newline in the value opens a second `key=value`
+          # line. Since profiles= is written before seed=, an injected
+          # `profiles=[...]` line lands after the constrained one, wins as
+          # the last value for the key, and fans the matrix out to
+          # attacker-chosen values. Reject anything but a bare non-negative
+          # integer seed, and forbid a newline in duration. The schedule
+          # and PR paths set literals that pass unchanged.
+          case "${seed}" in
+          ''|*[!0-9]*)
+            echo "seed must be a non-negative integer, got: ${seed}" >&2
+            exit 1
+            ;;
+          esac
+          case "${duration}" in
+          *$'\n'*)
+            echo "duration must not contain a newline" >&2
+            exit 1
+            ;;
+          esac
+          # Echoing to the run log is what records the resolved nightly
+          # seed there; the runner also records it in the uploaded
+          # summary.json and journal.jsonl. Writing the same three values
+          # to GITHUB_OUTPUT is what the matrix and the chaos job read.
+          echo "profiles: ${profiles}"
+          echo "seed: ${seed}"
+          echo "duration: ${duration}"
+          {
+            echo "profiles=${profiles}"
+            echo "seed=${seed}"
+            echo "duration=${duration}"
+          } >> "${GITHUB_OUTPUT}"
+
+  chaos:
+    name: Seeded chaos session (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    needs: params
+    # fail-fast: false keeps one profile's failure from cancelling the
+    # other five nightly jobs — each profile's run is worth its own
+    # artifact bundle.
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(needs.params.outputs.profiles) }}
+    # Budget for one bring-up (~10 min incl. image builds), the profile
+    # apply (up to three gateway restarts), the 10-minute wall-clock
+    # fault window, the final settle (≤ the runner's 2m settle timeout
+    # plus confirmation), ≤2 min of lab-state collection and teardown. A
+    # `timeout-minutes` cancellation is not a failure, so keeping the cap
+    # a backstop (rather than the thing that ends the run) is what lets
+    # the runner still dump its own lab-state bundle on the failure path.
+    timeout-minutes: 40
 
     env:
       E2E_TOPOLOGY: test/e2e/topology.clab.yml
@@ -74,9 +210,20 @@ jobs:
         # into the run script, so a dispatch payload can never inject
         # shell syntax into the command line.
         env:
-          CHAOS_SEED: ${{ inputs.seed }}
-          CHAOS_DURATION: ${{ inputs.duration }}
-        run: make e2e-chaos CHAOS_FLAGS="-duration ${CHAOS_DURATION} -seed ${CHAOS_SEED} -out ${RUNNER_TEMP}/chaos"
+          CHAOS_SEED: ${{ needs.params.outputs.seed }}
+          CHAOS_DURATION: ${{ needs.params.outputs.duration }}
+          CHAOS_PROFILE: ${{ matrix.profile }}
+        run: make e2e-chaos CHAOS_FLAGS="-duration ${CHAOS_DURATION} -seed ${CHAOS_SEED} -profile ${CHAOS_PROFILE} -out ${RUNNER_TEMP}/chaos"
+
+      # The runner dumps `lab-state/` into the out directory itself on any
+      # non-zero exit, but a `make e2e-up` failure dies before the runner
+      # ever starts. This guard collects lab state in exactly that case
+      # and never double-collects. (The job-level LAB env already serves
+      # collect-artifacts.sh.)
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          [ -d "${RUNNER_TEMP}/chaos/lab-state" ] || ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/chaos/lab-state"
 
       # Uploaded on every outcome, not just failure: the journal and the
       # run summary are the artifact the run exists to produce, and a
@@ -87,7 +234,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: e2e-artifacts-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-artifacts-chaos-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chaos
           if-no-files-found: warn
           retention-days: 7
