@@ -70,6 +70,8 @@
 # start honours:
 #   BGPD_WAIT_SECS=30      # readiness wait per start attempt, seconds
 #   BGPD_START_ATTEMPTS=3  # bounded retries before bring-up is failed
+# and the gateway-entrypoint gate honours:
+#   GWNODE_READY_SECS=120  # wait for the agent process per bring-up
 
 set -euo pipefail
 
@@ -125,6 +127,13 @@ BGP_ROUTER_ID_UPSTREAM="${BGP_ROUTER_ID_UPSTREAM:-100.64.0.1}"
 # full job re-run.
 BGPD_WAIT_SECS="${BGPD_WAIT_SECS:-30}"
 BGPD_START_ATTEMPTS="${BGPD_START_ATTEMPTS:-3}"
+
+# Budget for wait_for_gateway_agents. The gwnode entrypoint's own
+# readiness probes allow up to ~2 minutes of legitimate daemon start
+# time (OVS 30s + br-int 30s + FRR 30s + config push 30s) before it
+# gives up and says why, so the gate must not time out earlier and
+# steal that diagnostic.
+GWNODE_READY_SECS="${GWNODE_READY_SECS:-120}"
 
 CLIENT_NAME="${CLIENT_NAME:-client-1}"
 CLIENT_NODE="clab-${LAB_NAME}-${CLIENT_NAME}"
@@ -225,6 +234,71 @@ wait_for_chassis() {
             tail -n 50 /var/log/ovn/ovn-controller.log >&2 || true
         log "--- ${name}: docker logs ---"
         docker logs --tail 30 "clab-${LAB_NAME}-${name}" >&2 || true
+    done
+    exit 1
+}
+
+# Docker's `restart: always` (containerlab's policy for every node) hides
+# entrypoint crashes: the replacement container comes up healthy and
+# re-registers its chassis in SB, so wait_for_chassis passes — but a
+# restart that landed after containerlab wired the data-plane veths has
+# destroyed them with the old netns, and wire_gateway_underlay /
+# configure_upstream / configure_client then die on `Cannot find device
+# "eth1"` with no visible cause. Surface every restart loudly, with the
+# container's log tail (docker logs spans the previous instance too), so
+# a veth failure that follows is attributable from the job log alone.
+# Warn-only: a restart that landed before the links were wired is
+# harmless, and the wiring steps below still fail hard when it was not.
+report_container_restarts() {
+    local name node restarts
+    for name in "$@"; do
+        node="clab-${LAB_NAME}-${name}"
+        restarts="$(docker inspect --format '{{.RestartCount}}' "${node}" 2>/dev/null || true)"
+        if [ -n "${restarts}" ] && [ "${restarts}" != "0" ]; then
+            log "WARNING: ${node} restarted ${restarts}x since deploy — its entrypoint died at least once; log tail follows"
+            docker logs --tail 40 "${node}" >&2 || true
+        fi
+    done
+}
+
+# SB chassis registration is a MID-entrypoint milestone: ovn-controller
+# registers the chassis as soon as it connects to SB, before the gwnode
+# entrypoint has created vrf-provider (setup_vrf) or brought up FRR. So
+# wait_for_chassis passing does not make the gateways safe to touch —
+# on a fast runner, bootstrap's ~1s of NB provisioning can outrun the
+# entrypoint's remaining steps and wire_gateway_underlay then dies on
+# `ip link set eth1 master vrf-provider: Device does not exist`
+# (observed: registration at t+0.5s, wiring at t+0.9s, setup_vrf at
+# t+1.1s). Gate on the agent process instead: the entrypoint execs
+# ovn-network-agent as its final act, so a running agent implies every
+# prior milestone — VRF, loopback1, FRR started and configured. Same
+# signal as the image healthcheck, but polled at 1s instead of 10s.
+wait_for_gateway_agents() {
+    local pending name node
+    log "waiting for gwnode entrypoints to finish (agent running): $*"
+    for _ in $(seq 1 "${GWNODE_READY_SECS}"); do
+        pending=""
+        for name in "$@"; do
+            node="clab-${LAB_NAME}-${name}"
+            if ! docker exec "${node}" pgrep -f \
+                    /usr/local/bin/ovn-network-agent >/dev/null 2>&1; then
+                pending="${pending} ${name}"
+            fi
+        done
+        if [ -z "${pending}" ]; then
+            log "agent running on all $# gateways"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "gwnode entrypoint did not finish within ${GWNODE_READY_SECS}s;" \
+        "agent still missing on:${pending}" >&2
+    # The entrypoint's ERR trap and readiness probes log why it is stuck
+    # (or died) to the container log — dump it for each straggler.
+    # shellcheck disable=SC2086  # ${pending} is a space-separated name list
+    for name in ${pending}; do
+        log "--- ${name}: docker logs ---"
+        docker logs --tail 60 "clab-${LAB_NAME}-${name}" >&2 || true
     done
     exit 1
 }
@@ -368,9 +442,10 @@ configure_upstream() {
 
 # Dump the upstream container's FRR daemon state to stderr (the job
 # log) so a bgpd bring-up failure can be root-caused after the fact. The
-# upstream image is unpinned (frrouting/frr:latest), so every command is
-# individually best-effort and drawn from an independent source: a
-# future image change degrades one section, not the whole report.
+# upstream image is pinned by digest in topology.clab.yml, but every
+# command stays individually best-effort and drawn from an independent
+# source: a future image bump degrades one section, not the whole
+# report.
 dump_upstream_frr_state() {
     log "dumping ${UPSTREAM_NODE} FRR state for triage"
     log "--- /etc/frr/daemons ---"
@@ -650,6 +725,17 @@ main() {
     ensure_fips
     ensure_workload_lsp
     ensure_upstream_nexthop_mac_binding
+
+    # Before touching the wired interfaces, name any container that has
+    # been auto-restarted since deploy: a restart in the wrong window is
+    # the known cause of a missing eth1 below.
+    report_container_restarts "${chassis_names[@]}" "${UPSTREAM_NAME}" "${CLIENT_NAME}"
+
+    # The chassis gate above passes mid-entrypoint; the wiring and FRR
+    # steps below need the entrypoint's later milestones (vrf-provider,
+    # FRR). Sits here, not next to wait_for_chassis, so the NB
+    # provisioning above overlaps with the entrypoints finishing.
+    wait_for_gateway_agents "${chassis_names[@]}"
 
     # Underlay: each gateway's eth1 moves out of br-ex into vrf-provider
     # with a /30, upstream takes the matching /30s plus a /24 toward the
