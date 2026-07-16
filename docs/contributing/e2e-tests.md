@@ -1411,16 +1411,22 @@ dumped into `<out>/lab-state`.
 
 **In CI.** The runner has its own workflow,
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
-which runs on `workflow_dispatch` only and uploads the journal, the
-summary and the lab-state dump on every outcome. The seed and duration
-are dispatch inputs defaulting to `-seed 42 -duration 3m`; the run uses
-the default profile (a profile matrix is
-[#180](https://github.com/osism/ovn-network-agent/issues/180)). It is
-deliberately not part of `e2e.yml`'s PR path: the scenarios there each
-assert one fault and leave the lab baseline-green, while a chaos run is
-a randomized sequence that deliberately leaves the master wherever the
-last election put it. Dispatch it from the Actions tab when you touch
-the agent's failover, drain or chassis-cleanup paths.
+on three triggers. Nightly it fans out as a matrix over all six curated
+profiles, one job per profile at the default 10-minute window, with the
+seed set to the run id so each night is a different — and, because the
+runner records it, replayable — fault sequence. `workflow_dispatch`
+takes `seed`/`duration`/`profile` inputs (defaulting to 42 / 10m /
+`everything-on`), so replaying a failing nightly combination is just
+dispatching it with the seed, profile and duration read back from that
+job's artifacts. A pull request opts into a short smoke (3 minutes,
+seed 42, `everything-on`) by carrying the `chaos-smoke` label, rather
+than chaos running on every PR. Each profile's journal and summary
+upload on every outcome, with the lab-state dump added on failure. It
+is deliberately not part of `e2e.yml`'s PR path: the scenarios there
+each assert one fault and leave the lab baseline-green, while a chaos
+run is a randomized sequence that deliberately leaves the master
+wherever the last election put it. Dispatch it from the Actions tab
+when you touch the agent's failover, drain or chassis-cleanup paths.
 
 ### Manual setup for triage
 
@@ -1478,9 +1484,10 @@ Docs-only changes are skipped with a `paths-ignore` filter (`docs/**`,
 to date, so the merged commit already passed E2E on its PR and
 re-running the ~10 min suite post-merge would only burn runner time.
 The [chaos runner](#chaos-runner) is not part of this workflow — it has
-its own dispatch-only
+its own
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
-described in the chaos-runner section above.
+running on the nightly profile matrix, manual dispatch and the
+`chaos-smoke` PR label, described in the chaos-runner section above.
 
 One job runs per scenario, each on its own runner so a regression in one
 scenario is reported in isolation. Every job installs containerlab and
