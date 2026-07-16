@@ -231,7 +231,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | Scenario | `make` target | What it asserts | Issue |
 | --- | --- | --- | --- |
 | [Baseline](#baseline) | `e2e-baseline` | An external client reaches a FIP once the agent reconciles. | [#45](https://github.com/osism/ovn-network-agent/issues/45) |
-| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of six agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, and no gateway port is claimed twice. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177) |
+| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of six agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, no gateway port is claimed twice, and the lab converges to its config-aware expected state in settle windows. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177), [#179](https://github.com/osism/ovn-network-agent/issues/179) |
 | [Drain-hitless](#drain-hitless) | `e2e-drain-hitless` | A graceful `SIGTERM` drain loses fewer packets than a hard `docker kill` of the same chassis. | [#113](https://github.com/osism/ovn-network-agent/issues/113) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
 | [Hairpin](#hairpin) | `e2e-hairpin` | The `cookie=0x998` hairpin flow reflects FIP-to-FIP traffic on `br-ex`. | [#108](https://github.com/osism/ovn-network-agent/issues/108) |
@@ -888,9 +888,9 @@ structured artifacts. Its unit tests run under `make test` on any
 platform (they drive the real engine against a fake `docker`).
 
 **Inputs — and the replay contract.** The profile, the seed, the
-duration, the tick bounds and the action weights are the *only* inputs,
-and every decision the engine makes is drawn from a PCG stream seeded by
-`-seed` alone:
+duration, the tick bounds, the settle schedule and the action weights
+are the *only* inputs, and every decision the engine makes is drawn from
+a PCG stream seeded by `-seed` alone:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -898,11 +898,13 @@ and every decision the engine makes is drawn from a PCG stream seeded by
 | `-profile` | `everything-on` | The [configuration profile](#configuration-profiles): the start topology and the agent configuration each gateway runs. An unknown name is rejected. |
 | `-duration` | `10m` | How long to keep injecting faults. Must be at least `1s`. |
 | `-tick-min` / `-tick-max` | `10s` / `30s` | Bounds of the interval between decisions. `-tick-min` must be at least `100ms`: a tick interval near zero spins the loop and grows the journal without bound, on a run where no fault fits between two ticks. |
+| `-settle-every` | `3m` | How often injection pauses for a settle window that verifies the lab against its config-aware expected state. `0` runs only the final settle after the last fault; a negative value is rejected. |
+| `-settle-timeout` | `2m` | How long a settle window may take to reach full convergence before the divergence becomes violations. Must be at least `35s` — the window has to outlast one slow-cadence reconcile (15 s) plus the 20 s confirmation gap. |
 | `-weights` | registry defaults | `name=n,…`; an unknown action name is rejected. `-weights gateway-kill=0` disables a fault. |
 | `-lab` | `ovn-e2e` | containerlab lab name. |
 | `-out` | `chaos-artifacts` | Where the journal, the run record and the lab-state dump land. |
 | `-collect` | `test/e2e/scenarios/collect-artifacts.sh` | The lab-state collector, run into `<out>/lab-state` when the run does not pass. The default is repo-relative, so run the binary from the repo root (`make e2e-chaos` does). |
-| `-gwnode-config` | `test/e2e/gwnode-config.yaml` | The baked gateway agent config a profile's overlays are layered over. Also repo-relative. |
+| `-gwnode-config` | `test/e2e/gwnode-config.yaml` | The baked gateway agent config a profile's overlays are layered over. Also repo-relative. It now binds `metrics_listen` on loopback so the settle oracle can scrape each agent's own flap-indicator metrics. |
 
 Two runs with identical inputs against identically-behaving labs replay
 the identical action sequence. **Profile and seed together** identify a
@@ -926,7 +928,13 @@ cannot shift the stream: the run that skipped a decision draws the same
 values afterwards as the run that executed it. The flip is drawn on every
 tick even though only `config-flip` reads it, for that same reason. Wall
 clock only bounds *how many* ticks fit in `-duration`, so a slower lab
-truncates the tail of the sequence rather than changing it.
+truncates the tail of the sequence rather than changing it. Settle
+windows draw from that same wall clock and not from the seed: a build
+with settles fits fewer ticks into a given `-duration` than one without,
+so a run recorded before settles existed replays a shorter tail here —
+but for any given tick count the decision stream is exactly the one the
+seed produces. Both settle flags are echoed into `run-start` and
+`summary.json` alongside the seed and profile.
 
 ::: warning Sequences are versioned by the build, not by the seed alone
 A recorded seed replays the sequence it recorded only against the same
@@ -1123,8 +1131,9 @@ MAC-tweak flows exist only where routers are locally active, a
 port-forward-only profile has no FIP routes — rather than record a no-op
 deletion. Removing the MAC-tweak flow darkens external probes and is
 measured; the hairpin flow's restoration is not probe-observable from
-`client-1` (asserting its presence is the config-aware oracle of
-[#179](https://github.com/osism/ovn-network-agent/issues/179)).
+`client-1`, so the config-aware oracle of
+[#179](https://github.com/osism/ovn-network-agent/issues/179) asserts its
+presence in every settle window instead.
 
 **Routing flaps** restart the FRR/BGP daemons and let the run assert the
 announcements return — the probes from `client-1` are only reachable over
@@ -1232,6 +1241,100 @@ evidence that the invariants were evaluated at all: a run whose every
 dual-claim lookup failed asserted nothing, and fails with a
 `checks-never-ran` violation instead of reporting a clean pass.
 
+**The expected-state oracle.** A green probe proves a FIP is
+reachable; it cannot prove the lab is *configured the way it says it
+is*. A route left on a drained gateway, a DNAT rule surviving a config
+change, an announcement for a prefix the filter should exclude — none of
+these darken a probe, and a stale announcement drawing traffic to a dead
+gateway is worse than an outage. Without a config-aware oracle a
+profile-driven run cannot tell "the agent ignored my configuration" from
+"converged fine" (issue
+[#179](https://github.com/osism/ovn-network-agent/issues/179)).
+
+**The settle model.** Periodically (`-settle-every`) and always once
+more after the last fault, injection stops — the settle window runs
+*between* ticks, with every node already restored — and the oracle polls
+the lab every 5 s until every gateway's live data plane matches the
+state its *current* configuration demands. A first all-green evaluation
+is confirmed by a second one 20 s later, with the agent's
+`route_readds_total` steady between the two; only then does the window
+pass. If `-settle-timeout` expires first, the last evaluation's failures
+become violations, and any violation fails the run. Every poll recomputes
+the expectation, so a settle tracks a `config-flip` the instant it lands.
+
+**The seven verified planes.** For each gateway the oracle diffs the
+live data plane against a per-gateway expectation recomputed from the OVN
+NB/SB snapshot and that gateway's own config:
+
+| Plane | What the oracle checks |
+| --- | --- |
+| Kernel routes | proto-44 `/32`s on their device (`br-ex`, or `br-ex.<tag>` for a VLAN segment) |
+| FRR statics | `/32` statics in `vrf-provider` via the veth nexthop |
+| Prefix-list | the `ANNOUNCED-NETWORKS` entries |
+| Hairpin flows | OVS flows under cookie `0x998`, by destination |
+| MAC-tweak flows | the count of cookie `0x999` flows |
+| nftables | DNAT and hairpin-masquerade rules in table `ovn-network-agent` |
+| Managed VIPs | `/32` addresses on `port_forward_dev` |
+
+An eighth check reaches past the gateways to the upstream router: the BGP
+announcements `upstream` actually holds, bounded both ways — nothing
+stale (announced ⊆ desired) and nothing missing (every desired IP the
+mode requires must be announced). They are read from the upstream router
+itself, the ground truth of what the underlay carries, not from any
+gateway's claim about them.
+
+**Config awareness.** The expectation follows the configuration, not a
+fixed target — which is the whole point. With a `network_cidr` filter a
+floating IP outside it must appear in **no** plane; without
+`port_forwards` the agent's nftables table must carry no DNAT chains; in
+port-forward-only mode the agent must not touch OVN at all — its managed
+NB rows stay frozen at their prime content (`ovn-touched-in-pf-only`) and
+only the VIP planes are expected; with the drain disabled a terminating
+agent must not leave a lowered `Gateway_Chassis` priority behind
+(`drain-while-disabled`). Because every poll recomputes from the
+gateway's tracked config, a `cidr-toggle` or a `drain-toggle` moves the
+expectation with it.
+
+**Drain residue is tolerated where a drain explains it.** A
+`Gateway_Chassis` row sitting at priority 0 is a violation only when no
+legitimate drain accounts for it. The oracle tolerates three cases: a row
+already at 0 when the run started; a gateway whose last disruptive action
+ran with the drain *effectively* enabled (the marker / env / config
+resolution mirroring the entrypoint's own precedence); and a gateway
+whose drain question could not be asked at all — an unanswerable question
+tolerates the residue rather than inventing a violation. One blind spot
+is accepted by design: an agent that wrongly drains and then wrongly
+restores its own priority evades the between-ticks check, because the
+window only ever sees the settled state.
+
+**Snapshot invariants.** Three further checks hold across the whole
+snapshot rather than per gateway: the elected owner of every
+multi-candidate `chassisredirect` port must strictly outrank every peer
+(the priority lead HA re-election exists to keep); no managed route may
+name a chassis that has vanished from SB (vanished-chassis hygiene); and
+under port-forward-only the managed NB rows stay frozen at their prime
+content. That frozen-NB check is scoped to rows carrying the agent's own
+`external_ids` markers — an unmarked write would slip past it.
+
+**The metrics flap gate.** The set checks see a converged plane; they
+cannot see a route that is re-added on *every* reconcile and still looks
+right at each poll. So the oracle also scrapes each agent's own
+Prometheus endpoint (`metrics_listen`, loopback-only, over `docker exec`
+and a bash `/dev/tcp` socket) and fails the settle on a non-zero
+`consecutive_readds` or `inactive_routes`, or on any `route_readds_total`
+movement across the 20 s confirmation gap — a flap even when every probe
+stays green.
+
+**Violations and triage.** The oracle adds five violation kinds —
+`expected-state`, `route-flap`, `drain-while-disabled`,
+`ovn-touched-in-pf-only`, and `oracle-setup`. Each settle violation is
+stamped with the tick and the `journal_offset` of the last executed
+action, so a reader jumps from the violation in `summary.json` straight
+to the fault interleaving that preceded it in `journal.jsonl`.
+`oracle-setup` is the one that is fatal: when the oracle cannot prime
+against the green start state the run aborts with exit code 2, like any
+other setup it could not be built on.
+
 ::: details Why the runner re-wires the containerlab veth
 Any container exit destroys the containerlab veth
 `gateway-N:eth1 ↔ upstream:ethN`, and `docker start` does not bring it
@@ -1283,7 +1386,9 @@ flip among them — and either `executed` or a `skip_reason`), `inject` /
 between, and `rejected` when the agent refused it), `ovn-churn` (each
 executed churn, with the `object` it touched and the `from`/`to` values it
 moved between), `node-state`, `probe-transition`, `vip-repoint`,
-`violation` and `run-end`. A `decision`, `inject` or `converged` for a
+`settle-start` / `settle-result` (the latter with the `converged_ms` the
+settle window took to reach its expected state), `violation` and
+`run-end`. A `decision`, `inject` or `converged` for a
 multi-node fault carries the `peer` it also disrupted, and a decision that
 touched a named object (a route, a database server, an nftables table)
 carries it in `object` — so a run mixing all classes is triageable from the
@@ -1291,11 +1396,16 @@ artifacts alone.
 `summary.json` aggregates the run: inputs, tick and decision counts,
 actions by name, how many baseline sweeps ran and how many of them
 evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
-loss buckets, the per-action recovery durations, and every violation.
+loss buckets, the per-action recovery durations, a `settles` section (one
+entry per settle window: its tick, `converged_ms`, whether it passed, and
+how many violations it raised), and every violation — each now stamped
+with the `journal_offset` of the last executed action, so it points back
+into `journal.jsonl`.
 
 **Exit codes:** `0` the run passed, `1` the run recorded a violation,
 `2` the runner could not set the run up (bad flags, an unknown profile, a
-configuration the agent rejected, a start state that never went green).
+configuration the agent rejected, a start state that never went green, an
+oracle that could not prime against it).
 On any non-zero exit the lab's existing `collect-artifacts.sh` bundle is
 dumped into `<out>/lab-state`.
 
