@@ -1145,7 +1145,11 @@ touches a completion marker the restore gates on: run synchronously, the
 stop+start can outlive the runner's 30 s command timeout on a loaded CI
 machine — the SIGKILL reaps only the `docker exec` client while FRR
 restarts anyway, and the run records an `action-failed` violation for a
-lab that is healthy seconds later. `upstream-bgp-restart` stops `bgpd` on `upstream` and
+lab that is healthy seconds later. The marker wait runs on its own
+three-minute budget (`frrRecycleTimeout`), not the 60 s daemon-ready
+budget: it carries the whole stop+clear+start, which loaded runners have
+pushed past both shorter bounds while the lab-state dump showed FRR
+healthy again moments after the abort. `upstream-bgp-restart` stops `bgpd` on `upstream` and
 starts it back **in place** — never a `docker restart` and never
 `frrinit.sh restart`, because `watchfrr` is PID 1 on that node and either
 would take the container and its five containerlab veths down (the

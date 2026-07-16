@@ -585,7 +585,14 @@ func (l *lab) configureGatewayBGP(ctx context.Context, gw string, link underlayL
 // left unwatched, each remaining loop would spin out its 60s against
 // commands the dead context fails instantly.
 func (l *lab) waitReady(ctx context.Context, node, probe string) error {
-	deadline := l.now().Add(daemonReadyTimeout)
+	return l.waitReadyFor(ctx, node, probe, daemonReadyTimeout)
+}
+
+// waitReadyFor is waitReady on the caller's own budget — for the wait
+// that carries more than one daemon coming up, like the backgrounded FRR
+// recycle whose completion marker arrives only after a full stop+start.
+func (l *lab) waitReadyFor(ctx context.Context, node, probe string, timeout time.Duration) error {
+	deadline := l.now().Add(timeout)
 	for l.now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("waiting for %q on %s: %w", probe, node, err)
@@ -595,7 +602,7 @@ func (l *lab) waitReady(ctx context.Context, node, probe string) error {
 		}
 		l.sleep(2 * time.Second)
 	}
-	return fmt.Errorf("%q on %s did not succeed within %s", probe, node, daemonReadyTimeout)
+	return fmt.Errorf("%q on %s did not succeed within %s", probe, node, timeout)
 }
 
 // ensureVIPRouting points the port-forward VIP's two hand-plumbed routes
