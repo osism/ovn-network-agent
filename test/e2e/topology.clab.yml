@@ -59,32 +59,64 @@ topology:
       image: ovn-network-agent/gwnode:e2e
       env:
         CHASSIS_NAME: gateway-1
+      # Create the gateways only after `central` is up: the gwnode
+      # entrypoint resolves the SB remote (`central`) by name, and a
+      # gateway created before central could reach that lookup while the
+      # name was still unregistered. The entrypoint retries the lookup
+      # (see resolve_sb_remote in gwnode-entrypoint.sh); this ordering
+      # removes the race entirely instead of merely surviving it.
+      stages:
+        create:
+          wait-for:
+            - node: central
+              stage: create
 
     gateway-2:
       kind: linux
       image: ovn-network-agent/gwnode:e2e
       env:
         CHASSIS_NAME: gateway-2
+      # See gateway-1.
+      stages:
+        create:
+          wait-for:
+            - node: central
+              stage: create
 
     gateway-3:
       kind: linux
       image: ovn-network-agent/gwnode:e2e
       env:
         CHASSIS_NAME: gateway-3
+      # See gateway-1.
+      stages:
+        create:
+          wait-for:
+            - node: central
+              stage: create
 
     upstream:
       kind: linux
-      image: frrouting/frr:latest
+      # Pinned by digest so a registry-side change cannot alter the lab
+      # silently. Docker Hub's frrouting/frr is frozen at FRR 8.4 (last
+      # push 2022) — maintained images live on quay.io/frrouting/frr. The
+      # intermittent `bgpd crashed in startup, signal 11` seen in CI is
+      # inherent to this old build (bootstrap.sh retries the start);
+      # upgrading to a maintained FRR is a separate, behavior-changing
+      # step.
+      image: frrouting/frr:latest@sha256:990e83490108b686fd6df3b1cafa6bdbb2714acb00eedb9a89693946f46f45ce
 
     client-1:
       kind: linux
-      image: nicolaka/netshoot:latest
+      # v0.16 is the exact image `latest` resolved to when the pin
+      # landed — same content, now immutable and Renovate-updatable.
+      image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
       # Stay alive without a service — netshoot exits otherwise.
       cmd: "sleep infinity"
 
     client-2:
       kind: linux
-      image: nicolaka/netshoot:latest
+      image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
       cmd: "sleep infinity"
 
   links:

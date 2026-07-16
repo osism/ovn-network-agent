@@ -2,5 +2,16 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>osism/renovate-config"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Container image pins in containerlab topology files",
+      "managerFilePatterns": ["/\\.clab\\.ya?ml$/"],
+      "matchStrings": [
+        "image:\\s*(?<depName>[a-z0-9][a-z0-9._\\-/]*):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
   ]
 }

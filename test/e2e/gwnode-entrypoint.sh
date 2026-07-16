@@ -6,9 +6,18 @@
 # ovn-network-agent in the foreground so the container's lifecycle is
 # tied to the agent process.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 log() { printf '[gwnode] %s\n' "$*" >&2; }
+
+# `set -e` kills PID 1 without a word when an unguarded command fails, and
+# Docker's `restart: always` replaces the container so fast that the crash
+# is invisible — the restarted entrypoint's output just continues the log.
+# That silence is what made the eth1-destroying restart race (see the
+# daemon-start block below) cost days to root-cause. The trap cannot stop
+# the exit, but it names the dying command and line in `docker logs`.
+# `set -E` extends the trap into functions.
+trap 'log "FATAL: entrypoint exiting at line ${LINENO}: ${BASH_COMMAND} (exit $?)"' ERR
 
 # Use the chassis name the OVN central bootstrap script seeds. Falls back
 # to the container hostname so the image still works when launched outside
@@ -144,7 +153,15 @@ resolve_sb_remote() {
         return 0 # already numeric, or a form we do not understand — keep
     fi
     for _ in $(seq 1 30); do
-        ip="$(getent hosts "${host}" | awk '{print $1; exit}')"
+        # getent exits non-zero while the name is still unregistered — the
+        # very state this loop exists to wait out. Without the `|| true`,
+        # pipefail turns that into a failed assignment and `set -e` kills
+        # PID 1 on the first iteration, silently; when Docker's restart
+        # then lands after containerlab has wired eth1, the veth dies with
+        # the old netns and the lab is unrecoverable ("Cannot find device
+        # eth1" in bootstrap). That single line caused 7 of 9 lab bring-up
+        # failures between 2026-07-14 and 2026-07-16.
+        ip="$(getent hosts "${host}" | awk '{print $1; exit}' || true)"
         if [ -n "${ip}" ]; then
             log "resolved SB remote ${host} -> ${ip} for ovn-controller"
             OVN_SB_REMOTE="${proto}:${ip}:${port}"
