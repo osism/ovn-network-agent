@@ -17,7 +17,7 @@ a week even with no PR activity.**
 | Integration | `integration.yml` | PR (skips docs-only) | **`smoke`** |
 | govulncheck | `govulncheck.yml` | PR, push `main`, weekly | no |
 | E2E | `e2e.yml` | PR (skips docs-only), dispatch | no |
-| E2E Chaos | `e2e-chaos.yml` | dispatch | no |
+| E2E Chaos | `e2e-chaos.yml` | nightly, dispatch, PR label | no |
 | Docs | `docs.yml` | PR touching docs | no |
 | Package | `package.yml` | PR | no |
 | CodeQL | `codeql.yml` | PR, push `main`, weekly | no |
@@ -140,6 +140,32 @@ green-main contract needs:
 - **weekly cron** catches runner/kernel drift, toolchain updates, and a
   CVE published against a pinned dependency during a quiet period —
   surfacing it within a week with no PR activity.
+
+The chaos runner (`e2e-chaos.yml`) also runs nightly, on its own
+`17 3 * * *` cron — off the hour and staggered clear of the Monday
+05:00–06:00 UTC burst so the two schedules never contend for runners.
+Each night fans out as a `fail-fast: false` matrix over all six curated
+chaos profiles, one job per profile at 10 minutes, so a fault that only
+shows up under a particular gateway configuration still gets exercised.
+The seed is the run id, so successive nights explore different fault
+sequences rather than replaying one; it is echoed to the run log and
+recorded by the runner in the uploaded `summary.json` and
+`journal.jsonl`, so a failing night is fully replayable — dispatch
+`e2e-chaos.yml` with the seed, profile and duration read back from that
+job's artifacts and the run reproduces exactly.
+
+A pull request opts into a short chaos smoke by carrying the
+`chaos-smoke` label, which keeps chaos off the default PR gate;
+applying the label needs triage permission. The label is not created
+automatically — as a one-time repository-admin action (like applying
+the rulesets above), create it once with:
+
+```bash
+gh label create chaos-smoke \
+  --description "Run the e2e-chaos smoke on this PR"
+```
+
+Until the label exists the smoke trigger is inert.
 
 Scheduled-run failures appear in the Actions tab and notify the
 workflow file's last committer.
