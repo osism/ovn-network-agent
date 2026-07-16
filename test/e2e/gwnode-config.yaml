@@ -50,3 +50,12 @@ reconcile_interval: "5s"
 # issue #111 so a change to the default does not silently affect the
 # scenario's wall-clock budget.
 stale_chassis_grace_period: "30s"
+
+# Expose the Prometheus metrics endpoint so the chaos runner's
+# expected-state oracle (issue #179) can read the agent's own
+# flap-indicator series (ovn_network_agent_consecutive_readds,
+# ovn_network_agent_route_readds_total, ovn_network_agent_inactive_routes)
+# during settle windows. Loopback-only on purpose: the endpoint is
+# scraped via `docker exec` inside the gateway and is never exposed on
+# the lab networks.
+metrics_listen: "127.0.0.1:9273"
