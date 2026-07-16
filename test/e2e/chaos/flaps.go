@@ -28,6 +28,15 @@ const bgpdReadyProbe = "for _ in $(seq 1 30); do " +
 // gate would race the restart.
 const frrRestartDoneMarker = "/tmp/chaos-frr-restart.done"
 
+// frrRecycleTimeout bounds the wait for the recycle's completion marker.
+// The marker carries the whole stop+clear+start, not one daemon coming
+// ready, and on a loaded CI runner the recycle has outlived both the 30s
+// cmdTimeout (run 29501890572) and the 60s daemonReadyTimeout (run
+// 29516365849) — each time with the lab-state dump showing FRR healthy
+// again moments after the abort. Three minutes leaves the vtysh wait and
+// the BGP re-assert comfortable room inside the 5-minute restore backstop.
+const frrRecycleTimeout = 3 * time.Minute
+
 // flapActions is the routing-flap fault class. The upstream restart is the
 // run's widest legitimate blast radius — every FIP announcement withdraws
 // until bgpd is back — so it carries the low weight.
@@ -84,11 +93,12 @@ func flapActions() []*action {
 // marker — while the recycle is still in its stop phase, the old FRR
 // answers vtysh happily — then waits for the restarted vtysh and
 // re-asserts the BGP session — idempotent and self-cleaning, ending with
-// `write memory`. The agent re-adds its static routes on the next
-// reconcile, and the converge gate's green probes are the assertion that
-// the announcements returned.
+// `write memory`. The marker wait runs on frrRecycleTimeout, not the
+// daemon budget: it spans the full stop+clear+start. The agent re-adds
+// its static routes on the next reconcile, and the converge gate's green
+// probes are the assertion that the announcements returned.
 func restoreGatewayFRR(ctx context.Context, l *lab, gw string) error {
-	if err := l.waitReady(ctx, gw, "test -f "+frrRestartDoneMarker); err != nil {
+	if err := l.waitReadyFor(ctx, gw, "test -f "+frrRestartDoneMarker, frrRecycleTimeout); err != nil {
 		return fmt.Errorf("wait for the FRR recycle on %s: %w", gw, err)
 	}
 	if err := l.waitReady(ctx, gw, "vtysh -c 'show version'"); err != nil {
