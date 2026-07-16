@@ -1425,6 +1425,30 @@ oracle that could not prime against it).
 On any non-zero exit the lab's existing `collect-artifacts.sh` bundle is
 dumped into `<out>/lab-state`.
 
+**Reading a run back.** `-report` renders a recorded run as
+GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
+copy-pasteable replay line, the slowest recoveries against their
+budgets, per-probe loss totals, every loss window attributed to the
+fault whose inject→converged span it overlapped, the settle results,
+and the decisions the guardrails skipped:
+
+```sh
+# A run directory (or its summary.json) written with -out:
+make e2e-chaos-report CHAOS_RUN=/tmp/chaos-a
+
+# An Actions run URL — fetches the artifacts with `gh run download`
+# (so `gh` must be installed and authenticated) and renders every
+# chaos record the run uploaded, e.g. all six nightly profiles:
+make e2e-chaos-report CHAOS_RUN=https://github.com/osism/ovn-network-agent/actions/runs/<id>
+```
+
+The report's spine is `summary.json`; the `journal.jsonl` next to it
+adds what the record alone cannot say — the loss-window attribution and
+the skip reasons. Without a journal the report still renders, falling
+back to the record's 10-second loss buckets. Rendering exits `0` even
+for a run that recorded a failure: the report's exit code says whether
+the report could be produced, not what the run found.
+
 **In CI.** The runner has its own workflow,
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
 on three triggers. Nightly it fans out as a matrix over all six curated
@@ -1437,7 +1461,10 @@ dispatching it with the seed, profile and duration read back from that
 job's artifacts. A pull request opts into a short smoke (3 minutes,
 seed 42, `everything-on`) by carrying the `chaos-smoke` label, rather
 than chaos running on every PR. Each profile's journal and summary
-upload on every outcome, with the lab-state dump added on failure. It
+upload on every outcome, with the lab-state dump added on failure —
+and each job renders its own `-report` into the Actions job summary,
+so the verdict, the recovery durations and the loss windows are
+readable on the run page without downloading the artifact. It
 is deliberately not part of `e2e.yml`'s PR path: the scenarios there
 each assert one fault and leave the lab baseline-green, while a chaos
 run is a randomized sequence that deliberately leaves the master
