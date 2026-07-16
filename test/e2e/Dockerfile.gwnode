@@ -79,6 +79,7 @@ RUN apt-get update \
         iproute2 \
         iputils-ping \
         tcpdump \
+        tini \
  && apt-get purge -y software-properties-common \
  && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
@@ -108,4 +109,17 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
         && pgrep -x ovn-controller >/dev/null \
         && pgrep -f /usr/local/bin/ovn-network-agent >/dev/null
 
-ENTRYPOINT ["/usr/local/bin/gwnode-entrypoint.sh"]
+# tini must be PID 1: the daemons the entrypoint starts (watchfrr, zebra,
+# bgpd, staticd, ovsdb-server, ...) daemonize and reparent to PID 1, and the
+# agent the entrypoint execs is a Go binary that never wait()s for children
+# it did not spawn. Without a reaping init every daemon that exits stays a
+# zombie, `kill -0` keeps succeeding on it, and frrinit.sh's daemon_stop
+# waits out its full 120 s kill -0 loop per stop phase — turning one
+# `frrinit.sh stop` into a deterministic ~6 minutes (watchfrr, then
+# bgpd/staticd, then zebra last), which the chaos frr-restart action pushed
+# past three successively larger wait budgets (runs 29501890572,
+# 29516365849, 29525707974) before the zombies were found. tini also
+# forwards signals, so the in-container `kill -TERM 1` handle
+# (drain-hitless.sh, the chaos agent-terminate action) still reaches the
+# agent, and the container still follows the agent down.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/gwnode-entrypoint.sh"]

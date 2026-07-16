@@ -135,8 +135,8 @@ func injectGatewayKill(ctx context.Context, l *lab, gw string, _ int) error {
 	return l.killGateway(ctx, gw)
 }
 
-// injectAgentTerminate signals the agent (PID 1) and waits for the container
-// to follow it down. Whether the agent drains its gateway chassis before
+// injectAgentTerminate signals the agent through PID 1 (tini forwards the
+// SIGTERM) and waits for the container to follow it down. Whether the agent drains its gateway chassis before
 // exiting depends on how the lab was deployed — the fault is the same
 // either way, and the drain only changes how much the run loses.
 func injectAgentTerminate(ctx context.Context, l *lab, gw string, _ int) error {

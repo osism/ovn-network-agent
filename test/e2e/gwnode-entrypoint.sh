@@ -3,15 +3,19 @@
 #
 # Starts the supporting daemons in a fixed order — OVS local DB, OVS
 # vswitchd (userspace datapath), ovn-controller, FRR — then execs the
-# ovn-network-agent in the foreground so the container's lifecycle is
-# tied to the agent process.
+# ovn-network-agent in the foreground. tini is PID 1 (see
+# Dockerfile.gwnode) and runs this script as its only child, so the
+# container's lifecycle stays tied to the agent process — and the
+# daemons that daemonize out of this script get reaped when they exit
+# instead of lingering as zombies under the non-reaping agent.
 
 set -Eeuo pipefail
 
 log() { printf '[gwnode] %s\n' "$*" >&2; }
 
-# `set -e` kills PID 1 without a word when an unguarded command fails, and
-# Docker's `restart: always` replaces the container so fast that the crash
+# `set -e` kills this script without a word when an unguarded command fails
+# (tini exits with its child, taking the container down), and Docker's
+# `restart: always` replaces the container so fast that the crash
 # is invisible — the restarted entrypoint's output just continues the log.
 # That silence is what made the eth1-destroying restart race (see the
 # daemon-start block below) cost days to root-cause. The trap cannot stop
@@ -41,9 +45,9 @@ VRF_TABLE_ID="${VRF_TABLE_ID:-100}"
 # Why no daemon start script's exit status may be fatal here
 # ---------------------------------------------------------------------------
 #
-# This script runs under `set -e` AND it is the container's PID 1 (main()
+# This script runs under `set -e` AND it is tini's only child (main()
 # `exec`s the agent at the end). So an unguarded command that returns non-zero
-# does not merely abort a step: it kills PID 1, the container exits, and
+# does not merely abort a step: tini follows it down, the container exits, and
 # Docker's `restart: always` policy — which containerlab applies to every node
 # — restarts it.
 #

@@ -30,11 +30,16 @@ const frrRestartDoneMarker = "/tmp/chaos-frr-restart.done"
 
 // frrRecycleTimeout bounds the wait for the recycle's completion marker.
 // The marker carries the whole stop+clear+start, not one daemon coming
-// ready, and on a loaded CI runner the recycle has outlived both the 30s
-// cmdTimeout (run 29501890572) and the 60s daemonReadyTimeout (run
-// 29516365849) — each time with the lab-state dump showing FRR healthy
-// again moments after the abort. Three minutes leaves the vtysh wait and
-// the BGP re-assert comfortable room inside the 5-minute restore backstop.
+// ready. With tini reaping the gateway's orphans (Dockerfile.gwnode) the
+// recycle completes in seconds, so three minutes is a pure backstop for a
+// genuinely loaded runner. Before tini, every stopped daemon stayed a
+// zombie under the non-reaping agent PID 1, `kill -0` kept succeeding on
+// it, and frrinit.sh's daemon_stop waited out its full 120 s loop per
+// stop phase — a deterministic ~6-minute stop that outlived the 30 s
+// cmdTimeout (run 29501890572), the 60 s daemonReadyTimeout (run
+// 29516365849) and this budget (run 29525707974) in turn, each abort
+// misread as a slow runner because the lab-state dump — taken minutes
+// later — showed FRR healthy again.
 const frrRecycleTimeout = 3 * time.Minute
 
 // flapActions is the routing-flap fault class. The upstream restart is the
@@ -51,13 +56,13 @@ func flapActions() []*action {
 			recoveryBudget: 120 * time.Second,
 			inject: func(ctx context.Context, l *lab, gw string, _ int) error {
 				// The recycle runs backgrounded inside the container. Run
-				// synchronously, the stop+start can outlive cmdTimeout on a
-				// loaded CI runner — and the SIGKILL that follows reaps only
+				// synchronously, a slow stop+start rides the exec into
+				// cmdTimeout — and the SIGKILL that follows reaps only
 				// the docker exec client, so FRR restarted anyway while the
 				// engine recorded an action-failed violation for a lab that
 				// was healthy seconds later. The subshell survives the exec
 				// returning (stdio detached, reparented to the container's
-				// PID 1), and the marker it touches last is the completion
+				// init), and the marker it touches last is the completion
 				// signal restoreGatewayFRR gates on. The frrinit exit
 				// statuses stay hints, exactly as the gwnode entrypoint
 				// treats them.
