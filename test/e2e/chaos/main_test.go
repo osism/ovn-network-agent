@@ -11,17 +11,37 @@ import (
 	"time"
 )
 
+// The rejection names the floor, so a user who retries with exactly it gets a
+// window that can converge. That makes the floor a promise, and it has to clear
+// the arithmetic it is derived from: one slow-cadence reconcile to reach the
+// first all-green evaluation, plus the confirmation gap a first green that
+// fails its confirmation burns before the loop can try again.
+func TestSettleTimeoutFloorOutlastsAReconcileAndAConfirmation(t *testing.T) {
+	t.Parallel()
+	slow, err := time.ParseDuration(slowCadence)
+	if err != nil {
+		t.Fatalf("parse slowCadence %q: %v", slowCadence, err)
+	}
+	if want := slow + settleConfirmDelay; minSettleTimeout < want {
+		t.Fatalf("minSettleTimeout = %s, want >= %s (a %s reconcile plus the %s confirmation gap): "+
+			"a run taking the advertised floor at face value times out into false violations",
+			minSettleTimeout, want, slow, settleConfirmDelay)
+	}
+}
+
 // Bad inputs must fail before a single fault is injected: a run built on
 // a contradiction cannot be replayed and is not worth a lab.
 func TestRunRejectsInvalidInputs(t *testing.T) {
 	tests := []struct {
-		name     string
-		profile  string
-		duration time.Duration
-		tickMin  time.Duration
-		tickMax  time.Duration
-		weights  string
-		wantErr  string
+		name          string
+		profile       string
+		duration      time.Duration
+		tickMin       time.Duration
+		tickMax       time.Duration
+		settleEvery   time.Duration
+		settleTimeout time.Duration
+		weights       string
+		wantErr       string
 	}{
 		{
 			name:     "tick bounds inverted",
@@ -75,6 +95,27 @@ func TestRunRejectsInvalidInputs(t *testing.T) {
 			tickMax:  30 * time.Second,
 			wantErr:  "unknown profile",
 		},
+		// A negative settle cadence is a contradiction like an inverted tick
+		// bound: the run cannot schedule a settle window at all.
+		{
+			name:        "negative settle cadence",
+			duration:    time.Minute,
+			tickMin:     10 * time.Second,
+			tickMax:     30 * time.Second,
+			settleEvery: -time.Second,
+			wantErr:     "-settle-every",
+		},
+		// A settle window shorter than the floor could not outlast the slow
+		// reconcile a fault needs to converge, so every window would time out
+		// into a false violation.
+		{
+			name:          "settle timeout below the floor",
+			duration:      time.Minute,
+			tickMin:       10 * time.Second,
+			tickMax:       30 * time.Second,
+			settleTimeout: 10 * time.Second,
+			wantErr:       "below the 35s floor",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -85,17 +126,26 @@ func TestRunRejectsInvalidInputs(t *testing.T) {
 			if profile == "" {
 				profile = defaultProfileName
 			}
+			// A zero settle timeout is not the input under test, so it defaults
+			// to a valid one — the cases above reject a specific contradiction,
+			// not the absence of a settle flag.
+			settleTimeout := tc.settleTimeout
+			if settleTimeout == 0 {
+				settleTimeout = 2 * time.Minute
+			}
 			code, err := run(config{
-				seed:         42,
-				profile:      profile,
-				duration:     tc.duration,
-				tickMin:      tc.tickMin,
-				tickMax:      tc.tickMax,
-				weightSpec:   tc.weights,
-				labName:      "ovn-e2e",
-				outDir:       out,
-				collect:      "/nonexistent",
-				gwnodeConfig: "../gwnode-config.yaml",
+				seed:          42,
+				profile:       profile,
+				duration:      tc.duration,
+				tickMin:       tc.tickMin,
+				tickMax:       tc.tickMax,
+				settleEvery:   tc.settleEvery,
+				settleTimeout: settleTimeout,
+				weightSpec:    tc.weights,
+				labName:       "ovn-e2e",
+				outDir:        out,
+				collect:       "/nonexistent",
+				gwnodeConfig:  "../gwnode-config.yaml",
 			})
 
 			if code != exitFatal {
@@ -168,6 +218,166 @@ func TestDriveAbandonsARunWhoseProfileNeverLands(t *testing.T) {
 				t.Fatalf("journaled %+v, want the violation the run was abandoned on", ev)
 			}
 		})
+	}
+}
+
+// driveGreenResponses answers everything a full drive needs against a healthy
+// lab: the oracle's queries (through the oracleLab fixture), the management
+// address the applier discovers, and the live config it reads back — the baked
+// one, so the default profile restarts nothing and the oracle primes and
+// settles green.
+func driveGreenResponses(t *testing.T, fx *oracleLab) func([]string) (string, error) {
+	t.Helper()
+	base := string(baseConfig(t))
+	return func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(line, "cat "+agentConfigPath):
+			return base, nil
+		case strings.Contains(line, "ip -o -4 addr show eth0"):
+			return "172.20.20.4\n", nil
+		// currentMaster resolves the cr-lr0-public owner UUID to a name with a
+		// bare `list Chassis <uuid>`; the oracleLab fixture only models the
+		// --format=json form, so answer the bare one with the master itself.
+		case strings.Contains(line, "--bare") && strings.Contains(line, "list Chassis"):
+			return "gateway-1\n", nil
+		}
+		return fx.respond(argv)
+	}
+}
+
+func settleStartsIn(t *testing.T, journal string) int {
+	t.Helper()
+	n := 0
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == evSettleStart {
+			n++
+		}
+	}
+	return n
+}
+
+// Every run ends with one final settle over its config-aware expected state —
+// even a -settle-every of 0, where it is the only settle there is. An aborted
+// run is the exception: it has already failed on the parking violation, and
+// settling a lab with a dark node would only cascade.
+func TestDriveRunsTheFinalSettle(t *testing.T) {
+	t.Run("a green run ends with the final settle", func(t *testing.T) {
+		fx := newOracleLab(t)
+		clock := newFakeClock()
+		l := newTestLab(&fakeCommander{respond: driveGreenResponses(t, fx)}, clock)
+		p := defaultTestProfile(t)
+		ap := newApplier(l, p, baseConfig(t))
+		var buf bytes.Buffer
+		ap.jrnl = newJournal(&buf, clock.now)
+		// DurationMS 0 injects no fault, so the run is exactly its green start
+		// state plus the one final settle the feature always runs.
+		rec := &runRecord{
+			Inputs:        runInputs{SettleTimeoutMS: (90 * time.Second).Milliseconds()},
+			ActionsByName: map[string]int{},
+		}
+
+		code := drive(context.Background(), l, ap, nil, ap.jrnl, rec)
+		rec.finalize(clock.now())
+
+		if code != exitPass {
+			t.Fatalf("exit code = %d, want %d: %+v", code, exitPass, rec.Violations)
+		}
+		if len(rec.Settles) != 1 || !rec.Settles[0].Passed {
+			t.Fatalf("settles = %+v, want exactly one passing final settle", rec.Settles)
+		}
+		if ev := lastEventOf(t, buf.String(), evSettleResult); ev.Result != resultPass {
+			t.Fatalf("the final settle-result was not a pass: %+v", ev)
+		}
+		if settleStartsIn(t, buf.String()) != 1 {
+			t.Fatalf("journaled %d settle windows, want the one final settle", settleStartsIn(t, buf.String()))
+		}
+		if rec.Result != resultPass || len(rec.Violations) != 0 {
+			t.Fatalf("a green run did not pass: %+v", rec)
+		}
+	})
+
+	t.Run("an aborted run skips the final settle", func(t *testing.T) {
+		fx := newOracleLab(t)
+		clock := newFakeClock()
+		l := newTestLab(&fakeCommander{respond: driveGreenResponses(t, fx)}, clock)
+		p := defaultTestProfile(t)
+		ap := newApplier(l, p, baseConfig(t))
+		var buf bytes.Buffer
+		ap.jrnl = newJournal(&buf, clock.now)
+		rec := &runRecord{
+			Inputs: runInputs{
+				DurationMS:      time.Second.Milliseconds(),
+				TickMinMS:       (100 * time.Millisecond).Milliseconds(),
+				TickMaxMS:       (100 * time.Millisecond).Milliseconds(),
+				SettleTimeoutMS: (90 * time.Second).Milliseconds(),
+			},
+			ActionsByName: map[string]int{},
+		}
+		// A fault the runner cannot undo parks its node and aborts the run.
+		acts := noopActions("controller-restart")
+		acts[0].holdMin, acts[0].holdMax = 0, 0
+		acts[0].restore = func(context.Context, *lab, string) error { return errBoom }
+
+		code := drive(context.Background(), l, ap, acts, ap.jrnl, rec)
+		rec.finalize(clock.now())
+
+		// drive returns exitPass even for a recorded violation — the fatal
+		// codes are for setups it could not build, not for what a run found.
+		if code != exitPass {
+			t.Fatalf("exit code = %d, want %d", code, exitPass)
+		}
+		if rec.Result != resultFail {
+			t.Fatalf("result = %q, want %q — the run parked a node", rec.Result, resultFail)
+		}
+		if len(rec.Settles) != 0 || settleStartsIn(t, buf.String()) != 0 {
+			t.Fatalf("an aborted run still settled: settles=%+v, journal=%s", rec.Settles, buf.String())
+		}
+	})
+}
+
+// The oracle primes against the green start state before the first fault. A
+// prime it cannot complete is a setup failure the run record cannot express as
+// a lab fault, so the run is abandoned with exit 2 and an oracle-setup
+// violation, like any other it could not be built on.
+func TestDriveAbandonsWhenTheOracleCannotPrime(t *testing.T) {
+	fx := newOracleLab(t)
+	green := driveGreenResponses(t, fx)
+	// The lab comes up green, but the oracle cannot read the Gateway_Chassis
+	// table it primes its baseline from.
+	respond := func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "list Gateway_Chassis") {
+			return "", errBoom
+		}
+		return green(argv)
+	}
+	clock := newFakeClock()
+	l := newTestLab(&fakeCommander{respond: respond}, clock)
+	p := defaultTestProfile(t)
+	ap := newApplier(l, p, baseConfig(t))
+	var buf bytes.Buffer
+	ap.jrnl = newJournal(&buf, clock.now)
+	rec := &runRecord{
+		Inputs:        runInputs{SettleTimeoutMS: (90 * time.Second).Milliseconds()},
+		ActionsByName: map[string]int{},
+	}
+
+	code := drive(context.Background(), l, ap, nil, ap.jrnl, rec)
+
+	if code != exitFatal {
+		t.Fatalf("exit code = %d, want %d when the oracle cannot prime", code, exitFatal)
+	}
+	rec.finalize(clock.now())
+	if rec.Result != resultFail || len(rec.Violations) != 1 ||
+		rec.Violations[0].Kind != violationOracleSetup {
+		t.Fatalf("the summary of a run abandoned at prime does not say so: %+v", rec)
+	}
+	if ev := lastEventOf(t, buf.String(), evViolation); ev.Kind != violationOracleSetup {
+		t.Fatalf("journaled %+v, want the oracle-setup violation the run was abandoned on", ev)
+	}
+	// The final settle never runs on an abandoned setup.
+	if settleStartsIn(t, buf.String()) != 0 {
+		t.Fatalf("a run abandoned at prime still opened a settle window: %s", buf.String())
 	}
 }
 

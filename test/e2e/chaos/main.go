@@ -15,6 +15,14 @@
 // outages on the central node, management-path impairment, data-plane
 // drift the agent self-heals, routing flaps, and OVN churn.
 //
+// Between faults the run pauses for a settle window (issue #179): a
+// config-aware expected-state oracle polls every gateway's live data plane
+// until it matches the exact state its configuration demands, or the window
+// times out into a violation. So a run asserts the lab converged to its
+// expected state, not merely that no probe went red. -settle-every sets the
+// cadence (0 runs only a final settle after the last fault) and
+// -settle-timeout how long each window waits for convergence.
+//
 // Reproducibility is the contract: the profile, the seed, the duration,
 // the tick bounds and the action weights are the only inputs, and every
 // decision the engine makes is drawn from a PCG stream seeded by -seed
@@ -65,18 +73,30 @@ const minDuration = time.Second
 // that is already broken, where a `docker exec` can hang for good.
 const collectTimeout = 2 * time.Minute
 
+// minSettleTimeout is the floor under -settle-timeout. The timeout bounds how
+// long a window may take to reach its *first* all-green evaluation — the
+// confirmation that follows one is not deadline-bounded — so the window has to
+// outlast one slow-cadence reconcile (slowCadence = "15s" in flips.go) for a
+// fault to converge at all, plus the confirmation gap (settleConfirmDelay =
+// 20s) a first green that fails its confirmation burns before the loop can try
+// again. Below that a lab that was healing correctly times out into false
+// violations.
+const minSettleTimeout = 35 * time.Second
+
 // config is one run's inputs, as parsed from the flags.
 type config struct {
-	seed         int64
-	profile      string
-	duration     time.Duration
-	tickMin      time.Duration
-	tickMax      time.Duration
-	weightSpec   string
-	labName      string
-	outDir       string
-	collect      string
-	gwnodeConfig string
+	seed          int64
+	profile       string
+	duration      time.Duration
+	tickMin       time.Duration
+	tickMax       time.Duration
+	settleEvery   time.Duration
+	settleTimeout time.Duration
+	weightSpec    string
+	labName       string
+	outDir        string
+	collect       string
+	gwnodeConfig  string
 }
 
 func main() {
@@ -87,6 +107,8 @@ func main() {
 	flag.DurationVar(&cfg.duration, "duration", 10*time.Minute, "how long to keep injecting faults")
 	flag.DurationVar(&cfg.tickMin, "tick-min", 10*time.Second, "lower bound of the interval between decisions")
 	flag.DurationVar(&cfg.tickMax, "tick-max", 30*time.Second, "upper bound of the interval between decisions")
+	flag.DurationVar(&cfg.settleEvery, "settle-every", 3*time.Minute, "how often injection pauses for a settle window; 0 runs only the final settle")
+	flag.DurationVar(&cfg.settleTimeout, "settle-timeout", 2*time.Minute, "how long a settle window waits for full convergence")
 	flag.StringVar(&cfg.weightSpec, "weights", "", "override action weights, e.g. `gateway-kill=0,controller-restart=5`")
 	flag.StringVar(&cfg.labName, "lab", "ovn-e2e", "containerlab lab name")
 	flag.StringVar(&cfg.outDir, "out", "chaos-artifacts", "directory for the journal, the run record and the lab-state dump")
@@ -112,6 +134,12 @@ func run(cfg config) (int, error) {
 	}
 	if cfg.duration < minDuration {
 		return exitFatal, fmt.Errorf("-duration %s is below the %s floor", cfg.duration, minDuration)
+	}
+	if cfg.settleEvery < 0 {
+		return exitFatal, fmt.Errorf("-settle-every %s is negative", cfg.settleEvery)
+	}
+	if cfg.settleTimeout < minSettleTimeout {
+		return exitFatal, fmt.Errorf("-settle-timeout %s is below the %s floor", cfg.settleTimeout, minSettleTimeout)
 	}
 
 	// The profile and the config it is layered over are resolved before a
@@ -174,13 +202,15 @@ func run(cfg config) (int, error) {
 	ch.jrnl = jrnl
 	rec := &runRecord{
 		Inputs: runInputs{
-			Seed:       cfg.seed,
-			Profile:    p.name,
-			DurationMS: cfg.duration.Milliseconds(),
-			TickMinMS:  cfg.tickMin.Milliseconds(),
-			TickMaxMS:  cfg.tickMax.Milliseconds(),
-			Weights:    weights,
-			Lab:        cfg.labName,
+			Seed:            cfg.seed,
+			Profile:         p.name,
+			DurationMS:      cfg.duration.Milliseconds(),
+			TickMinMS:       cfg.tickMin.Milliseconds(),
+			TickMaxMS:       cfg.tickMax.Milliseconds(),
+			SettleEveryMS:   cfg.settleEvery.Milliseconds(),
+			SettleTimeoutMS: cfg.settleTimeout.Milliseconds(),
+			Weights:         weights,
+			Lab:             cfg.labName,
 		},
 		StartedAt:     started.UTC().Format(time.RFC3339Nano),
 		ActionsByName: map[string]int{},
@@ -233,6 +263,18 @@ func drive(ctx context.Context, l *lab, ap *applier, actions []*action, jrnl *jo
 	}
 	jrnl.emit(event{Event: evStateApplied, Detail: p.layers()})
 
+	// The oracle primes against the green start state before the first fault,
+	// so its baseline — the Gateway_Chassis rows already at priority 0, the
+	// managed routes, each gateway's drain environment — reflects a lab that
+	// is where its configuration wants it. A prime that cannot read that
+	// baseline is a setup failure, not a lab fault: the run is abandoned like
+	// any other it could not be built on.
+	orc := newOracle(l, ap)
+	orc.settleTimeout = time.Duration(rec.Inputs.SettleTimeoutMS) * time.Millisecond
+	if err := orc.prime(ctx); err != nil {
+		return abandon(jrnl, rec, violationOracleSetup, err)
+	}
+
 	// The prober and the baseline checks run for the whole run, alongside
 	// the engine. Both are cancelled and then *waited for* before the run
 	// record is read: a sweep still in flight would otherwise be
@@ -244,6 +286,8 @@ func drive(ctx context.Context, l *lab, ap *applier, actions []*action, jrnl *jo
 	probes.start(sideCtx)
 
 	e := newEngine(l, p, actions, probes, jrnl, rec)
+	e.oracle = orc
+	e.settleEvery = time.Duration(rec.Inputs.SettleEveryMS) * time.Millisecond
 	e.followMaster(ctx)
 
 	checks := &baselineChecks{lab: l, engine: e}
@@ -254,6 +298,16 @@ func drive(ctx context.Context, l *lab, ap *applier, actions []*action, jrnl *jo
 	}()
 
 	e.run(ctx)
+
+	// One final settle after the last fault, so the run always ends with the
+	// lab held to its full expected state — even on a -settle-every of 0,
+	// where it is the only settle there is. An aborted run skips it: it has
+	// already failed on the parking violation, and settling a lab with a dark
+	// node would only cascade violations derived from it. A cancelled run
+	// skips it too — the runner is unwinding, not measuring.
+	if !e.abort && ctx.Err() == nil {
+		e.settle(ctx)
+	}
 
 	stopSide()
 	probes.stop()
