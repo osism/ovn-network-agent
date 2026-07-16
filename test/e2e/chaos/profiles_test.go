@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -232,6 +234,84 @@ func TestProfileProbesOnlyWhatItsLayersPutUp(t *testing.T) {
 			t.Fatalf("%s configures the API VIP but never probes it", p.name)
 		}
 	}
+}
+
+// A profile added to the registry must also reach the workflow's nightly
+// matrix and its dispatch options — otherwise a night silently stops
+// covering it, or a replay dispatch cannot select it. Both lists are
+// duplicated from the registry by hand (a choice input's options cannot be
+// computed, and the schedule) matrix array lives inside a shell script), so
+// this parses each list and asserts the profile actually appears there —
+// not merely somewhere in the file, where a bare comment mention would
+// satisfy the check.
+func TestChaosWorkflowSweepsEveryProfile(t *testing.T) {
+	workflow, err := os.ReadFile("../../../.github/workflows/e2e-chaos.yml")
+	if err != nil {
+		t.Fatalf("read the chaos workflow: %v", err)
+	}
+
+	nightly := workflowNightlyProfiles(t, workflow)
+	options := workflowDispatchOptions(t, workflow)
+
+	for _, p := range profiles() {
+		if !nightly[p.name] {
+			t.Fatalf("profile %s is in the registry but not in the workflow's nightly matrix array — a night silently stops covering it", p.name)
+		}
+		if !options[p.name] {
+			t.Fatalf("profile %s is in the registry but not in the workflow's dispatch choice options — it cannot be replayed", p.name)
+		}
+	}
+}
+
+// workflowNightlyProfiles returns the profiles the schedule) case fans the
+// nightly matrix out over. The array lives inside the resolve step's shell
+// script (a YAML block scalar), so it is read out of the raw bytes rather
+// than the parsed YAML.
+func workflowNightlyProfiles(t *testing.T, workflow []byte) map[string]bool {
+	t.Helper()
+	m := regexp.MustCompile(`(?s)schedule\).*?profiles='(\[.*?\])'`).FindSubmatch(workflow)
+	if m == nil {
+		t.Fatal("could not locate the nightly profiles array in the schedule) case")
+	}
+	var names []string
+	if err := json.Unmarshal(m[1], &names); err != nil {
+		t.Fatalf("nightly profiles array is not valid JSON: %v", err)
+	}
+	return nameSet(names)
+}
+
+// workflowDispatchOptions returns the profiles the workflow_dispatch
+// `profile` choice offers for replay.
+func workflowDispatchOptions(t *testing.T, workflow []byte) map[string]bool {
+	t.Helper()
+	var doc struct {
+		On struct {
+			WorkflowDispatch struct {
+				Inputs struct {
+					Profile struct {
+						Options []string `yaml:"options"`
+					} `yaml:"profile"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal(workflow, &doc); err != nil {
+		t.Fatalf("parse the chaos workflow as YAML: %v", err)
+	}
+	opts := doc.On.WorkflowDispatch.Inputs.Profile.Options
+	if len(opts) == 0 {
+		t.Fatal("could not locate the workflow_dispatch profile choice options")
+	}
+	return nameSet(opts)
+}
+
+// nameSet indexes a list of profile names for membership tests.
+func nameSet(names []string) map[string]bool {
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		set[n] = true
+	}
+	return set
 }
 
 // profileGateway resolves one gateway's overlay out of a named profile.
