@@ -250,3 +250,363 @@ func eventsIn(t *testing.T, journal string) []event {
 	}
 	return out
 }
+
+// =============================================================================
+// Oracle lab fixture
+// =============================================================================
+//
+// oracleLab is a consistent set of canned answers for every query the oracle
+// makes, modelled on the everything-on profile: one router lr0 whose
+// distributed LRP lr0-public is owned by gateway-1, three Gateway_Chassis
+// candidates, two dnat_and_snat NATs, two managed static routes, and a flat
+// provider segment. It is built so a "green" fixture really evaluates green —
+// the observed data planes match what computeExpectation derives from the OVN
+// tables — and tests mutate one field before running to diverge a single
+// plane. Tests needing time-dependent behaviour (a plane that heals, a metric
+// that climbs) wrap respond with their own counter.
+
+// gwFIPs is the desired IP set the active gateway carries: the LRP gateway IP
+// (192.0.2.1) and the two NAT external IPs, all on the flat br-ex segment.
+var gwFIPs = []string{"192.0.2.1", "192.0.2.10", "192.0.2.12"}
+
+type gcExtra struct {
+	uuid, name, chassis string
+	priority            int
+}
+
+type managedRoute struct {
+	uuid, prefix, chassis, advertised string
+}
+
+type oracleLab struct {
+	t *testing.T
+
+	crOwner  string         // chassis owning cr-lr0-public
+	priority map[string]int // Gateway_Chassis priority per gateway
+	lrpGC    []string       // Gateway_Chassis row UUIDs on lr0-public
+	extraGC  []gcExtra      // Gateway_Chassis rows beyond the three candidates
+	managed  []managedRoute // managed static routes
+	snapErr  bool           // fail the OVN snapshot on every poll
+	marker   map[string]bool
+	drainEnv string // printenv OVN_NETWORK_DRAIN_ON_SHUTDOWN answer
+
+	dropKernel  map[string]string // gw → an IP to omit from proto-44 routes
+	consecutive map[string]int    // gw → ovn_network_agent_consecutive_readds
+	inactive    map[string]int    // gw → ovn_network_agent_inactive_routes
+	readds      map[string]int    // gw → ovn_network_agent_route_readds_total
+}
+
+func newOracleLab(t *testing.T) *oracleLab {
+	return &oracleLab{
+		t:        t,
+		crOwner:  "gateway-1",
+		priority: map[string]int{"gateway-1": 30, "gateway-2": 20, "gateway-3": 10},
+		lrpGC:    []string{"gc-gateway-1", "gc-gateway-2", "gc-gateway-3"},
+		managed: []managedRoute{
+			{uuid: "sr-10", prefix: "192.0.2.10/32", chassis: "gateway-1"},
+			{uuid: "sr-12", prefix: "192.0.2.12/32", chassis: "gateway-1"},
+		},
+		marker:      map[string]bool{},
+		drainEnv:    "false",
+		dropKernel:  map[string]string{},
+		consecutive: map[string]int{},
+		inactive:    map[string]int{},
+		readds:      map[string]int{},
+	}
+}
+
+func (o *oracleLab) respond(argv []string) (string, error) {
+	line := strings.Join(argv, " ")
+	has := func(s string) bool { return strings.Contains(line, s) }
+
+	if o.snapErr && has("list Chassis") {
+		return "", errBoom
+	}
+	switch {
+	case has("find Port_Binding type=chassisredirect"):
+		return o.portBinding(), nil
+	case has("find Logical_Router_Static_Route"):
+		return o.staticRoutes(), nil
+	case has("list Logical_Router_Port"):
+		return o.lrpTable(), nil
+	case has("list Logical_Router"):
+		return o.routerTable(), nil
+	case has("list Logical_Switch_Port"):
+		return o.lspTable(), nil
+	case has("list Logical_Switch"):
+		return o.lsTable(), nil
+	case has("list Gateway_Chassis"):
+		return o.gcTable(), nil
+	case has("list NAT"):
+		return o.natTable(), nil
+	case has("list Chassis"):
+		return o.chassisTable(), nil
+	case has("show bgp ipv4 unicast json"):
+		return o.upstreamBGP(), nil
+	}
+
+	if gw := gatewayOf(line); gw != "" {
+		switch {
+		case has("ip -j route show proto 44"):
+			return o.kernel(gw), nil
+		case has("show ip route vrf vrf-provider static json"):
+			return o.frr(gw), nil
+		case has("show ip prefix-list ANNOUNCED-NETWORKS"):
+			return o.prefixList(gw), nil
+		case has("dump-flows br-ex cookie=0x998"):
+			return o.hairpin(gw), nil
+		case has("dump-flows br-ex cookie=0x999"):
+			return o.macTweak(gw), nil
+		case has("nft list table ip ovn-network-agent"):
+			return "", errExit(o.t, 1) // table absent
+		case has("ip -j addr show dev loopback1"):
+			return "", errExit(o.t, 1) // device absent
+		case has("printenv OVN_NETWORK_DRAIN_ON_SHUTDOWN"):
+			return o.drainEnv + "\n", nil
+		case has("test -f " + profileMarkerPath):
+			if o.marker[gw] {
+				return "", nil
+			}
+			return "", errExit(o.t, 1) // marker absent
+		case has("/metrics"):
+			return o.metrics(gw), nil
+		}
+	}
+	return healthyLabResponses(argv)
+}
+
+// gatewayOf resolves which gateway container an argv targets.
+func gatewayOf(line string) string {
+	for _, gw := range gatewayNames() {
+		if strings.Contains(line, "clab-ovn-e2e-"+gw) {
+			return gw
+		}
+	}
+	return ""
+}
+
+func (o *oracleLab) active(gw string) bool { return gw == o.crOwner }
+
+// ---- OVN snapshot tables ----
+
+func (o *oracleLab) chassisTable() string {
+	rows := [][]any{}
+	for _, gw := range gatewayNames() {
+		rows = append(rows, []any{ovsUUID("ch-" + gw), gw})
+	}
+	return ovsTable([]string{"_uuid", "name"}, rows)
+}
+
+func (o *oracleLab) portBinding() string {
+	chassis := any(ovsSet())
+	if o.crOwner != "" {
+		chassis = ovsUUID("ch-" + o.crOwner)
+	}
+	return ovsTable([]string{"logical_port", "chassis"},
+		[][]any{{"cr-lr0-public", chassis}})
+}
+
+func (o *oracleLab) natTable() string {
+	return ovsTable([]string{"_uuid", "external_ip", "type"}, [][]any{
+		{ovsUUID("nat-10"), "192.0.2.10", "dnat_and_snat"},
+		{ovsUUID("nat-12"), "192.0.2.12", "dnat_and_snat"},
+	})
+}
+
+func (o *oracleLab) lrpTable() string {
+	return ovsTable([]string{"_uuid", "name", "networks", "gateway_chassis"},
+		[][]any{{ovsUUID("lrp-public"), "lr0-public", "192.0.2.1/24", gcRefs(o.lrpGC)}})
+}
+
+func (o *oracleLab) routerTable() string {
+	return ovsTable([]string{"_uuid", "name", "ports", "nat"},
+		[][]any{{ovsUUID("lr0"), "lr0", ovsUUID("lrp-public"),
+			ovsSet(ovsUUID("nat-10"), ovsUUID("nat-12"))}})
+}
+
+func (o *oracleLab) gcTable() string {
+	rows := [][]any{}
+	for _, gw := range gatewayNames() {
+		rows = append(rows, []any{ovsUUID("gc-" + gw), "lr0-public-" + gw, gw, o.priority[gw]})
+	}
+	for _, e := range o.extraGC {
+		rows = append(rows, []any{ovsUUID(e.uuid), e.name, e.chassis, e.priority})
+	}
+	return ovsTable([]string{"_uuid", "name", "chassis_name", "priority"}, rows)
+}
+
+func (o *oracleLab) staticRoutes() string {
+	rows := [][]any{}
+	for _, m := range o.managed {
+		ids := []string{"ovn-network-agent", "managed", "ovn-network-agent-chassis", m.chassis}
+		if m.advertised != "" {
+			ids = append(ids, "ovn-network-agent-advertised", m.advertised)
+		}
+		rows = append(rows, []any{ovsUUID(m.uuid), m.prefix, ovsMap(ids...)})
+	}
+	return ovsTable([]string{"_uuid", "ip_prefix", "external_ids"}, rows)
+}
+
+func (o *oracleLab) lsTable() string {
+	return ovsTable([]string{"_uuid", "name", "ports"},
+		[][]any{{ovsUUID("ls-public"), "public", ovsSet(ovsUUID("lsp-ln"), ovsUUID("lsp-router"))}})
+}
+
+func (o *oracleLab) lspTable() string {
+	return ovsTable([]string{"_uuid", "name", "type", "tag", "options"}, [][]any{
+		{ovsUUID("lsp-ln"), "ln-public", "localnet", ovsSet(), ovsMap("network_name", "physnet1")},
+		{ovsUUID("lsp-router"), "public-lr0", "router", ovsSet(), ovsMap("router-port", "lr0-public")},
+	})
+}
+
+// ---- per-gateway observations ----
+
+func (o *oracleLab) kernel(gw string) string {
+	arr := []map[string]string{}
+	if o.active(gw) {
+		for _, ip := range gwFIPs {
+			if o.dropKernel[gw] == ip {
+				continue
+			}
+			arr = append(arr, map[string]string{"dst": ip, "dev": "br-ex"})
+		}
+	}
+	b, _ := json.Marshal(arr)
+	return string(b)
+}
+
+func (o *oracleLab) frr(gw string) string {
+	doc := map[string][]map[string]any{}
+	if o.active(gw) {
+		for _, ip := range gwFIPs {
+			doc[ip+"/32"] = []map[string]any{{"nexthops": []map[string]string{{"ip": "169.254.0.1"}}}}
+		}
+	}
+	b, _ := json.Marshal(doc)
+	return string(b)
+}
+
+func (o *oracleLab) prefixList(gw string) string {
+	if !o.active(gw) {
+		return "" // the agent cleans the list on a standby gateway
+	}
+	return "ip prefix-list ANNOUNCED-NETWORKS: 1 entries\n" +
+		"   seq 5 permit 192.0.2.0/24 ge 32 le 32\n"
+}
+
+func (o *oracleLab) hairpin(gw string) string {
+	var b strings.Builder
+	b.WriteString("NXST_FLOW reply (xid=0x4):\n")
+	if o.active(gw) {
+		for _, ip := range gwFIPs {
+			fmt.Fprintf(&b, " cookie=0x998, table=0, priority=100,ip,nw_dst=%s actions=NORMAL\n", ip)
+		}
+	}
+	return b.String()
+}
+
+func (o *oracleLab) macTweak(gw string) string {
+	var b strings.Builder
+	b.WriteString("NXST_FLOW reply (xid=0x4):\n")
+	if o.active(gw) {
+		b.WriteString(" cookie=0x999, table=0, priority=100,dl_vlan=0 actions=mod_dl_src\n")
+		b.WriteString(" cookie=0x999, table=0, priority=100,dl_vlan=0 actions=mod_dl_dst\n")
+	}
+	return b.String()
+}
+
+func (o *oracleLab) metrics(gw string) string {
+	return fmt.Sprintf("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n"+
+		"# HELP ovn_network_agent_consecutive_readds ...\n"+
+		"ovn_network_agent_consecutive_readds %d\n"+
+		"ovn_network_agent_inactive_routes %d\n"+
+		"ovn_network_agent_route_readds_total{plane=\"kernel\"} %d\n"+
+		"ovn_network_agent_route_readds_total{plane=\"frr\"} 0\n",
+		o.consecutive[gw], o.inactive[gw], o.readds[gw])
+}
+
+func (o *oracleLab) upstreamBGP() string {
+	routes := map[string][]map[string]any{}
+	if o.crOwner != "" {
+		nexthop := addrOf(mustLink(o.t, o.crOwner).gatewayCIDR)
+		for _, ip := range gwFIPs {
+			routes[ip+"/32"] = []map[string]any{{"nexthops": []map[string]any{{"ip": nexthop}}}}
+		}
+	}
+	b, _ := json.Marshal(map[string]any{"routes": routes})
+	return string(b)
+}
+
+func mustLink(t *testing.T, gw string) underlayLink {
+	t.Helper()
+	link, ok := linkFor(gw)
+	if !ok {
+		t.Fatalf("no underlay link for %s", gw)
+	}
+	return link
+}
+
+// ---- OVSDB JSON builders ----
+
+// ovsTable renders one `ovn-{n,s}bctl --format=json` table. Each cell is a
+// scalar (string/int) or one of the ovs* wrappers below.
+func ovsTable(headings []string, rows [][]any) string {
+	if rows == nil {
+		rows = [][]any{}
+	}
+	b, err := json.Marshal(map[string]any{"headings": headings, "data": rows})
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func ovsUUID(id string) []any { return []any{"uuid", id} }
+
+func ovsSet(items ...any) []any { return []any{"set", items} }
+
+func ovsMap(kv ...string) []any {
+	pairs := [][]any{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		pairs = append(pairs, []any{kv[i], kv[i+1]})
+	}
+	return []any{"map", pairs}
+}
+
+// gcRefs renders a Gateway_Chassis reference column: a bare UUID for one row,
+// an OVSDB set for several, matching how ovsdb collapses single-element sets.
+func gcRefs(uuids []string) any {
+	if len(uuids) == 1 {
+		return ovsUUID(uuids[0])
+	}
+	items := make([]any, 0, len(uuids))
+	for _, u := range uuids {
+		items = append(items, ovsUUID(u))
+	}
+	return ovsSet(items...)
+}
+
+// oracleApplier builds an applier carrying just the config the oracle reads:
+// each gateway's current document and management address.
+func oracleApplier(docs map[string]map[string]any) *applier {
+	a := &applier{current: docs, mgmtIP: map[string]string{}}
+	for _, gw := range gatewayNames() {
+		a.mgmtIP[gw] = "172.20.20.4"
+	}
+	return a
+}
+
+// fullModeDocs parses the baked gwnode config into an independent document per
+// gateway — the everything-on profile, where every gateway runs full OVN mode.
+func fullModeDocs(t *testing.T) map[string]map[string]any {
+	t.Helper()
+	docs := map[string]map[string]any{}
+	for _, gw := range gatewayNames() {
+		doc, err := parseConfig(baseConfig(t))
+		if err != nil {
+			t.Fatalf("parse baked config: %v", err)
+		}
+		docs[gw] = doc
+	}
+	return docs
+}

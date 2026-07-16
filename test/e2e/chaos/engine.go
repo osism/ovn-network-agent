@@ -54,6 +54,11 @@ const (
 	violationProfileApply    = "profile-not-applied"
 	violationStartState      = "start-state-not-green"
 	violationChecksNeverRan  = "checks-never-ran"
+	violationExpectedState   = "expected-state"
+	violationRouteFlap       = "route-flap"
+	violationDrainDisabled   = "drain-while-disabled"
+	violationOVNTouched      = "ovn-touched-in-pf-only"
+	violationOracleSetup     = "oracle-setup"
 )
 
 // convergePollInterval is how often the engine re-checks a recovering
