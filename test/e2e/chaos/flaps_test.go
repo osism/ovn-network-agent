@@ -27,8 +27,12 @@ func lineContaining(f *fakeCommander, substr string) string {
 	return ""
 }
 
-// The gateway FRR restart stops FRR, clears the stale watchfrr state, and
-// starts it again — in that order — then its restore waits for vtysh and
+// The gateway FRR restart backgrounds the recycle inside the container —
+// clear the completion marker, then stop FRR, clear the stale watchfrr
+// state, start it again and touch the marker, in that order — so the
+// docker exec returns immediately instead of riding a slow stop+start
+// into cmdTimeout's SIGKILL. The restore gates on the marker before it
+// waits for vtysh (the old FRR answers vtysh while still stopping) and
 // re-asserts the BGP session so the announcements return.
 func TestFRRRestartRecyclesFRRAndReassertsBGP(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
@@ -40,21 +44,34 @@ func TestFRRRestartRecyclesFRRAndReassertsBGP(t *testing.T) {
 	}
 
 	line := lineContaining(cmd, "frrinit.sh")
+	unmark := strings.Index(line, "rm -f "+frrRestartDoneMarker)
 	stop := strings.Index(line, "frrinit.sh stop")
 	wipe := strings.Index(line, "rm -rf /var/tmp/frr/*")
 	start := strings.Index(line, "frrinit.sh start")
-	if stop < 0 || wipe < 0 || start < 0 {
-		t.Fatalf("the FRR restart did not stop, clear and start: %q", line)
+	mark := strings.Index(line, "touch "+frrRestartDoneMarker)
+	if unmark < 0 || stop < 0 || wipe < 0 || start < 0 || mark < 0 {
+		t.Fatalf("the FRR restart did not clear the marker, stop, wipe, start and mark: %q", line)
 	}
-	if stop >= wipe || wipe >= start {
+	if unmark >= stop || stop >= wipe || wipe >= start || start >= mark {
 		t.Fatalf("the FRR restart ran its steps out of order: %q", line)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(line), "&") {
+		t.Fatalf("the FRR recycle is not backgrounded — a slow stop+start would ride the exec into cmdTimeout: %q", line)
 	}
 
 	if err := act.restore(context.Background(), l, "gateway-1"); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	if !cmd.called("vtysh -c 'show version'") {
+	marker := cmd.indexOf("test -f " + frrRestartDoneMarker)
+	vtysh := cmd.indexOf("vtysh -c 'show version'")
+	if marker < 0 {
+		t.Fatalf("the restore did not gate on the recycle marker: %v", cmd.lines())
+	}
+	if vtysh < 0 {
 		t.Fatalf("the restore did not wait for FRR to come back: %v", cmd.lines())
+	}
+	if marker >= vtysh {
+		t.Fatalf("the restore probed vtysh before the recycle finished — the old FRR answers too: %v", cmd.lines())
 	}
 	if !cmd.called("router bgp 65000 vrf vrf-provider") {
 		t.Fatalf("the restore did not re-assert the BGP session: %v", cmd.lines())

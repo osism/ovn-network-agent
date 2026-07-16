@@ -1140,7 +1140,12 @@ announcements return — the probes from `client-1` are only reachable over
 the routes `upstream` re-learns over BGP, so a green probe set is the
 proof. `frr-restart` recycles a gateway's FRR the way the gwnode entrypoint
 does (stop, clear the stale `watchfrr` state, start) and re-asserts the
-session on restore. `upstream-bgp-restart` stops `bgpd` on `upstream` and
+session on restore. The recycle runs backgrounded inside the container and
+touches a completion marker the restore gates on: run synchronously, the
+stop+start can outlive the runner's 30 s command timeout on a loaded CI
+machine — the SIGKILL reaps only the `docker exec` client while FRR
+restarts anyway, and the run records an `action-failed` violation for a
+lab that is healthy seconds later. `upstream-bgp-restart` stops `bgpd` on `upstream` and
 starts it back **in place** — never a `docker restart` and never
 `frrinit.sh restart`, because `watchfrr` is PID 1 on that node and either
 would take the container and its five containerlab veths down (the
