@@ -51,6 +51,77 @@ func TestScenario_Failover(t *testing.T) {
 	testenv.AssertNoOVSFlow(t, "0x998", 20*time.Second)
 }
 
+// TestScenario_FailoverTakeoverAnnounceLatencyMetric (#131):
+//
+// TestScenario_Failover above covers the release direction (active →
+// standby); this covers the takeover direction (standby → active), which no
+// other scenario exercises, and asserts the failover-latency metric fires
+// end-to-end against real OVN + FRR.
+//
+// The chassisredirect Port_Binding starts bound to a peer chassis, so the
+// agent boots as standby and installs nothing. Rebinding the CR Port_Binding
+// to the local chassis — what ovn-northd does once this chassis wins the
+// gateway — is routed through the agent's immediate (non-debounced) SB event
+// path, which stamps the failover observation. The takeover reconcile must
+// then install the kernel + FRR routes for the FIP and record exactly one
+// ovn_network_agent_failover_announce_seconds sample, measured from the
+// chassisredirect observation to the completed BGP announce.
+func TestScenario_FailoverTakeoverAnnounceLatencyMetric(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	// Create the peer chassis first so the router's CR Port_Binding can start
+	// bound to it — the agent then boots as standby (no local routers).
+	peerChassis := testenv.MakeChassis(t, ctx, sb, "peer-host")
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "ftake",
+		LRPNetworks: []string{"198.51.100.11/24"},
+		ChassisUUID: peerChassis,
+	})
+	const fip = "198.51.100.66"
+	testenv.AddFIP(t, ctx, nb, router, fip, "10.0.0.66")
+
+	cfg := testenv.Defaults()
+	addr := testenv.FreeLoopbackAddr(t)
+	cfg.MetricsListen = addr
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// Standby pre-condition: with the CR port bound to the peer the agent must
+	// install nothing, so the post-takeover assertion really proves a takeover
+	// install (not a route that was there all along). Short timeouts suffice —
+	// nothing should ever appear.
+	testenv.AssertNoKernelRoute(t, fip, 5*time.Second)
+	testenv.AssertNoFRRRoute(t, fip, 5*time.Second)
+
+	// The histogram is registered from startup, so its _count series is
+	// present at 0 before any sample fires. The failover-record guard skips
+	// the startup trigger, so no takeover sample has been recorded yet.
+	testenv.AssertMetricEventually(t, addr,
+		"ovn_network_agent_failover_announce_seconds_count", nil,
+		func(v float64, present bool) bool { return present && v == 0 },
+		5*time.Second)
+
+	// Trigger the takeover: rebind the CR Port_Binding from the peer to the
+	// local chassis, as ovn-northd would once this chassis wins the gateway.
+	// The agent's SB event handler routes this through the immediate
+	// (non-debounced) path, which stamps the failover observation.
+	localUUID := testenv.LocalChassisUUID(t, ctx, sb)
+	testenv.SetCRPortChassis(t, ctx, sb, router.CRPortUUID, &localUUID)
+
+	// The takeover reconcile must install the kernel + FRR routes for the FIP
+	// — same routes as the steady active state, only the ordering differs.
+	testenv.AssertKernelRoute(t, fip, 20*time.Second)
+	testenv.AssertFRRRoute(t, fip, 20*time.Second)
+
+	// ...and record at least one failover-announce latency sample, closing the
+	// immediate-path stamp → takeover reconcile → announce → record chain.
+	testenv.AssertMetricEventually(t, addr,
+		"ovn_network_agent_failover_announce_seconds_count", nil,
+		func(v float64, present bool) bool { return present && v >= 1 },
+		20*time.Second)
+}
+
 // TestScenario_StaleChassisCleanup (#42 scenario 5):
 //
 // A managed NB static route tagged with the chassis name of a peer that
