@@ -86,6 +86,17 @@ systemctl is-active ovn-network-agent
 Optionally confirm Floating IP reachability from a client and check the
 [metrics endpoint](./metrics) before proceeding to the next node.
 
+To confirm the roll from Prometheus rather than node by node, count the
+fleet-wide `build_info` gauge by version — each agent exports one
+`ovn_network_agent_build_info` series carrying its `version` label:
+
+```text
+count by (version) (ovn_network_agent_build_info)
+```
+
+The result lists every version currently running across the fleet; it
+collapses to a single row once every node is upgraded.
+
 ## Mixed-version fleets
 
 While the fleet is half-upgraded, a peer still running a pre-handshake
@@ -95,6 +106,11 @@ node never releases its routes early, it is only slower. If you need
 faster drains during the upgrade window, temporarily lower `drain_timeout`
 or set `drain_settle_delay: 0` (see
 [Configure gateway drain](./gateway-drain)).
+
+The `count by (version) (ovn_network_agent_build_info)` query above pins down
+the window: while the counts straddle two versions the fleet is still mixed,
+and the per-instance `ovn_network_agent_build_info` series names exactly which
+nodes still run the old version.
 
 ## Downgrade / rollback
 

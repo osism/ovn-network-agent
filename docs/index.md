@@ -28,3 +28,33 @@ features:
   - title: Prometheus metrics
     details: Exposes reconcile counters, drain durations, OVN connection state, and stale-chassis cleanup events on an optional HTTP endpoint, with suggested alert rules.
 ---
+
+## Known limitations
+
+Weigh these current constraints before planning a deployment:
+
+- **IPv4-only FIP routing plane** — kernel routes, FRR announcements, and the
+  virtual-gateway path are IPv4 only. IPv6 NAT and LRP addresses are filtered
+  out of the kernel/FRR desired set at ingest, while the per-port IPv6
+  MAC-tweak OVS flow variant is kept. See the scope note in
+  [gatewayless provider networks](./explanation/gatewayless-networks) and issues
+  [#85](https://github.com/osism/ovn-network-agent/issues/85) /
+  [#70](https://github.com/osism/ovn-network-agent/issues/70).
+- **No runtime configuration reload** — configuration is read once at startup
+  and there is no SIGHUP reload, so restart the agent to apply any change
+  ([#91](https://github.com/osism/ovn-network-agent/issues/91)).
+- **Port forwarding is IPv4-only with modulo hashing** — multi-backend VIPs
+  distribute clients with `jhash ip saddr mod N` over the backend count. This
+  is sticky per client but not a consistent hash, so adding or removing a
+  backend remaps roughly `(N-1)/N` of clients, and there are no backend health
+  checks. See
+  [sticky load balancing](./guides/port-forwarding#sticky-load-balancing-multi-backend).
+- **Single provider bridge per agent** — each agent instance drives one
+  provider bridge (`bridge_dev`, default `br-ex`); VLAN localnet segments are
+  all served on that one bridge as `<bridge_dev>.<tag>` subinterfaces.
+- **Sizing and scale** — the OVSDB monitors replicate whole tables into every
+  agent — Southbound `Port_Binding` and `Chassis`, and Northbound `NAT`,
+  `Logical_Router`, `Logical_Router_Port`, `Logical_Router_Static_Route`,
+  `Static_MAC_Binding`, and `Gateway_Chassis` — so an agent's memory footprint
+  and reconcile time scale with the size of the whole cloud, not with
+  node-local state alone.
