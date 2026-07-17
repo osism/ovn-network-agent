@@ -20,10 +20,14 @@ import (
 //     gateway path (no pre-existing default route in NB) because that is the
 //     only feature today that plants entries with the "ovn-network-agent" =
 //     "managed" external_ids tag.
-//   - No "drain:" log lines appear in the agent's stderr. The drain branch
-//     in Agent.Run() is gated entirely on cfg.DrainOnShutdown, so a regression
-//     that started running drain unconditionally (or that emitted a drain
-//     log line from a stray code path) would surface as a spurious match here.
+//   - No drain-branch log lines appear in the agent's stderr. The drain
+//     branch in Agent.Run() is gated entirely on cfg.DrainOnShutdown, so a
+//     regression that started running drain unconditionally (or that emitted
+//     a drain log line from a stray code path) would surface as a spurious
+//     match here. The takeover-readiness marker writer is exempt: it is the
+//     writer half of the drain handshake and runs on every active node
+//     regardless of drain_on_shutdown, so a chassis that itself has drain
+//     disabled can still release a draining peer.
 func TestScenario_FailureInjection_RemoveManagedNBEntriesNoDrain(t *testing.T) {
 	ctx, cancel, nb, sb := startScenario(t)
 	defer cancel()
@@ -78,14 +82,32 @@ func TestScenario_FailureInjection_RemoveManagedNBEntriesNoDrain(t *testing.T) {
 	// drain helpers in ovn_gateway.go use ("drain: no gateway chassis ...",
 	// "drain: gateway chassis priority lowered", "drain: complete, ...",
 	// "drain: timeout exceeded ...") plus the top-level "drain mode active"
-	// log line in agent.go.
-	for _, marker := range []string{
-		"drain mode active",
-		"drain:",
-		"drain failed",
-	} {
-		if strings.Contains(logs, marker) {
-			t.Errorf("spurious drain log line %q present; tail:\n%s", marker, a.LogTail(60))
+	// log line in agent.go. The takeover-readiness marker writer is the one
+	// legitimate "drain:" line on a non-draining node (MarkTakeoverReady is
+	// not gated on cfg.DrainOnShutdown — it signals a draining peer, not the
+	// local node), so it is skipped line by line rather than punching a hole
+	// into the blanket match.
+	const markerWritten = "drain: takeover readiness marker written"
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, markerWritten) {
+			continue
 		}
+		for _, marker := range []string{
+			"drain mode active",
+			"drain:",
+			"drain failed",
+		} {
+			if strings.Contains(line, marker) {
+				t.Errorf("spurious drain log line %q present: %s\ntail:\n%s", marker, line, a.LogTail(60))
+			}
+		}
+	}
+
+	// The writer half of the handshake must keep running with drain
+	// disabled: a takeover chassis with drain_on_shutdown=false still has to
+	// release a draining peer. Asserted positively so a regression that
+	// gates MarkTakeoverReady on the local drain config surfaces here.
+	if !strings.Contains(logs, markerWritten) {
+		t.Errorf("takeover readiness marker was not written; tail:\n%s", a.LogTail(60))
 	}
 }

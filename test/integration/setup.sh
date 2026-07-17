@@ -135,6 +135,27 @@ configure_frr() {
         sleep 1
     done
 
+    # The frr package's postinst starts frr.service at install time with the
+    # stock daemons file (bgpd=no), and /etc/frr/daemons is only read on a
+    # service (re)start — `enable --now` on an already-running service is a
+    # no-op, leaving bgpd down and every `router bgp` line below rejected.
+    # Restart to pick up the edit; skipped when a re-run finds bgpd already
+    # registered with watchfrr.
+    if ! vtysh -c 'show daemons' 2>/dev/null | grep -qw bgpd; then
+        log "restarting frr to start bgpd"
+        systemctl restart frr
+    fi
+    for _ in $(seq 1 30); do
+        if vtysh -c 'show daemons' 2>/dev/null | grep -qw bgpd; then
+            break
+        fi
+        sleep 1
+    done
+    if ! vtysh -c 'show daemons' 2>/dev/null | grep -qw bgpd; then
+        echo "bgpd did not start (check /etc/frr/daemons and frr.service)" >&2
+        exit 1
+    fi
+
     # Create the provider VRF as a Linux device so FRR can attach to it.
     # On the GHA azure-flavoured kernel the vrf module lives in
     # linux-modules-extra-<uname>, which isn't installed by default; pull it
@@ -168,6 +189,14 @@ router bgp 65000 vrf vrf-provider
 end
 write memory
 EOF
+
+    # vtysh applies config line by line and exits 0 even when a whole block
+    # is rejected (e.g. its daemon is down), so verify the BGP instance
+    # actually exists in the running config.
+    if ! vtysh -c 'show running-config' | grep -q '^router bgp 65000 vrf vrf-provider'; then
+        echo "router bgp config was not applied (is bgpd running?)" >&2
+        exit 1
+    fi
 }
 
 ensure_nftables() {
