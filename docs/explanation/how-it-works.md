@@ -23,9 +23,6 @@ provider bridge).
      requests for FIP addresses.
 4. **Reacts** instantly to changes — for each router whose gateway is active
    on this chassis:
-   - Ensures a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static
-     MAC binding** in OVN NB so reply traffic exits the logical router
-     correctly (see [Gatewayless provider networks](gatewayless-networks)).
    - Installs **OVS MAC-tweak flows** on the provider bridge so the kernel
      accepts packets from OVN (rewrites destination MAC to `br-ex` MAC).
    - Installs **OVS hairpin flows** (per FIP, priority 910) that reflect
@@ -33,14 +30,14 @@ provider bridge).
      rewriting both source MAC (`br-ex` MAC) and destination MAC (owning
      router port MAC) — see
      [Hairpin OVS flows](gatewayless-networks#hairpin-ovs-flows-on-br-ex).
-   - Applies the **active priority lead boost** to its `Gateway_Chassis`
-     entries: when this chassis is active, its priority is raised to
-     `max(max peer + 1, 2)` so a peer returning from drain (restored to 1)
-     cannot trigger reverse failover — see
-     [Priority semantics](gateway-drain#priority-semantics).
-   - Reconciles **per-network veth-leak routes and policy rules** in the
-     veth leak table (default 200) so SNAT reply traffic on the provider
-     subnet crosses into `vrf-provider` for BGP delivery.
+   - Ensures a **default route** (`0.0.0.0/0 via <virtual-gw>`) and **static
+     MAC binding** in OVN NB so reply traffic exits the logical router
+     correctly (see [Gatewayless provider networks](gatewayless-networks)).
+   - If configured, reconciles the **FRR prefix-list** with
+     `permit <network> ge 32 le 32` entries for each discovered provider
+     network. This is the BGP outbound filter, and a standby chassis empties
+     it, so it is repopulated *before* the announce below — otherwise the
+     takeover would advertise nothing.
    - Ensures `/32` **kernel routes** (with IP rules when using a dedicated
      routing table) and **FRR static routes** in the VRF for each FIP, SNAT
      IP, router LRP gateway IP, and (independent of router locality)
@@ -49,7 +46,10 @@ provider bridge).
      full IPv6 support ([#85](https://github.com/osism/ovn-network-agent/issues/85),
      [#70](https://github.com/osism/ovn-network-agent/issues/70)) lands. A
      single malformed OVN row (an invalid `external_ip`) degrades only its own
-     FIP — it never fails the whole batch.
+     FIP — it never fails the whole batch. The stability steps below
+     deliberately run after this kernel/FRR route installation and BGP
+     announce so a failover takeover announce is never gated behind them
+     (issue #131).
    - **Route ownership** is explicit: every agent-created kernel route is
      tagged with the agent's route protocol (`proto 44`) and every FRR static
      route uses the agent's veth next-hop. Reconciliation — including standby
@@ -59,9 +59,14 @@ provider bridge).
      still-desired routes are re-tagged automatically on the next reconcile;
      any stale pre-upgrade leftovers are indistinguishable from operator
      routes and must be cleaned up once by hand.
-   - If configured, reconciles the **FRR prefix-list** with
-     `permit <network> ge 32 le 32` entries for each discovered provider
-     network.
+   - Applies the **active priority lead boost** to its `Gateway_Chassis`
+     entries: when this chassis is active, its priority is raised to
+     `max(max peer + 1, 2)` so a peer returning from drain (restored to 1)
+     cannot trigger reverse failover — see
+     [Priority semantics](gateway-drain#priority-semantics).
+   - Reconciles **per-network veth-leak routes and policy rules** in the
+     veth leak table (default 200) so SNAT reply traffic on the provider
+     subnet crosses into `vrf-provider` for BGP delivery.
    - If no routers are locally active: removes all managed routes (port
      forward VIPs still get kernel/FRR routes if any are configured).
 5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP
