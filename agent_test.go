@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os/exec"
 	"reflect"
@@ -1417,6 +1418,152 @@ func TestReconcileLeavesFailoverStampForTheAnnouncingCycle(t *testing.T) {
 	// reconcile: a stamp re-taken later would record a near-zero latency.
 	if sum < 0.4 || sum > 2.0 {
 		t.Errorf("failover_announce_seconds sum = %v, want ~0.4 (the observed→announce interval)", sum)
+	}
+}
+
+// TestReconcileAnnouncesBeforeStabilitySteps pins the reconcile ordering
+// introduced by issue #131: on a takeover the BGP announce — the FRR
+// route-add followed by the "clear ip bgp ... soft out" soft-refresh — must
+// run BEFORE the stability steps, and the post-change route verification must
+// run AFTER it. Gating the announce behind the stability steps (priority lead,
+// veth-leak, stale-chassis cleanup) adds seconds of external downtime on a
+// failover, so a regression reverting the reorder must fail here.
+//
+// The prefix-list is deliberately NOT a stability step: it is the BGP
+// outbound filter (neighbor ... prefix-list ... out) and permits the FIP
+// /32s, so an announce that runs before it is populated advertises nothing.
+// A standby chassis empties the list, so on a takeover the repopulation must
+// precede the announce.
+//
+// The pin is expressed as an index ordering over the recorded vtysh calls:
+//
+//	prefix-list  "ip prefix-list fip-out ... permit 198.51.100.0/24 ge 32 le 32"
+//	             (ReconcileFRRPrefixList — the BGP outbound filter)
+//	  <
+//	route-add    "ip route 198.51.100.0/32 ..."              (ensureRoutes)
+//	  <
+//	soft-refresh "clear ip bgp vrf vrf-provider * soft out"  (ensureRoutes)
+//	  <
+//	route re-add "ip route 198.51.100.0/32 ..."              (verifyRoutes)
+//
+// AC1 (the announce is not filtered away) is pinned by prefix-list <
+// route-add < soft-refresh: with the prefix-list repopulation deferred to
+// after ensureRoutes, the soft-refresh runs against an empty outbound filter
+// and the takeover advertises zero prefixes, which inverts the assertion.
+//
+// AC2 (verification still runs, after the announce) is pinned by
+// soft-refresh < route re-add. The vtysh recorder answers every FRR static
+// listing with an empty document, so verifyRoutes finds the freshly announced
+// /32 "missing" and re-adds it — a second route-add call that only
+// verifyRoutes issues and that must land after the announce. The listing
+// itself cannot anchor AC2: ListFRRRoutes and InactiveFRRRoutes share the
+// same memoized "show ip route ... static json" query, so a second listing
+// appears with or without verifyRoutes (checkFRRRouteActivity re-reads too).
+//
+// EnsureActivePriorityLead and the stale-chassis cleanup are NB/SB-side, not
+// vtysh, so they cannot be interleaved with the vtysh stream and are not
+// asserted here.
+func TestReconcileAnnouncesBeforeStabilitySteps(t *testing.T) {
+	rec := newVtyshRecorder()
+	// Non-dry-run RouteManager so the FRR helpers actually reach the vtysh
+	// hook (dry-run would short-circuit them). FRRPrefixList is non-empty so
+	// ReconcileFRRPrefixList populates the outbound filter. The OVS hook is a
+	// no-op recorder so the pre-announce OVS steps (EnsureSegments, hairpin
+	// flows) don't shell out on this host, and the kernel-route listing hook
+	// keeps verifyRoutes from bailing out before its FRR re-read on hosts
+	// where kernel routes are unsupported.
+	rm := &RouteManager{
+		cfg:                  Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", FRRPrefixList: "fip-out"},
+		execVtyshHook:        rec.hook(),
+		execOVSHook:          newOVSRecorder().hook(),
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) { return nil, nil },
+	}
+
+	// Same OVN rig as takeoverAgent: one locally-active router whose LRP
+	// network 198.51.100.0/24 makes 198.51.100.0 the desired announce IP.
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{{
+			RouterName:  "router1",
+			LRPName:     "lrp-abc",
+			LRPMAC:      "aa:aa:aa:aa:aa:aa",
+			LRPNetworks: []string{"198.51.100.0/24"},
+		}},
+		HasLocalRouters:    true,
+		DiscoveredNetworks: []*net.IPNet{cidr},
+	})
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	// The kernel-route add helpers error out on this host (no br-ex);
+	// reconcile only logs those and proceeds to the FRR/vtysh path, which is
+	// all this test inspects.
+	a.reconcile(context.Background(), "event")
+
+	// firstIdx locates a recorded vtysh call by a substring of its full,
+	// space-joined args; -1 when absent. allIdxs returns every match.
+	firstIdx := func(sub string) int {
+		for i, args := range rec.calls {
+			if strings.Contains(strings.Join(args, " "), sub) {
+				return i
+			}
+		}
+		return -1
+	}
+	allIdxs := func(sub string) []int {
+		var idxs []int
+		for i, args := range rec.calls {
+			if strings.Contains(strings.Join(args, " "), sub) {
+				idxs = append(idxs, i)
+			}
+		}
+		return idxs
+	}
+	dump := func() string {
+		var b strings.Builder
+		for i, args := range rec.calls {
+			fmt.Fprintf(&b, "\n  [%d] %s", i, strings.Join(args, " "))
+		}
+		return b.String()
+	}
+
+	// route-add occurrences: the announce's add of the desired /32
+	// (ensureRoutes), then verifyRoutes' re-add of the same /32.
+	routeAdds := allIdxs("ip route 198.51.100.0/32")
+	softRefresh := firstIdx("clear ip bgp vrf vrf-provider * soft out")
+	// The prefix-list populate: the entry that permits the FIP /32s through
+	// the BGP outbound filter.
+	prefixListAdd := firstIdx("permit 198.51.100.0/24 ge 32 le 32")
+
+	if len(routeAdds) == 0 || softRefresh < 0 || prefixListAdd < 0 {
+		t.Fatalf("missing expected vtysh calls: prefixListAdd=%d routeAdds=%v softRefresh=%d; calls:%s",
+			prefixListAdd, routeAdds, softRefresh, dump())
+	}
+
+	// AC1: the outbound filter is populated before the announce, and the
+	// announce is route-add followed by soft-refresh. Deferring the
+	// prefix-list to after the announce advertises nothing.
+	if prefixListAdd >= routeAdds[0] || routeAdds[0] >= softRefresh {
+		t.Errorf("prefix-list must be populated before the announce: prefixListAdd=%d routeAdd=%d softRefresh=%d; calls:%s",
+			prefixListAdd, routeAdds[0], softRefresh, dump())
+	}
+
+	// AC2: verifyRoutes still runs, after the announce. The recorder reports
+	// an empty FRR document on every listing, so verifyRoutes re-adds the
+	// /32 it just announced — deleting verifyRoutes drops this second add.
+	if len(routeAdds) < 2 {
+		t.Fatalf("want the announce's route-add plus verifyRoutes' re-add, got %v; calls:%s",
+			routeAdds, dump())
+	}
+	if reAdd := routeAdds[1]; reAdd <= softRefresh {
+		t.Errorf("route verification must run after the announce: softRefresh=%d reAdd=%d; calls:%s",
+			softRefresh, reAdd, dump())
 	}
 }
 
