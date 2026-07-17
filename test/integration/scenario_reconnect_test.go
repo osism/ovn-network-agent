@@ -90,6 +90,8 @@ func TestScenario_OVNDatabasePauseResume(t *testing.T) {
 //   - ovn_connection_state drops to 0 for both DBs — the proof the inactivity
 //     probe fired and libovsdb disconnected rather than merely stalling — and
 //     recovers to 1 after resume,
+//   - /readyz tracks that transition (200 -> 503 -> 200), proving it
+//     distinguishes an alive-but-disconnected agent from a functional one,
 //   - the agent stays alive across the whole outage,
 //   - the FIP route installed before the outage survives it, and
 //   - a NB change made AFTER reconnect still drives reconciliation, proving
@@ -129,10 +131,12 @@ func TestScenario_OVNReconnectAfterLongOutage(t *testing.T) {
 			timeout)
 	}
 
-	// Pre-condition: the route landed and both DB connections read as up.
+	// Pre-condition: the route landed, both DB connections read as up, and
+	// /readyz reports the agent functional.
 	testenv.AssertKernelRoute(t, fip1, 15*time.Second)
 	assertConnState("nb", 1, 10*time.Second)
 	assertConnState("sb", 1, 10*time.Second)
+	testenv.AssertHTTPStatusEventually(t, addr, "/readyz", 200, 10*time.Second)
 
 	if !a.Alive() {
 		t.Fatalf("agent exited before the outage; setup is broken (last logs:\n%s)", a.LogTail(40))
@@ -151,6 +155,13 @@ func TestScenario_OVNReconnectAfterLongOutage(t *testing.T) {
 	assertConnState("nb", 0, 90*time.Second)
 	assertConnState("sb", 0, 90*time.Second)
 
+	// With both DBs disconnected the agent is alive but not functional, so
+	// /readyz must report 503 even though the process is up and /healthz still
+	// answers 200 — the #165 acceptance criterion distinguishing process-alive
+	// from agent-functional. Readiness flipped with the gauges above, so a
+	// short timeout suffices.
+	testenv.AssertHTTPStatusEventually(t, addr, "/readyz", 503, 10*time.Second)
+
 	// Honour the >40s outage floor deterministically by holding the remainder
 	// of 45s (the gauge-drop asserts above already consumed most of it).
 	if held := time.Since(start); held < 45*time.Second {
@@ -164,9 +175,11 @@ func TestScenario_OVNReconnectAfterLongOutage(t *testing.T) {
 
 	resume()
 
-	// Recovery: both gauges climb back to 1.
+	// Recovery: both gauges climb back to 1, and /readyz returns to 200 once a
+	// post-reconnect reconcile completes.
 	assertConnState("nb", 1, 45*time.Second)
 	assertConnState("sb", 1, 45*time.Second)
+	testenv.AssertHTTPStatusEventually(t, addr, "/readyz", 200, 30*time.Second)
 
 	// The pre-outage route survived the disconnect/reconnect.
 	testenv.AssertKernelRoute(t, fip1, 15*time.Second)

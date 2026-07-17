@@ -250,3 +250,57 @@ func TestScenario_MetricsDesiredStateGauges(t *testing.T) {
 		func(v float64, present bool) bool { return present && v == 1 },
 		5*time.Second)
 }
+
+// TestScenario_MetricsBuildInfoAndReadyz (#165):
+//
+// The observability-readiness work exposes two process-health signals on the
+// metrics listener: an ovn_network_agent_build_info gauge (constant 1, carrying
+// the build version as a label) and a /readyz endpoint that returns 200 only
+// once the agent is functional — OVN connected and a route-synced reconcile
+// completed. This scenario brings a real agent up against OVN and asserts
+// build_info is exposed as a single series valued 1, that the liveness-only
+// /healthz answers 200, and that /readyz flips to 200 once the startup
+// reconcile lands. The version label carries git describe output in the
+// integration build, so we assert only that exactly one series exists at 1.
+func TestScenario_MetricsBuildInfoAndReadyz(t *testing.T) {
+	_, cancel, _, _ := startScenario(t)
+	defer cancel()
+
+	cfg := testenv.Defaults()
+	addr := testenv.FreeLoopbackAddr(t)
+	cfg.MetricsListen = addr
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// ovn_network_agent_build_info is a constant gauge exposed as a single
+	// version-labelled series valued 1. The version label carries git describe
+	// output in the integration build, so match label-agnostically: iterate the
+	// family's inner map, requiring exactly one series whose value is 1.
+	deadline := time.Now().Add(10 * time.Second)
+	var family map[string]float64
+	for {
+		family = testenv.ScrapeMetrics(t, addr)["ovn_network_agent_build_info"]
+		exactlyOne := len(family) == 1
+		valueIsOne := false
+		for _, v := range family {
+			valueIsOne = v == 1
+		}
+		if exactlyOne && valueIsOne {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ovn_network_agent_build_info: want exactly one series "+
+				"valued 1, got %v", family)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// /healthz is unconditional liveness — 200 while the process is up.
+	testenv.AssertHTTPStatusEventually(t, addr, "/healthz", 200, 5*time.Second)
+
+	// /readyz turns 200 once the agent connects to OVN and its startup
+	// reconcile syncs routes; the startup reconcile completes shortly after
+	// readyAgent returns, so a modest budget suffices.
+	testenv.AssertHTTPStatusEventually(t, addr, "/readyz", 200, 15*time.Second)
+}
