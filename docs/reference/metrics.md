@@ -13,10 +13,11 @@ ovn-network-agent --metrics-listen 127.0.0.1:9273
 curl -s http://127.0.0.1:9273/metrics
 ```
 
-Two paths are served:
+Three paths are served:
 
 - `/metrics` — Prometheus exposition format
-- `/healthz` — returns `200 ok` for liveness probes
+- `/healthz` — always returns `200 ok` while the process is up (liveness only)
+- `/readyz` — returns `200` only when the agent is functional (OVN connected, last reconcile succeeded); `503` otherwise
 
 All metrics are prefixed with `ovn_network_agent_`. The table below is generated from the
 `prometheus.New*` constructors in

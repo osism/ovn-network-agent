@@ -593,6 +593,137 @@ func TestReconcileFailedAnnounceWithholdsMarker(t *testing.T) {
 	}
 }
 
+// TestReconcileRecordsReadinessOutcome pins the /readyz feed: reconcile stamps
+// the last-reconcile outcome via setLastReconcileStatus(cycleOK), where cycleOK
+// tracks routeSyncResult.ready. A successful announce and a healthy standby
+// cycle both report ready; a failed announce reports not-ready.
+func TestReconcileRecordsReadinessOutcome(t *testing.T) {
+	// a. Successful announce — modelled on
+	// TestReconcileWritesMarkerAfterSuccessfulAnnounce. Dry-run FRR/BGP never
+	// fail, so ensureRoutes reports ready and the cycle is OK.
+	t.Run("successful announce is ready", func(t *testing.T) {
+		m := withTestMetrics(t)
+		rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
+		c, nb, _ := newOVNClientWithFakes(t, "host-a")
+		c.state.Replace(OVNState{
+			LocalRouters:    []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1"}},
+			HasLocalRouters: true,
+		})
+		nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+		nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+			UUID:     "sr1",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-b",
+				takeoverReadyMarkerKey:      "host-b",
+			},
+		})
+
+		a := &Agent{
+			cfg:            Config{},
+			ovn:            c,
+			routing:        rm,
+			reconcileCh:    make(chan struct{}, 1),
+			missingChassis: make(map[string]time.Time),
+		}
+		a.reconcile(context.Background(), "test")
+
+		if !m.readiness.reconcileRan.Load() {
+			t.Error("reconcileRan not set after a completed reconcile")
+		}
+		if !m.readiness.lastReconcileOK.Load() {
+			t.Error("lastReconcileOK false after a successful announce")
+		}
+	})
+
+	// b. Failed announce — modelled on TestReconcileFailedAnnounceWithholdsMarker.
+	// The FRR batch add errors, so ensureRoutes reports not-ready.
+	t.Run("failed announce is not ready", func(t *testing.T) {
+		m := withTestMetrics(t)
+		const (
+			fip    = "198.51.100.50"
+			bridge = "ovnagent-nonexistent-br"
+			lrpMAC = "fa:16:3e:aa:aa:aa"
+		)
+		rec := newVtyshRecorder()
+		rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
+			"-c", "ip route " + fip + "/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
+			"", errors.New("test: vtysh add failed"))
+		rm := &RouteManager{
+			cfg: Config{
+				BridgeDev:   bridge,
+				VRFName:     "vrf-provider",
+				VethNexthop: "169.254.0.1",
+			},
+			execVtyshHook: rec.hook(),
+			execOVSHook: func(*exec.Cmd) ([]byte, error) {
+				return nil, errors.New("test: no ovs available")
+			},
+			listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+				return []kernelRouteEntry{{IP: fip, Dev: bridge}}, nil
+			},
+		}
+
+		c, nb, _ := newOVNClientWithFakes(t, "host-a")
+		c.state.Replace(OVNState{
+			LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
+			HasLocalRouters:  true,
+			NATIPToRouterMAC: map[string]string{fip: lrpMAC},
+		})
+		nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+		nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+			UUID:     "sr1",
+			IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{
+				"ovn-network-agent":         "managed",
+				"ovn-network-agent-chassis": "host-b",
+				takeoverReadyMarkerKey:      "host-b",
+			},
+		})
+
+		a := &Agent{
+			cfg:            Config{},
+			ovn:            c,
+			routing:        rm,
+			reconcileCh:    make(chan struct{}, 1),
+			missingChassis: make(map[string]time.Time),
+		}
+		a.reconcile(context.Background(), "test")
+
+		if !m.readiness.reconcileRan.Load() {
+			t.Error("reconcileRan not set after a completed reconcile")
+		}
+		if m.readiness.lastReconcileOK.Load() {
+			t.Error("lastReconcileOK true after a failed announce")
+		}
+	})
+
+	// c. Healthy standby — modelled on
+	// TestReconcileNoLocalRoutersInvokesRemoveAllRoutes. No local routers and
+	// no VIPs takes the removeAllRoutes branch, which leaves cycleOK true.
+	t.Run("healthy standby is ready", func(t *testing.T) {
+		m := withTestMetrics(t)
+		rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
+		c, _, _ := newOVNClientWithFakes(t, "host-a")
+		a := &Agent{
+			cfg:            Config{},
+			ovn:            c,
+			routing:        rm,
+			reconcileCh:    make(chan struct{}, 1),
+			missingChassis: make(map[string]time.Time),
+		}
+		a.reconcile(context.Background(), "test")
+
+		if !m.readiness.reconcileRan.Load() {
+			t.Error("reconcileRan not set after a completed reconcile")
+		}
+		if !m.readiness.lastReconcileOK.Load() {
+			t.Error("lastReconcileOK false for a healthy standby cycle")
+		}
+	})
+}
+
 // hasMarkerUpdate reports whether any recorded write updates a
 // Logical_Router_Static_Route external_ids with a takeover readiness marker
 // naming chassis.

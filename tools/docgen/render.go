@@ -159,9 +159,10 @@ func renderMetrics(info *sourceInfo) string {
 	b.WriteString("ovn-network-agent --metrics-listen 127.0.0.1:9273\n")
 	b.WriteString("curl -s http://127.0.0.1:9273/metrics\n")
 	b.WriteString("```\n\n")
-	b.WriteString("Two paths are served:\n\n")
+	b.WriteString("Three paths are served:\n\n")
 	b.WriteString("- `/metrics` — Prometheus exposition format\n")
-	b.WriteString("- `/healthz` — returns `200 ok` for liveness probes\n\n")
+	b.WriteString("- `/healthz` — always returns `200 ok` while the process is up (liveness only)\n")
+	b.WriteString("- `/readyz` — returns `200` only when the agent is functional (OVN connected, last reconcile succeeded); `503` otherwise\n\n")
 	if info.Namespace != "" {
 		fmt.Fprintf(&b, "All metrics are prefixed with `%s_`. The table below is generated from the\n", info.Namespace)
 	} else {
