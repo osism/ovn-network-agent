@@ -21,6 +21,9 @@ const metricsNamespace = "ovn_network_agent"
 type metricsRegistry struct {
 	registry *prometheus.Registry
 
+	// Build metadata
+	buildInfo *prometheus.GaugeVec
+
 	// Reconcile metrics
 	reconcileTotal      *prometheus.CounterVec
 	reconcileDuration   prometheus.Histogram
@@ -72,6 +75,12 @@ func newMetricsRegistry() *metricsRegistry {
 	reg := prometheus.NewRegistry()
 	m := &metricsRegistry{
 		registry: reg,
+
+		buildInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "build_info",
+			Help:      "Always 1, labelled with the running agent version (from -ldflags \"-X main.version=…\").",
+		}, []string{"version"}),
 
 		reconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -174,6 +183,7 @@ func newMetricsRegistry() *metricsRegistry {
 	}
 
 	reg.MustRegister(
+		m.buildInfo,
 		m.reconcileTotal,
 		m.reconcileDuration,
 		m.reconcileInProgress,
@@ -195,6 +205,7 @@ func newMetricsRegistry() *metricsRegistry {
 	// Initialise label series so they appear in /metrics with a zero value
 	// from the first scrape, instead of materialising only on the first
 	// observation.
+	m.buildInfo.WithLabelValues(version).Set(1)
 	m.reconcileTotal.WithLabelValues("event").Add(0)
 	m.reconcileTotal.WithLabelValues("periodic").Add(0)
 	m.reconcileTotal.WithLabelValues("startup").Add(0)
