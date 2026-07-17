@@ -46,6 +46,11 @@ regenerate it with `go generate ./...`.
 
 ## Suggested alerts
 
+Ready-to-load rules implementing these alerts ship in
+[`contrib/prometheus-rules.yaml`](https://github.com/osism/ovn-network-agent/blob/main/contrib/prometheus-rules.yaml),
+and each alert has a cause→diagnosis→remediation section in the
+[troubleshooting guide](../guides/troubleshooting).
+
 - `consecutive_readds >= 3` — persistent route instability (FRR or kernel
   races).
 - `ovn_connection_state{database="nb"} == 0` for >2m — NB DB unreachable;
