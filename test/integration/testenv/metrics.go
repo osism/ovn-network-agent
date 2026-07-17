@@ -125,6 +125,47 @@ func AssertMetricEventually(
 	}
 }
 
+// AssertHTTPStatusEventually polls GET http://addr<path> until the response
+// status equals want or timeout expires. Useful for asserting that a readiness
+// endpoint has flipped (e.g. /readyz 200 <-> 503) without baking in a fixed
+// sleep. Transport errors are tolerated across the deadline — the listener may
+// briefly refuse connections around startup — and surface only if the timeout
+// is reached. On timeout it fails with the last observed status and body.
+func AssertHTTPStatusEventually(
+	t *testing.T,
+	addr, path string,
+	want int,
+	timeout time.Duration,
+) {
+	t.Helper()
+	url := "http://" + addr + path
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(timeout)
+	var lastStatus int
+	var lastBody string
+	for {
+		resp, err := client.Get(url)
+		if err != nil {
+			lastStatus = 0
+			lastBody = err.Error()
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			lastStatus = resp.StatusCode
+			lastBody = string(body)
+			if lastStatus == want {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("GET %s did not return status %d within %s "+
+				"(last status=%d, body:\n%s)",
+				url, want, timeout, lastStatus, lastBody)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // FreeLoopbackAddr returns a 127.0.0.1:<port> address whose port is currently
 // free. The listener is opened and closed before returning, leaving a small
 // TOCTOU window — the agent re-listens immediately on startup, so collisions
