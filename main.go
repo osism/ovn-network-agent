@@ -92,7 +92,8 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	if cfg.MetricsListen != "" {
-		if err := startMetricsServer(ctx, cfg.MetricsListen, initMetrics()); err != nil {
+		m := initMetricsForConfig(cfg)
+		if err := startMetricsServer(ctx, cfg.MetricsListen, m); err != nil {
 			slog.Error("failed to start metrics endpoint", "addr", cfg.MetricsListen, "error", err)
 			os.Exit(1)
 		}
@@ -116,6 +117,14 @@ func main() {
 	}
 
 	slog.Info("ovn-network-agent stopped")
+}
+
+// initMetricsForConfig builds the process-wide metrics registry for cfg. In
+// port-forward-only mode there is no OVN client, so OVN connection state must
+// not gate /readyz: ovnRequired is the negation of PortForwardOnly. Keeping the
+// derivation here (rather than inline in main) makes it testable.
+func initMetricsForConfig(cfg Config) *metricsRegistry {
+	return initMetrics(!cfg.PortForwardOnly)
 }
 
 func setupLogging(level string) {

@@ -263,10 +263,17 @@ func drainOutcome(err, ctxErr error, drained bool) string {
 // The trigger label identifies why the cycle ran (event, periodic, startup).
 func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	start := time.Now()
+	// cycleOK tracks whether this cycle can forward: it is defined by
+	// routeSyncResult.ready — the same signal the drain takeover handshake
+	// trusts for "this node can forward". Best-effort steps that only log
+	// (EnsureSegments, EnsureGatewayRouting, prefix-list) intentionally do not
+	// flip readiness.
+	cycleOK := true
 	setReconcileInProgress(true)
 	defer func() {
 		setReconcileInProgress(false)
 		recordReconcile(trigger, time.Since(start))
+		setLastReconcileStatus(cycleOK)
 	}()
 
 	// This cycle's FRR readers share one static-route document; drop the memo
@@ -431,7 +438,10 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	var routeSync routeSyncResult
 	if len(desiredIPs) > 0 || state.HasLocalRouters {
 		routeSync = a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
+		cycleOK = routeSync.ready
 	} else {
+		// The removeAllRoutes standby path leaves cycleOK true — a healthy
+		// standby is ready.
 		a.removeAllRoutes("no locally active routers and no port forward VIPs")
 	}
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,7 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	recordDrain("completed", time.Second)
 	recordStaleChassisCleanup("success", 2)
 	setMissingChassis(1)
+	setLastReconcileStatus(true)
 }
 
 func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
@@ -225,6 +227,111 @@ func TestStartMetricsServerServesMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(string(body), "ovn_network_agent_reconcile_total") {
 		t.Errorf("body missing reconcile_total; got:\n%s", body)
 	}
+
+	// /healthz is liveness-only and always 200 while the process is up.
+	healthz, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer func() { _ = healthz.Body.Close() }()
+	if healthz.StatusCode != http.StatusOK {
+		t.Errorf("/healthz status = %d, want 200", healthz.StatusCode)
+	}
+
+	// /readyz on a fresh registry with no reconcile recorded is not ready.
+	readyz, err := http.Get("http://" + addr + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	defer func() { _ = readyz.Body.Close() }()
+	if readyz.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("/readyz status = %d, want 503", readyz.StatusCode)
+	}
+}
+
+// callReadyz drives readyzHandler against the given registry and returns the
+// response recorder so callers can assert on status and body.
+func callReadyz(m *metricsRegistry) *httptest.ResponseRecorder {
+	rr := httptest.NewRecorder()
+	readyzHandler(m)(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	return rr
+}
+
+// TestReadyzNotReadyBeforeFirstReconcile proves a fresh agent that has not yet
+// completed a reconcile reports 503, even with OVN checks disabled.
+func TestReadyzNotReadyBeforeFirstReconcile(t *testing.T) {
+	m := withTestMetrics(t) // ovnRequired stays false
+
+	rr := callReadyz(m)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "awaiting first reconcile") {
+		t.Errorf("body missing 'awaiting first reconcile'; got:\n%s", rr.Body.String())
+	}
+}
+
+// TestReadyzReflectsReconcileOutcome proves readiness flips with the recorded
+// reconcile outcome once at least one cycle has run.
+func TestReadyzReflectsReconcileOutcome(t *testing.T) {
+	m := withTestMetrics(t) // ovnRequired stays false
+
+	setLastReconcileStatus(true)
+	if rr := callReadyz(m); rr.Code != http.StatusOK || rr.Body.String() != "ok\n" {
+		t.Errorf("after ok reconcile: status = %d body = %q, want 200 %q", rr.Code, rr.Body.String(), "ok\n")
+	}
+
+	setLastReconcileStatus(false)
+	rr := callReadyz(m)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("after failed reconcile: status = %d, want 503", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "last reconcile failed") {
+		t.Errorf("body missing 'last reconcile failed'; got:\n%s", rr.Body.String())
+	}
+}
+
+// TestReadyzRequiresOVNWhenConfigured proves that OVN connection state gates
+// readiness only when ovnRequired is set.
+func TestReadyzRequiresOVNWhenConfigured(t *testing.T) {
+	t.Run("ovn required", func(t *testing.T) {
+		m := withTestMetrics(t)
+		m.readiness.ovnRequired = true
+		setLastReconcileStatus(true)
+
+		// nb/sb disconnected: both checks fail even though reconcile is OK.
+		rr := callReadyz(m)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("disconnected: status = %d, want 503", rr.Code)
+		}
+		if body := rr.Body.String(); !strings.Contains(body, "nb disconnected") || !strings.Contains(body, "sb disconnected") {
+			t.Errorf("body missing nb/sb disconnected lines; got:\n%s", body)
+		}
+
+		// Both connected: ready.
+		setOVNConnectionState("nb", true)
+		setOVNConnectionState("sb", true)
+		if rr := callReadyz(m); rr.Code != http.StatusOK {
+			t.Errorf("connected: status = %d, want 200", rr.Code)
+		}
+
+		// SB drops again: unready.
+		setOVNConnectionState("sb", false)
+		if rr := callReadyz(m); rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("sb dropped: status = %d, want 503", rr.Code)
+		}
+	})
+
+	t.Run("ovn not required ignores connection state", func(t *testing.T) {
+		m := withTestMetrics(t) // ovnRequired stays false
+		setLastReconcileStatus(true)
+		setOVNConnectionState("nb", false)
+		setOVNConnectionState("sb", false)
+
+		if rr := callReadyz(m); rr.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200 despite disconnected OVN", rr.Code)
+		}
+	})
 }
 
 // TestInitMetricsAssignsProcessRegistry verifies that initMetrics builds a
@@ -235,7 +342,7 @@ func TestInitMetricsAssignsProcessRegistry(t *testing.T) {
 	metrics = nil
 	t.Cleanup(func() { metrics = prev })
 
-	m := initMetrics()
+	m := initMetrics(false)
 	if m == nil {
 		t.Fatal("initMetrics returned nil")
 	}
@@ -245,6 +352,39 @@ func TestInitMetricsAssignsProcessRegistry(t *testing.T) {
 	if m.registry == nil {
 		t.Error("returned registry has no underlying prometheus.Registry")
 	}
+}
+
+// TestInitMetricsForConfigDerivesOVNRequired guards the config→ovnRequired
+// mapping wired into main: flipping the negation would make /readyz gate on OVN
+// connectivity in port-forward-only mode (perpetual 503) or ignore it in full
+// mode (ready with OVN down). Both subtests go red if that derivation breaks.
+func TestInitMetricsForConfigDerivesOVNRequired(t *testing.T) {
+	prev := metrics
+	t.Cleanup(func() { metrics = prev })
+
+	t.Run("port-forward-only leaves OVN out of readiness", func(t *testing.T) {
+		m := initMetricsForConfig(Config{PortForwardOnly: true})
+		if m.readiness.ovnRequired {
+			t.Error("ovnRequired = true in port-forward-only mode, want false")
+		}
+		// A successful reconcile is enough: /readyz is 200 with no OVN connection.
+		setLastReconcileStatus(true)
+		if rr := callReadyz(m); rr.Code != http.StatusOK {
+			t.Errorf("/readyz = %d in port-forward-only mode, want 200", rr.Code)
+		}
+	})
+
+	t.Run("full mode gates readiness on OVN", func(t *testing.T) {
+		m := initMetricsForConfig(Config{PortForwardOnly: false})
+		if !m.readiness.ovnRequired {
+			t.Error("ovnRequired = false in full mode, want true")
+		}
+		// Reconcile OK but OVN never connected: /readyz stays 503.
+		setLastReconcileStatus(true)
+		if rr := callReadyz(m); rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("/readyz = %d with OVN disconnected, want 503", rr.Code)
+		}
+	})
 }
 
 func TestSetReconcileInProgressTogglesGauge(t *testing.T) {

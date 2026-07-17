@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,6 +14,18 @@ import (
 )
 
 const metricsNamespace = "ovn_network_agent"
+
+// readinessState feeds the /readyz endpoint. ovnRequired is written once in
+// initMetrics before the HTTP server starts and read-only afterwards; the
+// remaining fields are updated concurrently by the reconcile loop and the
+// OVN connection callbacks, hence atomic.
+type readinessState struct {
+	ovnRequired     bool
+	nbConnected     atomic.Bool
+	sbConnected     atomic.Bool
+	reconcileRan    atomic.Bool
+	lastReconcileOK atomic.Bool
+}
 
 // metricsRegistry holds the Prometheus collectors used by the agent. Tests
 // can construct a fresh registry; production uses a process-wide singleton
@@ -53,6 +66,9 @@ type metricsRegistry struct {
 	// Stale chassis cleanup
 	staleChassisCleanupTotal *prometheus.CounterVec
 	missingChassis           prometheus.Gauge
+
+	// Readiness signals backing the /readyz endpoint
+	readiness readinessState
 }
 
 // metrics is the process-wide registry. It is non-nil after initMetrics()
@@ -62,9 +78,12 @@ var metrics *metricsRegistry
 
 // initMetrics builds the process-wide metrics registry. Calling it twice
 // would re-register collectors and panic, so callers must invoke it at most
-// once. Returns the registry for the HTTP handler.
-func initMetrics() *metricsRegistry {
+// once. Returns the registry for the HTTP handler. ovnRequired gates the OVN
+// connection checks in /readyz: it is false in port-forward-only mode, where
+// there is no OVN client and OVN state must not gate readiness.
+func initMetrics(ovnRequired bool) *metricsRegistry {
 	m := newMetricsRegistry()
+	m.readiness.ovnRequired = ovnRequired
 	metrics = m
 	return m
 }
@@ -235,10 +254,14 @@ func startMetricsServer(ctx context.Context, listenAddr string, m *metricsRegist
 	mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{
 		Registry: m.registry,
 	}))
+	// /healthz is liveness-only by design: it reports 200 whenever the
+	// process is up. Use /readyz for readiness (OVN connected, reconcile
+	// succeeded).
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/readyz", readyzHandler(m))
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -268,6 +291,40 @@ func startMetricsServer(ctx context.Context, listenAddr string, m *metricsRegist
 	}()
 
 	return nil
+}
+
+// readyzHandler reports whether the agent is functional, as opposed to the
+// liveness-only /healthz: OVN NB and SB connected (unless running
+// port-forward-only), at least one reconcile completed, and the last
+// reconcile's route sync succeeded. Returns 200 "ok" when ready, 503 with
+// one plain-text line per failing check otherwise.
+func readyzHandler(m *metricsRegistry) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		var failures []string
+		if m.readiness.ovnRequired {
+			if !m.readiness.nbConnected.Load() {
+				failures = append(failures, "unready: ovn nb disconnected")
+			}
+			if !m.readiness.sbConnected.Load() {
+				failures = append(failures, "unready: ovn sb disconnected")
+			}
+		}
+		if !m.readiness.reconcileRan.Load() {
+			failures = append(failures, "unready: awaiting first reconcile")
+		} else if !m.readiness.lastReconcileOK.Load() {
+			failures = append(failures, "unready: last reconcile failed")
+		}
+
+		if len(failures) > 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			for _, f := range failures {
+				_, _ = w.Write([]byte(f + "\n"))
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	}
 }
 
 // =============================================================================
@@ -353,6 +410,12 @@ func setOVNConnectionState(database string, connected bool) {
 		v = 1
 	}
 	metrics.ovnConnectionState.WithLabelValues(database).Set(v)
+	switch database {
+	case "nb":
+		metrics.readiness.nbConnected.Store(connected)
+	case "sb":
+		metrics.readiness.sbConnected.Store(connected)
+	}
 }
 
 func recordDrain(outcome string, duration time.Duration) {
@@ -378,4 +441,14 @@ func setMissingChassis(n int) {
 		return
 	}
 	metrics.missingChassis.Set(float64(n))
+}
+
+// setLastReconcileStatus records the outcome of the most recent reconcile
+// cycle for the /readyz endpoint.
+func setLastReconcileStatus(ok bool) {
+	if metrics == nil {
+		return
+	}
+	metrics.readiness.reconcileRan.Store(true)
+	metrics.readiness.lastReconcileOK.Store(ok)
 }
