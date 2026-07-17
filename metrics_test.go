@@ -53,6 +53,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		t.Fatalf("Gather() error: %v", err)
 	}
 	wantMetrics := []string{
+		"ovn_network_agent_build_info",
 		"ovn_network_agent_reconcile_total",
 		"ovn_network_agent_reconcile_duration_seconds",
 		"ovn_network_agent_desired_ips",
@@ -76,6 +77,43 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		if !gotNames[name] {
 			t.Errorf("metric %s missing from registry", name)
 		}
+	}
+}
+
+func TestBuildInfoGaugeCarriesVersionLabel(t *testing.T) {
+	m := newMetricsRegistry()
+
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error: %v", err)
+	}
+
+	var found bool
+	for _, mf := range got {
+		if mf.GetName() != "ovn_network_agent_build_info" {
+			continue
+		}
+		found = true
+		series := mf.GetMetric()
+		if len(series) != 1 {
+			t.Fatalf("build_info series count = %d, want 1", len(series))
+		}
+		item := series[0]
+		var version string
+		for _, l := range item.GetLabel() {
+			if l.GetName() == "version" {
+				version = l.GetValue()
+			}
+		}
+		if version != "dev" {
+			t.Errorf("build_info version label = %q, want %q", version, "dev")
+		}
+		if v := item.GetGauge().GetValue(); v != 1 {
+			t.Errorf("build_info value = %v, want 1", v)
+		}
+	}
+	if !found {
+		t.Error("build_info gauge missing from registry")
 	}
 }
 

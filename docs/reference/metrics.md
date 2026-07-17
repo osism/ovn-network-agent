@@ -25,6 +25,7 @@ regenerate it with `go generate ./...`.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
+| `ovn_network_agent_build_info` | gauge (vec) | `version` | Always 1, labelled with the running agent version (from -ldflags "-X main.version=…"). |
 | `ovn_network_agent_reconcile_total` | counter (vec) | `trigger`={`event`,`periodic`,`startup`} | Total reconcile cycles, labelled by trigger source. |
 | `ovn_network_agent_reconcile_duration_seconds` | histogram | — | Duration of a single reconcile cycle in seconds. |
 | `ovn_network_agent_reconcile_in_progress` | gauge | — | 1 while a reconcile cycle is running, 0 otherwise. |
