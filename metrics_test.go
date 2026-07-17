@@ -406,6 +406,7 @@ func TestRecordDrainCountsByOutcome(t *testing.T) {
 	recordDrain("completed", 750*time.Millisecond)
 	recordDrain("timeout", 5*time.Second)
 	recordDrain("completed", 250*time.Millisecond)
+	recordDrain("noop", 10*time.Millisecond)
 
 	got, _ := m.registry.Gather()
 	for _, mf := range got {
@@ -420,8 +421,8 @@ func TestRecordDrainCountsByOutcome(t *testing.T) {
 				}
 			}
 		}
-		if seen["completed"] != 2 || seen["timeout"] != 1 {
-			t.Errorf("drain_total = %v, want completed=2 timeout=1", seen)
+		if seen["completed"] != 2 || seen["timeout"] != 1 || seen["noop"] != 1 {
+			t.Errorf("drain_total = %v, want completed=2 timeout=1 noop=1", seen)
 		}
 	}
 }

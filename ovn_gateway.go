@@ -809,11 +809,14 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 // shortly after the agent's initial subscription (see issue #115). When the
 // cache shows no row at all for the local chassis, fall back to a direct
 // OVSDB select so the drain does not silently no-op.
-func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) error {
+//
+// It reports whether any Gateway_Chassis priorities were actually lowered, so
+// the caller can distinguish a real drain from a no-op.
+func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) (drained bool, err error) {
 	// Step 1: Find all Gateway_Chassis entries for this chassis with priority > 0.
 	var gwChassisList []NBGatewayChassis
 	if err := o.nbClient.List(ctx, &gwChassisList); err != nil {
-		return fmt.Errorf("list gateway chassis: %w", err)
+		return false, fmt.Errorf("list gateway chassis: %w", err)
 	}
 
 	toDrain, hasLocalRow := filterDrainCandidates(gwChassisList, localChassisName)
@@ -829,7 +832,7 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		var err error
 		serverList, err = o.selectLocalGatewayChassis(ctx, localChassisName)
 		if err != nil {
-			return fmt.Errorf("drain: cache miss + NB select fallback failed: %w", err)
+			return false, fmt.Errorf("drain: cache miss + NB select fallback failed: %w", err)
 		}
 		toDrain, _ = filterDrainCandidates(serverList, localChassisName)
 		if len(toDrain) > 0 {
@@ -858,7 +861,7 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 				"server_entries", summarizeGatewayChassis(serverList))
 		}
 		slog.Info("drain: no gateway chassis entries to drain on this chassis", attrs...)
-		return nil
+		return false, nil
 	}
 
 	// Step 2: Set priority to 0 in a single batched transaction.
@@ -879,7 +882,7 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	}
 	if len(allOps) > 0 {
 		if err := o.transactOps(ctx, allOps); err != nil {
-			return fmt.Errorf("drain: failed to lower gateway chassis priorities: %w", err)
+			return false, fmt.Errorf("drain: failed to lower gateway chassis priorities: %w", err)
 		}
 	}
 
@@ -894,19 +897,19 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	for {
 		remaining, err := o.countLocalCRPorts(ctx, localChassisName)
 		if err != nil {
-			return fmt.Errorf("drain: failed to query port bindings: %w", err)
+			return true, fmt.Errorf("drain: failed to query port bindings: %w", err)
 		}
 		if remaining == 0 {
 			slog.Info("drain: complete, all gateways migrated away")
 			o.awaitTakeoverReady(ctx, localChassisName)
-			return nil
+			return true, nil
 		}
 		slog.Info("drain: waiting for gateway migration", "remaining_gateways", remaining)
 
 		select {
 		case <-ctx.Done():
 			slog.Warn("drain: timeout exceeded, proceeding with shutdown", "remaining_gateways", remaining)
-			return nil
+			return true, nil
 		case <-o.drainWatchCh:
 			// A chassisredirect Port_Binding changed — re-check without waiting
 			// for the safety re-poll tick.

@@ -1814,3 +1814,32 @@ func TestAgentRunPortForwardOnly(t *testing.T) {
 		t.Fatal("Run() did not return within 2s in port-forward-only mode")
 	}
 }
+
+// TestDrainOutcome pins the drain_total outcome precedence: a drain error
+// outranks a timeout, a timeout outranks a noop, and only an unqualified
+// success — something drained, no error, no deadline — reports "completed".
+func TestDrainOutcome(t *testing.T) {
+	errBoom := errors.New("boom")
+	tests := []struct {
+		name    string
+		err     error
+		ctxErr  error
+		drained bool
+		want    string
+	}{
+		{"error outranks timeout, noop and a drained result", errBoom, context.DeadlineExceeded, false, "error"},
+		{"error outranks a clean drained result", errBoom, nil, true, "error"},
+		{"timeout outranks noop when nothing drained", nil, context.DeadlineExceeded, false, "timeout"},
+		{"timeout outranks a drained result", nil, context.DeadlineExceeded, true, "timeout"},
+		{"nothing drained is noop", nil, nil, false, "noop"},
+		{"drained with no error or deadline is completed", nil, nil, true, "completed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := drainOutcome(tt.err, tt.ctxErr, tt.drained); got != tt.want {
+				t.Errorf("drainOutcome(%v, %v, %v) = %q, want %q", tt.err, tt.ctxErr, tt.drained, got, tt.want)
+			}
+		})
+	}
+}
