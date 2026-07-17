@@ -1,0 +1,76 @@
+# Prometheus alerting rules for ovn-network-agent.
+#
+# Implements the suggested alerts from the generated metrics reference
+# (docs/reference/metrics.md) with ready-to-load expressions. Keep the
+# expressions in sync with the alert bullets in tools/docgen/render.go.
+#
+# Load via prometheus.yml:
+#   rule_files:
+#     - /etc/prometheus/rules/ovn-network-agent.yaml
+groups:
+  - name: ovn-network-agent
+    rules:
+      - alert: OVNNetworkAgentRouteInstability
+        expr: 'ovn_network_agent_consecutive_readds >= 3'
+        labels:
+          severity: warning
+        annotations:
+          summary: "Persistent route instability on {{ $labels.instance }}"
+          description: >-
+            The agent has re-added managed routes for at least three
+            consecutive reconcile cycles on {{ $labels.instance }},
+            indicating persistent route instability (FRR or kernel races).
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentrouteinstability"
+      - alert: OVNNetworkAgentNBDisconnected
+        expr: 'ovn_network_agent_ovn_connection_state{database="nb"} == 0'
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OVN Northbound DB unreachable from {{ $labels.instance }}"
+          description: >-
+            The OVN NB database has been unreachable for over 2m on
+            {{ $labels.instance }}; the agent cannot write OVN state.
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentnbdisconnected"
+      - alert: OVNNetworkAgentRouteFlapping
+        expr: 'rate(ovn_network_agent_route_readds_total[10m]) > 0'
+        labels:
+          severity: warning
+        annotations:
+          summary: "Routes flapping on {{ $labels.instance }}"
+          description: >-
+            Managed routes are being re-added by post-change verification
+            on {{ $labels.instance }} (flapping routes).
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentrouteflapping"
+      - alert: OVNNetworkAgentInactiveRoutes
+        expr: 'ovn_network_agent_inactive_routes > 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FIP routes not advertised via BGP on {{ $labels.instance }}"
+          description: >-
+            FIP /32s are configured in FRR but not advertised via BGP (e.g.
+            an unresolvable next-hop) on {{ $labels.instance }}; those FIPs
+            are unreachable from outside.
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentinactiveroutes"
+      - alert: OVNNetworkAgentSlowFailoverAnnounce
+        expr: 'histogram_quantile(0.95, rate(ovn_network_agent_failover_announce_seconds_bucket[1h])) > 2'
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow failover BGP announces on {{ $labels.instance }}"
+          description: >-
+            The p95 failover announce time on {{ $labels.instance }} exceeds
+            2s — slower than the ~2s failover budget.
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentslowfailoverannounce"
+      - alert: OVNNetworkAgentSlowReconcile
+        expr: 'histogram_quantile(0.95, rate(ovn_network_agent_reconcile_duration_seconds_bucket[5m])) > 5'
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow reconcile cycles on {{ $labels.instance }}"
+          description: >-
+            The p95 reconcile duration on {{ $labels.instance }} exceeds 5s
+            (slow reconciles).
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentslowreconcile"

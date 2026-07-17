@@ -188,6 +188,11 @@ func renderMetrics(info *sourceInfo) string {
 	}
 
 	b.WriteString("\n## Suggested alerts\n\n")
+	b.WriteString("Ready-to-load rules implementing these alerts ship in\n")
+	b.WriteString("[`contrib/prometheus-rules.yaml`](https://github.com/osism/ovn-network-agent/blob/main/contrib/prometheus-rules.yaml),\n")
+	b.WriteString("and each alert has a cause→diagnosis→remediation section in the\n")
+	b.WriteString("[troubleshooting guide](../guides/troubleshooting).\n\n")
+	// Keep these bullets in sync with contrib/prometheus-rules.yaml.
 	b.WriteString("- `consecutive_readds >= 3` — persistent route instability (FRR or kernel\n")
 	b.WriteString("  races).\n")
 	b.WriteString("- `ovn_connection_state{database=\"nb\"} == 0` for >2m — NB DB unreachable;\n")
