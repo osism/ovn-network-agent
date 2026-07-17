@@ -1198,8 +1198,12 @@ func TestDrainGateways_NothingToDrain(t *testing.T) {
 	)
 	_ = sb
 
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if drained {
+		t.Errorf("drained = true, want false — nothing to drain")
 	}
 	if got := nb.recordedTransacts(); len(got) != 0 {
 		t.Errorf("expected no transacts, got %+v", got)
@@ -1217,8 +1221,12 @@ func TestDrainGateways_BatchesAndCompletesWhenSBDrained(t *testing.T) {
 	// SB shows no chassisredirect ports for host-a → first poll returns 0.
 	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
 
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — priorities were lowered")
 	}
 
 	tx := nb.recordedTransacts()
@@ -1259,8 +1267,12 @@ func TestDrainGateways_TimeoutReturnsNilWithRemainingPorts(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	if err := c.DrainGateways(ctx, "host-a"); err != nil {
+	drained, err := c.DrainGateways(ctx, "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — priorities were lowered before the timeout")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("drain blocked too long: %v (ctx should fire promptly)", elapsed)
@@ -1296,8 +1308,12 @@ func TestDrainGateways_FallsBackToServerSelectOnCacheMiss(t *testing.T) {
 	})
 	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
 
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — the recovered row was drained")
 	}
 
 	tx := nb.recordedTransacts()
@@ -1348,8 +1364,12 @@ func TestDrainGateways_EmptyMatchAfterCacheMissLogsServerRows(t *testing.T) {
 		"priority":     float64(0),
 	})
 
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if drained {
+		t.Errorf("drained = true, want false — the recovered row was already at priority 0")
 	}
 
 	out := logs.String()
@@ -1374,8 +1394,12 @@ func TestDrainGateways_NoFallbackWhenLocalRowPresentAtZero(t *testing.T) {
 		&NBGatewayChassis{UUID: "g1", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 0},
 	)
 
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if drained {
+		t.Errorf("drained = true, want false — the local row was already at priority 0")
 	}
 	if got := nb.recordedTransacts(); len(got) != 0 {
 		t.Errorf("expected no transacts (cache has the row), got %+v", got)
@@ -1393,7 +1417,7 @@ func TestDrainGateways_FallbackReturnsErrorOnTransactFailure(t *testing.T) {
 	)
 	nb.transactErr = errors.New("connection refused")
 
-	err := c.DrainGateways(context.Background(), "host-a")
+	_, err := c.DrainGateways(context.Background(), "host-a")
 	if err == nil || !strings.Contains(err.Error(), "NB select fallback failed") {
 		t.Errorf("expected fallback error to be surfaced, got %v", err)
 	}
@@ -1516,8 +1540,12 @@ func TestDrainGateways_EventSignalWakesMigrationWait(t *testing.T) {
 	}()
 
 	start := time.Now()
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — priorities were lowered before the wait")
 	}
 	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
 		t.Errorf("drain returned after %v; expected the event to wake it well under the %v re-poll", elapsed, drainRecheckInterval)
@@ -1659,8 +1687,12 @@ func TestDrainGateways_SettleDelayHoldsBeforeReturn(t *testing.T) {
 	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
 
 	start := time.Now()
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — priorities were lowered before the settle hold")
 	}
 	elapsed := time.Since(start)
 	if elapsed < c.cfg.DrainSettleDelay {
@@ -1684,8 +1716,12 @@ func TestDrainGateways_SettleDelaySkippedWhenNothingToDrain(t *testing.T) {
 	)
 
 	start := time.Now()
-	if err := c.DrainGateways(context.Background(), "host-a"); err != nil {
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
 		t.Fatalf("DrainGateways: %v", err)
+	}
+	if drained {
+		t.Errorf("drained = true, want false — nothing to drain")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("drain held for %v with nothing to drain; settle delay must not apply", elapsed)

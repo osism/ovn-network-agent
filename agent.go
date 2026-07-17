@@ -205,17 +205,12 @@ func (a *Agent) Run(ctx context.Context) error {
 				drainCtx, drainCancel := context.WithTimeout(context.Background(), a.cfg.DrainTimeout)
 				slog.Info("drain mode active, migrating gateways away", "timeout", a.cfg.DrainTimeout)
 				drainStart := time.Now()
-				err := a.ovn.DrainGateways(drainCtx, a.ovn.GetState().LocalChassisName)
+				drained, err := a.ovn.DrainGateways(drainCtx, a.ovn.GetState().LocalChassisName)
 				drainElapsed := time.Since(drainStart)
-				switch {
-				case err != nil:
+				if err != nil {
 					slog.Error("drain failed", "error", err)
-					recordDrain("error", drainElapsed)
-				case drainCtx.Err() != nil:
-					recordDrain("timeout", drainElapsed)
-				default:
-					recordDrain("completed", drainElapsed)
 				}
+				recordDrain(drainOutcome(err, drainCtx.Err(), drained), drainElapsed)
 				drainCancel()
 
 				// The OVN refresh loop stopped the moment ctx was cancelled,
@@ -245,6 +240,22 @@ func (a *Agent) Run(ctx context.Context) error {
 			slog.Debug("periodic reconciliation")
 			a.reconcile(ctx, triggerPeriodic)
 		}
+	}
+}
+
+// drainOutcome maps a shutdown drain result to its drain_total outcome
+// label. Precedence: error, then timeout, then noop (nothing was
+// drained), then completed.
+func drainOutcome(err, ctxErr error, drained bool) string {
+	switch {
+	case err != nil:
+		return "error"
+	case ctxErr != nil:
+		return "timeout"
+	case !drained:
+		return "noop"
+	default:
+		return "completed"
 	}
 }
 
