@@ -30,6 +30,7 @@ Full documentation is published at
   - [Configure gateway drain](https://osism.github.io/ovn-network-agent/guides/gateway-drain)
   - [Configure the FRR prefix list](https://osism.github.io/ovn-network-agent/guides/frr-prefix-list)
   - [Enable metrics and alerts](https://osism.github.io/ovn-network-agent/guides/metrics)
+  - [Troubleshooting](https://osism.github.io/ovn-network-agent/guides/troubleshooting)
 - Reference:
   - [Configuration](https://osism.github.io/ovn-network-agent/reference/configuration)
   - [Metrics](https://osism.github.io/ovn-network-agent/reference/metrics)

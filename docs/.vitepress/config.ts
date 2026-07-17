@@ -35,6 +35,7 @@ export default defineConfig({
           { text: 'Configure gateway drain', link: '/guides/gateway-drain' },
           { text: 'Configure the FRR prefix list', link: '/guides/frr-prefix-list' },
           { text: 'Enable metrics and alerts', link: '/guides/metrics' },
+          { text: 'Troubleshooting', link: '/guides/troubleshooting' },
         ],
       },
       {
