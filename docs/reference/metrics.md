@@ -52,5 +52,7 @@ regenerate it with `go generate ./...`.
 - `inactive_routes > 0` for >2m — FIP `/32`s configured in FRR but not
   advertised via BGP (e.g. an unresolvable next-hop); those FIPs are
   unreachable from outside.
+- `histogram_quantile(0.95, rate(failover_announce_seconds_bucket[1h])) > 2`
+  — failover announces slower than the ~2s failover budget.
 - `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`
   — slow reconciles.

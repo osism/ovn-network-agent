@@ -31,5 +31,7 @@ All metrics are prefixed with `ovn_network_agent_`.
 - `ovn_connection_state{database="nb"} == 0` for >2m — NB DB unreachable;
   agent cannot write OVN state.
 - `rate(route_readds_total[10m]) > 0` — flapping routes.
+- `histogram_quantile(0.95, rate(failover_announce_seconds_bucket[1h])) > 2`
+  — failover announces slower than the ~2s failover budget.
 - `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`
   — slow reconciles.
