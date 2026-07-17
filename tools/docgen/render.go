@@ -195,6 +195,8 @@ func renderMetrics(info *sourceInfo) string {
 	b.WriteString("- `inactive_routes > 0` for >2m — FIP `/32`s configured in FRR but not\n")
 	b.WriteString("  advertised via BGP (e.g. an unresolvable next-hop); those FIPs are\n")
 	b.WriteString("  unreachable from outside.\n")
+	b.WriteString("- `histogram_quantile(0.95, rate(failover_announce_seconds_bucket[1h])) > 2`\n")
+	b.WriteString("  — failover announces slower than the ~2s failover budget.\n")
 	b.WriteString("- `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`\n")
 	b.WriteString("  — slow reconciles.\n")
 
