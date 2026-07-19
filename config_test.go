@@ -1,8 +1,16 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -277,6 +285,9 @@ func TestApplyFileConfig(t *testing.T) {
 	if err := applyYAMLConfig(t, &cfg, `
 ovn_sb_remote: "tcp:10.0.0.1:6642"
 ovn_nb_remote: "tcp:10.0.0.1:6641"
+ovn_ssl_ca: "/etc/ovn/ca.pem"
+ovn_ssl_cert: "/etc/ovn/cert.pem"
+ovn_ssl_key: "/etc/ovn/key.pem"
 bridge_dev: "br-provider"
 reconcile_interval: "30s"
 `); err != nil {
@@ -288,6 +299,15 @@ reconcile_interval: "30s"
 	}
 	if cfg.OVNNBRemote != "tcp:10.0.0.1:6641" {
 		t.Errorf("OVNNBRemote = %q, want %q", cfg.OVNNBRemote, "tcp:10.0.0.1:6641")
+	}
+	if cfg.OVNSSLCA != "/etc/ovn/ca.pem" {
+		t.Errorf("OVNSSLCA = %q, want %q", cfg.OVNSSLCA, "/etc/ovn/ca.pem")
+	}
+	if cfg.OVNSSLCert != "/etc/ovn/cert.pem" {
+		t.Errorf("OVNSSLCert = %q, want %q", cfg.OVNSSLCert, "/etc/ovn/cert.pem")
+	}
+	if cfg.OVNSSLKey != "/etc/ovn/key.pem" {
+		t.Errorf("OVNSSLKey = %q, want %q", cfg.OVNSSLKey, "/etc/ovn/key.pem")
 	}
 	if cfg.BridgeDev != "br-provider" {
 		t.Errorf("BridgeDev = %q, want %q", cfg.BridgeDev, "br-provider")
@@ -342,6 +362,9 @@ func TestApplyEnvConfig(t *testing.T) {
 	}
 
 	t.Setenv("OVN_NETWORK_OVN_SB_REMOTE", "tcp:10.0.0.99:6642")
+	t.Setenv("OVN_NETWORK_OVN_SSL_CA", "/etc/ovn/ca.pem")
+	t.Setenv("OVN_NETWORK_OVN_SSL_CERT", "/etc/ovn/cert.pem")
+	t.Setenv("OVN_NETWORK_OVN_SSL_KEY", "/etc/ovn/key.pem")
 	t.Setenv("OVN_NETWORK_LOG_LEVEL", "debug")
 	t.Setenv("OVN_NETWORK_RECONCILE_INTERVAL", "5m")
 	t.Setenv("OVN_NETWORK_NETWORK_CIDR", "10.0.0.0/24")
@@ -353,6 +376,15 @@ func TestApplyEnvConfig(t *testing.T) {
 
 	if cfg.OVNSBRemote != "tcp:10.0.0.99:6642" {
 		t.Errorf("OVNSBRemote = %q, want %q", cfg.OVNSBRemote, "tcp:10.0.0.99:6642")
+	}
+	if cfg.OVNSSLCA != "/etc/ovn/ca.pem" {
+		t.Errorf("OVNSSLCA = %q, want %q", cfg.OVNSSLCA, "/etc/ovn/ca.pem")
+	}
+	if cfg.OVNSSLCert != "/etc/ovn/cert.pem" {
+		t.Errorf("OVNSSLCert = %q, want %q", cfg.OVNSSLCert, "/etc/ovn/cert.pem")
+	}
+	if cfg.OVNSSLKey != "/etc/ovn/key.pem" {
+		t.Errorf("OVNSSLKey = %q, want %q", cfg.OVNSSLKey, "/etc/ovn/key.pem")
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "debug")
@@ -2341,5 +2373,521 @@ func TestConfigOptionsDefaultsMatchLoadConfig(t *testing.T) {
 		got.CleanupOnShutdown != want.CleanupOnShutdown ||
 		got.PortForwardCTZone != want.PortForwardCTZone {
 		t.Errorf("loadConfig defaults diverge from the registry:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// writeTestTLSFiles generates a self-signed ECDSA P-256 certificate and its
+// private key, writes both as PEM into a temp dir, and returns the two paths.
+// The certificate file doubles as a CA input for ovnTLSConfig: AppendCertsFromPEM
+// only parses the PEM (no chain verification) and tls.LoadX509KeyPair does not
+// verify the leaf against a CA either, so one self-signed cert satisfies both.
+func writeTestTLSFiles(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	return writeTestTLSFilesNotAfter(t, time.Now().Add(time.Hour))
+}
+
+// writeTestTLSFilesNotAfter is writeTestTLSFiles with a caller-chosen NotAfter,
+// so a test can produce a certificate that is already past its validity.
+func writeTestTLSFilesNotAfter(t *testing.T, notAfter time.Time) (certPath, keyPath string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ovn-network-agent-test"},
+		NotBefore:             notAfter.Add(-24 * time.Hour),
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	writeTestPEM(t, certPath, "CERTIFICATE", der)
+	writeTestPEM(t, keyPath, "EC PRIVATE KEY", keyDER)
+	return certPath, keyPath
+}
+
+func writeTestPEM(t *testing.T, path, blockType string, der []byte) {
+	t.Helper()
+	buf := pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: der})
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func TestOVNTLSConfig(t *testing.T) {
+	certPath, keyPath := writeTestTLSFiles(t)
+
+	garbagePath := filepath.Join(t.TempDir(), "garbage.pem")
+	if err := os.WriteFile(garbagePath, []byte("not a pem file\n"), 0o600); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	missingPath := filepath.Join(t.TempDir(), "does-not-exist.pem")
+
+	// A valid key that a config-management run left group-readable.
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read key: %v", err)
+	}
+	looseKeyPath := filepath.Join(t.TempDir(), "key.pem")
+	if err := os.WriteFile(looseKeyPath, keyPEM, 0o640); err != nil {
+		t.Fatalf("write group-readable key: %v", err)
+	}
+	// open(2) masks the mode with the process umask, so under umask 077 the
+	// file would land at 0600 and this case would stop testing anything.
+	if err := os.Chmod(looseKeyPath, 0o640); err != nil {
+		t.Fatalf("chmod group-readable key: %v", err)
+	}
+
+	tests := []struct {
+		name             string
+		ca, cert, key    string
+		wantNil          bool     // expect (nil, nil)
+		wantErr          []string // substrings the error must contain; empty = expect success
+		wantRootCAs      bool
+		wantCertificates int
+	}{
+		{
+			name:    "all empty",
+			wantNil: true,
+		},
+		{
+			name:             "ca only",
+			ca:               certPath,
+			wantRootCAs:      true,
+			wantCertificates: 0,
+		},
+		{
+			name:             "ca cert key",
+			ca:               certPath,
+			cert:             certPath,
+			key:              keyPath,
+			wantRootCAs:      true,
+			wantCertificates: 1,
+		},
+		{
+			// Mutual TLS against servers whose certificates chain to the
+			// system trust store: legal, and the only quadrant where
+			// RootCAs must stay nil while a client certificate is loaded.
+			name:             "cert key without ca",
+			cert:             certPath,
+			key:              keyPath,
+			wantRootCAs:      false,
+			wantCertificates: 1,
+		},
+		{
+			name:    "cert without key",
+			cert:    certPath,
+			wantErr: []string{"ovn-ssl-cert", "ovn-ssl-key"},
+		},
+		{
+			name:    "group readable key",
+			cert:    certPath,
+			key:     looseKeyPath,
+			wantErr: []string{"ovn-ssl-key", "0640", "group- or world-accessible"},
+		},
+		{
+			name:    "nonexistent key",
+			cert:    certPath,
+			key:     missingPath,
+			wantErr: []string{"stat ovn-ssl-key", missingPath},
+		},
+		{
+			name:    "key without cert",
+			key:     keyPath,
+			wantErr: []string{"ovn-ssl-cert", "ovn-ssl-key"},
+		},
+		{
+			name:    "nonexistent ca",
+			ca:      missingPath,
+			wantErr: []string{"ovn-ssl-ca", missingPath},
+		},
+		{
+			name:    "ca without pem certificates",
+			ca:      garbagePath,
+			wantErr: []string{"no PEM certificates found"},
+		},
+		{
+			name:    "garbage cert key pair",
+			cert:    garbagePath,
+			key:     garbagePath,
+			wantErr: []string{"ovn-ssl-cert", "ovn-ssl-key"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc, err := ovnTLSConfig(tt.ca, tt.cert, tt.key)
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("ovnTLSConfig() error = nil, want error")
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ovnTLSConfig() error = %v, want nil", err)
+			}
+			if tt.wantNil {
+				if tc != nil {
+					t.Fatalf("ovnTLSConfig() = %+v, want nil", tc)
+				}
+				return
+			}
+			if tc == nil {
+				t.Fatal("ovnTLSConfig() = nil, want non-nil")
+			}
+			if tc.MinVersion != tls.VersionTLS12 {
+				t.Errorf("MinVersion = %d, want %d (TLS 1.2)", tc.MinVersion, tls.VersionTLS12)
+			}
+			if (tc.RootCAs != nil) != tt.wantRootCAs {
+				t.Errorf("RootCAs set = %v, want %v", tc.RootCAs != nil, tt.wantRootCAs)
+			}
+			if len(tc.Certificates) != tt.wantCertificates {
+				t.Errorf("Certificates = %d, want %d", len(tc.Certificates), tt.wantCertificates)
+			}
+		})
+	}
+}
+
+// TestOVNTLSConfigWarnsOnExpiredCert pins the expiry warning. LoadX509KeyPair
+// validates the key against the certificate but ignores NotBefore/NotAfter, so
+// an expired client certificate otherwise loads cleanly, passes --check-config,
+// and only fails at the next handshake — long after the PEMs were rotated.
+func TestOVNTLSConfigWarnsOnExpiredCert(t *testing.T) {
+	const warning = "ovn-ssl-cert has expired"
+
+	t.Run("expired cert warns but still loads", func(t *testing.T) {
+		buf := captureSlog(t)
+		certPath, keyPath := writeTestTLSFilesNotAfter(t, time.Now().Add(-time.Hour))
+
+		tc, err := ovnTLSConfig("", certPath, keyPath)
+		if err != nil {
+			t.Fatalf("ovnTLSConfig() error = %v, want nil", err)
+		}
+		if len(tc.Certificates) != 1 {
+			t.Errorf("Certificates = %d, want 1 (an expired cert must warn, not be dropped)", len(tc.Certificates))
+		}
+		if !strings.Contains(buf.String(), warning) {
+			t.Errorf("warnings %q do not contain %q", buf.String(), warning)
+		}
+	})
+
+	t.Run("valid cert does not warn", func(t *testing.T) {
+		buf := captureSlog(t)
+		certPath, keyPath := writeTestTLSFiles(t)
+
+		if _, err := ovnTLSConfig("", certPath, keyPath); err != nil {
+			t.Fatalf("ovnTLSConfig() error = %v, want nil", err)
+		}
+		if strings.Contains(buf.String(), warning) {
+			t.Errorf("warnings %q unexpectedly contain %q", buf.String(), warning)
+		}
+	})
+}
+
+// TestValidateConfigWarnsOnClientCertWithoutCA covers the quadrant where the
+// agent presents a client certificate but pins no CA. It is the most dangerous
+// of the partial TLS setups — server certificates fall back to the host's
+// system root store, so any publicly trusted CA can impersonate the databases —
+// and the least likely to be noticed, because the connection comes up and works.
+func TestValidateConfigWarnsOnClientCertWithoutCA(t *testing.T) {
+	certPath, keyPath := writeTestTLSFiles(t)
+	// Substring unique to this warning: the "no TLS material at all" warning
+	// also names the system trust store.
+	const warning = "set ovn-ssl-ca to pin"
+
+	tests := []struct {
+		name        string
+		withCA      bool
+		ssl         bool
+		wantWarning bool
+	}{
+		{
+			name:        "cert and key without ca over ssl",
+			ssl:         true,
+			wantWarning: true,
+		},
+		{
+			// The CA pin is what makes the difference; with it the same
+			// remotes are fully verified.
+			name:   "ca cert and key over ssl",
+			withCA: true,
+			ssl:    true,
+		},
+		{
+			// Inert TLS material over cleartext remotes: the operator gets
+			// the "no effect" warning, not a trust-store one.
+			name: "cert and key without ca over tcp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := captureSlog(t)
+			cfg := Config{
+				VethNexthop:       "169.254.0.1",
+				VRFName:           "vrf-provider",
+				ReconcileInterval: 60 * time.Second,
+				OVNSSLCert:        certPath,
+				OVNSSLKey:         keyPath,
+			}
+			if tt.withCA {
+				cfg.OVNSSLCA = certPath
+			}
+			if tt.ssl {
+				cfg.OVNSBRemote = "ssl:10.0.0.1:6642"
+				cfg.OVNNBRemote = "ssl:10.0.0.1:6641"
+			} else {
+				cfg.OVNSBRemote = "tcp:10.0.0.1:6642"
+				cfg.OVNNBRemote = "tcp:10.0.0.1:6641"
+			}
+
+			if err := validateConfig(&cfg); err != nil {
+				t.Fatalf("validateConfig() error = %v, want nil", err)
+			}
+			if got := strings.Contains(buf.String(), warning); got != tt.wantWarning {
+				t.Errorf("warning %q present = %v, want %v; warnings: %q", warning, got, tt.wantWarning, buf.String())
+			}
+		})
+	}
+}
+
+func TestValidateConfigDerivesOVNTLS(t *testing.T) {
+	certPath, keyPath := writeTestTLSFiles(t)
+
+	baseConfig := func() Config {
+		return Config{
+			VethNexthop:       "169.254.0.1",
+			VRFName:           "vrf-provider",
+			ReconcileInterval: 60 * time.Second,
+		}
+	}
+
+	t.Run("paths set", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.OVNSSLCA = certPath
+		cfg.OVNSSLCert = certPath
+		cfg.OVNSSLKey = keyPath
+		if err := validateConfig(&cfg); err != nil {
+			t.Fatalf("validateConfig: %v", err)
+		}
+		if cfg.OVNTLS == nil {
+			t.Fatal("OVNTLS = nil, want non-nil after validateConfig")
+		}
+	})
+
+	t.Run("paths unset", func(t *testing.T) {
+		cfg := baseConfig()
+		if err := validateConfig(&cfg); err != nil {
+			t.Fatalf("validateConfig: %v", err)
+		}
+		if cfg.OVNTLS != nil {
+			t.Fatalf("OVNTLS = %+v, want nil when no ovn-ssl-* option is set", cfg.OVNTLS)
+		}
+	})
+}
+
+func TestValidateConfigRejectsMixedSSLRemotes(t *testing.T) {
+	tests := []struct {
+		name     string
+		sbRemote string
+		nbRemote string
+		wantErr  string // substring the error must name; empty = expect no error
+	}{
+		{
+			name:     "mixed ssl and tcp in SB list",
+			sbRemote: "ssl:10.0.0.1:6642,tcp:10.0.0.2:6642",
+			wantErr:  "ovn-sb-remote",
+		},
+		{
+			name:     "mixed ssl and tcp in NB list",
+			nbRemote: "ssl:10.0.0.1:6641,tcp:10.0.0.2:6641",
+			wantErr:  "ovn-nb-remote",
+		},
+		{
+			name:     "all ssl in both lists",
+			sbRemote: "ssl:10.0.0.1:6642,ssl:10.0.0.2:6642",
+			nbRemote: "ssl:10.0.0.1:6641,ssl:10.0.0.2:6641",
+		},
+		{
+			name:     "ssl NB with tcp SB",
+			sbRemote: "tcp:10.0.0.1:6642",
+			nbRemote: "ssl:10.0.0.1:6641",
+		},
+		{
+			name:     "ssl remotes without ca (warn only)",
+			sbRemote: "ssl:10.0.0.1:6642",
+			nbRemote: "ssl:10.0.0.1:6641",
+		},
+		{
+			// libovsdb lowercases the scheme, so "SSL:" dials TLS and
+			// "tcp:" does not — the list still downgrades on failover.
+			name:     "mixed uppercase SSL and tcp in NB list",
+			nbRemote: "SSL:10.0.0.1:6641,tcp:10.0.0.2:6641",
+			wantErr:  "ovn-nb-remote",
+		},
+		{
+			name:     "uppercase SSL in both lists",
+			sbRemote: "SSL:10.0.0.1:6642",
+			nbRemote: "SSL:10.0.0.1:6641",
+		},
+		{
+			name:     "unsupported scheme in SB list",
+			sbRemote: "sl:10.0.0.1:6642",
+			nbRemote: "tcp:10.0.0.1:6641",
+			wantErr:  "unsupported endpoint scheme",
+		},
+		{
+			name:     "endpoint without scheme in NB list",
+			sbRemote: "tcp:10.0.0.1:6642",
+			nbRemote: "localhost",
+			wantErr:  "has no scheme",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				VethNexthop:       "169.254.0.1",
+				VRFName:           "vrf-provider",
+				ReconcileInterval: 60 * time.Second,
+				OVNSBRemote:       tt.sbRemote,
+				OVNNBRemote:       tt.nbRemote,
+			}
+			err := validateConfig(&cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateConfig() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateConfig() error = nil, want error naming %s", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not name %s", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateConfigOVNSchemeWarnings pins the warnings that depend on how
+// validateConfig classifies each remote's scheme. They are the only signal an
+// operator gets for a half-configured TLS setup, so a misclassified scheme
+// shows up here as a missing — or, worse, a factually wrong — warning.
+func TestValidateConfigOVNSchemeWarnings(t *testing.T) {
+	certPath, keyPath := writeTestTLSFiles(t)
+
+	tests := []struct {
+		name       string
+		sbRemote   string
+		nbRemote   string
+		withTLS    bool
+		wantLog    []string // substrings the warnings must contain
+		wantNotLog []string // substrings the warnings must not contain
+	}{
+		{
+			// Both remotes dial TLS in libovsdb, so the TLS material is
+			// load-bearing: telling the operator it "has no effect" would
+			// invite them to delete the CA pin.
+			name:       "uppercase SSL remotes with TLS material",
+			sbRemote:   "SSL:10.0.0.1:6642",
+			nbRemote:   "SSL:10.0.0.1:6641",
+			withTLS:    true,
+			wantNotLog: []string{"have no effect", "mixed schemes"},
+		},
+		{
+			name:     "TLS NB with cleartext SB",
+			sbRemote: "tcp:10.0.0.1:6642",
+			nbRemote: "ssl:10.0.0.1:6641",
+			withTLS:  true,
+			wantLog:  []string{"mixed schemes"},
+		},
+		{
+			name:       "both remotes cleartext",
+			sbRemote:   "tcp:10.0.0.1:6642",
+			nbRemote:   "tcp:10.0.0.1:6641",
+			wantNotLog: []string{"mixed schemes"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := captureSlog(t)
+			cfg := Config{
+				VethNexthop:       "169.254.0.1",
+				VRFName:           "vrf-provider",
+				ReconcileInterval: 60 * time.Second,
+				OVNSBRemote:       tt.sbRemote,
+				OVNNBRemote:       tt.nbRemote,
+			}
+			if tt.withTLS {
+				cfg.OVNSSLCA = certPath
+				cfg.OVNSSLCert = certPath
+				cfg.OVNSSLKey = keyPath
+			}
+			if err := validateConfig(&cfg); err != nil {
+				t.Fatalf("validateConfig() error = %v, want nil", err)
+			}
+			for _, want := range tt.wantLog {
+				if !strings.Contains(buf.String(), want) {
+					t.Errorf("warnings %q do not contain %q", buf.String(), want)
+				}
+			}
+			for _, notWant := range tt.wantNotLog {
+				if strings.Contains(buf.String(), notWant) {
+					t.Errorf("warnings %q unexpectedly contain %q", buf.String(), notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadConfigOVNSSLPrecedence(t *testing.T) {
+	caFile, _ := writeTestTLSFiles(t)
+	caEnv, _ := writeTestTLSFiles(t)
+	caFlag, _ := writeTestTLSFiles(t)
+
+	content := fmt.Sprintf(`
+ovn_sb_remote: "tcp:10.0.0.1:6642"
+ovn_nb_remote: "tcp:10.0.0.1:6641"
+veth_leak_enabled: false
+ovn_ssl_ca: %q
+`, caFile)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Setenv("OVN_NETWORK_OVN_SSL_CA", caEnv)
+
+	cfg, err := loadConfig([]string{"--config", path, "--ovn-ssl-ca", caFlag})
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.OVNSSLCA != caFlag {
+		t.Errorf("OVNSSLCA = %q, want %q (flag > env > file)", cfg.OVNSSLCA, caFlag)
+	}
+	if cfg.OVNTLS == nil {
+		t.Error("OVNTLS = nil, want non-nil (ovn-ssl-ca resolves to a real cert)")
 	}
 }
