@@ -23,8 +23,13 @@ import (
 // to run the agent. Zero-valued fields fall back to AgentConfig defaults
 // applied by Defaults().
 type AgentConfig struct {
-	OVNNBRemote   string   `yaml:"ovn_nb_remote"`
-	OVNSBRemote   string   `yaml:"ovn_sb_remote"`
+	OVNNBRemote string `yaml:"ovn_nb_remote"`
+	OVNSBRemote string `yaml:"ovn_sb_remote"`
+	// OVNSSLCA/OVNSSLCert/OVNSSLKey are the PEM file paths for ssl: OVN
+	// remotes (mirrors the agent's ovn_ssl_ca/ovn_ssl_cert/ovn_ssl_key).
+	OVNSSLCA      string   `yaml:"ovn_ssl_ca,omitempty"`
+	OVNSSLCert    string   `yaml:"ovn_ssl_cert,omitempty"`
+	OVNSSLKey     string   `yaml:"ovn_ssl_key,omitempty"`
 	BridgeDev     string   `yaml:"bridge_dev"`
 	BridgeIP      string   `yaml:"bridge_ip,omitempty"`
 	VRFName       string   `yaml:"vrf_name"`
@@ -375,6 +380,9 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 
 	put("ovn_nb_remote", cfg.OVNNBRemote)
 	put("ovn_sb_remote", cfg.OVNSBRemote)
+	put("ovn_ssl_ca", cfg.OVNSSLCA)
+	put("ovn_ssl_cert", cfg.OVNSSLCert)
+	put("ovn_ssl_key", cfg.OVNSSLKey)
 	put("bridge_dev", cfg.BridgeDev)
 	put("bridge_ip", cfg.BridgeIP)
 	put("vrf_name", cfg.VRFName)
