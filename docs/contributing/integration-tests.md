@@ -33,6 +33,7 @@ test/integration/
   scenario_router_masquerade_ordering_test.go — router_masquerade configured before SNAT NAT exists (#88 item 4)
   scenario_same_batch_fip_test.go             — single OVSDB transaction adds + removes FIPs (#88 item 5)
   scenario_partial_failure_retry_test.go      — FRR write fails, kernel untouched, only FRR re-added (#88 item 6)
+  scenario_ovn_ssl_test.go                    — mutual-TLS NB/SB connect against dedicated pssl ovsdb-servers + untrusted-CA rejection + bad-cert-path startup failure (#164)
   testenv/                                    — Setup, Teardown, RunAgent, MakeLocalRouter, Assert*, ScrapeMetrics, WithFailingTool, StartDrainRebind, StopOVNDatabases, StopNBDatabase, …
 ```
 
