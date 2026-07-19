@@ -17,8 +17,8 @@ If you only want a quick task-oriented reference, jump to:
 Before you start, the host needs the following in place. These match the
 [prerequisites listed in the explanation section](../explanation/architecture):
 
-- **OVN** — TCP access to OVN Southbound and Northbound databases on the
-  control nodes. The agent runs on network/gateway nodes where no local DB
+- **OVN** — TCP (or TLS `ssl:`) access to OVN Southbound and Northbound
+  databases on the control nodes. The agent runs on network/gateway nodes where no local DB
   sockets exist.
 - **FRR** — `vtysh` must be available and the VRF + BGP configuration must
   already exist.

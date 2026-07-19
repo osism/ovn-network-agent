@@ -96,11 +96,92 @@ port_forwards:
 
 Switching modes at runtime is not supported — it requires a restart.
 
+## TLS for the OVN connections
+
+The agent dials `ssl:` remotes over TLS when you set the `ovn_ssl_ca`,
+`ovn_ssl_cert`, and `ovn_ssl_key` options. Use this to protect the
+write-capable Northbound connection on the management network.
+
+```yaml
+ovn_sb_remote: "ssl:10.10.0.1:6642,ssl:10.10.0.2:6642,ssl:10.10.0.3:6642"
+ovn_nb_remote: "ssl:10.10.0.1:6641,ssl:10.10.0.2:6641,ssl:10.10.0.3:6641"
+
+ovn_ssl_ca: "/etc/ovn-network-agent/ca.pem"
+ovn_ssl_cert: "/etc/ovn-network-agent/cert.pem"
+ovn_ssl_key: "/etc/ovn-network-agent/key.pem"
+```
+
+An ovsdb-server started with `--ca-cert` requires a client certificate: set
+both `ovn_ssl_cert` and `ovn_ssl_key` (they must be set together). With only
+`ovn_ssl_ca`, the agent verifies the servers against your private CA but
+presents no client certificate.
+
+Set `ovn_ssl_ca` even when the servers use a publicly trusted certificate.
+Without it the agent falls back to the host's system trust store, so any CA in
+that store can impersonate the databases; the agent logs a warning at startup
+when an `ssl:` remote is dialed with no CA pinned.
+
+The private key authenticates the agent to the write-capable Northbound
+database, so keep it readable only by the account the agent runs as:
+
+```bash
+chmod 0600 /etc/ovn-network-agent/key.pem
+```
+
+A group- or world-accessible `ovn_ssl_key` is a startup error naming the file
+and its mode — check the mode your configuration management deploys, not just
+the one you set by hand.
+
+Use the same PKI as the rest of the deployment. The three options correspond
+to Neutron's `[ovn] ovn_nb_ca_cert` / `ovn_nb_certificate` /
+`ovn_nb_private_key` (and the `_sb_` equivalents) and to ovn-controller's `-C`
+/ `-c` / `-p` flags — point the agent at the same CA and, if required, a
+keypair issued by it.
+
+The agent's Go TLS client verifies the server certificate against the host it
+dials, so each server certificate must carry the remote's IP address or DNS
+name as a subject alternative name (SAN). C ovs/ovn clients check only the CA
+chain, so a certificate minted with `ovs-pki` without SANs passes
+ovn-controller but fails the agent's handshake.
+
+A single remote list must not mix `ssl:` and `tcp:` endpoints — the agent
+rejects such a list at startup. libovsdb fails over between the entries
+transparently, so one plaintext entry would let a connection silently
+downgrade to cleartext. Schemes are matched case-insensitively, and a scheme
+other than `ssl:`, `tcp:` or `unix:` is rejected at startup rather than at the
+first connection attempt.
+
+The NB and SB lists may use different schemes from each other, so you can
+migrate one database at a time. While only one of them is on `ssl:`, the agent
+logs a warning at startup so a half-finished migration is not mistaken for a
+completed one — the cleartext database still carries the chassis and
+`Port_Binding` data the agent turns into routes, FRR announcements, and NAT
+rules.
+
+The certificate files are read once at startup; there is no runtime reload
+([#91](https://github.com/osism/ovn-network-agent/issues/91)). Restart the
+agent after rotating them. An already-expired `ovn_ssl_cert` is loaded with a
+warning rather than rejected — an established session survives its own expiry,
+so the failure surfaces only at the next reconnect.
+
+### Staying on plaintext tcp:
+
+The Northbound connection is write-capable — the agent writes default routes,
+static MAC bindings, and Gateway_Chassis priorities — so a plaintext `tcp:`
+remote is a tampering and man-in-the-middle surface on the control plane. If
+you cannot move to `ssl:` yet, reduce the exposure:
+
+- Run the OVN databases on a dedicated management network.
+- Restrict the listener via the ovsdb-server `Connection` row. For example,
+  `ovn-nbctl set-connection ptcp:6641:<mgmt-ip>` binds the NB listener to the
+  management address only.
+
 ## Prerequisites
 
-- **OVN** (full mode only): TCP access to OVN Southbound and Northbound
-  databases on the control nodes (the agent runs on network/gateway nodes
-  where no local DB sockets exist). Not needed in port-forward-only mode.
+- **OVN** (full mode only): TCP or TLS (`ssl:`) access to the OVN Southbound
+  and Northbound databases on the control nodes (the agent runs on
+  network/gateway nodes where no local DB sockets exist). Not needed in
+  port-forward-only mode.
 - **FRR**: `vtysh` must be available and the VRF + BGP configuration must
   already exist.
 - **Linux**: provider bridge (e.g. `br-ex`) must exist in full mode;
@@ -140,6 +221,10 @@ effective value:
 - An unparsable or out-of-range value — an unparsable duration or integer, or
   a non-positive `reconcile_interval` — is a startup error naming the setting,
   on the flag, environment-variable, and config-file paths alike.
+- A broken TLS certificate file — an unreadable or unparsable `ovn_ssl_ca`,
+  `ovn_ssl_cert`, or `ovn_ssl_key` — is a startup error too, and
+  `--check-config` loads and parses the same files, so it is caught before a
+  restart rather than on the next start.
 - An unknown config-file key (for example a typo like `drain_on_shutdow`) is
   logged as a warning naming the key and then ignored — the key is accepted so
   a newer config stays forward-compatible with an older agent, but the typo is

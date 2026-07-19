@@ -83,7 +83,7 @@ See [Known limitations](https://osism.github.io/ovn-network-agent/#known-limitat
 in the docs for detail. In brief:
 
 - **IPv4-only FIP routing plane** — kernel routes, FRR announcements, and the virtual gateway are IPv4 only ([#85](https://github.com/osism/ovn-network-agent/issues/85) / [#70](https://github.com/osism/ovn-network-agent/issues/70)).
-- **No runtime configuration reload** — config is read once at startup; restart the agent to apply changes ([#91](https://github.com/osism/ovn-network-agent/issues/91)).
+- **No runtime configuration reload** — config is read once at startup; restart the agent to apply changes, including the TLS certificate files for `ssl:` OVN remotes ([#91](https://github.com/osism/ovn-network-agent/issues/91)).
 - **Port forwarding is IPv4-only** — multi-backend VIPs use `jhash ip saddr mod N`: sticky per client but not a consistent hash (a backend change remaps most clients), with no backend health checks.
 - **Single provider bridge per agent** — one `bridge_dev` per instance; VLAN localnet segments all ride that one bridge.
 - **Sizing** — the OVSDB monitors replicate whole Southbound/Northbound tables into every agent, so memory and reconcile time grow with cloud size, not node-local state alone.

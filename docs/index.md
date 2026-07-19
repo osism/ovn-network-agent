@@ -41,7 +41,8 @@ Weigh these current constraints before planning a deployment:
   [#85](https://github.com/osism/ovn-network-agent/issues/85) /
   [#70](https://github.com/osism/ovn-network-agent/issues/70).
 - **No runtime configuration reload** — configuration is read once at startup
-  and there is no SIGHUP reload, so restart the agent to apply any change
+  and there is no SIGHUP reload, so restart the agent to apply any change,
+  including the TLS certificate files for `ssl:` OVN remotes
   ([#91](https://github.com/osism/ovn-network-agent/issues/91)).
 - **Port forwarding is IPv4-only with modulo hashing** — multi-backend VIPs
   distribute clients with `jhash ip saddr mod N` over the backend count. This
