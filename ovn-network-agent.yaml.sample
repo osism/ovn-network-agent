@@ -27,6 +27,20 @@ ovn_sb_remote: "tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642"
 # port-forward-only mode.
 ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 
+# TLS for ssl: OVN remotes (default: plaintext tcp:).
+# To dial the databases over TLS, give both remotes ssl: endpoints instead of
+# tcp: — a single remote list must not mix the two schemes:
+# ovn_sb_remote: "ssl:10.10.0.1:6642,ssl:10.10.0.2:6642,ssl:10.10.0.3:6642"
+# ovn_nb_remote: "ssl:10.10.0.1:6641,ssl:10.10.0.2:6641,ssl:10.10.0.3:6641"
+# CA certificate (PEM) that signed the OVN NB/SB server certificates (private CA).
+# ovn_ssl_ca: "/etc/ovn-network-agent/ca.pem"
+# Client certificate and key (PEM) for mutual TLS; must be set together.
+# ovn_ssl_cert: "/etc/ovn-network-agent/cert.pem"
+# ovn_ssl_key: "/etc/ovn-network-agent/key.pem"
+# The private key must not be group- or world-accessible (chmod 0600) — the
+# agent refuses to start otherwise.
+# The files are read once at startup — rotation requires a restart.
+
 # Provider bridge device for kernel routes (default: br-ex)
 # bridge_dev: "br-ex"
 

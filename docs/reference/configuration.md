@@ -23,6 +23,9 @@ regenerate this page with `go generate ./...`.
 | `--check-config` | — | — | `false` | Validate configuration and exit (exit code 0 = valid, 1 = invalid) |
 | `--ovn-sb-remote` | `OVN_NETWORK_OVN_SB_REMOTE` | `ovn_sb_remote` |  | OVN Southbound DB remote, comma-separated for cluster |
 | `--ovn-nb-remote` | `OVN_NETWORK_OVN_NB_REMOTE` | `ovn_nb_remote` |  | OVN Northbound DB remote, comma-separated for cluster |
+| `--ovn-ssl-ca` | `OVN_NETWORK_OVN_SSL_CA` | `ovn_ssl_ca` |  | Path to the CA certificate (PEM) that signed the OVN NB/SB server certificates, for ssl: remotes |
+| `--ovn-ssl-cert` | `OVN_NETWORK_OVN_SSL_CERT` | `ovn_ssl_cert` |  | Path to the client certificate (PEM) presented to OVN NB/SB for mutual TLS (requires ovn-ssl-key) |
+| `--ovn-ssl-key` | `OVN_NETWORK_OVN_SSL_KEY` | `ovn_ssl_key` |  | Path to the private key (PEM) for ovn-ssl-cert (requires ovn-ssl-cert) |
 | `--bridge-dev` | `OVN_NETWORK_BRIDGE_DEV` | `bridge_dev` | `br-ex` | Provider bridge device for kernel routes |
 | `--vrf-name` | `OVN_NETWORK_VRF_NAME` | `vrf_name` | `vrf-provider` | VRF name for FRR routes |
 | `--veth-nexthop` | `OVN_NETWORK_VETH_NEXTHOP` | `veth_nexthop` | `169.254.0.1` | Nexthop IP for FRR static routes in the VRF |

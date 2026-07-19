@@ -14,11 +14,24 @@
 
 # OVN Southbound DB connection (required)
 # The agent runs on network/gateway nodes and connects to the OVN databases
-# on the control nodes via TCP. Comma-separated for clustered setups (failover).
+# on the control nodes. Use tcp: for plaintext or ssl: for TLS (see the
+# OVN_NETWORK_OVN_SSL_* options below). Comma-separated for clustered setups
+# (failover).
 OVN_NETWORK_OVN_SB_REMOTE=tcp:10.10.0.1:6642,tcp:10.10.0.2:6642,tcp:10.10.0.3:6642
 
 # OVN Northbound DB connection (required)
 OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641
+
+# TLS for ssl: OVN remotes (leave empty for plaintext tcp: remotes).
+# A single remote list must not mix ssl: and tcp: endpoints. The files below
+# are read once at startup — rotating them requires a restart.
+# CA certificate (PEM) that signed the OVN NB/SB server certificates.
+#OVN_NETWORK_OVN_SSL_CA=
+# Client certificate/key pair (PEM) presented for mutual TLS; set together.
+# The private key must not be group- or world-accessible (chmod 0600) — the
+# agent refuses to start otherwise.
+#OVN_NETWORK_OVN_SSL_CERT=
+#OVN_NETWORK_OVN_SSL_KEY=
 
 # Provider bridge device for kernel routes
 #OVN_NETWORK_BRIDGE_DEV=br-ex

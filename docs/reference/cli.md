@@ -17,6 +17,9 @@ regenerate it with `go generate ./...`.
 | `--check-config` | `false` | Validate configuration and exit (exit code 0 = valid, 1 = invalid) |
 | `--ovn-sb-remote` |  | OVN Southbound DB remote, comma-separated for cluster |
 | `--ovn-nb-remote` |  | OVN Northbound DB remote, comma-separated for cluster |
+| `--ovn-ssl-ca` |  | Path to the CA certificate (PEM) that signed the OVN NB/SB server certificates, for ssl: remotes |
+| `--ovn-ssl-cert` |  | Path to the client certificate (PEM) presented to OVN NB/SB for mutual TLS (requires ovn-ssl-key) |
+| `--ovn-ssl-key` |  | Path to the private key (PEM) for ovn-ssl-cert (requires ovn-ssl-cert) |
 | `--bridge-dev` | `br-ex` | Provider bridge device for kernel routes |
 | `--vrf-name` | `vrf-provider` | VRF name for FRR routes |
 | `--veth-nexthop` | `169.254.0.1` | Nexthop IP for FRR static routes in the VRF |

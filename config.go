@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -112,8 +114,20 @@ type PortForwardVIP struct {
 
 // Config holds all runtime configuration for the agent.
 type Config struct {
-	OVNSBRemote       string
-	OVNNBRemote       string
+	OVNSBRemote string
+	OVNNBRemote string
+
+	// OVNSSLCA, OVNSSLCert and OVNSSLKey are PEM file paths used to dial
+	// ssl: OVN remotes. They are read once at startup; rotating the files
+	// requires a restart.
+	OVNSSLCA   string
+	OVNSSLCert string
+	OVNSSLKey  string
+
+	// OVNTLS is derived by validateConfig from the three ovn-ssl-* path
+	// options; nil when none of them are set.
+	OVNTLS *tls.Config
+
 	BridgeDev         string
 	VRFName           string
 	VethNexthop       string
@@ -411,6 +425,12 @@ func configOptions() []configOption {
 			func(c *Config) *string { return &c.OVNSBRemote }),
 		stringOpt("ovn-nb-remote", "", "OVN Northbound DB remote, comma-separated for cluster",
 			func(c *Config) *string { return &c.OVNNBRemote }),
+		stringOpt("ovn-ssl-ca", "", "Path to the CA certificate (PEM) that signed the OVN NB/SB server certificates, for ssl: remotes",
+			func(c *Config) *string { return &c.OVNSSLCA }),
+		stringOpt("ovn-ssl-cert", "", "Path to the client certificate (PEM) presented to OVN NB/SB for mutual TLS (requires ovn-ssl-key)",
+			func(c *Config) *string { return &c.OVNSSLCert }),
+		stringOpt("ovn-ssl-key", "", "Path to the private key (PEM) for ovn-ssl-cert (requires ovn-ssl-cert)",
+			func(c *Config) *string { return &c.OVNSSLKey }),
 		stringOpt("bridge-dev", "br-ex", "Provider bridge device for kernel routes",
 			func(c *Config) *string { return &c.BridgeDev }),
 		stringOpt("vrf-name", "vrf-provider", "VRF name for FRR routes",
@@ -608,6 +628,105 @@ func validateMode(cfg *Config) error {
 	return nil
 }
 
+// ovnTLSConfig builds the *tls.Config used to dial ssl: OVN remotes from the
+// ovn-ssl-ca/-cert/-key path options. It returns (nil, nil) when none are set,
+// so a plain tcp: deployment carries no TLS material. The CA, when given,
+// becomes RootCAs so server certificates verify against the operator's private
+// CA instead of the system trust store; the cert/key pair (which must be set
+// together) becomes the client certificate for mutual TLS; the key file is
+// rejected unless its mode keeps it off-limits to group and other. Reading the
+// files here means a bad path fails the config load — and --check-config —
+// rather than the first dial.
+func ovnTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
+	if caPath == "" && certPath == "" && keyPath == "" {
+		return nil, nil
+	}
+	if (certPath == "") != (keyPath == "") {
+		return nil, fmt.Errorf("ovn-ssl-cert and ovn-ssl-key must be set together")
+	}
+
+	tc := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	if caPath != "" {
+		pem, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("read ovn-ssl-ca %q: %w", caPath, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("ovn-ssl-ca %q: no PEM certificates found", caPath)
+		}
+		tc.RootCAs = pool
+	}
+
+	if certPath != "" {
+		// The private key is what lets anything speak for this agent
+		// against the write-capable NB database, so refuse to load one
+		// that other local accounts can read. A config-management run
+		// that forgets the mode would otherwise hand every account on
+		// the gateway node a working client identity, silently.
+		fi, err := os.Stat(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("stat ovn-ssl-key %q: %w", keyPath, err)
+		}
+		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+			return nil, fmt.Errorf("ovn-ssl-key %q has mode %04o: the private key must not be group- or world-accessible (chmod 0600)", keyPath, perm)
+		}
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load ovn-ssl-cert %q / ovn-ssl-key %q: %w", certPath, keyPath, err)
+		}
+		// LoadX509KeyPair checks that the key matches the certificate but
+		// never looks at the validity period, so an expired leaf loads
+		// cleanly and passes --check-config while every handshake it is
+		// used for is rejected. Warn instead of failing: an agent that
+		// refuses to start mid-renewal is worse than one that reconnects
+		// as soon as the new PEMs land.
+		if leaf := cert.Leaf; leaf != nil && time.Now().After(leaf.NotAfter) {
+			slog.Warn("ovn-ssl-cert has expired: OVN TLS handshakes will be rejected until it is renewed and the agent restarted",
+				"path", certPath, "not_after", leaf.NotAfter)
+		}
+		tc.Certificates = []tls.Certificate{cert}
+	}
+
+	return tc, nil
+}
+
+// remoteUsesSSL reports whether an OVN remote list dials over TLS. Every
+// endpoint in the list must agree: an all-ssl: list uses TLS, a list with no
+// ssl: endpoints (including the empty list) does not. A list that mixes ssl:
+// with plaintext endpoints is rejected — libovsdb fails over between the
+// entries transparently, so a single tcp: entry would let a connection
+// silently downgrade away from TLS.
+//
+// Schemes are matched case-insensitively because libovsdb hands each endpoint
+// to net/url, which lowercases the scheme before dispatching: "SSL:" dials TLS
+// there. Classifying it as plaintext here would let "SSL:host,tcp:host" past
+// the mixing check and reinstate exactly the downgrade this guards against.
+// An endpoint whose scheme libovsdb cannot dial at all is rejected here rather
+// than at the first connect, so --check-config catches the typo.
+func remoteUsesSSL(flagName, remote string) (bool, error) {
+	var ssl, plain int
+	for _, endpoint := range ovsdbEndpoints(remote) {
+		scheme, _, ok := strings.Cut(endpoint, ":")
+		if !ok {
+			return false, fmt.Errorf("invalid %s %q: endpoint %q has no scheme", flagName, remote, endpoint)
+		}
+		switch strings.ToLower(scheme) {
+		case "ssl":
+			ssl++
+		case "tcp", "unix":
+			plain++
+		default:
+			return false, fmt.Errorf("invalid %s %q: unsupported endpoint scheme %q", flagName, remote, scheme)
+		}
+	}
+	if ssl > 0 && plain > 0 {
+		return false, fmt.Errorf("invalid %s %q: mixes ssl: and non-ssl endpoints — use one scheme for the whole list so a failover cannot silently downgrade to plaintext", flagName, remote)
+	}
+	return ssl > 0, nil
+}
+
 func validateConfig(cfg *Config) error {
 	if net.ParseIP(cfg.VethNexthop) == nil {
 		return fmt.Errorf("invalid veth-nexthop IP: %q", cfg.VethNexthop)
@@ -632,6 +751,45 @@ func validateConfig(cfg *Config) error {
 	// FRR prefix-list validation
 	if cfg.FRRPrefixList != "" && !isValidIdentifier(cfg.FRRPrefixList) {
 		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
+	}
+
+	// TLS for ssl: OVN remotes. Reject a remote list that mixes ssl: with
+	// plaintext endpoints (a failover must not silently downgrade), then
+	// derive the *tls.Config from the ovn-ssl-* path options.
+	sbSSL, err := remoteUsesSSL("ovn-sb-remote", cfg.OVNSBRemote)
+	if err != nil {
+		return err
+	}
+	nbSSL, err := remoteUsesSSL("ovn-nb-remote", cfg.OVNNBRemote)
+	if err != nil {
+		return err
+	}
+	cfg.OVNTLS, err = ovnTLSConfig(cfg.OVNSSLCA, cfg.OVNSSLCert, cfg.OVNSSLKey)
+	if err != nil {
+		return err
+	}
+	// Warn — rather than reject — on the suspicious-but-working
+	// combinations, matching the unknown-config-key precedent in
+	// applyFileConfig. Every ssl: remote that reaches a dial without a
+	// RootCAs pin trusts the host's system root store, so any publicly
+	// trusted CA can impersonate the databases; TLS material with no ssl:
+	// remote is merely inert.
+	if (sbSSL || nbSSL) && cfg.OVNTLS == nil {
+		slog.Warn("ssl: OVN remotes configured without ovn-ssl-ca/ovn-ssl-cert/ovn-ssl-key: server certificates must chain to the system trust store and no client certificate will be presented")
+	}
+	if (sbSSL || nbSSL) && cfg.OVNTLS != nil && cfg.OVNTLS.RootCAs == nil {
+		slog.Warn("ovn-ssl-cert/ovn-ssl-key are set without ovn-ssl-ca: OVN server certificates are verified against the system trust store, so any publicly trusted CA can impersonate the databases — set ovn-ssl-ca to pin the deployment's own CA")
+	}
+	if cfg.OVNTLS != nil && !sbSSL && !nbSSL {
+		slog.Warn("ovn-ssl-ca/ovn-ssl-cert/ovn-ssl-key are set but no OVN remote uses ssl:, so the TLS options have no effect")
+	}
+	// Per-database schemes are allowed so operators can migrate NB and SB
+	// separately, but the half-migrated state must not look like the finished
+	// one: the cleartext side still carries chassis and Port_Binding data that
+	// becomes kernel routes, FRR announcements and NAT rules here.
+	if sbSSL != nbSSL {
+		slog.Warn("OVN remotes use mixed schemes: one database is dialed over TLS and the other in cleartext",
+			"ovn_sb_remote_tls", sbSSL, "ovn_nb_remote_tls", nbSSL)
 	}
 
 	// ReconcileInterval feeds time.NewTicker, which panics on a
