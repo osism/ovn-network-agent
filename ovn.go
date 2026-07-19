@@ -337,6 +337,9 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 	for _, ep := range ovsdbEndpoints(o.cfg.OVNSBRemote) {
 		sbOpts = append(sbOpts, client.WithEndpoint(ep))
 	}
+	if o.cfg.OVNTLS != nil {
+		sbOpts = append(sbOpts, client.WithTLSConfig(o.cfg.OVNTLS))
+	}
 	o.sbClient, err = client.NewOVSDBClient(sbDBModel, sbOpts...)
 	if err != nil {
 		return fmt.Errorf("create SB client: %w", err)
@@ -370,6 +373,9 @@ func (o *OVNClient) Connect(ctx context.Context) error {
 	}
 	for _, ep := range ovsdbEndpoints(o.cfg.OVNNBRemote) {
 		nbOpts = append(nbOpts, client.WithEndpoint(ep))
+	}
+	if o.cfg.OVNTLS != nil {
+		nbOpts = append(nbOpts, client.WithTLSConfig(o.cfg.OVNTLS))
 	}
 	o.nbClient, err = client.NewOVSDBClient(nbDBModel, nbOpts...)
 	if err != nil {
