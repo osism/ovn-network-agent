@@ -458,16 +458,32 @@ func TestFailedRestoreParksTheNodeAndFailsTheRun(t *testing.T) {
 	}
 }
 
-// converged() has three gates. The container-health one is driven by
-// TestRecoveryBudgetExpiryIsAViolation; these are the other two. Each is
-// the only thing between a node that came back wrong — its chassis never
-// re-registered, or its data path never came back — and being declared
-// healthy and re-targeted.
-func TestConvergenceGatesOnTheChassisAndTheDataPath(t *testing.T) {
+// converged() has four gates. The container-health one is driven by
+// TestRecoveryBudgetExpiryIsAViolation; these are the other three. Each is
+// the only thing between a node that came back wrong — no agent process,
+// a chassis that never re-registered, a data path that never came back —
+// and being declared healthy and re-targeted.
+func TestConvergenceGatesOnTheAgentTheChassisAndTheDataPath(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*engine)
 	}{
+		{
+			// The gwnode entrypoint brings OVS, ovn-controller and FRR up
+			// before it execs the agent, so a container can answer "healthy"
+			// with its chassis row still in SB while the node has no agent at
+			// all. Re-admitting it there is what filled the nightly runs with
+			// `agent-down` violations against nodes that were merely booting.
+			name: "the node is up but its agent has not been exec'd yet",
+			mutate: func(e *engine) {
+				e.lab.cmd = &fakeCommander{respond: func(argv []string) (string, error) {
+					if strings.Contains(strings.Join(argv, " "), "pgrep -f "+agentBinary) {
+						return "", errExit(t, 1)
+					}
+					return healthyLabResponses(argv)
+				}}
+			},
+		},
 		{
 			name: "the node is up but its chassis never re-registers in SB",
 			mutate: func(e *engine) {

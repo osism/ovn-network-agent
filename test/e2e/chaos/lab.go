@@ -359,6 +359,33 @@ func (l *lab) checkConfig(ctx context.Context, gw, path string) (bool, string, e
 	return true, strings.TrimSpace(out), nil
 }
 
+// gatewayBack reports whether a gateway has returned to service after a
+// container lifecycle event: the container healthy, its agent process
+// running, and its chassis back in SB.
+//
+// The agent is asked for by name rather than left to the container
+// healthcheck, even though the healthcheck covers it too. The run holds
+// every node in its healthy pool to the agent-alive invariant, so it has to
+// re-admit a node on that same signal — anything weaker puts a gateway that
+// is still running its entrypoint back in the pool, and every sweep until
+// the agent execs records an `agent-down` against a node that is merely
+// booting (issue #205). Reading the invariant off the same probe that
+// asserts it is what keeps the two from drifting apart again.
+//
+// agentAlive's error means the question could not be asked, which reads
+// here as "not back yet": the callers are poll loops with a budget of their
+// own, so a docker daemon under load costs a retry rather than a verdict.
+func (l *lab) gatewayBack(ctx context.Context, gw string) bool {
+	if l.containerHealth(ctx, gw) != "healthy" {
+		return false
+	}
+	alive, err := l.agentAlive(ctx, gw)
+	if err != nil || !alive {
+		return false
+	}
+	return l.chassisInSB(ctx, gw)
+}
+
 // chassisInSB reports whether gw still has (or has re-registered) its
 // SB Chassis row.
 func (l *lab) chassisInSB(ctx context.Context, gw string) bool {

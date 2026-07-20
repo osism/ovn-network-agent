@@ -245,6 +245,33 @@ func TestApplyProfileFailsWhenAGatewayNeverComesBack(t *testing.T) {
 	}
 }
 
+// The roll waits for the agent, not just for the container. A gateway
+// whose entrypoint is still on its way to the exec answers "healthy" — OVS
+// and ovn-controller are up by then — so a roll that stopped there would
+// take the next gateway down while the previous one had no agent on the new
+// configuration at all.
+func TestApplyProfileWaitsForTheAgentNotJustTheContainer(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "pgrep -f "+agentBinary) {
+			return "", errExit(t, 1) // the entrypoint has not exec'd it yet
+		}
+		return labWithConfig("stale config\n")(argv)
+	}}
+	a := newTestApplier(t, cmd, "flat-minimal")
+
+	err := a.applyProfile(context.Background())
+
+	if err == nil {
+		t.Fatal("a gateway whose agent never started was reported as reconfigured")
+	}
+	if !strings.Contains(err.Error(), "did not come back") {
+		t.Fatalf("error %q does not say the gateway never returned", err)
+	}
+	if got := cmd.count(restartCmd); got != 1 {
+		t.Fatalf("restarted %d gateways, want the roll to stop at the one whose agent never came back", got)
+	}
+}
+
 // A flip is a rolling reconfiguration: the new configuration is validated
 // with the agent's own checker, then swapped in, then the node is
 // restarted onto it. Doing any of that in the other order would restart a

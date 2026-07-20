@@ -685,7 +685,9 @@ func (e *engine) converged(ctx context.Context, d decision) bool {
 }
 
 // nodeConverged reports whether one node is back in service, by the signal
-// its scope defines.
+// its scope defines. A gateway's is gatewayBack — which includes its agent
+// process, so a node the engine puts back in the healthy pool is one the
+// agent-alive sweep can legitimately hold to that invariant.
 func (e *engine) nodeConverged(ctx context.Context, d decision, node string) bool {
 	switch d.action.scope {
 	case scopeCentral:
@@ -695,7 +697,7 @@ func (e *engine) nodeConverged(ctx context.Context, d decision, node string) boo
 	case scopeUpstream:
 		return bgpdAlive(ctx, e.lab)
 	default:
-		return e.lab.containerHealth(ctx, node) == "healthy" && e.lab.chassisInSB(ctx, node)
+		return e.lab.gatewayBack(ctx, node)
 	}
 }
 
