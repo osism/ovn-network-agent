@@ -70,8 +70,10 @@
 # start honours:
 #   BGPD_WAIT_SECS=30      # readiness wait per start attempt, seconds
 #   BGPD_START_ATTEMPTS=3  # bounded retries before bring-up is failed
-# and the gateway-entrypoint gate honours:
+# the gateway-entrypoint gate honours:
 #   GWNODE_READY_SECS=120  # wait for the agent process per bring-up
+# and the next-hop MAC binding write honours:
+#   MAC_BINDING_ADD_ATTEMPTS=5  # retries against a racing agent write
 
 set -euo pipefail
 
@@ -134,6 +136,13 @@ BGPD_START_ATTEMPTS="${BGPD_START_ATTEMPTS:-3}"
 # gives up and says why, so the gate must not time out earlier and
 # steal that diagnostic.
 GWNODE_READY_SECS="${GWNODE_READY_SECS:-120}"
+
+# Budget for the upstream next-hop Static_MAC_Binding write, which has a
+# second writer racing it — see ensure_upstream_nexthop_mac_binding. One
+# retry is enough to converge in practice (the losing attempt's own
+# error proves the winning row is already committed); the rest of the
+# budget is headroom.
+MAC_BINDING_ADD_ATTEMPTS="${MAC_BINDING_ADD_ATTEMPTS:-5}"
 
 CLIENT_NAME="${CLIENT_NAME:-client-1}"
 CLIENT_NODE="clab-${LAB_NAME}-${CLIENT_NAME}"
@@ -596,9 +605,42 @@ ensure_upstream_nexthop_mac_binding() {
     # lookup so the egress packet leaves OVN and the agent's catch-all
     # flow on br-ex then redirects it into the kernel + vrf-provider
     # path.
+    #
+    # This row has a second writer. Every gateway agent maintains the
+    # same binding — once it binds the localnet segment it rewrites the
+    # MAC to that segment's own interface, inserting the row when it is
+    # absent — and the agents have been running since their containers
+    # started, so one of them can reach the row first. `--may-exist` is
+    # not an atomic upsert: ovn-nbctl decides insert-vs-update from the
+    # snapshot its IDL holds, and nothing in the resulting transaction
+    # asserts that the row is *still* absent at commit time. An agent
+    # insert landing in that window makes OVSDB reject our insert for
+    # duplicating (logical_port, ip) — a constraint violation, which
+    # ovn-nbctl treats as fatal rather than retryable, so the whole
+    # bring-up dies before any scenario runs (issue #207).
+    #
+    # Retrying converges the two writers on one row: the failure itself
+    # proves the agent's row is committed, so the next attempt's fresh
+    # snapshot sees it and takes the update path. Whichever MAC wins the
+    # last write does not matter — the agent re-asserts its own on the
+    # next reconcile pass, exactly as it does in a race-free bring-up.
     log "ensuring static MAC binding ${UPSTREAM_NEXTHOP_IP} → ${UPSTREAM_NEXTHOP_MAC} on ${LR_PUBLIC_PORT}"
-    nbctl --may-exist static-mac-binding-add "${LR_PUBLIC_PORT}" \
-        "${UPSTREAM_NEXTHOP_IP}" "${UPSTREAM_NEXTHOP_MAC}"
+    local attempt output
+    for attempt in $(seq 1 "${MAC_BINDING_ADD_ATTEMPTS}"); do
+        if output="$(nbctl --may-exist static-mac-binding-add "${LR_PUBLIC_PORT}" \
+                "${UPSTREAM_NEXTHOP_IP}" "${UPSTREAM_NEXTHOP_MAC}" 2>&1)"; then
+            return 0
+        fi
+        log "static MAC binding write attempt" \
+            "${attempt}/${MAC_BINDING_ADD_ATTEMPTS} failed: ${output}"
+        if [ "${attempt}" -ne "${MAC_BINDING_ADD_ATTEMPTS}" ]; then
+            sleep 1
+        fi
+    done
+    echo "static MAC binding ${UPSTREAM_NEXTHOP_IP} on ${LR_PUBLIC_PORT} could not" \
+        "be written after ${MAC_BINDING_ADD_ATTEMPTS} attempts" >&2
+    nbctl static-mac-binding-list >&2 || true
+    exit 1
 }
 
 configure_client() {

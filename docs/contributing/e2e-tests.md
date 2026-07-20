@@ -145,10 +145,24 @@ chassis registration for every gateway, and the upstream `bgpd`. The
 `bgpd` start — the one daemon bootstrap starts itself — is retried up
 to `BGPD_START_ATTEMPTS` (default `3`) times, each attempt waiting
 `BGPD_WAIT_SECS` (default `30` s) for the daemon to register, so a
-one-off startup hiccup heals itself instead of failing the job. When
-any gate times out, the awaited daemon's own output and surrounding
-state are dumped into the job log (and, for a CI run, the collected
-artifacts — see [Triaging a failed run](#triaging-a-failed-run)) so
+one-off startup hiccup heals itself instead of failing the job.
+
+The upstream next-hop `Static_MAC_Binding` is written the same way, for
+a different reason: the gateway agents maintain that same row and have
+been running since their containers started, so one can insert it
+between bootstrap's own existence check and its insert. `--may-exist`
+is not an atomic upsert — `ovn-nbctl` picks insert-vs-update from its
+IDL snapshot — and the losing insert is rejected as a uniqueness
+violation on `(logical_port, ip)`, which `ovn-nbctl` treats as fatal.
+The write is retried up to `MAC_BINDING_ADD_ATTEMPTS` (default `5`)
+times; the next attempt's snapshot contains the agent's row, so it
+updates that row instead of inserting a second one. Which MAC survives
+the last write is irrelevant — the owning agent re-asserts its own on
+its next reconcile pass.
+
+When any gate times out, the awaited daemon's own output and
+surrounding state are dumped into the job log (and, for a CI run, the
+collected artifacts — see [Triaging a failed run](#triaging-a-failed-run)) so
 the failure can be root-caused after the fact. The mid-run lab recycle
 in `drain-hitless` re-runs the same gates, so it inherits the same
 diagnostics and retries.
