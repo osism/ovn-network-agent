@@ -319,7 +319,17 @@ func ensureResponders(ctx context.Context, l *lab, p *profile) error {
 			fmt.Sprintf("ovs-vsctl --may-exist add-port br-int %s -- set Interface %s external_ids:iface-id=%s",
 				hostVeth, hostVeth, n.lsp),
 			fmt.Sprintf("ip link set %s up", hostVeth),
-			fmt.Sprintf("ip netns list | awk '{print $1}' | grep -qx %s || ip netns add %s", n.name, n.name),
+			// Enter the namespace rather than asking `ip netns list`
+			// whether it exists. A container restart destroys the
+			// namespace but leaves its anchor under /run/netns behind as
+			// a dead regular file — the gateway image mounts no tmpfs on
+			// /run — so it stays listed while every use of it fails
+			// ("Peer netns reference is invalid", EINVAL). Clearing the
+			// dead anchor first is what makes the re-create possible;
+			// `ip netns delete` covers both states, detaching a live
+			// mount and unlinking the file.
+			fmt.Sprintf("ip netns exec %s true 2>/dev/null || { ip netns delete %s 2>/dev/null || true; ip netns add %s; }",
+				n.name, n.name, n.name),
 			fmt.Sprintf("ip -n %s link show %s >/dev/null 2>&1 || ip link set %s netns %s",
 				n.name, nsVeth, nsVeth, n.name),
 			fmt.Sprintf("ip -n %s link set lo up", n.name),

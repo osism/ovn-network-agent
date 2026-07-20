@@ -635,8 +635,17 @@ ovs-vsctl --may-exist add-port br-int "${WORKLOAD_HOST_VETH}" \
     -- set Interface "${WORKLOAD_HOST_VETH}" external_ids:iface-id="${WORKLOAD_LSP}"
 ip link set "${WORKLOAD_HOST_VETH}" up
 
-# Workload netns + peer-side veth.
-if ! ip netns list | awk '{print $1}' | grep -qx "${WORKLOAD_NETNS}"; then
+# Workload netns + peer-side veth. The guard enters the namespace rather
+# than asking `ip netns list` whether it exists: a container restart
+# destroys the namespace but leaves its anchor under /run/netns behind as
+# a dead regular file — the gwnode image mounts no tmpfs on /run — so it
+# stays listed while every use of it fails ("Peer netns reference is
+# invalid", EINVAL) and `ip netns add` fails with EEXIST. Clearing the dead
+# anchor first is what makes the re-create possible; `ip netns delete`
+# covers both states, detaching a live mount and unlinking the file. A
+# healthy namespace is left alone, so the workload's processes survive.
+if ! ip netns exec "${WORKLOAD_NETNS}" true 2>/dev/null; then
+    ip netns delete "${WORKLOAD_NETNS}" 2>/dev/null || true
     ip netns add "${WORKLOAD_NETNS}"
 fi
 if ! ip -n "${WORKLOAD_NETNS}" link show "${WORKLOAD_NS_VETH}" >/dev/null 2>&1; then
