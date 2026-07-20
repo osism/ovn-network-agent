@@ -135,7 +135,8 @@ type gatewayExpectation struct {
 	// DesiredIPs is the sorted, deduplicated set of IPv4 addresses that need a
 	// route and an announcement: the locally-active routers' NAT external IPs
 	// (filtered by the effective networks) and LRP gateway IPs, plus the
-	// configured port-forward VIPs. Mirrors desired_state.go DesiredIPs.
+	// port-forward VIPs this gateway can announce. Mirrors desired_state.go
+	// DesiredIPs, including the dormant-VIP gate (see rule 4b below).
 	DesiredIPs []string
 
 	// KernelRouteDev maps each desired IP to the kernel device its proto-44
@@ -146,7 +147,9 @@ type gatewayExpectation struct {
 
 	// FRRStatic is the set of /32 IPs expected as FRR static routes via the
 	// veth nexthop. It equals DesiredIPs in both modes: ensureRoutes manages
-	// FRR for every desired IP, active or standby, full or pf-only.
+	// FRR for every desired IP, active or standby, full or pf-only. On a
+	// full-mode standby that set is empty — the dormant VIPs are not in it,
+	// which is what keeps inactive_routes at 0 there (#206).
 	FRRStatic []string
 
 	// PrefixList is the sorted set of CIDR strings the ANNOUNCED-NETWORKS
@@ -239,7 +242,19 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 	// the VIPs.
 	natIPs, lrpIPs, ipTag := ovnDesired(local, effective)
 	hairpin := sortedUnique(append(append([]string{}, natIPs...), lrpIPs...))
-	desired := sortedUnique(append(append([]string{}, hairpin...), vips...))
+
+	// Rule 4b (#206) — a port-forward VIP joins the route plane only where the
+	// agent also maintains the prefix-list that would permit it: always in
+	// pf-only mode, in full mode only on an active gateway. On a full-mode
+	// standby the VIPs are dormant (agent.go vipRoutesAnnounceable): no kernel
+	// route, no FRR static route, so nothing can sit in FRR unadvertised and
+	// hold the inactive-routes gauge non-zero. The DNAT plane below is
+	// unaffected — dormancy withholds the routes, not the nftables rules.
+	routableVIPs := vips
+	if !pfOnly && !active {
+		routableVIPs = nil
+	}
+	desired := sortedUnique(append(append([]string{}, hairpin...), routableVIPs...))
 
 	exp := gatewayExpectation{
 		Mode:           mode,

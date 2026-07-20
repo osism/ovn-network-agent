@@ -4,6 +4,7 @@ package integration
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -535,6 +536,57 @@ func TestScenario_PortForwardRouterMasquerade(t *testing.T) {
 				r.HasMasquerade()
 		},
 		30*time.Second, "router masquerade rule for VIP "+vip+" with SNAT IP "+snatIP)
+}
+
+// TestScenario_PortForwardVIPDormantWithoutLocalRouters (#206).
+//
+// A gateway whose config carries a port-forward VIP but which hosts no local
+// routers cannot advertise that VIP: reconcile takes the standby path, which
+// empties the FRR prefix-list and the veth-leak network routes. Installing the
+// VIP's routes anyway left an FRR static route zebra never selects — the agent
+// logged "FRR static routes are configured but inactive" at ERROR on every
+// reconcile and held ovn_network_agent_inactive_routes at 1 indefinitely, which
+// the shipped alert rule fires on.
+//
+// The VIP is dormant instead: no kernel route, no FRR route, one info-level
+// report, and nothing for the inactive-route check to alarm on. The DNAT plane
+// is deliberately still asserted — dormancy withholds the routes, not the
+// nftables rules, so a gateway that later gains routers only needs the announce.
+func TestScenario_PortForwardVIPDormantWithoutLocalRouters(t *testing.T) {
+	// No MakeLocalRouter call: the agent connects to OVN (gateway mode, not
+	// port-forward-only — Defaults() sets both remotes) and finds no locally
+	// active router, which is exactly the reported condition.
+	cfg := startPFScenario(t)
+
+	const vip = "198.51.100.42"
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP: vip,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 80, DestAddr: "10.0.0.100",
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// The DNAT rule still lands — proof the agent reconciled the VIP and did
+	// not simply ignore the config block.
+	testenv.AssertNftRuleInChain(t, pfTable, "prerouting_dnat",
+		func(r testenv.NftRule) bool { return r.HasMatch("ip", "daddr", vip) },
+		30*time.Second, "DNAT rule for dormant VIP "+vip)
+
+	// Neither route may appear. Both assertions poll for their whole timeout,
+	// so this covers several reconcile cycles at the 5s default interval.
+	testenv.AssertNoFRRRoute(t, vip, 15*time.Second)
+	testenv.AssertNoKernelRoute(t, vip, 5*time.Second)
+
+	logs := a.LogTail(100000)
+	if strings.Contains(logs, "FRR static routes are configured but inactive") {
+		t.Errorf("dormant VIP must not raise the inactive-route alarm; last logs:\n%s", a.LogTail(40))
+	}
+	if !strings.Contains(logs, "port-forward VIPs are dormant on this node") {
+		t.Errorf("expected the dormancy to be reported once at info level; last logs:\n%s", a.LogTail(40))
+	}
 }
 
 // TestScenario_PortForwardL3mdevSysctls (#43 scenario 6).

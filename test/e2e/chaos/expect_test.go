@@ -211,6 +211,56 @@ func TestExpectationPortForwardOnlySkipsEveryOVNPlane(t *testing.T) {
 	})
 }
 
+// A port-forward VIP on a full-mode standby gateway is dormant (#206): it gets
+// no kernel route and no FRR static route, because the standby path empties the
+// prefix-list that would advertise it. The route planes must therefore expect
+// nothing — the whole point is that no unadvertisable static route sits in FRR
+// holding inactive_routes non-zero, which the oracle's settle gate refuses to
+// pass. The DNAT plane is unaffected: dormancy withholds the routes, not the
+// nftables rules.
+func TestExpectationDormantVIPOnStandbyGateway(t *testing.T) {
+	// gateway-1 owns the only CR port, so gateway-2 is a standby — while both
+	// carry the API VIP in their configuration.
+	snap := ovnSnapshot{
+		CRPortChassis: map[string]string{"cr-lr0-public": "gateway-1"},
+		LRPs:          map[string]lrpRow{"lr0-public": {Networks: []string{"192.0.2.1/24"}}},
+		LRPNameByUUID: map[string]string{"uuid-lr0-public": "lr0-public"},
+		Routers: map[string]routerRow{"lr0": {
+			LRPUUIDs: []string{"uuid-lr0-public"},
+			NATs:     []natRow{{ExternalIP: "192.0.2.10", Type: "dnat_and_snat"}},
+		}},
+		Chassis:         map[string]bool{"gateway-1": true, "gateway-2": true},
+		SegmentTagByLRP: map[string]int{"lr0-public": 0},
+	}
+	// flat-dnat is the full-mode profile that puts the API VIP on every
+	// gateway, so gateway-2 carries a VIP it cannot announce.
+	doc := render(t, profileGateway(t, "flat-dnat", "gateway-2"), "172.20.20.5")
+
+	exp := computeExpectation(snap, "gateway-2", doc, "172.20.20.5")
+
+	if exp.Mode != "full" || exp.Active {
+		t.Fatalf("mode=%q active=%v, want a full-mode standby gateway", exp.Mode, exp.Active)
+	}
+	if len(exp.DesiredIPs) != 0 {
+		t.Fatalf("DesiredIPs = %v, want none — the VIP is dormant on a standby", exp.DesiredIPs)
+	}
+	if len(exp.FRRStatic) != 0 {
+		t.Fatalf("FRRStatic = %v, want no FRR route for a dormant VIP", exp.FRRStatic)
+	}
+	if len(exp.KernelRouteDev) != 0 {
+		t.Fatalf("KernelRouteDev = %v, want no kernel route for a dormant VIP", exp.KernelRouteDev)
+	}
+	if len(exp.MustAnnounce) != 0 {
+		t.Fatalf("MustAnnounce = %v, want nothing announced from a standby", exp.MustAnnounce)
+	}
+	// The DNAT plane still follows the config alone, so a gateway that later
+	// wins the CR port only needs the announce.
+	assertDNAT(t, exp.DNAT, []dnatExpectation{
+		{VIP: apiVIPAddr, Proto: "tcp", Port: apiVIPPort, Backend: "172.20.20.5", DestPort: apiVIPPort},
+	})
+	assertSet(t, "ManagedVIPs", exp.ManagedVIPs, []string{apiVIPAddr})
+}
+
 // With no port_forwards the agent's nftables table carries no DNAT chains and
 // manages no VIP address; with the API VIP it carries exactly the one DNAT rule
 // to the gateway's mgmtIP, and the hairpin-masquerade set follows the flag.

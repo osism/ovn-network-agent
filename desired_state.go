@@ -42,6 +42,11 @@ type desiredState struct {
 	// DesiredIPs is HairpinIPs plus the port-forward VIPs, deduplicated and
 	// sorted. This is the set that gets kernel routes and FRR announcements.
 	DesiredIPs []string
+
+	// DormantVIPs lists the configured port-forward VIPs left out of
+	// DesiredIPs because this node cannot advertise them, sorted. Reported by
+	// reconcile at info level on change.
+	DormantVIPs []string
 }
 
 // buildHairpinTargets collects every IP that needs a hairpin flow: the NAT
@@ -127,17 +132,27 @@ func splitIPv4(targets map[string]HairpinTarget) (v4, nonV4 []string) {
 // computeDesiredState derives everything reconcile needs from an OVN snapshot
 // and the configured port forwards. In port-forward-only mode state is the zero
 // OVNState, so the result reduces to the VIPs alone.
-func computeDesiredState(state OVNState, portForwards []PortForwardVIP) desiredState {
+//
+// announceVIPs decides whether the configured port-forward VIPs join the route
+// plane this cycle; reconcile derives it from whether this node maintains the
+// FRR prefix-list that would permit them (see vipRoutesAnnounceable). When it is
+// false the VIPs are reported as DormantVIPs instead: no kernel route, no FRR
+// static route, and nothing for the inactive-route check to alarm on.
+func computeDesiredState(state OVNState, portForwards []PortForwardVIP, announceVIPs bool) desiredState {
 	targets := buildHairpinTargets(state)
 	hairpinIPs, excludedNonV4 := splitIPv4(targets)
 	segments, segmentByName := buildDesiredSegments(state.LocalRouters)
 
 	// desiredIPs extends hairpinIPs with the port-forward VIPs — these need
-	// kernel routes on br-ex and FRR static routes for BGP announcement,
-	// independent of whether any OVN routers are locally active.
+	// kernel routes on br-ex and FRR static routes for BGP announcement.
 	desiredIPs := make([]string, 0, len(hairpinIPs)+len(portForwards))
 	desiredIPs = append(desiredIPs, hairpinIPs...)
+	var dormantVIPs []string
 	for _, pf := range portForwards {
+		if !announceVIPs {
+			dormantVIPs = append(dormantVIPs, pf.VIP)
+			continue
+		}
 		desiredIPs = append(desiredIPs, pf.VIP)
 	}
 
@@ -148,5 +163,6 @@ func computeDesiredState(state OVNState, portForwards []PortForwardVIP) desiredS
 		HairpinIPs:     hairpinIPs,
 		ExcludedNonV4:  excludedNonV4,
 		DesiredIPs:     uniqueIPs(desiredIPs),
+		DormantVIPs:    uniqueIPs(dormantVIPs),
 	}
 }

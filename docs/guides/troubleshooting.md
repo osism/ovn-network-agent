@@ -225,6 +225,10 @@ the next-hop is the fault.
 unresolvable — the veth pair is missing or down, or the VRF is misconfigured —
 so FRR keeps the route but never installs or advertises it.
 
+A port-forward VIP on a gateway without locally active routers is *not* a cause:
+such a VIP is [dormant](../explanation/port-forwarding#dormant-vips-on-a-gateway-without-local-routers)
+and gets no route at all, so it cannot contribute to this alert.
+
 **Diagnosis.** The agent logs `FRR static routes are configured but inactive —
 these FIPs are not advertised via BGP` with the affected `ips` and `vrf`.
 Confirm with step 5 of [Agent up but no routes

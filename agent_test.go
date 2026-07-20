@@ -280,6 +280,61 @@ func TestVerifyRoutesDetectsDevMismatch(t *testing.T) {
 // to resolve is skipped. A flat segment (bridge is correct), a resolved VLAN
 // segment, and an unknown segment must all route normally — misclassifying any
 // of them would either mis-deliver traffic or needlessly freeze a route.
+// TestVIPRoutesAnnounceable pins the #206 gate: a port-forward VIP only gets a
+// route where the agent also maintains the FRR prefix-list that would permit it.
+func TestVIPRoutesAnnounceable(t *testing.T) {
+	tests := []struct {
+		name            string
+		portForwardOnly bool
+		hasLocalRouters bool
+		want            bool
+	}{
+		// The defect: no local routers means reconcile empties the
+		// prefix-list, so a VIP route could never be advertised.
+		{"gateway without local routers", false, false, false},
+		{"gateway with local routers", false, true, true},
+		// Port-forward-only mode never takes the standby path and serves
+		// its VIPs without any OVN state at all.
+		{"port-forward-only", true, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Agent{cfg: Config{PortForwardOnly: tt.portForwardOnly}}
+			got := a.vipRoutesAnnounceable(OVNState{HasLocalRouters: tt.hasLocalRouters})
+			if got != tt.want {
+				t.Errorf("vipRoutesAnnounceable = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReportDormantVIPsLogsOnChange is the other half of the #206 fix: the
+// dormancy is reported when the set changes, not on every reconcile. The old
+// behaviour logged at ERROR every cycle for as long as the condition held.
+func TestReportDormantVIPsLogsOnChange(t *testing.T) {
+	a := &Agent{}
+
+	a.reportDormantVIPs([]string{"192.0.2.99"})
+	if a.dormantVIPs != "192.0.2.99" {
+		t.Fatalf("dormantVIPs = %q, want the reported set memoized", a.dormantVIPs)
+	}
+	// Same set again — nothing changes, so nothing is re-reported.
+	a.reportDormantVIPs([]string{"192.0.2.99"})
+	if a.dormantVIPs != "192.0.2.99" {
+		t.Errorf("dormantVIPs = %q, want unchanged on a repeat", a.dormantVIPs)
+	}
+	// A second VIP joining is a change and must be picked up.
+	a.reportDormantVIPs([]string{"192.0.2.99", "203.0.113.10"})
+	if a.dormantVIPs != "192.0.2.99,203.0.113.10" {
+		t.Errorf("dormantVIPs = %q, want the grown set", a.dormantVIPs)
+	}
+	// Recovery clears the memo so a later dormancy is reported again.
+	a.reportDormantVIPs(nil)
+	if a.dormantVIPs != "" {
+		t.Errorf("dormantVIPs = %q, want cleared on recovery", a.dormantVIPs)
+	}
+}
+
 func TestSegmentRouteUnresolved(t *testing.T) {
 	tag := 101
 	desired := map[string]DesiredSegment{
