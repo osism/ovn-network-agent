@@ -16,7 +16,7 @@ jobs:
     # cross-repo PAT, so a moved `main` upstream must not silently change
     # what executes here. Bump deliberately (see docs/contributing/ci.md).
     # SHA is osism/.github @main as of 2026-07-13.
-    uses: osism/.github/.github/workflows/add-to-project.yml@b57ddf3f8be8035457adb666aeef86eda8672aaa # main
+    uses: osism/.github/.github/workflows/add-to-project.yml@04f1ab2308f98357d78aaf9cd4f994cd10049a63 # main
     secrets:
       # ADD_TO_PROJECT_PAT should be a fine-grained PAT scoped to the
       # minimum: organization Projects read/write (plus the default repo
