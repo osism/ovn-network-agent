@@ -35,6 +35,11 @@ type Agent struct {
 	// misconfiguration) and triggers escalated logging.
 	consecutiveReAdds int
 
+	// lastNexthopRepair is when the agent last flapped veth-provider's address
+	// to make zebra relearn the next-hop's connected route. Rate-limits that
+	// repair to one attempt per nexthopRepairCooldown.
+	lastNexthopRepair time.Time
+
 	// missingChassis tracks when each chassis was first observed as absent
 	// from the OVN SB Chassis table. Used for stale entry cleanup with a
 	// configurable grace period.
@@ -937,6 +942,12 @@ func (a *Agent) cleanup() {
 // with route re-adds before logging escalates from Warn to Error.
 const consecutiveReAddThreshold = 3
 
+// nexthopRepairCooldown is the minimum interval between two attempts to make
+// zebra relearn the veth next-hop's connected route. The repair withdraws the
+// VRF's routes through the veth for an instant, so it is paced rather than run
+// on every reconcile for as long as the condition lasts.
+const nexthopRepairCooldown = time.Minute
+
 // verifyRoutes checks that all desired IPs still have both a kernel route
 // (on the right interface) and an FRR static route after route mutations.
 // Any route that disappeared (e.g. due to a vtysh race or unexpected FRR
@@ -1009,6 +1020,7 @@ func (a *Agent) verifyRoutes(desiredIPs []string, ipDev map[string]string, skipK
 				"consecutive_cycles", a.consecutiveReAdds,
 				"re_added_this_cycle", totalReAdds,
 			)
+			a.repairUnresolvableNexthop()
 		}
 	} else {
 		a.consecutiveReAdds = 0
@@ -1016,6 +1028,53 @@ func (a *Agent) verifyRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	setConsecutiveReAdds(a.consecutiveReAdds)
 
 	return totalReAdds
+}
+
+// repairUnresolvableNexthop diagnoses the one cause of persistent route
+// instability the agent can fix by itself, and fixes it.
+//
+// When zebra is missing the connected route for the veth /30, every FIP static
+// the agent configures fails to resolve and none of them enters the RIB.
+// ListFRRRoutes then reports the routes missing, verifyRoutes re-adds them, and
+// the re-add changes nothing because they were configured all along — so the
+// agent retries forever while every FIP is unreachable and BGP advertises
+// nothing. Detection already worked; this is the missing remediation.
+//
+// The repair runs only once the next-hop is confirmed unresolvable, and at most
+// once per nexthopRepairCooldown. Any other cause of re-adds — a competing
+// writer of the same routes, an FRR reload — leaves the next-hop resolvable, and
+// for those the agent must not touch the address: the routes it flapped would
+// still be taken away by whatever is taking them away.
+func (a *Agent) repairUnresolvableNexthop() {
+	if !a.cfg.VethLeakEnabled || a.cfg.DryRun {
+		return
+	}
+	resolvable, err := a.routing.VethNexthopResolvable()
+	if err != nil {
+		slog.Warn("could not check whether the veth next-hop resolves", "error", err)
+		return
+	}
+	if resolvable {
+		return
+	}
+
+	// Worth its own line: the "routes required re-adding" error above names the
+	// symptom, and every other cause of it is somebody else deleting routes.
+	// This one is the agent's own next-hop being unresolvable, which no amount
+	// of re-adding can repair, and it is invisible in the route tables the
+	// operator would otherwise go and check.
+	slog.Error("veth next-hop is unresolvable: zebra has no connected route covering it, so no FIP route can enter the RIB and none is advertised via BGP",
+		"nexthop", a.cfg.VethNexthop, "dev", vethProviderName, "vrf", a.cfg.VRFName)
+
+	if !a.lastNexthopRepair.IsZero() && time.Since(a.lastNexthopRepair) < nexthopRepairCooldown {
+		return
+	}
+	a.lastNexthopRepair = time.Now()
+	recordNexthopRepair()
+
+	if err := a.routing.refreshVethNexthop(a.effectiveFilters); err != nil {
+		slog.Error("failed to re-notify the kernel about the veth-provider address", "error", err)
+	}
 }
 
 // checkFRRRouteActivity surfaces desired routes that exist as FRR static

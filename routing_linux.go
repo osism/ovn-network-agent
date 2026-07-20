@@ -728,6 +728,79 @@ func (rm *RouteManager) SetupVethLeak() error {
 	return nil
 }
 
+// RefreshVethNexthop deletes and re-adds veth-provider's address so the kernel
+// re-emits the RTM_NEWADDR that zebra needs in order to install the connected
+// route for the veth /30 — the route every FIP static resolves through.
+//
+// This repairs the startup race described in VethNexthopResolvable: zebra can
+// record veth-provider's address and then process its VRF enslavement, ending up
+// with the interface in the VRF but without its prefix, and the kernel never
+// repeats the notification on its own. Flapping the address is the cheapest way
+// to make it repeat.
+//
+// Deleting the address makes the kernel purge the connected prefix along with
+// every route that resolved through it, so this restores what it removed before
+// returning: the per-network leak routes are reconciled from the caller's
+// networks, and the permanent neighbour entry for the next-hop is reinstalled
+// because the kernel may flush the device's neighbour table with the address.
+// Leaving either to the next reconcile would trade one broken data plane for a
+// briefly broken one.
+func (rm *RouteManager) RefreshVethNexthop(networks []*net.IPNet) error {
+	if !rm.cfg.VethLeakEnabled {
+		return nil
+	}
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would refresh the veth-provider address",
+			"dev", vethProviderName, "ip", rm.cfg.VethProviderIP)
+		return nil
+	}
+
+	providerIP := net.ParseIP(rm.cfg.VethProviderIP)
+	if providerIP == nil {
+		return fmt.Errorf("invalid veth provider IP: %q", rm.cfg.VethProviderIP)
+	}
+	nexthopIP := net.ParseIP(rm.cfg.VethNexthop)
+	if nexthopIP == nil {
+		return fmt.Errorf("invalid veth nexthop: %q", rm.cfg.VethNexthop)
+	}
+
+	vethProvider, err := netlink.LinkByName(vethProviderName)
+	if err != nil {
+		return fmt.Errorf("find %s: %w", vethProviderName, err)
+	}
+	vethDefault, err := netlink.LinkByName(vethDefaultName)
+	if err != nil {
+		return fmt.Errorf("find %s: %w", vethDefaultName, err)
+	}
+
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: providerIP, Mask: net.CIDRMask(vethPrefixLen, 32)},
+	}
+	if err := netlink.AddrDel(vethProvider, addr); err != nil && !isNoSuchAddr(err) {
+		return fmt.Errorf("remove IP from %s: %w", vethProviderName, err)
+	}
+	if err := netlink.AddrAdd(vethProvider, addr); err != nil && !isFileExists(err) {
+		return fmt.Errorf("re-add IP to %s: %w", vethProviderName, err)
+	}
+
+	if err := netlink.NeighSet(&netlink.Neigh{
+		LinkIndex:    vethProvider.Attrs().Index,
+		IP:           nexthopIP,
+		HardwareAddr: vethDefault.Attrs().HardwareAddr,
+		State:        netlink.NUD_PERMANENT,
+	}); err != nil {
+		return fmt.Errorf("set neighbor on %s: %w", vethProviderName, err)
+	}
+
+	if err := rm.ReconcileVethLeakNetworks(networks); err != nil {
+		return fmt.Errorf("restore veth leak networks after address refresh: %w", err)
+	}
+
+	slog.Warn("re-notified the kernel about the veth-provider address so zebra can relearn its connected route",
+		"dev", vethProviderName, "ip", rm.cfg.VethProviderIP, "nexthop", rm.cfg.VethNexthop, "networks", len(networks))
+	return nil
+}
+
 // TeardownVethLeak removes all veth leak resources. Errors on missing resources
 // are silently ignored so the method is safe to call even if setup was partial.
 func (rm *RouteManager) TeardownVethLeak() error {
