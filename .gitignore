@@ -1,6 +1,9 @@
 # Binary
 ovn-network-agent
 
+# Stray build of the E2E chaos runner (the Makefile uses `go run` instead)
+/test/e2e/chaos/chaos
+
 # Default -out directory of the E2E chaos runner (make e2e-chaos)
 chaos-artifacts/
 
