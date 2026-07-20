@@ -368,9 +368,10 @@ locally (INPUT chain), and the reply originates from the OUTPUT hook. The
 ## Running as a standalone VIP service (port-forward-only mode)
 
 Port forwarding does not depend on OVN. The DNAT rules, the VIP addresses,
-the connmark-based return routing, and the FRR static routes that announce
-the VIPs are all managed independently of any OVN gateway state — the
-reconcile loop already asserts them regardless of local router presence.
+and the connmark-based return routing are all managed independently of any
+OVN gateway state — the reconcile loop asserts them regardless of local
+router presence (see [Dormant VIPs](#dormant-vips-on-a-gateway-without-local-routers)
+for the one part that is gated: the routes that announce the VIPs).
 
 That makes it useful to run the agent as a *pure* VIP service on a node
 that is **not** an OVN gateway chassis at all: a node hosting DNS
@@ -411,3 +412,40 @@ constrained in this mode (see
 [Configure the agent](../guides/configuration#port-forward-only-mode)):
 `router_masquerade` is rejected outright, and `hairpin_masquerade`
 requires an explicit `network_cidr`.
+
+## Dormant VIPs on a gateway without local routers
+
+A VIP is only routable on a node where the agent also maintains the FRR
+prefix-list that permits it. On a gateway that hosts no locally active
+router — a standby chassis, or one whose routers have failed over
+elsewhere — reconcile takes the standby path and empties both that
+prefix-list and the veth-leak network routes. A VIP route installed there
+could never be advertised.
+
+The agent therefore treats such a VIP as **dormant**: it installs no
+`<vip>/32` kernel route and no FRR static route, and reports the condition
+once at INFO level:
+
+```
+port-forward VIPs are dormant on this node — no locally active routers,
+so they cannot be advertised and no routes are installed
+```
+
+The DNAT plane is *not* withheld. The nftables rules, the VIP address on
+`port_forward_dev`, the conntrack zones, and the policy routing are all
+still asserted, so a gateway that later gains a local router only needs the
+announce — the data path is already in place. When that happens the agent
+logs `port-forward VIPs are no longer dormant` and installs the routes on
+the next reconcile.
+
+Port-forward-only mode never takes the standby path, so its VIPs are never
+dormant — a pure VIP-service node serves them without any OVN state at all.
+
+::: tip Why not install the route anyway?
+It was installed unconditionally before, and the result was an FRR static
+route that zebra never selected: not advertised, but present. That held
+`ovn_network_agent_inactive_routes` at a non-zero value — which the shipped
+`OVNNetworkAgentInactiveRoutes` alert fires on — and logged
+`FRR static routes are configured but inactive` at ERROR level on every
+reconcile, indefinitely.
+:::

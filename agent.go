@@ -43,6 +43,10 @@ type Agent struct {
 	// staleCleanupJitter is a random duration (0-30s) added to the grace
 	// period to prevent multiple agents from cleaning up simultaneously.
 	staleCleanupJitter time.Duration
+
+	// dormantVIPs is the comma-joined set of port-forward VIPs last reported
+	// as dormant, so reportDormantVIPs logs a change rather than every cycle.
+	dormantVIPs string
 }
 
 // maxStaleCleanupJitter is the maximum random jitter added to the stale
@@ -302,7 +306,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// Everything the cycle needs to derive from OVN is a pure function of the
 	// snapshot plus the configured VIPs (see desired_state.go). Past this
 	// point reconcile only acts on the result.
-	desired := computeDesiredState(state, a.cfg.PortForwards)
+	desired := computeDesiredState(state, a.cfg.PortForwards, a.vipRoutesAnnounceable(state))
 	hairpinTargets := desired.HairpinTargets
 	desiredSegments := desired.Segments
 	desiredIPs := desired.DesiredIPs
@@ -311,6 +315,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		slog.Debug("excluding non-IPv4 addresses from the route/announce plane, IPv6 support tracked in #85/#70",
 			"ips", desired.ExcludedNonV4)
 	}
+	a.reportDormantVIPs(desired.DormantVIPs)
 
 	setDesiredState(len(desiredIPs), len(state.LocalRouters), len(a.effectiveFilters))
 	setLocalnetSegments(len(desiredSegments))
@@ -432,9 +437,9 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	}
 
 	// The BGP announce. Ensure routes for all desired IPs (FIPs, SNATs, and
-	// port forward VIPs). When no local routers are present but port
-	// forwards are configured, this still installs VIP routes on br-ex and
-	// in FRR.
+	// the port-forward VIPs this node can announce — see
+	// vipRoutesAnnounceable; dormant VIPs are not in desiredIPs and are
+	// withdrawn by the standby path below like any other undesired route).
 	var routeSync routeSyncResult
 	if len(desiredIPs) > 0 || state.HasLocalRouters {
 		routeSync = a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
@@ -442,7 +447,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	} else {
 		// The removeAllRoutes standby path leaves cycleOK true — a healthy
 		// standby is ready.
-		a.removeAllRoutes("no locally active routers and no port forward VIPs")
+		a.removeAllRoutes("no locally active routers and no announceable port forward VIPs")
 	}
 
 	// Failover-latency metric: time from observing the chassisredirect
@@ -590,6 +595,43 @@ func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
 		}
 	}
 	return v4
+}
+
+// vipRoutesAnnounceable reports whether the configured port-forward VIPs should
+// get kernel and FRR routes this cycle.
+//
+// A VIP is only routable where the agent also maintains the FRR prefix-list that
+// permits it. Without local routers reconcile takes the standby path, which
+// empties that prefix-list and the veth-leak network routes — a VIP route
+// installed anyway could never be advertised. It would sit in FRR as a static
+// route that zebra never selects, holding ovn_network_agent_inactive_routes at a
+// non-zero value and logging at ERROR on every cycle, indefinitely (#206). Such
+// a VIP is dormant instead: nothing installed, reported once at info level.
+//
+// Port-forward-only mode never takes the standby path and serves its VIPs
+// without any OVN state at all, so it always announces them.
+func (a *Agent) vipRoutesAnnounceable(state OVNState) bool {
+	return a.cfg.PortForwardOnly || state.HasLocalRouters
+}
+
+// reportDormantVIPs logs the port-forward VIPs this node cannot announce, once
+// per change of the set rather than on every reconcile: the condition persists
+// for as long as the node holds no local routers, and the point of declining to
+// install the route is to stop the per-cycle noise. Recovery is logged too, so
+// the dormancy has a matching end in the journal.
+func (a *Agent) reportDormantVIPs(dormant []string) {
+	key := strings.Join(dormant, ",")
+	if key == a.dormantVIPs {
+		return
+	}
+	switch {
+	case len(dormant) > 0:
+		slog.Info("port-forward VIPs are dormant on this node — no locally active routers, so they cannot be advertised and no routes are installed",
+			"count", len(dormant), "vips", dormant)
+	case a.dormantVIPs != "":
+		slog.Info("port-forward VIPs are no longer dormant — installing their routes")
+	}
+	a.dormantVIPs = key
 }
 
 // segmentRouteUnresolved reports whether an IP on the given localnet segment

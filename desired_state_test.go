@@ -137,8 +137,8 @@ func TestSplitIPv4Empty(t *testing.T) {
 }
 
 // TestComputeDesiredState drives the whole derivation, including the VIP merge:
-// port-forward VIPs join the desired set even with no local routers, and a VIP
-// that duplicates a FIP must appear once.
+// announceable port-forward VIPs join the desired set, and a VIP that duplicates
+// a FIP must appear once.
 func TestComputeDesiredState(t *testing.T) {
 	state := OVNState{
 		NATIPToRouterMAC: map[string]string{
@@ -156,8 +156,11 @@ func TestComputeDesiredState(t *testing.T) {
 		{VIP: "198.51.100.50"},
 	}
 
-	got := computeDesiredState(state, forwards)
+	got := computeDesiredState(state, forwards, true)
 
+	if len(got.DormantVIPs) != 0 {
+		t.Errorf("DormantVIPs = %v, want empty when the VIPs are announceable", got.DormantVIPs)
+	}
 	if want := []string{"198.51.100.50", "203.0.113.10"}; !reflect.DeepEqual(got.DesiredIPs, want) {
 		t.Errorf("DesiredIPs = %v, want %v (VIPs merged, deduped, sorted)", got.DesiredIPs, want)
 	}
@@ -180,7 +183,7 @@ func TestComputeDesiredState(t *testing.T) {
 // where reconcile passes the zero OVNState: the derivation must reduce to the
 // VIPs alone without touching any nil map.
 func TestComputeDesiredStatePortForwardOnly(t *testing.T) {
-	got := computeDesiredState(OVNState{}, []PortForwardVIP{{VIP: "203.0.113.10"}})
+	got := computeDesiredState(OVNState{}, []PortForwardVIP{{VIP: "203.0.113.10"}}, true)
 
 	if want := []string{"203.0.113.10"}; !reflect.DeepEqual(got.DesiredIPs, want) {
 		t.Errorf("DesiredIPs = %v, want %v", got.DesiredIPs, want)
@@ -190,5 +193,45 @@ func TestComputeDesiredStatePortForwardOnly(t *testing.T) {
 	}
 	if len(got.Segments) != 0 {
 		t.Errorf("Segments = %+v, want empty with no OVN state", got.Segments)
+	}
+}
+
+// TestComputeDesiredStateDormantVIPs covers the routerless gateway of #206: with
+// the VIPs not announceable they must leave the route plane entirely — no kernel
+// route, no FRR static route — and be reported as dormant instead. Installing
+// them anyway left an unadvertisable FRR route that alarmed on every cycle.
+func TestComputeDesiredStateDormantVIPs(t *testing.T) {
+	forwards := []PortForwardVIP{
+		{VIP: "203.0.113.10"},
+		{VIP: "192.0.2.99"},
+		// A duplicate must not be reported twice.
+		{VIP: "203.0.113.10"},
+	}
+
+	got := computeDesiredState(OVNState{}, forwards, false)
+
+	if len(got.DesiredIPs) != 0 {
+		t.Errorf("DesiredIPs = %v, want empty — dormant VIPs get no routes", got.DesiredIPs)
+	}
+	if want := []string{"192.0.2.99", "203.0.113.10"}; !reflect.DeepEqual(got.DormantVIPs, want) {
+		t.Errorf("DormantVIPs = %v, want %v (deduped, sorted)", got.DormantVIPs, want)
+	}
+}
+
+// TestComputeDesiredStateDormantVIPsKeepFIPs guards the blast radius: dormancy
+// applies to the VIPs alone. A node that somehow holds FIPs must still announce
+// them, so only the VIP entries are withheld from DesiredIPs.
+func TestComputeDesiredStateDormantVIPsKeepFIPs(t *testing.T) {
+	state := OVNState{
+		NATIPToRouterMAC: map[string]string{"198.51.100.50": "aa:aa:aa:aa:aa:01"},
+	}
+
+	got := computeDesiredState(state, []PortForwardVIP{{VIP: "203.0.113.10"}}, false)
+
+	if want := []string{"198.51.100.50"}; !reflect.DeepEqual(got.DesiredIPs, want) {
+		t.Errorf("DesiredIPs = %v, want %v — the FIP stays, only the VIP is dormant", got.DesiredIPs, want)
+	}
+	if want := []string{"203.0.113.10"}; !reflect.DeepEqual(got.DormantVIPs, want) {
+		t.Errorf("DormantVIPs = %v, want %v", got.DormantVIPs, want)
 	}
 }
