@@ -187,7 +187,12 @@ ovs-vsctl --may-exist add-port br-int "${FIP_B_HOST_VETH}" \
     -- set Interface "${FIP_B_HOST_VETH}" external_ids:iface-id="${FIP_B_LSP}"
 ip link set "${FIP_B_HOST_VETH}" up
 
-if ! ip netns list | awk '{print $1}' | grep -qx "${FIP_B_NETNS}"; then
+# Enter the namespace rather than asking `ip netns list` whether it exists:
+# a container restart leaves a dead anchor under /run/netns that keeps it
+# listed while every use of it fails. See ensure_workload_netns in
+# bootstrap.sh for the full rationale.
+if ! ip netns exec "${FIP_B_NETNS}" true 2>/dev/null; then
+    ip netns delete "${FIP_B_NETNS}" 2>/dev/null || true
     ip netns add "${FIP_B_NETNS}"
 fi
 if ! ip -n "${FIP_B_NETNS}" link show "${FIP_B_NS_VETH}" >/dev/null 2>&1; then

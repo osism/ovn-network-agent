@@ -137,6 +137,39 @@ func TestEveryProbedFIPHasARestoredResponder(t *testing.T) {
 	}
 }
 
+// The namespace guard must establish that the namespace is usable, not
+// merely that it is listed. A container restart destroys the namespace but
+// leaves a dead anchor under /run/netns, which keeps `ip netns list`
+// answering yes; provisioning then skips the re-create and fails moving the
+// veth in ("Peer netns reference is invalid", EINVAL). That is deterministic
+// after every gateway restart — a profile apply or a lifecycle-fault
+// restore — so the listing guard must not come back.
+func TestResponderGuardSurvivesADeadNamespaceAnchor(t *testing.T) {
+	cmd := &fakeCommander{respond: healthyLabResponses}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := ensureResponders(context.Background(), l, defaultTestProfile(t)); err != nil {
+		t.Fatalf("ensureResponders: %v", err)
+	}
+
+	for _, n := range responders(defaultTestProfile(t)) {
+		if cmd.called("ip netns list | awk '{print $1}' | grep -qx " + n.name) {
+			t.Fatalf("responder %s is guarded by a listing that a dead anchor satisfies: %v",
+				n.name, cmd.lines())
+		}
+		if !cmd.called("ip netns exec " + n.name + " true 2>/dev/null") {
+			t.Fatalf("responder %s is not probed for usability before it is trusted: %v",
+				n.name, cmd.lines())
+		}
+		// The dead anchor has to go before `ip netns add`, which would
+		// otherwise fail with EEXIST and leave the namespace unusable.
+		if !cmd.called("ip netns delete " + n.name + " 2>/dev/null || true; ip netns add " + n.name) {
+			t.Fatalf("responder %s re-creates its namespace without clearing the dead anchor: %v",
+				n.name, cmd.lines())
+		}
+	}
+}
+
 // A profile that puts up no VLAN networks must not layer them anyway: the
 // point of flat-minimal is a lab whose agents have less to reconcile, and
 // a stray VLAN network would leave residue no probe measures.
