@@ -92,9 +92,14 @@ func (f *fakeCommander) count(substr string) int {
 
 // healthyLabResponses answers every query the runner makes about a lab
 // that is behaving: daemons up, chassis registered, cr-lr0-public bound.
-// The one thing it models as gone is eth1 — a container lifecycle event
-// destroys the containerlab veth, which is the whole reason the restore
-// path exists.
+// The one thing it models as gone is eth1 (the `ip link show eth1` probe) —
+// a container lifecycle event destroys the containerlab veth, which is the
+// whole reason the restore path exists. The restore's own verification reads
+// eth1 back with a *different* probe (`ip -o -4 addr show eth1`) after the
+// rewire has re-created it, so the two answers stand for two points in the
+// restore rather than contradicting each other. The container's identity
+// (.State.StartedAt) is stable, so no reincarnation is detected unless a test
+// varies it deliberately (#217).
 func healthyLabResponses(argv []string) (string, error) {
 	line := strings.Join(argv, " ")
 	switch {
@@ -102,8 +107,25 @@ func healthyLabResponses(argv []string) (string, error) {
 		return "healthy\n", nil
 	case strings.Contains(line, "{{.State.Running}}"):
 		return "false\n", nil // a killed container stays down until started
+	case strings.Contains(line, "{{.State.StartedAt}}"):
+		return "2026-07-20T12:00:00.000000000Z\n", nil
 	case strings.Contains(line, "ip link show eth1"):
 		return "Device \"eth1\" does not exist.", errBoom
+	case strings.Contains(line, "ip -o -4 addr show eth1"):
+		// The rewire re-created eth1 and gave it the underlay address; the
+		// verification reads it back on the incarnation the rewire ran against.
+		if link, ok := linkFor(gatewayOf(line)); ok {
+			return fmt.Sprintf("2: eth1    inet %s scope global eth1\n", link.gatewayCIDR), nil
+		}
+		return "", nil
+	case strings.Contains(line, "show running-config"):
+		// configureGatewayBGP has replaced the entrypoint placeholder with the
+		// real session; the verification greps this for the router-id and peer.
+		if link, ok := linkFor(gatewayOf(line)); ok {
+			return fmt.Sprintf("router bgp 65000 vrf vrf-provider\n bgp router-id %s\n"+
+				" neighbor %s remote-as 65001\n", addrOf(link.gatewayCIDR), addrOf(link.upstreamCIDR)), nil
+		}
+		return "", nil
 	case strings.Contains(line, "pgrep -f /usr/local/bin/ovn-network-agent"):
 		return "1\n", nil
 	case strings.Contains(line, "pgrep -x bgpd"):

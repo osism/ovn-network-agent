@@ -357,11 +357,74 @@ func ensureResponders(ctx context.Context, l *lab, p *profile) error {
 // container up or recycle the whole lab. A chaos run has to put the node
 // back, because the guardrails only re-target a node that has returned
 // and converged.
+//
+// The restore is reincarnation-proof (#217). A `docker restart` can make the
+// gwnode entrypoint suicide on a failed first FRR start, and `restart: always`
+// then boots a second incarnation whose fresh netns discards every repair the
+// restore applied against the first (#216). So restoreNode waits for the
+// entrypoint to finish before it touches anything, and — should a container
+// still manage to die after going healthy — notices the identity change and
+// repairs the incarnation that survived, rather than returning a success the
+// artifacts contradict.
 func restoreNode(ctx context.Context, l *lab, p *profile, gw string) error {
-	if err := l.rewireUnderlay(ctx, gw); err != nil {
+	// (1) Repair the final incarnation, not the first one. Wait until the
+	// container is healthy, its agent has exec'd and its chassis is back
+	// (gatewayBack): repairs applied after the agent execs cannot be wiped by
+	// an entrypoint-driven reboot, because the entrypoint has nothing left to
+	// fail on. This is the load-bearing fix — (2) and (3) below only keep the
+	// run truthful if some future container dies after going healthy anyway.
+	if err := l.waitGatewayBack(ctx, gw); err != nil {
+		return err
+	}
+	if err := restoreUnderlay(ctx, l, gw); err != nil {
 		return err
 	}
 	return reprovisionNode(ctx, l, p, gw)
+}
+
+// restoreUnderlay rewires the underlay and proves the result stuck on the
+// incarnation it landed on, re-running the rewire once if the container
+// reincarnated under it.
+//
+// rewireUnderlay ends by verifying its own outcome (verifyUnderlay), so a
+// rewire that returns nil has an eth1 with the right address and a real BGP
+// session — on whichever container was running when it ran. (2) reads the
+// container's identity either side of the rewire: an identity that changed
+// means the netns those repairs went into is gone, so the rewire is re-run
+// against the new incarnation after waiting for it to come back. A restore
+// that still cannot satisfy this after one re-attempt fails the action —
+// naming the reincarnation — a truthful verdict the artifacts can be read
+// against, instead of a 3-minute recovery-timeout pointing at convergence.
+func restoreUnderlay(ctx context.Context, l *lab, gw string) error {
+	const attempts = 2
+	var reincarnation error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		before, err := l.containerIdentity(ctx, gw)
+		if err != nil {
+			return fmt.Errorf("read %s identity before rewiring its underlay: %w", gw, err)
+		}
+		rewireErr := l.rewireUnderlay(ctx, gw)
+		after, err := l.containerIdentity(ctx, gw)
+		if err != nil {
+			return fmt.Errorf("read %s identity after rewiring its underlay: %w", gw, err)
+		}
+		if after == before {
+			// The container the rewire configured is still the one running: its
+			// result — success or a genuine failure — stands.
+			return rewireErr
+		}
+		// The container reincarnated while the rewire ran: everything it wrote
+		// went into a netns that died with the previous incarnation. Wait for
+		// the new one and rewire it — once.
+		reincarnation = fmt.Errorf("%s reincarnated during restore (started %s, now %s); "+
+			"the rewired underlay landed in a netns that no longer exists", gw, before, after)
+		if attempt < attempts {
+			if err := l.waitGatewayBack(ctx, gw); err != nil {
+				return fmt.Errorf("wait for %s after it reincarnated during restore: %w", gw, err)
+			}
+		}
+	}
+	return reincarnation
 }
 
 // reprovisionNode re-creates the node-local state a container restart
