@@ -96,15 +96,13 @@ start_daemon() {
     fi
 }
 
-# Poll until the daemon is actually usable. A genuine failure must still fail,
-# so a timeout exits — but it names the daemon and, when given a `diag`
-# function, dumps its state first, so the next occurrence is root-causable from
-# the container log alone.
-#
-# `diag` may be empty for daemons whose failure the probe itself makes obvious.
-await_ready() {
-    local label="$1" attempts="$2" diag="$3"
-    shift 3
+# Poll until the daemon is actually usable, returning non-zero on timeout
+# instead of dying. Only callers that can do something about a timeout use
+# this directly — start_frr, which retries the start; every other daemon goes
+# through await_ready.
+probe_ready() {
+    local attempts="$1"
+    shift
     local i
     for (( i = 1; i <= attempts; i++ )); do
         if "$@" >/dev/null 2>&1; then
@@ -112,6 +110,21 @@ await_ready() {
         fi
         sleep 1
     done
+    return 1
+}
+
+# probe_ready for the daemons whose failure this script cannot recover from. A
+# genuine failure must still fail, so a timeout exits — but it names the daemon
+# and, when given a `diag` function, dumps its state first, so the next
+# occurrence is root-causable from the container log alone.
+#
+# `diag` may be empty for daemons whose failure the probe itself makes obvious.
+await_ready() {
+    local label="$1" attempts="$2" diag="$3"
+    shift 3
+    if probe_ready "${attempts}" "$@"; then
+        return 0
+    fi
     log "ERROR: ${label} did not become ready within ${attempts}s"
     if [ -n "${diag}" ]; then
         "${diag}"
@@ -242,6 +255,13 @@ setup_loopback() {
 
 FRR_READY_ATTEMPTS="${FRR_READY_ATTEMPTS:-30}"
 FRR_CONFIG_ATTEMPTS="${FRR_CONFIG_ATTEMPTS:-30}"
+# How many times start_frr may run the whole clean + start + probe cycle
+# before it gives up and lets PID 1 die. See the retry loop for why the
+# second attempt is worth its own FRR_READY_ATTEMPTS budget.
+FRR_START_ATTEMPTS="${FRR_START_ATTEMPTS:-2}"
+
+# The daemons frrinit.sh runs on this image, as an ERE for pgrep/pkill.
+FRR_DAEMON_PATTERN='watchfrr|zebra|bgpd|staticd'
 
 # Everything we know about why FRR would not come up, on the way out.
 # Best-effort throughout: this runs on the failure path, and a missing
@@ -249,23 +269,88 @@ FRR_CONFIG_ATTEMPTS="${FRR_CONFIG_ATTEMPTS:-30}"
 dump_frr_diagnostics() {
     log "--- FRR diagnostics ---"
     /usr/lib/frr/frrinit.sh status 2>&1 | sed 's/^/[gwnode]   /' >&2 || true
-    pgrep -af 'watchfrr|zebra|bgpd|staticd' 2>/dev/null \
+    pgrep -af "${FRR_DAEMON_PATTERN}" 2>/dev/null \
         | sed 's/^/[gwnode]   /' >&2 || true
     tail -n 40 /var/log/frr/* 2>/dev/null | sed 's/^/[gwnode]   /' >&2 || true
 }
 
-start_frr() {
-    log "starting FRR"
-    # watchfrr keeps state under /var/tmp/frr; stale entries from a
-    # previous crash-restart make it refuse to start. Clean up before
-    # launching frrinit.sh.
+# Remove the previous incarnation's FRR runtime state.
+#
+# `docker restart` keeps the container filesystem but not the processes, so
+# whatever the killed daemons left in FRR's two state directories survives
+# into the next boot — while that boot's PID numbering starts from 1 again.
+#
+# /var/tmp/frr is watchfrr's own state; stale entries there make it refuse to
+# start. /var/run/frr is the one that cost a chaos run (issue #216): it holds
+# the pid files, the vty sockets and the zserv socket, and frrcommon.sh's
+# daemon_stop() trusts any pid file it can read — it `kill -0`s the number,
+# SIGINTs it, then spins in `while kill -0 "$pid"` for up to 120 s waiting for
+# it to die. The daemons the entrypoint starts before FRR (ovsdb-server,
+# ovs-vswitchd, ovn-controller) land in exactly the PID range the previous
+# boot's FRR daemons recorded, so that number is regularly live again — and
+# then the stop never returns, having SIGINT'd an innocent daemon on the way.
+#
+# watchfrr walks straight into it. Its initial connect to zebra/bgpd/staticd
+# fails because they are not up yet (normal, and logged as such), so it forks
+# `watchfrr.sh restart all` -> all_stop -> daemon_stop, which hangs on the
+# stale pid; watchfrr shoots the child after 20 s, has started no daemon, and
+# exits "[EC 268435457] all configured daemons failed to start". Confirmed
+# locally against this image by planting a live PID in /var/run/frr/bgpd.pid
+# across a `docker restart`, which reproduces that log verbatim.
+clean_frr_runtime_state() {
     rm -rf /var/tmp/frr/* 2>/dev/null || true
-    # /usr/lib/frr/frrinit.sh is the canonical service entrypoint shipped
-    # by the FRR Debian package; it launches the daemons listed in
-    # /etc/frr/daemons.
-    start_daemon "frrinit.sh start" /usr/lib/frr/frrinit.sh start
-    await_ready "FRR (vtysh)" "${FRR_READY_ATTEMPTS}" dump_frr_diagnostics \
-        vtysh -c 'show version'
+    rm -rf /var/run/frr/* 2>/dev/null || true
+}
+
+# Clear the field before a retry. Deliberately not `frrinit.sh stop`: that
+# drives the very daemon_stop() a stale pid file hangs, so the cleanup would
+# inherit the failure it exists to undo.
+stop_frr_leftovers() {
+    pkill -TERM -x "${FRR_DAEMON_PATTERN}" 2>/dev/null || true
+    local i
+    for (( i = 1; i <= 10; i++ )); do
+        pgrep -x "${FRR_DAEMON_PATTERN}" >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    log "leftover FRR daemons survived SIGTERM; sending SIGKILL"
+    pkill -KILL -x "${FRR_DAEMON_PATTERN}" 2>/dev/null || true
+    sleep 1
+}
+
+# A failed FRR start used to be terminal: await_ready exited, tini followed it
+# down, and Docker's `restart: always` recreated the container. That is a ~85 s
+# round trip which also discards everything an external actor had built against
+# the dead incarnation — the chaos harness's underlay veth and VRF repairs, any
+# netns responder re-created in the meantime — and none of it is visible in the
+# log, because the new container's entrypoint simply continues it. So retry in
+# place first, say so loudly, and keep PID-1 suicide as the last resort.
+#
+# The per-attempt budget stays FRR_READY_ATTEMPTS rather than being doubled
+# into one long wait: a healthy FRR answers vtysh in a second or two, so a
+# retry only ever spends time on a boot that was otherwise going to spend a
+# whole container lifecycle.
+start_frr() {
+    local attempt
+    for (( attempt = 1; attempt <= FRR_START_ATTEMPTS; attempt++ )); do
+        if (( attempt > 1 )); then
+            log "RETRY: FRR never came up; stopping leftovers and starting it again in place"
+            stop_frr_leftovers
+        fi
+        log "starting FRR (attempt ${attempt}/${FRR_START_ATTEMPTS})"
+        clean_frr_runtime_state
+        # /usr/lib/frr/frrinit.sh is the canonical service entrypoint shipped
+        # by the FRR Debian package; it launches the daemons listed in
+        # /etc/frr/daemons.
+        start_daemon "frrinit.sh start" /usr/lib/frr/frrinit.sh start
+        if probe_ready "${FRR_READY_ATTEMPTS}" vtysh -c 'show version'; then
+            return 0
+        fi
+        log "ERROR: FRR (vtysh) did not become ready within ${FRR_READY_ATTEMPTS}s" \
+            "(attempt ${attempt}/${FRR_START_ATTEMPTS})"
+        dump_frr_diagnostics
+    done
+    log "ERROR: FRR did not come up in ${FRR_START_ATTEMPTS} attempts; exiting"
+    exit 1
 }
 
 # The config the agent expects, on stdin for vtysh: the prefix-list it
