@@ -177,7 +177,13 @@ resolve_sb_remote() {
 }
 
 configure_ovs() {
-    log "configuring Open_vSwitch external_ids for ovn-controller"
+    # The encap IP is logged because it is the one value here that is not
+    # fixed by the topology file: it is read off eth0 at every boot. When
+    # the 2026-07-18 chaos run deadlocked two chassis on SB's unique
+    # (type, ip) Encap index (issue #208), nothing in the container log
+    # said which address each gateway had claimed, and the swap had to be
+    # reconstructed from the collected OVS dumps.
+    log "configuring Open_vSwitch external_ids for ovn-controller (chassis=${CHASSIS_NAME} encap-ip=${ENCAP_IP})"
     ovs-vsctl set Open_vSwitch . \
         external_ids:ovn-remote="${OVN_SB_REMOTE}" \
         external_ids:ovn-encap-type=geneve \

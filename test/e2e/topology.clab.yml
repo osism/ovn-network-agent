@@ -21,6 +21,27 @@ name: ovn-e2e
 mgmt:
   network: ovn-e2e-mgmt
   ipv4-subnet: 172.30.0.0/24
+  # Every node below pins its `mgmt-ipv4`. Leaving them to Docker's IPAM
+  # is what broke the 2026-07-18 nightly chaos run (issue #208): the
+  # `double-failover` fault stops two gateways at once, and on restart
+  # IPAM handed the two freed addresses back in start order — so
+  # gateway-1 and gateway-2 came back with each other's address.
+  #
+  # A gateway's management address is its geneve encap IP (see ENCAP_IP
+  # in gwnode-entrypoint.sh), and SB's Encap table carries a unique index
+  # on (type, ip). After the swap each ovn-controller tried to claim the
+  # address the other chassis' stale row still held, both transactions
+  # aborted on that index, and neither could go first: a permanent,
+  # symmetric deadlock. The two controllers logged ~93k "OVNSB commit
+  # failed, force recompute next time" lines in four minutes, geneve
+  # tunnels stayed pointed at the wrong nodes (gateway-1 built one to
+  # itself), and all five probes stayed red until the run gave up. The
+  # agent was blameless throughout — it held all three cr-* ports and
+  # advertised its eight FIP routes the whole time.
+  #
+  # Pinning the addresses makes a restart return the same encap IP, so
+  # the index can never be contended. TestTopologyPinsManagementAddresses
+  # guards the pins against a node being added without one.
 
 topology:
   defaults:
@@ -50,6 +71,7 @@ topology:
     central:
       kind: linux
       image: ovn-network-agent/central:e2e
+      mgmt-ipv4: 172.30.0.2
       ports:
         - 6641:6641/tcp
         - 6642:6642/tcp
@@ -57,6 +79,9 @@ topology:
     gateway-1:
       kind: linux
       image: ovn-network-agent/gwnode:e2e
+      # Pinned: this address becomes the chassis' geneve encap IP. See the
+      # mgmt block above for what an unpinned one costs.
+      mgmt-ipv4: 172.30.0.11
       env:
         CHASSIS_NAME: gateway-1
       # Create the gateways only after `central` is up: the gwnode
@@ -74,6 +99,8 @@ topology:
     gateway-2:
       kind: linux
       image: ovn-network-agent/gwnode:e2e
+      # See gateway-1.
+      mgmt-ipv4: 172.30.0.12
       env:
         CHASSIS_NAME: gateway-2
       # See gateway-1.
@@ -86,6 +113,8 @@ topology:
     gateway-3:
       kind: linux
       image: ovn-network-agent/gwnode:e2e
+      # See gateway-1.
+      mgmt-ipv4: 172.30.0.13
       env:
         CHASSIS_NAME: gateway-3
       # See gateway-1.
@@ -105,18 +134,21 @@ topology:
       # upgrading to a maintained FRR is a separate, behavior-changing
       # step.
       image: frrouting/frr:latest@sha256:990e83490108b686fd6df3b1cafa6bdbb2714acb00eedb9a89693946f46f45ce
+      mgmt-ipv4: 172.30.0.3
 
     client-1:
       kind: linux
       # v0.16 is the exact image `latest` resolved to when the pin
       # landed — same content, now immutable and Renovate-updatable.
       image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+      mgmt-ipv4: 172.30.0.4
       # Stay alive without a service — netshoot exits otherwise.
       cmd: "sleep infinity"
 
     client-2:
       kind: linux
       image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+      mgmt-ipv4: 172.30.0.5
       cmd: "sleep infinity"
 
   links:
