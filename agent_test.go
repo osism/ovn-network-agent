@@ -173,6 +173,124 @@ func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
 	}
 }
 
+// unresolvableNexthopAgent builds an agent in the #214 failure state: the FIP
+// statics are configured in FRR but none entered the RIB, so every cycle sees
+// them missing and re-adds them. connected controls what zebra reports as
+// connected in the VRF — the fixture's only variable, and the one that decides
+// whether the agent's own next-hop is the cause.
+//
+// PortForwardOnly keeps verifyRoutes off the kernel plane: the failure is
+// FRR-side, and the agent must not be driven at netlink from a unit test.
+func unresolvableNexthopAgent(t *testing.T, connected string) (*Agent, *[][]*net.IPNet) {
+	t.Helper()
+
+	rec := newVtyshRecorder()
+	// No static route is in the RIB — an unresolvable next-hop keeps all of
+	// them out of it, which is what makes verifyRoutes re-add forever.
+	rec.on(strings.Fields("vtysh -c show ip route vrf vrf-provider static json"), "{}", nil)
+	rec.on(strings.Fields("vtysh -c show ip route vrf vrf-provider connected json"), connected, nil)
+
+	rm := &RouteManager{cfg: Config{
+		BridgeDev:       "br-ex",
+		VRFName:         "vrf-provider",
+		VethNexthop:     "169.254.0.1",
+		VethProviderIP:  "169.254.0.2",
+		VethLeakEnabled: true,
+		PortForwardOnly: true,
+	}}
+	rm.execVtyshHook = rec.hook()
+
+	var refreshed [][]*net.IPNet
+	rm.refreshVethNexthopHook = func(networks []*net.IPNet) error {
+		refreshed = append(refreshed, networks)
+		return nil
+	}
+
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	return &Agent{
+		cfg:              rm.cfg,
+		routing:          rm,
+		effectiveFilters: []*net.IPNet{cidr},
+	}, &refreshed
+}
+
+// TestVerifyRoutesRepairsUnresolvableNexthop is the regression test for #214.
+// Before the fix the agent detected this state and retried the one action that
+// could not fix it, forever. It must now re-notify the kernel about the
+// veth-provider address so zebra relearns the connected route — but only after
+// the instability has persisted, and only once per cooldown, because the flap
+// briefly withdraws the VRF's routes through the veth.
+func TestVerifyRoutesRepairsUnresolvableNexthop(t *testing.T) {
+	// zebra holds the uplink's connected route but not the veth /30.
+	a, refreshed := unresolvableNexthopAgent(t, frrConnectedRoutesJSON("100.64.1.0/30"))
+	desired := []string{"192.0.2.1"}
+
+	// Below the threshold the fault is not yet established: a single missing
+	// route is an ordinary race and must not cost an address flap.
+	for i := 1; i < consecutiveReAddThreshold; i++ {
+		a.verifyRoutes(desired, nil, nil)
+		if len(*refreshed) != 0 {
+			t.Fatalf("repair ran after %d cycle(s), want none before the threshold of %d", i, consecutiveReAddThreshold)
+		}
+	}
+
+	a.verifyRoutes(desired, nil, nil)
+	if len(*refreshed) != 1 {
+		t.Fatalf("repair ran %d times at the threshold, want 1", len(*refreshed))
+	}
+	if len((*refreshed)[0]) != 1 {
+		t.Errorf("repair got %d networks, want the agent's 1 effective filter", len((*refreshed)[0]))
+	}
+
+	// Still broken on the next cycle: the diagnosis repeats, the flap does not.
+	a.verifyRoutes(desired, nil, nil)
+	if len(*refreshed) != 1 {
+		t.Errorf("repair ran %d times, want 1 — the cooldown must suppress the second attempt", len(*refreshed))
+	}
+
+	// Once the cooldown has elapsed the agent tries again: a flap that did not
+	// take must not leave the data plane down for good.
+	a.lastNexthopRepair = time.Now().Add(-2 * nexthopRepairCooldown)
+	a.verifyRoutes(desired, nil, nil)
+	if len(*refreshed) != 2 {
+		t.Errorf("repair ran %d times after the cooldown elapsed, want 2", len(*refreshed))
+	}
+}
+
+// TestVerifyRoutesLeavesResolvableNexthopAlone is the other half of the
+// contract. Persistent re-adds with a next-hop that does resolve mean something
+// else is deleting the routes; flapping the address would not stop it and would
+// take the veth's routes down for no reason.
+func TestVerifyRoutesLeavesResolvableNexthopAlone(t *testing.T) {
+	a, refreshed := unresolvableNexthopAgent(t, frrConnectedRoutesJSON("169.254.0.0/30", "100.64.1.0/30"))
+	desired := []string{"192.0.2.1"}
+
+	for i := 0; i < consecutiveReAddThreshold+2; i++ {
+		a.verifyRoutes(desired, nil, nil)
+	}
+	if a.consecutiveReAdds < consecutiveReAddThreshold {
+		t.Fatalf("consecutiveReAdds = %d, want the instability detector to have fired", a.consecutiveReAdds)
+	}
+	if len(*refreshed) != 0 {
+		t.Errorf("repair ran %d times with a resolvable next-hop, want 0", len(*refreshed))
+	}
+}
+
+// TestRepairUnresolvableNexthopSkipsWhenVethLeakDisabled proves the repair stays
+// out of deployments that have no veth to flap — there the next-hop is the
+// operator's own and the agent has no business touching it.
+func TestRepairUnresolvableNexthopSkipsWhenVethLeakDisabled(t *testing.T) {
+	a, refreshed := unresolvableNexthopAgent(t, frrConnectedRoutesJSON("100.64.1.0/30"))
+	a.cfg.VethLeakEnabled = false
+
+	for i := 0; i < consecutiveReAddThreshold+1; i++ {
+		a.verifyRoutes([]string{"192.0.2.1"}, nil, nil)
+	}
+	if len(*refreshed) != 0 {
+		t.Errorf("repair ran %d times with veth leak disabled, want 0", len(*refreshed))
+	}
+}
+
 // TestEnsureRoutesDevMismatchDoesNotWithdrawFRR covers the (IP, Dev) model:
 // a kernel route that sits on the wrong segment interface is re-replaced on
 // the right device, but the IP is still desired — so its FRR announcement

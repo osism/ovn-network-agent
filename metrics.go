@@ -49,9 +49,10 @@ type metricsRegistry struct {
 	localnetSegments  prometheus.Gauge
 
 	// Route stability metrics
-	routeReAddsTotal  *prometheus.CounterVec
-	consecutiveReAdds prometheus.Gauge
-	inactiveRoutes    prometheus.Gauge
+	routeReAddsTotal    *prometheus.CounterVec
+	consecutiveReAdds   prometheus.Gauge
+	inactiveRoutes      prometheus.Gauge
+	nexthopRepairsTotal prometheus.Counter
 
 	// Failover metrics
 	failoverAnnounceDuration prometheus.Histogram
@@ -162,6 +163,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside.",
 		}),
 
+		nexthopRepairsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "nexthop_repairs_total",
+			Help:      "Total times the agent re-notified the kernel about the veth-provider address because zebra was missing the connected route for the veth next-hop. Non-zero means every FIP route had failed to resolve and was not advertised via BGP.",
+		}),
+
 		failoverAnnounceDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "failover_announce_seconds",
@@ -213,6 +220,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.routeReAddsTotal,
 		m.consecutiveReAdds,
 		m.inactiveRoutes,
+		m.nexthopRepairsTotal,
 		m.failoverAnnounceDuration,
 		m.ovnConnectionState,
 		m.drainDuration,
@@ -383,6 +391,13 @@ func setConsecutiveReAdds(n int) {
 		return
 	}
 	metrics.consecutiveReAdds.Set(float64(n))
+}
+
+func recordNexthopRepair() {
+	if metrics == nil {
+		return
+	}
+	metrics.nexthopRepairsTotal.Inc()
 }
 
 func setInactiveRoutes(n int) {

@@ -54,6 +54,18 @@ groups:
             an unresolvable next-hop) on {{ $labels.instance }}; those FIPs
             are unreachable from outside.
           runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentinactiveroutes"
+      - alert: OVNNetworkAgentNexthopRepaired
+        expr: 'rate(ovn_network_agent_nexthop_repairs_total[1h]) > 0'
+        labels:
+          severity: warning
+        annotations:
+          summary: "Veth next-hop was unresolvable on {{ $labels.instance }}"
+          description: >-
+            zebra was missing the connected route for the veth next-hop on
+            {{ $labels.instance }}, so no FIP route could resolve and none was
+            advertised via BGP. The agent re-notified the kernel about the
+            veth-provider address to repair it.
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentnexthoprepaired"
       - alert: OVNNetworkAgentSlowFailoverAnnounce
         expr: 'histogram_quantile(0.95, rate(ovn_network_agent_failover_announce_seconds_bucket[1h])) > 2'
         labels:

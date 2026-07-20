@@ -37,6 +37,7 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_route_readds_total` | counter (vec) | `plane`={`kernel`,`frr`} | Total routes re-added by post-change verification, labelled by route plane. |
 | `ovn_network_agent_consecutive_readds` | gauge | — | Number of consecutive reconcile cycles that required route re-adds. Sustained non-zero indicates persistent route instability. |
 | `ovn_network_agent_inactive_routes` | gauge | — | Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside. |
+| `ovn_network_agent_nexthop_repairs_total` | counter | — | Total times the agent re-notified the kernel about the veth-provider address because zebra was missing the connected route for the veth next-hop. Non-zero means every FIP route had failed to resolve and was not advertised via BGP. |
 | `ovn_network_agent_failover_announce_seconds` | histogram | — | Time from observing a chassisredirect change to completing the BGP announce of the takeover FIP routes, in seconds. Measured on the takeover reconcile. |
 | `ovn_network_agent_ovn_connection_state` | gauge (vec) | `database`={`nb`,`sb`} | 1 when the named OVN database client is connected, 0 otherwise. |
 | `ovn_network_agent_drain_duration_seconds` | histogram | — | Duration of a gateway drain operation in seconds. |
@@ -59,6 +60,9 @@ and each alert has a cause→diagnosis→remediation section in the
 - `inactive_routes > 0` for >2m — FIP `/32`s configured in FRR but not
   advertised via BGP (e.g. an unresolvable next-hop); those FIPs are
   unreachable from outside.
+- `rate(nexthop_repairs_total[1h]) > 0` — zebra was missing the connected
+  route for the veth next-hop, so no FIP route could resolve. The agent
+  repaired it; the alert says it happened.
 - `histogram_quantile(0.95, rate(failover_announce_seconds_bucket[1h])) > 2`
   — failover announces slower than the ~2s failover budget.
 - `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`

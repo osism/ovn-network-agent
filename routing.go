@@ -60,6 +60,11 @@ type RouteManager struct {
 	// FRR/vtysh helpers. Tests set this to capture commands without executing them.
 	execVtyshHook ovsExecFunc
 
+	// refreshVethNexthopHook, when non-nil, replaces RefreshVethNexthop in the
+	// next-hop repair. Tests set this to observe that the repair ran, and with
+	// which networks, without touching netlink.
+	refreshVethNexthopHook func(networks []*net.IPNet) error
+
 	// frrRouteCache memoizes FRR's static-route document for the current
 	// reconcile cycle. ListFRRRoutes and InactiveFRRRoutes now issue the
 	// identical `show ip route ... static json` query, so without this a
@@ -127,6 +132,15 @@ func (rm *RouteManager) listKernelRoutes() ([]kernelRouteEntry, error) {
 		return rm.listKernelRoutesHook()
 	}
 	return rm.ListKernelRoutes()
+}
+
+// refreshVethNexthop dispatches to the platform RefreshVethNexthop, or to the
+// test hook when one is set.
+func (rm *RouteManager) refreshVethNexthop(networks []*net.IPNet) error {
+	if rm.refreshVethNexthopHook != nil {
+		return rm.refreshVethNexthopHook(networks)
+	}
+	return rm.RefreshVethNexthop(networks)
 }
 
 // validateIP checks that the given string is a valid IPv4 address. IPv6 is
@@ -377,6 +391,62 @@ func (rm *RouteManager) InactiveFRRRoutes(ips []string) ([]string, error) {
 	return inactive, nil
 }
 
+// VethNexthopResolvable reports whether zebra holds a connected route in the
+// VRF that covers the agent's veth next-hop.
+//
+// Every FIP route the agent announces is an `ip route <fip>/32 <veth-nexthop>`
+// static under the VRF, so the connected prefix of the next-hop's own /30 is
+// what makes all of them resolvable. Zebra learns that prefix from an
+// RTM_NEWADDR on veth-provider, and the kernel does not re-emit one when an
+// interface changes VRF — so a zebra that processes the enslavement after
+// recording the address can end up holding the interface without its prefix and
+// never re-learn it. In that state no static enters the RIB at all: ListFRRRoutes
+// reports every route missing, verifyRoutes re-adds them, and the re-add cannot
+// help because the configuration was never what was wrong. The FIPs stay
+// unreachable and BGP advertises nothing.
+//
+// The lookup is deliberately scoped to connected routes. Zebra does not resolve
+// a static's next-hop through a default route (`ip nht resolve-via-default` is
+// off for statics), so matching against the whole RIB would call the next-hop
+// resolvable whenever the VRF carries a default and would mask exactly the
+// condition this detects. A route type that cannot resolve the next-hop must not
+// count as evidence that it does.
+func (rm *RouteManager) VethNexthopResolvable() (bool, error) {
+	if rm.cfg.DryRun {
+		return true, nil
+	}
+	nexthopIP := net.ParseIP(rm.cfg.VethNexthop)
+	if nexthopIP == nil {
+		return false, fmt.Errorf("invalid veth nexthop: %q", rm.cfg.VethNexthop)
+	}
+
+	output, err := rm.runVtysh("-c", fmt.Sprintf("show ip route vrf %s connected json", rm.cfg.VRFName))
+	if err != nil {
+		return false, fmt.Errorf("vtysh list connected routes json: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	// FRR emits an empty body rather than "{}" when the VRF has no connected
+	// routes; that VRF resolves no next-hop at all.
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return false, nil
+	}
+	var routes map[string][]frrRouteEntry
+	if err := json.Unmarshal([]byte(trimmed), &routes); err != nil {
+		return false, fmt.Errorf("parse vtysh connected route json: %w", err)
+	}
+
+	for prefix := range routes {
+		_, ipNet, err := net.ParseCIDR(prefix)
+		if err != nil {
+			continue
+		}
+		if ipNet.Contains(nexthopIP) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RefreshBGP triggers an outbound BGP soft-refresh so that peers learn about
 // route changes immediately instead of waiting for the MRAI timer.
 func (rm *RouteManager) RefreshBGP() error {
@@ -576,4 +646,12 @@ func isNoSuchRoute(err error) bool {
 
 func isNoSuchRule(err error) bool {
 	return errors.Is(err, syscall.ENOENT)
+}
+
+// isNoSuchAddr reports the same "it was already gone" outcome for an address
+// delete, which the kernel answers with EADDRNOTAVAIL. RefreshVethNexthop
+// deletes an address only to re-add it, so an address that is already absent
+// leaves it with exactly the work it meant to do.
+func isNoSuchAddr(err error) bool {
+	return errors.Is(err, syscall.EADDRNOTAVAIL)
 }

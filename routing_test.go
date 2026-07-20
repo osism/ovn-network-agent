@@ -406,6 +406,134 @@ func TestDisabledVethLeak(t *testing.T) {
 	}
 }
 
+// frrConnectedRoutesJSON renders an FRR `show ip route vrf <vrf> connected json`
+// document for the given prefixes, each directly connected via veth-provider.
+func frrConnectedRoutesJSON(prefixes ...string) string {
+	entries := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		entries = append(entries, fmt.Sprintf(
+			`%q:[{"prefix":%q,"protocol":"connected","selected":true,"installed":true,`+
+				`"nexthops":[{"directlyConnected":true,"interfaceName":"veth-provider"}]}]`, p, p))
+	}
+	return "{" + strings.Join(entries, ",") + "}"
+}
+
+// TestVethNexthopResolvable pins the detection side of #214: the next-hop counts
+// as resolvable only when a *connected* prefix in the VRF covers it. The bug it
+// exists to catch is a zebra that holds veth-provider in the VRF — and resolves
+// the interface for other route types — while never having installed the /30's
+// own connected prefix.
+func TestVethNexthopResolvable(t *testing.T) {
+	const query = "vtysh -c show ip route vrf vrf-provider connected json"
+
+	tests := []struct {
+		name    string
+		output  string
+		err     error
+		want    bool
+		wantErr bool
+	}{
+		{
+			name:   "connected prefix covers the next-hop",
+			output: frrConnectedRoutesJSON("169.254.0.0/30", "100.64.1.0/30"),
+			want:   true,
+		},
+		{
+			// The exact broken state from the nightly: the VRF's only
+			// connected route is the uplink, and the veth /30 is absent.
+			name:   "veth connected prefix missing",
+			output: frrConnectedRoutesJSON("100.64.1.0/30"),
+			want:   false,
+		},
+		{
+			// FRR answers with an empty body, not "{}", when nothing matches.
+			name:   "no connected routes at all",
+			output: "",
+			want:   false,
+		},
+		{
+			name:   "empty json object",
+			output: "{}",
+			want:   false,
+		},
+		{
+			name:    "vtysh failure is reported, not read as unresolvable",
+			output:  "some vtysh error",
+			err:     errors.New("exit status 1"),
+			wantErr: true,
+		},
+		{
+			name:    "malformed json is reported, not read as unresolvable",
+			output:  "not json at all",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := newVtyshRecorder()
+			rec.on(strings.Fields(query), tt.output, tt.err)
+			rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}}
+			rm.execVtyshHook = rec.hook()
+
+			got, err := rm.VethNexthopResolvable()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("VethNexthopResolvable() error = nil, want an error")
+				}
+				// An unreadable answer must not be mistaken for a
+				// confirmed-unresolvable next-hop: the caller flaps an
+				// address on that verdict.
+				if got {
+					t.Errorf("VethNexthopResolvable() = true on error, want false")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VethNexthopResolvable() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("VethNexthopResolvable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVethNexthopResolvableDryRun proves the check never reports a repairable
+// fault in dry-run, where there is no state to read and nothing to repair.
+func TestVethNexthopResolvableDryRun(t *testing.T) {
+	rec := newVtyshRecorder()
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
+	rm.execVtyshHook = rec.hook()
+
+	got, err := rm.VethNexthopResolvable()
+	if err != nil || !got {
+		t.Errorf("VethNexthopResolvable() in dry-run = (%v, %v), want (true, nil)", got, err)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("dry-run issued %d vtysh calls, want 0", len(rec.calls))
+	}
+}
+
+func TestRefreshVethNexthopDryRunAndDisabled(t *testing.T) {
+	base := Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1", VethProviderIP: "169.254.0.2", VethLeakTableID: 200}
+
+	dryRun := base
+	dryRun.VethLeakEnabled = true
+	dryRun.DryRun = true
+	rm := &RouteManager{cfg: dryRun}
+	if err := rm.RefreshVethNexthop(nil); err != nil {
+		t.Errorf("RefreshVethNexthop() in dry-run should not error, got: %v", err)
+	}
+
+	disabled := base
+	disabled.VethLeakEnabled = false
+	rm = &RouteManager{cfg: disabled}
+	if err := rm.RefreshVethNexthop(nil); err != nil {
+		t.Errorf("RefreshVethNexthop() when disabled should not error, got: %v", err)
+	}
+}
+
 func TestNewRouteManagerFRRPrefixList(t *testing.T) {
 	cfg := Config{
 		BridgeDev:     "br-ex",

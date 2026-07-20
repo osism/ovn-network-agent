@@ -159,18 +159,61 @@ outside the agent keeps deleting the FRR or kernel routes it installs.
 
 **Likely causes.** A competing agent or script managing the same VRF/table, an
 FRR daemon restarting or racing on `vtysh`, or a kernel route being flushed by
-another controller.
+another controller. One further cause looks identical from this alert but is not
+a competing writer at all: an unresolvable veth next-hop, which keeps the agent's
+own routes out of the RIB so verification reports them missing every cycle. See
+[`OVNNetworkAgentNexthopRepaired`](#alert-ovnnetworkagentnexthoprepaired).
 
 **Diagnosis.** Look for the escalated error line `persistent route instability
 detected: routes required re-adding for multiple consecutive cycles` (it
-carries `consecutive_cycles` and `re_added_this_cycle`). Then compare the FRR
-and kernel state against the agent's intent using steps 5 and 6 of [Agent up
-but no routes appear](#agent-up-but-no-routes-appear).
+carries `consecutive_cycles` and `re_added_this_cycle`). If it is accompanied by
+`veth next-hop is unresolvable`, the cause is the next-hop, not another writer —
+follow that alert instead. Otherwise compare the FRR and kernel state against the
+agent's intent using steps 5 and 6 of [Agent up but no routes
+appear](#agent-up-but-no-routes-appear).
 
 **Remediation.** Find and stop the other writer of these routes. The agent
 re-adds routes each cycle, so connectivity is usually preserved, but the churn
 must be resolved at its source — the agent cannot win a fight with a competing
 controller.
+
+## Alert: OVNNetworkAgentNexthopRepaired
+
+Fires on `rate(nexthop_repairs_total[1h]) > 0`.
+
+**Meaning.** zebra was missing the connected route for the veth `/30` that every
+FIP static resolves through, so none of those statics entered the RIB, nothing
+was redistributed, and the node advertised no FIPs at all — an outage on the
+gateway that owns the traffic, even though the agent, FRR's `running-config` and
+the kernel all looked correct. The agent detected this and re-notified the kernel
+about the `veth-provider` address so zebra could relearn the route. The alert
+reports that the repair ran; it does not mean the repair failed.
+
+**Likely causes.** A startup race between the agent and zebra. The agent enslaves
+`veth-provider` into the VRF and assigns its address; the kernel does not re-emit
+`RTM_NEWADDR` when an interface changes VRF, so a zebra that records the address
+and then processes the enslavement ends up holding the interface without its
+prefix and never re-learns it on its own.
+
+**Diagnosis.** The signature is a VRF that knows the interface but not its own
+prefix:
+
+```bash
+vtysh -c 'show ip route vrf vrf-provider connected'   # 169.254.0.0/30 absent
+vtysh -c 'show ip route vrf vrf-provider static'      # no S>* routes at all
+vtysh -c 'show running-config' | grep 'ip route'      # …yet all /32s configured
+ip route show table 100 | grep veth-provider          # …and the kernel has it
+```
+
+`show bgp vrf vrf-provider ipv4 summary` on the upstream peer shows `PfxRcd 0`
+from this gateway for the duration.
+
+**Remediation.** None normally required — the agent repairs this itself, at most
+once a minute for as long as the condition lasts, and the repair restores the
+per-network leak routes it disturbs. Investigate if the alert repeats: a
+next-hop that goes unresolvable again after a successful repair is no longer the
+startup race, and `journalctl -u frr` around the repair will show whether zebra
+is restarting or losing the interface for some other reason.
 
 ## Alert: OVNNetworkAgentNBDisconnected
 

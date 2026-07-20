@@ -117,6 +117,17 @@ func (rm *RouteManager) SetupVethLeak() error {
 	return fmt.Errorf("veth VRF leak is only supported on Linux")
 }
 
+func (rm *RouteManager) RefreshVethNexthop(networks []*net.IPNet) error {
+	if !rm.cfg.VethLeakEnabled {
+		return nil
+	}
+	if rm.cfg.DryRun {
+		slog.Info("[dry-run] would refresh the veth-provider address", "networks", len(networks))
+		return nil
+	}
+	return fmt.Errorf("veth VRF leak is only supported on Linux")
+}
+
 func (rm *RouteManager) TeardownVethLeak() error {
 	if !rm.cfg.VethLeakEnabled {
 		return nil
