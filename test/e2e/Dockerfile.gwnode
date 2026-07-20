@@ -104,10 +104,19 @@ RUN chmod 0755 /usr/local/bin/gwnode-entrypoint.sh \
 # both running. `pgrep -x` matches against /proc/<pid>/comm, which Linux
 # truncates to 15 chars — "ovn-network-agent" is 17, so the agent has to
 # be matched via the full cmdline with `pgrep -f`.
+#
+# The agent pattern is anchored, and that anchor is the whole check. Docker
+# runs a shell-form CMD through `/bin/sh -c "<the line below>"`, so the
+# pattern is a word on the probing shell's *own* command line — and `pgrep`
+# excludes only itself, never its parent. Unanchored it matched that shell
+# on every probe, which made the agent clause a tautology: the container
+# reported healthy the moment OVS and ovn-controller were up, while the
+# entrypoint still had FRR to bring up before it execs the agent. Everything
+# that waits for `healthy` believed it (issue #205).
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
     CMD ovs-vsctl show >/dev/null 2>&1 \
         && pgrep -x ovn-controller >/dev/null \
-        && pgrep -f /usr/local/bin/ovn-network-agent >/dev/null
+        && pgrep -f '^/usr/local/bin/ovn-network-agent' >/dev/null
 
 # tini must be PID 1: the daemons the entrypoint starts (watchfrr, zebra,
 # bgpd, staticd, ovsdb-server, ...) daemonize and reparent to PID 1, and the

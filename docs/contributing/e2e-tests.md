@@ -1041,8 +1041,8 @@ the agent, so `docker restart` is the reload.
 3. Roll the gateways one at a time: write the profile marker, `mv` the
    staged config over the live one, `docker restart`, re-wire the node
    (the same `restoreNode` the faults use), then gate on the container
-   being healthy and the chassis back in SB before the next gateway is
-   touched.
+   being healthy, the agent process running on the new configuration and
+   the chassis back in SB before the next gateway is touched.
 
 A gateway already running the rendered config is **skipped** — no
 restart, no gate. On a fresh lab that is exactly what `everything-on`
@@ -1248,8 +1248,20 @@ fault is in flight at a time, and the "how many instances may be in flight"
 guardrail is one for every action by construction.
 
 **Convergence and recovery budgets.** After each restore the runner polls
-the node back to health: the container healthy, its chassis back in SB,
-and every probe green. Budget expiry is a `recovery-timeout` violation
+the node back to health: the container healthy, its **agent process
+running**, its chassis back in SB, and every probe green. The agent is
+asked for by name rather than left to the container healthcheck that also
+covers it — the run holds every node in its healthy pool to the
+agent-alive invariant, so it re-admits a node on that same signal. A
+gateway restarted by `gateway-restart`, `gateway-kill`, `agent-terminate`
+or `config-flip` is still running its entrypoint (OVS, `ovn-controller`,
+FRR) long after the container reports healthy, and re-admitting it there
+made every sweep in that window record an `agent-down` against a node that
+was merely booting — 33 of them across the first four nightly runs, one
+config-flip restart producing eight (issue
+[#205](https://github.com/osism/ovn-network-agent/issues/205)). Reading
+the invariant off the same probe that asserts it is what keeps the two
+from drifting apart again. Budget expiry is a `recovery-timeout` violation
 and parks the node — it is never targeted again and the run fails. A park
 also ends the run early (journaled as `run-aborted`): the parked node's
 data path stays dark, and since convergence gates on *every* probe being

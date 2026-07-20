@@ -114,6 +114,58 @@ func TestCheckAgentsAliveSkipsNodesUnderFault(t *testing.T) {
 	}
 }
 
+// A restarted gateway is booting, not broken. Its container answers
+// "healthy" as soon as OVS and ovn-controller are up and its chassis row
+// never went away — but the entrypoint still has FRR to bring up before it
+// execs the agent, and the run must not put the node back in the healthy
+// pool for that whole window. It did, and every sweep in between recorded
+// an `agent-down` against a node on its way back: eight of them from one
+// config-flip restart in the 2026-07-20 nightly, 33 across four runs
+// (issue #205).
+func TestARestartedGatewayIsNotSweptUntilItsAgentIsBack(t *testing.T) {
+	clock := newFakeClock()
+	// The entrypoint execs the agent a minute after the restart. Everything
+	// else about the node reads healthy from the first poll — which is
+	// exactly what makes the window invisible without asking for the agent.
+	agentBackAt := clock.now().Add(60 * time.Second)
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		if strings.Contains(line, "pgrep -f "+agentBinary) &&
+			strings.Contains(line, "gateway-2") && clock.now().Before(agentBackAt) {
+			return "", errExit(t, 1)
+		}
+		return healthyLabResponses(argv)
+	}}
+
+	rec := &runRecord{ActionsByName: map[string]int{}}
+	l := newTestLab(cmd, clock)
+	e := newEngine(l, defaultTestProfile(t), nil, greenProbes{},
+		newJournal(&bytes.Buffer{}, clock.now), rec)
+	e.now, e.wait = clock.now, clock.wait
+	checks := &baselineChecks{lab: l, engine: e}
+
+	restart := noopActions("config-flip")[0]
+	restart.holdMin, restart.holdMax = 0, 0
+	restart.recoveryBudget = 180 * time.Second
+	e.execute(context.Background(), decision{tick: 1, action: restart, target: "gateway-2"})
+
+	// The sweep the baseline checks run alongside the engine, the moment it
+	// declared the node back in service.
+	checks.checkAgentsAlive(context.Background())
+
+	if len(rec.Violations) != 0 {
+		t.Fatalf("violations = %+v, want none: gateway-2 was booting, not agent-down", rec.Violations)
+	}
+	if got := e.nodeState("gateway-2"); got != nodeHealthy {
+		t.Fatalf("gateway-2 = %q, want %q — its agent came back well inside the budget", got, nodeHealthy)
+	}
+	if clock.now().Before(agentBackAt) {
+		t.Fatalf("convergence returned at %s, before the agent was back at %s: "+
+			"the node re-entered the healthy pool while it was still booting",
+			clock.now(), agentBackAt)
+	}
+}
+
 // Two chassis forwarding for the same gateway port at once is the split
 // HA re-election exists to avoid. The claim set is the `chassis` column
 // plus every member of `additional_chassis`.

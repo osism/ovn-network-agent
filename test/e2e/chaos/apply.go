@@ -181,16 +181,16 @@ func (a *applier) mark(ctx context.Context, gw string, owned bool) error {
 }
 
 // waitBack holds the roll until the reconfigured gateway is back: the
-// container healthy (the image's healthcheck covers OVS, ovn-controller
-// and the agent) and its chassis re-registered in SB. Rolling on before
-// that would have two of three gateways down at once.
+// container healthy, its agent running on the new configuration, and its
+// chassis re-registered in SB. Rolling on before that would have two of
+// three gateways down at once.
 func (a *applier) waitBack(ctx context.Context, gw string) error {
 	deadline := a.lab.now().Add(profileApplyTimeout)
 	for a.lab.now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if a.lab.containerHealth(ctx, gw) == "healthy" && a.lab.chassisInSB(ctx, gw) {
+		if a.lab.gatewayBack(ctx, gw) {
 			return nil
 		}
 		a.lab.sleep(convergePollInterval)
