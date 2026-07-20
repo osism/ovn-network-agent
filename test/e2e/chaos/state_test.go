@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -101,6 +102,76 @@ func TestRestoreNodeRewiresBeforeReprovisioning(t *testing.T) {
 	}
 	if rewire > responder {
 		t.Fatalf("the workloads were rebuilt before the underlay was back: %v", cmd.lines())
+	}
+}
+
+// A container that reincarnates while restoreNode is repairing it — a failed
+// first FRR start makes the gwnode entrypoint suicide as PID 1 and docker
+// boots a second incarnation (#216) — wipes the netns the rewire configured.
+// The restore must notice the identity change, re-run its rewire against the
+// second incarnation, and only then declare the node back: eth1 and the BGP
+// session asserted on the container that survived, not the one that is gone.
+func TestRestoreNodeRewiresTheSecondIncarnationAfterAReincarnation(t *testing.T) {
+	incarnation := 0
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(line, "{{.State.StartedAt}}"):
+			return fmt.Sprintf("2026-07-20T12:00:%02dZ\n", incarnation), nil
+		case strings.Contains(line, "containerlab tools veth create"):
+			// The first rewire lands on incarnation 0; as it wires the veth the
+			// container reincarnates once, so the identity read after it differs.
+			if incarnation == 0 {
+				incarnation = 1
+			}
+			return "", nil
+		}
+		return healthyLabResponses(argv)
+	}}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := restoreNode(context.Background(), l, defaultTestProfile(t), "gateway-1"); err != nil {
+		t.Fatalf("restore did not survive the reincarnation: %v", err)
+	}
+
+	if got := cmd.count("containerlab tools veth create"); got != 2 {
+		t.Fatalf("the rewire ran %d times, want it re-run once against the second incarnation: %v",
+			got, cmd.lines())
+	}
+}
+
+// A container that keeps dying after every rewire cannot be restored. The
+// restore fails truthfully after one re-attempt, naming the reincarnation, so
+// the run records an action-failed the artifacts can be read against instead
+// of burning the recovery budget on a node that structurally cannot converge
+// and blaming the lab with a recovery-timeout.
+func TestRestoreNodeFailsNamingTheReincarnationWhenItNeverStabilizes(t *testing.T) {
+	incarnation := 0
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(line, "{{.State.StartedAt}}"):
+			return fmt.Sprintf("2026-07-20T12:00:%02dZ\n", incarnation), nil
+		case strings.Contains(line, "containerlab tools veth create"):
+			incarnation++ // the container is reborn during every rewire
+			return "", nil
+		}
+		return healthyLabResponses(argv)
+	}}
+	l := newTestLab(cmd, newFakeClock())
+
+	err := restoreNode(context.Background(), l, defaultTestProfile(t), "gateway-1")
+	if err == nil {
+		t.Fatal("a container that never stopped reincarnating was reported as restored")
+	}
+	if !strings.Contains(err.Error(), "reincarnated") {
+		t.Fatalf("error %q does not name the reincarnation", err)
+	}
+	// One re-attempt, no more: the rewire runs on the first incarnation and one
+	// more, then the restore gives up rather than chasing an unstable container.
+	if got := cmd.count("containerlab tools veth create"); got != 2 {
+		t.Fatalf("the rewire ran %d times, want exactly the attempt and one re-attempt: %v",
+			got, cmd.lines())
 	}
 }
 

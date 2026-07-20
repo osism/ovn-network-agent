@@ -69,12 +69,16 @@ const convergePollInterval = 5 * time.Second
 // action's recovery budget: the budget is the SLO the *lab* is held to
 // once the node is back, while the restore is the runner reassembling
 // what a container lifecycle event destroyed. The longest restore path
-// (a gateway-kill on the workload host) chains four wait loops that sum
-// to 190s on their own — bounding it by the 180s budget would cut a slow
-// but healthy bring-up off half-way and report the runner's own
-// arithmetic as an action the lab could not recover from. Every command
-// underneath is bounded by cmdTimeout, so this is a backstop against a
-// wedged restore, not the thing that paces it.
+// (a gateway-kill on the workload host) now front-loads a gatewayBack wait
+// (#217) that absorbs a #216 double boot (~87s, bounded by gatewayBackTimeout)
+// before the daemon-ready waits inside rewireUnderlay — which then return at
+// once, since gatewayBack already proved the daemons up — plus the netns
+// reprovision; a rewire re-run against a reincarnation adds one more
+// gatewayBack wait. Every branch stays comfortably inside 5m, and bounding it
+// by the 180s recovery budget would instead cut a slow but healthy bring-up
+// off half-way and report the runner's own arithmetic as an action the lab
+// could not recover from. Every command underneath is bounded by cmdTimeout,
+// so this is a backstop against a wedged restore, not the thing that paces it.
 const restoreTimeout = 5 * time.Minute
 
 // action is one fault the engine can inject. inject and restore are the

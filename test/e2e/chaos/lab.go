@@ -272,6 +272,27 @@ func (l *lab) containerHealth(ctx context.Context, gw string) string {
 	return strings.TrimSpace(out)
 }
 
+// containerIdentity returns a token that changes when the container is
+// replaced by a fresh incarnation. .State.StartedAt is the cheapest stable
+// identity: docker restamps it every time it (re)starts the container, so a
+// value that differs across a restore means the netns the restore's repairs
+// went into is gone — the container reincarnated under them, the way a failed
+// first FRR start does after a `docker restart` (#216). An inspect docker
+// could not answer is handed to the caller, never folded into "unchanged":
+// fabricating a stable identity from a failed read would let a reincarnation
+// pass unnoticed.
+func (l *lab) containerIdentity(ctx context.Context, gw string) (string, error) {
+	out, err := l.docker(ctx, "inspect", "-f", "{{.State.StartedAt}}", l.node(gw))
+	if err != nil {
+		return "", fmt.Errorf("read the identity of %s: %w", gw, err)
+	}
+	id := strings.TrimSpace(out)
+	if id == "" {
+		return "", fmt.Errorf("%s reports no start time — cannot tell one incarnation from the next", gw)
+	}
+	return id, nil
+}
+
 // agentAlive reports whether the agent process is running on gw. pgrep
 // exits 1 when nothing matches — the condition under test, and a negative
 // answer. Every other failure means the question could not be asked at
@@ -384,6 +405,38 @@ func (l *lab) gatewayBack(ctx context.Context, gw string) bool {
 		return false
 	}
 	return l.chassisInSB(ctx, gw)
+}
+
+// gatewayBackTimeout bounds the wait for a returning gateway to finish its
+// entrypoint before the restore repairs it. It is sized to absorb a #216
+// double boot (~87s: a failed first FRR start suicides PID 1 and docker boots
+// a second incarnation) with margin — a clean boot execs the agent in a second
+// or two — while staying well inside restoreTimeout, so even a rewire that has
+// to be re-run against a reincarnation cannot push one restore past its
+// backstop.
+const gatewayBackTimeout = 120 * time.Second
+
+// waitGatewayBack holds until gw has finished coming back after a container
+// lifecycle event — container healthy, agent exec'd, chassis re-registered
+// (gatewayBack) — or the budget expires. restoreNode waits on it before it
+// touches the netns, so the repairs land on the incarnation the entrypoint
+// finished with rather than one a failed FRR start is about to reboot out from
+// under them (#216). gatewayBack's transient "not back yet" (a docker daemon
+// under load) costs a poll, not a verdict; the loop gives up as soon as ctx is
+// done, since restoreTimeout expires long before this clock would.
+func (l *lab) waitGatewayBack(ctx context.Context, gw string) error {
+	deadline := l.now().Add(gatewayBackTimeout)
+	for l.now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("waiting for %s to come back: %w", gw, err)
+		}
+		if l.gatewayBack(ctx, gw) {
+			return nil
+		}
+		l.sleep(convergePollInterval)
+	}
+	return fmt.Errorf("%s did not come back within %s after its container was recycled",
+		gw, gatewayBackTimeout)
 }
 
 // chassisInSB reports whether gw still has (or has re-registered) its
@@ -573,7 +626,45 @@ func (l *lab) rewireUnderlay(ctx context.Context, gw string) error {
 	if err := l.waitReady(ctx, gw, "vtysh -c 'show version'"); err != nil {
 		return fmt.Errorf("wait for FRR on %s: %w", gw, err)
 	}
-	return l.configureGatewayBGP(ctx, gw, link)
+	if err := l.configureGatewayBGP(ctx, gw, link); err != nil {
+		return err
+	}
+	return l.verifyUnderlay(ctx, gw, link)
+}
+
+// verifyUnderlay asserts the rewire's own outcome before the restore declares
+// the node back: eth1 exists and carries the expected underlay address, and
+// FRR's running-config names the real upstream neighbor with the real
+// router-id rather than the entrypoint's placeholder. A rewire that cannot
+// satisfy this has landed nowhere useful — most often because the container
+// reincarnated under it (#216), taking the netns the rewire configured with
+// it — and must fail the restore truthfully instead of returning a success the
+// recovery gate then spends its whole budget contradicting. It does not wait
+// for the session to reach Established: that legitimately takes seconds and is
+// what the converge gate's end-to-end probes already prove.
+func (l *lab) verifyUnderlay(ctx context.Context, gw string, link underlayLink) error {
+	addr, err := l.sh(ctx, gw, "ip -o -4 addr show eth1")
+	if err != nil {
+		return fmt.Errorf("verify eth1 on %s: %w", gw, err)
+	}
+	if !strings.Contains(addr, link.gatewayCIDR) {
+		return fmt.Errorf("eth1 on %s does not carry %s after the rewire: %q",
+			gw, link.gatewayCIDR, strings.TrimSpace(addr))
+	}
+	cfg, err := l.sh(ctx, gw, "vtysh -c 'show running-config'")
+	if err != nil {
+		return fmt.Errorf("read the BGP config on %s: %w", gw, err)
+	}
+	routerID := addrOf(link.gatewayCIDR)
+	if !strings.Contains(cfg, "bgp router-id "+routerID) {
+		return fmt.Errorf("BGP on %s is not configured with router-id %s after the rewire "+
+			"(entrypoint placeholder still in place?)", gw, routerID)
+	}
+	neighbor := addrOf(link.upstreamCIDR)
+	if !strings.Contains(cfg, "neighbor "+neighbor) {
+		return fmt.Errorf("BGP on %s names no neighbor %s after the rewire", gw, neighbor)
+	}
+	return nil
 }
 
 // configureGatewayBGP replaces the placeholder BGP config the gwnode

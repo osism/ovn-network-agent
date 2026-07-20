@@ -101,8 +101,16 @@ func TestGatewayKillRestoreRewiresTheUnderlay(t *testing.T) {
 // re-created when it is still there — `veth create` would fail on an
 // existing interface.
 func TestRewireSkipsTheVethWhenTheInterfaceSurvived(t *testing.T) {
-	// Unlike healthyLabResponses, this lab still has its eth1.
-	cmd := &fakeCommander{}
+	// Unlike healthyLabResponses, this lab still has its eth1, so the
+	// `ip link show eth1` probe succeeds and the veth is not re-created. Its
+	// address and BGP config are answered by healthyLabResponses, which the
+	// rewire's own verification reads back.
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "ip link show eth1") {
+			return "", nil
+		}
+		return healthyLabResponses(argv)
+	}}
 	l := newTestLab(cmd, newFakeClock())
 
 	if err := l.rewireUnderlay(context.Background(), "gateway-1"); err != nil {
