@@ -214,8 +214,13 @@ diagnostics and retries.
 - each gateway's FRR (in `vrf-provider`): eBGP against its specific
   upstream `/30` endpoint, redistributing the FIP `/32` static
   routes that the agent installs in `vrf-provider`. The placeholder
-  neighbor pushed by `gwnode-entrypoint.sh` (`192.0.2.1`) is
-  replaced by `bootstrap.sh` once the underlay is up.
+  neighbor seeded by `gwnode-entrypoint.sh` (`192.0.2.1`) is
+  replaced by `bootstrap.sh` once the underlay is up. The entrypoint
+  only seeds that placeholder when it finds `vrf-provider` without a
+  BGP router — a restarted container reloads the real config from
+  `/etc/frr/frr.conf` (`bootstrap.sh` ends its push with `write
+  memory`), and pushing the placeholder on top of it would reset the
+  router-id to `127.0.0.1` and re-add the dead `192.0.2.1` neighbor.
 - `client-1`: `10.0.0.2/24` on `eth1`, default route via `10.0.0.1`.
 - `gateway-3` (the priority-10 chassis): a veth pair
   `vm1-host` ↔ `vm1-eth0` — the host side is bound to `br-int` with
