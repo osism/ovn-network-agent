@@ -676,11 +676,24 @@ func (l *lab) verifyUnderlay(ctx context.Context, gw string, link underlayLink) 
 // It no longer races the entrypoint for the last word: configure_frr
 // skips its placeholder whenever the VRF already carries a BGP router
 // (issue #218), so this config survives whichever of the two runs second.
+//
+// `redistribute connected route-map ANNOUNCE-CONNECTED` is the port-forward
+// VIP's announce path (#223): the VIP is a local /32 on port_forward_dev, so
+// its connected route — filtered through a route-map that matches
+// ANNOUNCED-NETWORKS — is what BGP exports. The route-map form is deliberate:
+// on a standby the agent deletes ANNOUNCED-NETWORKS, and an undefined list
+// inside a route-map `match` is a no-match that falls through to the terminal
+// deny, exporting nothing — whereas a bare `redistribute connected` would leak
+// the underlay /30s. The route-map rides in the same transaction and is
+// persisted by the existing `write memory`.
 func (l *lab) configureGatewayBGP(ctx context.Context, gw string, link underlayLink) error {
 	upstreamIP := addrOf(link.upstreamCIDR)
 	routerID := addrOf(link.gatewayCIDR)
 	config := strings.Join([]string{
 		"configure terminal",
+		"route-map ANNOUNCE-CONNECTED permit 10",
+		" match ip address prefix-list ANNOUNCED-NETWORKS",
+		"exit",
 		"no router bgp 65000 vrf vrf-provider",
 		"router bgp 65000 vrf vrf-provider",
 		" bgp router-id " + routerID,
@@ -689,6 +702,7 @@ func (l *lab) configureGatewayBGP(ctx context.Context, gw string, link underlayL
 		" neighbor " + upstreamIP + " remote-as 65001",
 		" address-family ipv4 unicast",
 		"  redistribute static",
+		"  redistribute connected route-map ANNOUNCE-CONNECTED",
 		"  neighbor " + upstreamIP + " activate",
 		"  neighbor " + upstreamIP + " prefix-list ANNOUNCED-NETWORKS out",
 		" exit-address-family",

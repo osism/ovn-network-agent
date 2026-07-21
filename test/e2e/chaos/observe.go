@@ -673,11 +673,16 @@ func atoi(s string) int {
 // Upstream announcements
 // =============================================================================
 
-// upstreamRoutes maps each announced /32 (bare IP) to the set of gateways
-// announcing it, as read from the upstream BGP router.
+// upstreamRoutes maps each gateway-attributed announced prefix to the set of
+// gateways announcing it, as read from the upstream BGP router. A /32 is keyed
+// by its bare IP (matching AnnounceBound, which holds bare /32 IPs); any other
+// prefix keeps its full CIDR string, so a leaked non-/32 (an underlay /30 a
+// mis-filtered redistribute connected would export) lands in the "unexpected"
+// half of the oracle's announced check (#223).
 type upstreamRoutes map[string]map[string]bool
 
-// announcedBy returns the /32 IPs gw is currently announcing upstream.
+// announcedBy returns the prefixes gw is currently announcing upstream, keyed
+// as upstreamRoutes documents (bare IP for a /32, full CIDR otherwise).
 func (u upstreamRoutes) announcedBy(gw string) map[string]bool {
 	out := map[string]bool{}
 	for ip, gws := range u {
@@ -718,10 +723,17 @@ func observeUpstream(ctx context.Context, l *lab) (upstreamRoutes, error) {
 
 	routes := upstreamRoutes{}
 	for prefix, paths := range doc.Routes {
-		if !strings.HasSuffix(prefix, "/32") {
-			continue
+		// A /32 keeps its bare-IP key (so it matches AnnounceBound); any other
+		// prefix keeps its full CIDR string, so a gateway-attributed non-/32 —
+		// an underlay /30 a bare `redistribute connected` would leak — is
+		// recorded and flagged as unexpected by the announce bound. Only
+		// gateway-attributed prefixes land here at all: an upstream-originated
+		// route resolves to no gateway (byNexthop maps only gateway addresses)
+		// and stays invisible, as before.
+		key := prefix
+		if strings.HasSuffix(prefix, "/32") {
+			key = strings.TrimSuffix(prefix, "/32")
 		}
-		ip := strings.TrimSuffix(prefix, "/32")
 		for _, p := range paths {
 			addrs := make([]string, 0, len(p.Nexthops)+1)
 			for _, nh := range p.Nexthops {
@@ -732,10 +744,10 @@ func observeUpstream(ctx context.Context, l *lab) (upstreamRoutes, error) {
 			}
 			for _, addr := range addrs {
 				if gw := byNexthop[addr]; gw != "" {
-					if routes[ip] == nil {
-						routes[ip] = map[string]bool{}
+					if routes[key] == nil {
+						routes[key] = map[string]bool{}
 					}
-					routes[ip][gw] = true
+					routes[key][gw] = true
 				}
 			}
 		}

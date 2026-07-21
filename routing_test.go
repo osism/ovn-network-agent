@@ -662,7 +662,7 @@ func TestDryRunPortForward(t *testing.T) {
 	}
 
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
-	if err := rm.ReconcilePortForward([]*net.IPNet{cidr}, nil); err != nil {
+	if err := rm.ReconcilePortForward([]*net.IPNet{cidr}, nil, true); err != nil {
 		t.Errorf("ReconcilePortForward() dry-run error: %v", err)
 	}
 
@@ -683,7 +683,7 @@ func TestDisabledPortForward(t *testing.T) {
 	if err := rm.SetupPortForward(); err != nil {
 		t.Errorf("SetupPortForward() disabled error: %v", err)
 	}
-	if err := rm.ReconcilePortForward(nil, nil); err != nil {
+	if err := rm.ReconcilePortForward(nil, nil, true); err != nil {
 		t.Errorf("ReconcilePortForward() disabled error: %v", err)
 	}
 	if err := rm.TeardownPortForward(); err != nil {

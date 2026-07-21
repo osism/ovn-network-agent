@@ -90,8 +90,39 @@ port_forwards:
 
 Each VIP can optionally be managed by the agent (`manage_vip: true`). When
 enabled, the agent adds the VIP as a `/32` address on the configured loopback
-interface (default: `loopback1`) inside `vrf-provider`. This is the address
-that FRR announces via BGP to make the VIP reachable from the external fabric.
+interface (default: `loopback1`) inside `vrf-provider`. That address is the
+VIP's BGP announce path: its **connected route** is what FRR redistributes to
+the external fabric. The agent does *not* write an FRR static route for the VIP
+— a static to the same `/32` would be permanently shadowed by the connected
+route (a local address always wins over a static to the same prefix) and never
+advertised.
+
+For the announcement to leave the box, the gateway's BGP configuration must
+redistribute connected routes through the `ANNOUNCED-NETWORKS` prefix-list, via
+a route-map:
+
+```
+router bgp <asn> vrf vrf-provider
+ address-family ipv4 unicast
+  redistribute connected route-map ANNOUNCE-CONNECTED
+ exit-address-family
+!
+route-map ANNOUNCE-CONNECTED permit 10
+ match ip address prefix-list ANNOUNCED-NETWORKS
+```
+
+The route-map form is deliberate. An undefined prefix-list inside a route-map
+`match` is a *no-match* that falls through to the route-map's terminal deny, so
+a standby that has emptied `ANNOUNCED-NETWORKS` exports nothing via connected —
+whereas a bare `redistribute connected`, or only a neighbor `prefix-list … out`
+naming an undefined list, would treat the missing list as permit-all and leak
+the underlay `/30`s.
+
+On a full-mode gateway that hosts no local routers the agent **removes** the
+managed VIP address (see the dormancy section in the port-forwarding
+explanation). The reasoning: on such a standby the agent has emptied
+`ANNOUNCED-NETWORKS`, so a present address must not be exportable — withholding
+the address is what keeps the standby from announcing a VIP it does not own.
 
 When `manage_vip: false`, the VIP address must already exist on the interface
 (e.g. configured statically or by another tool).

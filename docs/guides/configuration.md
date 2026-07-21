@@ -67,8 +67,12 @@ also serves any configured `port_forwards`.
 
 When `port_forwards` is configured but **both** OVN remotes are left unset,
 the agent runs as a standalone VIP service: it manages only the configured
-port-forward VIPs — DNAT rules, VIP addresses, connmark return routing, and
-FRR static routes for BGP announcement — and never connects to OVN.
+port-forward VIPs — DNAT rules, VIP addresses, and connmark return routing —
+and never connects to OVN. Each managed VIP address is announced via BGP
+through its connected route on `port_forward_dev` (the gateway's FRR must
+`redistribute connected` through the `ANNOUNCED-NETWORKS` route-map — see the
+[port-forwarding guide](port-forwarding#vip-address-management)), not through
+an FRR static route.
 
 Use this for a node that should only expose configured VIPs (for example a
 DNS resolver, monitoring collector, or API proxy) and is not an OVN gateway

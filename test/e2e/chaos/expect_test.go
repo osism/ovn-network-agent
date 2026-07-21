@@ -189,7 +189,12 @@ func TestExpectationPortForwardOnlySkipsEveryOVNPlane(t *testing.T) {
 	}
 	// Desired is the VIP alone — no FIPs, no gateway IPs.
 	assertSet(t, "DesiredIPs", exp.DesiredIPs, []string{apiVIPAddr})
-	assertSet(t, "FRRStatic", exp.FRRStatic, []string{apiVIPAddr})
+	// #223: the VIP is desired (kernel/announce plane) but is never an FRR
+	// static — it announces through its connected route. In pf-only mode there
+	// is no OVN view, so the FRR-static set is empty.
+	if len(exp.FRRStatic) != 0 {
+		t.Fatalf("FRRStatic = %v, want empty — the VIP announces via its connected route, not a static", exp.FRRStatic)
+	}
 	if !exp.SkipKernel || !exp.SkipHairpin || !exp.SkipPrefixList {
 		t.Fatalf("pf-only must skip the kernel/OVS/prefix planes: skipKernel=%v skipHairpin=%v skipPrefix=%v",
 			exp.SkipKernel, exp.SkipHairpin, exp.SkipPrefixList)
@@ -258,7 +263,12 @@ func TestExpectationDormantVIPOnStandbyGateway(t *testing.T) {
 	assertDNAT(t, exp.DNAT, []dnatExpectation{
 		{VIP: apiVIPAddr, Proto: "tcp", Port: apiVIPPort, Backend: "172.20.20.5", DestPort: apiVIPPort},
 	})
-	assertSet(t, "ManagedVIPs", exp.ManagedVIPs, []string{apiVIPAddr})
+	// #223: the VIP address is the announce path, so a full-mode standby
+	// withholds it — the managed-VIP set is empty even though the config carries
+	// manage_vip. This is the new mechanism the dormancy (#206) is enforced by.
+	if len(exp.ManagedVIPs) != 0 {
+		t.Fatalf("ManagedVIPs = %v, want none — a standby withholds the VIP address", exp.ManagedVIPs)
+	}
 }
 
 // With no port_forwards the agent's nftables table carries no DNAT chains and
