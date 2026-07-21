@@ -146,34 +146,28 @@ func TestApplyProfileSkipsGatewaysThatAreAlreadyOnTheConfig(t *testing.T) {
 // gateways roll one at a time: each is back — container healthy, chassis
 // re-registered — before the next one is touched.
 func TestApplyProfileRollsTheGatewaysOneAtATime(t *testing.T) {
-	// gateway-1 is already on the config the heterogeneous profile leaves
-	// it on — the baked one — so only the other two have to roll.
-	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
-		line := strings.Join(argv, " ")
-		if strings.Contains(line, "cat "+agentConfigPath) && strings.Contains(line, "gateway-1") {
-			return string(baseConfig(t)), nil
-		}
-		return labWithConfig("stale config\n")(argv)
-	}}
+	// The heterogeneous profile overlays all three gateways, so all
+	// three have to roll.
+	cmd := &fakeCommander{respond: labWithConfig("stale config\n")}
 	a := newTestApplier(t, cmd, "heterogeneous")
 
 	if err := a.applyProfile(context.Background()); err != nil {
 		t.Fatalf("applyProfile: %v", err)
 	}
 
-	firstRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-2")
-	firstBack := cmd.indexOf("find Chassis name=gateway-2")
-	secondRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-3")
-	if firstRestart < 0 || firstBack < 0 || secondRestart < 0 {
-		t.Fatalf("the roll did not restart and gate both overlaid gateways: %v", cmd.lines())
+	firstRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-1")
+	firstBack := cmd.indexOf("find Chassis name=gateway-1")
+	secondRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-2")
+	secondBack := cmd.indexOf("find Chassis name=gateway-2")
+	thirdRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-3")
+	if firstRestart < 0 || firstBack < 0 || secondRestart < 0 || secondBack < 0 || thirdRestart < 0 {
+		t.Fatalf("the roll did not restart and gate all three overlaid gateways: %v", cmd.lines())
 	}
 	if firstBack > secondRestart {
-		t.Fatalf("gateway-3 was restarted before gateway-2 was back: %v", cmd.lines())
+		t.Fatalf("gateway-2 was restarted before gateway-1 was back: %v", cmd.lines())
 	}
-	// gateway-1 runs the baked config under this profile, so it is never
-	// restarted at all.
-	if cmd.called("docker restart clab-ovn-e2e-gateway-1") {
-		t.Fatalf("a gateway the profile leaves alone was restarted: %v", cmd.lines())
+	if secondBack > thirdRestart {
+		t.Fatalf("gateway-3 was restarted before gateway-2 was back: %v", cmd.lines())
 	}
 	if !cmd.called("printf '%s' 'heterogeneous' > " + profileMarkerPath) {
 		t.Fatalf("the reconfigured gateways were not marked as profile-owned: %v", cmd.lines())

@@ -1030,7 +1030,7 @@ The set is curated, not combinatorial:
 | `flat-dnat` | hairpin + port-forward | the API VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip` |
 | `vlan-no-dnat` | hairpin + VLAN | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs |
 | `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
-| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` baked, `gateway-2` API VIP + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` |
+| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` API VIP, `gateway-2` API VIP + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` |
 
 The **API VIP** (`192.0.2.80:8080`) is the agent's own DNAT path, as
 opposed to `pf-vip`, which is an OVN `Load_Balancer`. Its backend is a
@@ -1043,9 +1043,14 @@ exactly the effective networks: a VIP outside every covered prefix is
 never announced. In `pf-only` that filter has to be set by hand
 (`network_cidr`) — without OVN there is nothing to discover it from.
 
-Under `heterogeneous`, `api-vip` is announced by `gateway-2` alone, so it
-is legitimately dark while `gateway-2` is held down — the same
-pinned-resource semantics the VLAN FIPs already have on `gateway-1`.
+Under `heterogeneous`, the API VIP sits on `gateway-1` *and*
+`gateway-2`: a full-mode gateway only announces its port-forward VIPs
+while it holds a locally active router (the dormant gate), and at start
+every router is active on `gateway-1`, the highest-priority chassis —
+carried by `gateway-2` alone the VIP would be dormant on every gateway
+and the `api-vip` probe could never go green. With both carrying it, the
+active chassis announces it from the start, and losing `gateway-1` hands
+`lr0` — and with it the announce — to `gateway-2`.
 
 **How a profile is applied.** No image rebuild, no redeploy: the config
 file is the only thing that changes, and the gwnode entrypoint `exec`s
