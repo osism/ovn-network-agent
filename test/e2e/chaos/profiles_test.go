@@ -173,13 +173,12 @@ func TestHeterogeneousProfileRendersOneConfigPerGateway(t *testing.T) {
 		t.Fatalf("profileByName: %v", err)
 	}
 
-	base := baseConfig(t)
-	first, err := renderConfig(base, p.gwConfig("gateway-1"), "172.20.20.4")
-	if err != nil {
-		t.Fatalf("render gateway-1: %v", err)
+	first := render(t, p.gwConfig("gateway-1"), "172.20.20.4")
+	if vipsIn(t, first)[apiVIPAddr] == nil {
+		t.Fatalf("gateway-1 = %v, want the API VIP", first)
 	}
-	if !bytes.Equal(first, base) {
-		t.Fatalf("gateway-1 was meant to stay on the baked config:\n%s", first)
+	if first["drain_on_shutdown"] == true {
+		t.Fatalf("gateway-1 = %v, want the VIP without the drain — that is gateway-2's variant", first)
 	}
 
 	second := render(t, p.gwConfig("gateway-2"), "172.20.20.5")
@@ -198,8 +197,8 @@ func TestHeterogeneousProfileRendersOneConfigPerGateway(t *testing.T) {
 		t.Fatalf("gateway-3 was handed a DNAT config it never asked for: %v", third["port_forwards"])
 	}
 
-	if got := p.apiVIPGateways(); len(got) != 1 || got[0] != "gateway-2" {
-		t.Fatalf("apiVIPGateways = %v, want only the gateway whose config carries the VIP", got)
+	if got := strings.Join(p.apiVIPGateways(), ","); got != "gateway-1,gateway-2" {
+		t.Fatalf("apiVIPGateways = %v, want exactly the gateways whose configs carry the VIP", got)
 	}
 }
 

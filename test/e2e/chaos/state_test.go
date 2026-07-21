@@ -283,14 +283,16 @@ func TestStartStateStartsTheAPIBackendOnlyOnItsGateways(t *testing.T) {
 		t.Fatalf("applyStartState: %v", err)
 	}
 
-	if !cmd.called("exec -d clab-ovn-e2e-gateway-2 /usr/local/bin/pf-backend -addr :8080 -log " + apiBackendLog) {
-		t.Fatalf("the API backend was not started on the gateway that announces the VIP: %v", cmd.lines())
+	for _, gw := range []string{"gateway-1", "gateway-2"} {
+		if !cmd.called("exec -d clab-ovn-e2e-" + gw + " /usr/local/bin/pf-backend -addr :8080 -log " + apiBackendLog) {
+			t.Fatalf("the API backend was not started on %s, whose config carries the VIP: %v", gw, cmd.lines())
+		}
 	}
-	if cmd.called("exec -d clab-ovn-e2e-gateway-1 /usr/local/bin/pf-backend") {
+	if cmd.called("exec -d clab-ovn-e2e-gateway-3 /usr/local/bin/pf-backend") {
 		t.Fatalf("the API backend was started on a gateway whose config has no VIP: %v", cmd.lines())
 	}
-	if cmd.count("pkill -f "+apiBackendLog) != 1 {
-		t.Fatalf("the API backend was reset on more than its own gateway: %v", cmd.lines())
+	if cmd.count("pkill -f "+apiBackendLog) != 2 {
+		t.Fatalf("the API backend was reset on more than its own gateways: %v", cmd.lines())
 	}
 	for _, line := range cmd.lines() {
 		if strings.Contains(line, "pkill") && strings.Contains(line, "/usr/local/bin/pf-backend") {
@@ -314,9 +316,10 @@ func TestReprovisionRestartsTheAPIBackendOnItsGateways(t *testing.T) {
 	}
 
 	// A gateway with neither node-local workloads nor an API VIP has
-	// nothing to reprovision.
+	// nothing to reprovision — under this profile every gateway carries
+	// something, so the empty case needs one without any DNAT at all.
 	peer := &fakeCommander{respond: healthyLabResponses}
-	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()), p, "gateway-1"); err != nil {
+	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()), testProfile(t, "vlan-no-dnat"), "gateway-1"); err != nil {
 		t.Fatalf("reprovision gateway-1: %v", err)
 	}
 	if len(peer.lines()) != 0 {

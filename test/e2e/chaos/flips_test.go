@@ -101,7 +101,7 @@ func TestInapplicableFlips(t *testing.T) {
 		},
 		{
 			flip: "masquerade-toggle", profile: "heterogeneous", gw: "gateway-3",
-			reason: "only gateway-2 carries the API VIP under this profile",
+			reason: "the profile keeps the API VIP off this gateway",
 		},
 		{
 			flip: "cidr-toggle", profile: "heterogeneous", gw: "gateway-3",

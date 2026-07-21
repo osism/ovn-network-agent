@@ -219,16 +219,23 @@ func profiles() []*profile {
 		},
 		{
 			// What a rollout looks like from the inside: the gateways run
-			// different configurations at the same time. The API VIP is
-			// announced by gateway-2 alone, so it is legitimately dark
-			// while gateway-2 is held down — the same pinned-resource
-			// semantics the VLAN FIPs already have on gateway-1.
+			// different configurations at the same time. The API VIP sits
+			// on gateway-1 *and* gateway-2: a full-mode gateway only
+			// announces its port-forward VIPs while it holds a locally
+			// active router (the dormant gate, #206), and at start every
+			// router is active on gateway-1, the highest-priority chassis
+			// — pinned to gateway-2 alone the VIP would be dormant on
+			// every gateway and the api-vip probe could never go green.
+			// Carried by both, the active chassis announces it from the
+			// start, and losing gateway-1 hands lr0 — and with it the
+			// announce — to gateway-2.
 			name:        "heterogeneous",
 			description: "each gateway on a different configuration, as mid-rollout",
 			hairpin:     true,
 			vlans:       true,
 			ovnLB:       true,
 			gateways: map[string]gwConfig{
+				"gateway-1": {apiVIP: true},
 				"gateway-2": {apiVIP: true, drainOnShutdown: true},
 				"gateway-3": {
 					networkCIDRs:      explicitCIDRs,
