@@ -311,10 +311,15 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// Everything the cycle needs to derive from OVN is a pure function of the
 	// snapshot plus the configured VIPs (see desired_state.go). Past this
 	// point reconcile only acts on the result.
-	desired := computeDesiredState(state, a.cfg.PortForwards, a.vipRoutesAnnounceable(state))
+	// One announceability decision drives both the desired-state fork and the
+	// VIP-address gate below, so computeDesiredState and ReconcilePortForward
+	// can never disagree about whether this cycle announces the VIPs.
+	announce := a.vipRoutesAnnounceable(state)
+	desired := computeDesiredState(state, a.cfg.PortForwards, announce)
 	hairpinTargets := desired.HairpinTargets
 	desiredSegments := desired.Segments
 	desiredIPs := desired.DesiredIPs
+	frrStaticIPs := desired.FRRStaticIPs
 
 	if len(desired.ExcludedNonV4) > 0 {
 		slog.Debug("excluding non-IPv4 addresses from the route/announce plane, IPv6 support tracked in #85/#70",
@@ -412,7 +417,11 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 
 	// Port forwarding reconciliation runs regardless of local router
 	// presence — DNAT VIPs are managed independently of OVN gateway state.
-	if err := a.routing.ReconcilePortForward(a.effectiveFilters, state.SNATIPs); err != nil {
+	// announce gates the VIP address: an announceable VIP has its /32 added to
+	// port_forward_dev (so its connected route is exported), a dormant one has
+	// it withheld. This is now the dormancy lever (#206), the DNAT rules are
+	// unaffected either way.
+	if err := a.routing.ReconcilePortForward(a.effectiveFilters, state.SNATIPs, announce); err != nil {
 		slog.Error("failed to reconcile port forwarding", "error", err)
 	}
 
@@ -441,13 +450,16 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		ipDev[ip] = a.routing.SegmentDev(target.Segment)
 	}
 
-	// The BGP announce. Ensure routes for all desired IPs (FIPs, SNATs, and
-	// the port-forward VIPs this node can announce — see
-	// vipRoutesAnnounceable; dormant VIPs are not in desiredIPs and are
-	// withdrawn by the standby path below like any other undesired route).
+	// The BGP announce. Ensure routes for all desired IPs: FIPs and SNATs get
+	// an FRR static route (the frrStaticIPs subset) plus a kernel route, while
+	// the port-forward VIPs this node can announce get only the kernel /32 —
+	// they are advertised through their connected route on port_forward_dev,
+	// not an FRR static (see desired_state.go FRRStaticIPs). Dormant VIPs are
+	// not in desiredIPs and their address was withheld by ReconcilePortForward
+	// above, so nothing announces them.
 	var routeSync routeSyncResult
 	if len(desiredIPs) > 0 || state.HasLocalRouters {
-		routeSync = a.ensureRoutes(desiredIPs, ipDev, skipKernelRoute)
+		routeSync = a.ensureRoutes(desiredIPs, frrStaticIPs, ipDev, skipKernelRoute)
 		cycleOK = routeSync.ready
 	} else {
 		// The removeAllRoutes standby path leaves cycleOK true — a healthy
@@ -496,12 +508,14 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// disappeared during the mutation. Runs after the announce and only
 	// when routes actually changed, matching the pre-#131 trigger.
 	if routeSync.changed {
-		a.verifyRoutes(desiredIPs, ipDev, skipKernelRoute)
+		a.verifyRoutes(desiredIPs, frrStaticIPs, ipDev, skipKernelRoute)
 	}
 
-	// Surface desired routes that are configured in FRR but not actually
-	// advertised via BGP — ensureRoutes alone cannot detect this.
-	a.checkFRRRouteActivity(desiredIPs)
+	// Surface FRR-static routes that are configured but not actually advertised
+	// via BGP — ensureRoutes alone cannot detect this. Only the OVN-derived set
+	// is checked: a VIP is announced through its connected route, so it has no
+	// static for this check to alarm on.
+	a.checkFRRRouteActivity(frrStaticIPs)
 
 	// Check for stale chassis entries from dead nodes (runs on every agent).
 	// This runs after gateway routing reconciliation so that a surviving agent
@@ -603,15 +617,17 @@ func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
 }
 
 // vipRoutesAnnounceable reports whether the configured port-forward VIPs should
-// get kernel and FRR routes this cycle.
+// be announced this cycle: whether their /32 address is added to
+// port_forward_dev (so its connected route is exported via BGP) and whether
+// they join the kernel-route plane.
 //
-// A VIP is only routable where the agent also maintains the FRR prefix-list that
-// permits it. Without local routers reconcile takes the standby path, which
-// empties that prefix-list and the veth-leak network routes — a VIP route
-// installed anyway could never be advertised. It would sit in FRR as a static
-// route that zebra never selects, holding ovn_network_agent_inactive_routes at a
-// non-zero value and logging at ERROR on every cycle, indefinitely (#206). Such
-// a VIP is dormant instead: nothing installed, reported once at info level.
+// A VIP is only announceable where the agent also maintains the FRR prefix-list
+// that permits it. Without local routers reconcile takes the standby path,
+// which empties that prefix-list and the veth-leak network routes — a VIP
+// announced anyway could never be advertised, and with the route-map on
+// redistribute connected the deleted prefix-list stops the connected export
+// outright. Such a VIP is dormant instead: its address is withheld from
+// port_forward_dev, so nothing is announced, reported once at info level (#206).
 //
 // Port-forward-only mode never takes the standby path and serves its VIPs
 // without any OVN state at all, so it always announces them.
@@ -621,8 +637,8 @@ func (a *Agent) vipRoutesAnnounceable(state OVNState) bool {
 
 // reportDormantVIPs logs the port-forward VIPs this node cannot announce, once
 // per change of the set rather than on every reconcile: the condition persists
-// for as long as the node holds no local routers, and the point of declining to
-// install the route is to stop the per-cycle noise. Recovery is logged too, so
+// for as long as the node holds no local routers, and the point of withholding
+// the VIP address is to stop the per-cycle noise. Recovery is logged too, so
 // the dormancy has a matching end in the journal.
 func (a *Agent) reportDormantVIPs(dormant []string) {
 	key := strings.Join(dormant, ",")
@@ -631,10 +647,10 @@ func (a *Agent) reportDormantVIPs(dormant []string) {
 	}
 	switch {
 	case len(dormant) > 0:
-		slog.Info("port-forward VIPs are dormant on this node — no locally active routers, so they cannot be advertised and no routes are installed",
+		slog.Info("port-forward VIPs are dormant on this node — no locally active routers, so they cannot be advertised and their address is withheld from the port-forward device",
 			"count", len(dormant), "vips", dormant)
 	case a.dormantVIPs != "":
-		slog.Info("port-forward VIPs are no longer dormant — installing their routes")
+		slog.Info("port-forward VIPs are no longer dormant — restoring their address on the port-forward device")
 	}
 	a.dormantVIPs = key
 }
@@ -687,6 +703,10 @@ type routeSyncResult struct {
 }
 
 // ensureRoutes adds routes for all desired IPs and removes stale ones.
+// desiredIPs is the kernel-route plane (FIPs, SNATs, gateway IPs, and the
+// announceable VIPs); frrStaticIPs is the subset that also gets an FRR static
+// route via the veth next-hop — the OVN-derived IPs only, never a VIP, whose
+// connected route on port_forward_dev is its announce path.
 // ipDev names the kernel interface each IP's route belongs on; kernel routes
 // are reconciled as (IP, device) pairs so a route that sits on the wrong
 // segment interface is replaced. IPs in skipKernelRoute keep their existing
@@ -695,18 +715,22 @@ type routeSyncResult struct {
 // It returns what changed so the caller can run the post-announce route
 // verification, record the failover-latency metric, and decide whether to
 // write the takeover readiness marker.
-func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) routeSyncResult {
+func (a *Agent) ensureRoutes(desiredIPs, frrStaticIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) routeSyncResult {
 	kernelOK := true
 	desiredSet := make(map[string]bool, len(desiredIPs))
 	for _, ip := range desiredIPs {
 		desiredSet[ip] = true
 	}
+	frrStaticSet := make(map[string]bool, len(frrStaticIPs))
+	for _, ip := range frrStaticIPs {
+		frrStaticSet[ip] = true
+	}
 
 	// Kernel routes live on the provider bridge (br-ex) or a per-VLAN
 	// segment interface on it. In port-forward-only mode the node need not
-	// have br-ex, so only FRR static routes are managed — the VIP is
-	// reachable as a local address on port_forward_dev, and the FRR route
-	// handles BGP announcement.
+	// have br-ex, so no kernel routes are managed at all — frrStaticIPs is
+	// empty there too, and each VIP is announced as a local address on
+	// port_forward_dev via its connected route rather than an FRR static.
 	manageKernel := !a.cfg.PortForwardOnly
 
 	// Collect current state so we only add what is actually missing.
@@ -743,7 +767,9 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 	for _, ip := range desiredIPs {
 		dev := a.desiredRouteDev(ip, ipDev)
 		needsKernel := manageKernel && !skipKernelRoute[ip] && !currentKernelSet[kernelRouteEntry{IP: ip, Dev: dev}]
-		needsFRR := !currentFRRSet[ip]
+		// Only OVN-derived IPs get an FRR static; a VIP announces through its
+		// connected route, so it is never in frrStaticSet.
+		needsFRR := frrStaticSet[ip] && !currentFRRSet[ip]
 
 		if !needsKernel && !needsFRR {
 			slog.Debug("route already exists", "ip", ip)
@@ -794,9 +820,16 @@ func (a *Agent) ensureRoutes(desiredIPs []string, ipDev map[string]string, skipK
 		removedKernel = append(removedKernel, e)
 	}
 
-	// Collect orphaned FRR routes that have no corresponding kernel route.
+	// Collect orphaned FRR statics: any listed static whose IP is not in the
+	// FRR-static set (and not already queued for removal above). Comparing
+	// against frrStaticSet rather than the kernel-desired set is what withdraws
+	// a VIP's static — a VIP is kernel-desired, so the stale-kernel loop above
+	// skips it, but it is no longer an FRR-static IP, so this loop is the only
+	// path that removes the shadowed static a pre-upgrade agent left behind (on
+	// the first cycle after the upgrade). ListFRRRoutes scopes to the veth
+	// next-hop, so such a static is listed and caught here.
 	for _, ip := range currentFRR {
-		if !desiredSet[ip] && !removedSet[ip] {
+		if !frrStaticSet[ip] && !removedSet[ip] {
 			slog.Info("removing orphaned FRR route", "ip", ip)
 			delFRR = append(delFRR, ip)
 		}
@@ -948,8 +981,11 @@ const consecutiveReAddThreshold = 3
 // on every reconcile for as long as the condition lasts.
 const nexthopRepairCooldown = time.Minute
 
-// verifyRoutes checks that all desired IPs still have both a kernel route
-// (on the right interface) and an FRR static route after route mutations.
+// verifyRoutes checks that every desired IP still has its kernel route (on the
+// right interface) and that every FRR-static IP still has its FRR static route
+// after route mutations. frrStaticIPs is the OVN-derived subset of desiredIPs —
+// a VIP is not in it (its announce path is the connected route on
+// port_forward_dev, not a static), so verifyRoutes never re-adds a VIP static.
 // Any route that disappeared (e.g. due to a vtysh race or unexpected FRR
 // behaviour) is re-added immediately so that existing connections are not
 // disrupted. Every desired IP is agent-produced by construction, so all are
@@ -961,7 +997,7 @@ const nexthopRepairCooldown = time.Minute
 // skipKernelRoute are not re-added at the kernel level: their VLAN segment did
 // not resolve this cycle, so their existing route must be left untouched
 // rather than recreated on the bridge fallback.
-func (a *Agent) verifyRoutes(desiredIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) int {
+func (a *Agent) verifyRoutes(desiredIPs, frrStaticIPs []string, ipDev map[string]string, skipKernelRoute map[string]bool) int {
 	// Re-read current FRR routes.
 	currentFRR, err := a.routing.ListFRRRoutes()
 	if err != nil {
@@ -988,10 +1024,17 @@ func (a *Agent) verifyRoutes(desiredIPs []string, ipDev map[string]string, skipK
 		}
 	}
 
+	frrStaticSet := make(map[string]bool, len(frrStaticIPs))
+	for _, ip := range frrStaticIPs {
+		frrStaticSet[ip] = true
+	}
+
 	var reAddFRR []string
 	reAddKernel := 0
 	for _, ip := range desiredIPs {
-		if !frrSet[ip] {
+		// Only re-add the FRR static for an OVN-derived IP; a VIP has no static
+		// to miss (it announces through its connected route).
+		if frrStaticSet[ip] && !frrSet[ip] {
 			slog.Warn("FRR route missing after route change, re-adding", "ip", ip)
 			reAddFRR = append(reAddFRR, ip)
 		}
@@ -1077,16 +1120,19 @@ func (a *Agent) repairUnresolvableNexthop() {
 	}
 }
 
-// checkFRRRouteActivity surfaces desired routes that exist as FRR static
-// routes but are not selected/installed, and therefore not advertised via BGP.
-// Such a route is invisible to ensureRoutes — ListFRRRoutes still reports it as
-// present — yet leaves the FIP unreachable from outside. Re-adding would not
-// help (the route already exists; the next-hop is the fault), so the condition
-// is reported loudly and exposed through the inactive_routes metric for
-// alerting. A failed check leaves the metric at its previous value rather than
-// falsely resetting it to zero.
-func (a *Agent) checkFRRRouteActivity(desiredIPs []string) {
-	inactive, err := a.routing.InactiveFRRRoutes(desiredIPs)
+// checkFRRRouteActivity surfaces FRR-static routes that exist but are not
+// selected/installed, and therefore not advertised via BGP. It runs on
+// frrStaticIPs (the OVN-derived set), never on a port-forward VIP: a VIP is
+// announced through its connected route on port_forward_dev, so its absent
+// static is not this check's concern and can never hold inactive_routes
+// non-zero. Such a route is invisible to ensureRoutes — ListFRRRoutes still
+// reports it as present — yet leaves the FIP unreachable from outside. Re-adding
+// would not help (the route already exists; the next-hop is the fault), so the
+// condition is reported loudly and exposed through the inactive_routes metric
+// for alerting. A failed check leaves the metric at its previous value rather
+// than falsely resetting it to zero.
+func (a *Agent) checkFRRRouteActivity(frrStaticIPs []string) {
+	inactive, err := a.routing.InactiveFRRRoutes(frrStaticIPs)
 	if err != nil {
 		slog.Warn("could not verify FRR route activity", "error", err)
 		return

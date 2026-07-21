@@ -417,6 +417,14 @@ frr_config() {
     # An empty vrf node renders as nothing in the running config, so there
     # is no state to probe for here — and re-asserting it is a no-op.
     printf 'vrf %s\nexit-vrf\n' "${VRF_NAME}"
+    # The route-map `redistribute connected` filters the VIP /32 through (#223).
+    # Asserted unconditionally like the vrf stanza — re-applying the identical
+    # route-map is a no-op, and unlike the BGP block below it must exist whether
+    # or not a real BGP router already owns the VRF (the two writers of the real
+    # config assert the same route-map in their own transactions). The match on
+    # ANNOUNCED-NETWORKS means a standby that deleted that list exports nothing
+    # via connected, so a present VIP address there is never advertised.
+    printf 'route-map ANNOUNCE-CONNECTED permit 10\n match ip address prefix-list ANNOUNCED-NETWORKS\nexit\n'
     if grep -q '^ip prefix-list ANNOUNCED-NETWORKS ' <<<"${running}"; then
         # The agent owns the entries at runtime and replaces this seed with
         # the real /32s, so re-seeding would put a permit-everything entry
@@ -439,6 +447,7 @@ router bgp 65000 vrf ${VRF_NAME}
  neighbor 192.0.2.1 remote-as 65001
  address-family ipv4 unicast
   redistribute static
+  redistribute connected route-map ANNOUNCE-CONNECTED
   neighbor 192.0.2.1 activate
   neighbor 192.0.2.1 prefix-list ANNOUNCED-NETWORKS out
  exit-address-family

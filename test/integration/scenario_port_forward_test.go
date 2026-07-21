@@ -238,9 +238,16 @@ func TestScenario_PortForwardMatrix(t *testing.T) {
 		// manage_vip:true should add the VIP/32 to loopback1; manage_vip:false
 		// (the default) should leave it absent. Verified via
 		// `ip -j addr show dev loopback1`.
+		//
+		// Runs in port-forward-only mode (both OVN remotes cleared, the config
+		// writer omits empty keys): pf-only is where "manage_vip adds the
+		// address" holds unconditionally, because the VIP is always announceable.
+		// Routerless full mode would now withhold the address as dormant (#223).
 		{
 			name: "manage_vip_on_off",
 			setup: func(t *testing.T, cfg *testenv.AgentConfig) {
+				cfg.OVNNBRemote = ""
+				cfg.OVNSBRemote = ""
 				cfg.PortForwards = []testenv.PortForwardVIPFixture{
 					{
 						VIP:       "198.51.100.10",
@@ -559,8 +566,11 @@ func TestScenario_PortForwardVIPDormantWithoutLocalRouters(t *testing.T) {
 	cfg := startPFScenario(t)
 
 	const vip = "198.51.100.42"
+	// manage_vip so the address is the thing under test: a full-mode standby
+	// must withhold it — the new dormancy mechanism (#223).
 	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
-		VIP: vip,
+		VIP:       vip,
+		ManageVIP: true,
 		Rules: []testenv.PortForwardRuleFixture{{
 			Proto: "tcp", Port: 80, DestAddr: "10.0.0.100",
 		}},
@@ -575,10 +585,13 @@ func TestScenario_PortForwardVIPDormantWithoutLocalRouters(t *testing.T) {
 		func(r testenv.NftRule) bool { return r.HasMatch("ip", "daddr", vip) },
 		30*time.Second, "DNAT rule for dormant VIP "+vip)
 
-	// Neither route may appear. Both assertions poll for their whole timeout,
-	// so this covers several reconcile cycles at the 5s default interval.
+	// Neither route may appear, and the VIP address must be withheld from the
+	// port-forward device — the announce path itself is what dormancy withholds
+	// now (#223). All three assertions poll for their whole timeout, so this
+	// covers several reconcile cycles at the 5s default interval.
 	testenv.AssertNoFRRRoute(t, vip, 15*time.Second)
 	testenv.AssertNoKernelRoute(t, vip, 5*time.Second)
+	testenv.AssertVIPNotOnLoopback(t, vip, 15*time.Second)
 
 	logs := a.LogTail(100000)
 	if strings.Contains(logs, "FRR static routes are configured but inactive") {
@@ -586,6 +599,66 @@ func TestScenario_PortForwardVIPDormantWithoutLocalRouters(t *testing.T) {
 	}
 	if !strings.Contains(logs, "port-forward VIPs are dormant on this node") {
 		t.Errorf("expected the dormancy to be reported once at info level; last logs:\n%s", a.LogTail(40))
+	}
+}
+
+// TestScenario_PortForwardVIPAnnouncedViaConnected (#223).
+//
+// The active-gateway counterpart of the dormant scenario, and the direct pin
+// for the bug this issue fixes. On a gateway that owns a local router the
+// managed VIP is announceable, so the agent installs its /32 address on
+// port_forward_dev (whose connected route is the BGP announce path) and its
+// kernel /32 on the provider bridge — but writes no FRR static for it. The
+// pre-fix agent wrote that static and the connected route permanently shadowed
+// it, so the VIP was never advertised while the agent logged the inactive-route
+// ERROR every cycle. Here the static must be absent *while active*, no
+// inactive-route alarm may fire, and the two other planes (address, kernel
+// route) must be present.
+func TestScenario_PortForwardVIPAnnouncedViaConnected(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+	testenv.EnsureLoopback1(t)
+	testenv.ScrubPortForwardResidue(t)
+
+	// A locally-active router makes this gateway active, so its managed VIP is
+	// announceable — the condition under which the bug manifested.
+	_ = testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "pfannouncer",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	const vip = "198.51.100.50"
+	cfg := pfDefaults(t)
+	cfg.PortForwards = []testenv.PortForwardVIPFixture{{
+		VIP:       vip,
+		ManageVIP: true,
+		Rules: []testenv.PortForwardRuleFixture{{
+			Proto: "tcp", Port: 80, DestAddr: "10.0.0.100",
+		}},
+	}}
+
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+	// A SIGKILL from a failing assertion would leave nft / loopback residue.
+	t.Cleanup(func() { testenv.ScrubPortForwardResidue(t) })
+
+	// The announce path exists: the VIP address on the port-forward device
+	// (its connected route is what BGP redistributes) and the kernel /32 on the
+	// provider bridge.
+	testenv.AssertVIPOnLoopback(t, vip, 15*time.Second)
+	testenv.AssertKernelRoute(t, vip, 15*time.Second)
+
+	// The shadowed static must be gone while the gateway is active — the actual
+	// bug. The negative assertion polls its whole timeout, covering several
+	// reconcile cycles at the 5s default interval.
+	testenv.AssertNoFRRRoute(t, vip, 15*time.Second)
+
+	// And no inactive-route alarm: with the VIP out of the FRR-static set,
+	// nothing sits in FRR unadvertised holding ovn_network_agent_inactive_routes
+	// non-zero.
+	logs := a.LogTail(100000)
+	if strings.Contains(logs, "FRR static routes are configured but inactive") {
+		t.Errorf("an announced VIP must not raise the inactive-route alarm; last logs:\n%s", a.LogTail(40))
 	}
 }
 
@@ -688,6 +761,11 @@ func TestScenario_PortForwardOutputChains(t *testing.T) {
 // AgentProc.Stop, and assert both the table and the VIP are gone.
 func TestScenario_PortForwardCleanupOnSIGTERM(t *testing.T) {
 	cfg := startPFScenario(t)
+	// Port-forward-only mode (both remotes cleared): pf-only is where a
+	// manage_vip address is added unconditionally, so there is a managed VIP to
+	// clean up. Routerless full mode would now withhold it as dormant (#223).
+	cfg.OVNNBRemote = ""
+	cfg.OVNSBRemote = ""
 
 	const vip = "198.51.100.99"
 	cfg.PortForwards = []testenv.PortForwardVIPFixture{{

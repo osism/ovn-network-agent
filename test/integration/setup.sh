@@ -171,9 +171,16 @@ configure_frr() {
     # Push minimal FRR config: vrf-provider + ANNOUNCED-NETWORKS prefix-list +
     # a dummy BGP peer (192.0.2.1, no real session). Idempotent: re-running
     # the conf-t block overwrites prior state for these objects.
+    # The redistribute-connected route-map is inert here (the dummy neighbor
+    # never establishes) but kept for parity with the gateway configs the chaos
+    # lab and gwnode entrypoint write — the port-forward VIP's announce path
+    # (#223).
     vtysh <<'EOF'
 configure terminal
 ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 0.0.0.0/0 ge 32 le 32
+route-map ANNOUNCE-CONNECTED permit 10
+ match ip address prefix-list ANNOUNCED-NETWORKS
+exit
 vrf vrf-provider
 exit-vrf
 router bgp 65000 vrf vrf-provider
@@ -183,6 +190,7 @@ router bgp 65000 vrf vrf-provider
  neighbor 192.0.2.1 update-source lo
  address-family ipv4 unicast
   redistribute static
+  redistribute connected route-map ANNOUNCE-CONNECTED
   neighbor 192.0.2.1 activate
   neighbor 192.0.2.1 prefix-list ANNOUNCED-NETWORKS out
  exit-address-family

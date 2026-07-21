@@ -393,7 +393,9 @@ What still runs in this mode:
   above.
 - The veth pair between the default VRF and `vrf-provider`, used by the
   DNAT return path.
-- FRR static routes for the VIP addresses, so BGP announces them.
+- The managed VIP addresses on `port_forward_dev`, whose connected routes BGP
+  redistributes to announce them (no FRR static route is written for a VIP — it
+  would be shadowed by the connected route and never advertised).
 - The periodic reconcile ticker, which re-asserts the VIP and DNAT state.
 
 What is skipped, because it is OVN-specific:
@@ -403,8 +405,9 @@ What is skipped, because it is OVN-specific:
   drain-on-shutdown, and FIP/SNAT-IP route management.
 - Provider-bridge setup (`br-ex`). A pure VIP-service node need not have
   `br-ex`: no `<vip>/32` kernel route is installed on it, the VIP is
-  reachable as a local address on `port_forward_dev`, and the FRR static
-  route carries the BGP announcement.
+  reachable as a local address on `port_forward_dev`, and the connected route
+  of that address carries the BGP announcement (via `redistribute connected`
+  through the `ANNOUNCED-NETWORKS` route-map).
 
 Because router SNAT IPs and provider CIDRs are normally discovered from
 OVN, the two source-selective masquerade options that rely on them are
@@ -415,37 +418,47 @@ requires an explicit `network_cidr`.
 
 ## Dormant VIPs on a gateway without local routers
 
-A VIP is only routable on a node where the agent also maintains the FRR
+A VIP is only announceable on a node where the agent also maintains the FRR
 prefix-list that permits it. On a gateway that hosts no locally active
 router — a standby chassis, or one whose routers have failed over
 elsewhere — reconcile takes the standby path and empties both that
-prefix-list and the veth-leak network routes. A VIP route installed there
-could never be advertised.
+prefix-list and the veth-leak network routes. A VIP announced there could
+never be advertised.
 
-The agent therefore treats such a VIP as **dormant**: it installs no
-`<vip>/32` kernel route and no FRR static route, and reports the condition
-once at INFO level:
+Because a VIP's announce path is now the connected route of its address on
+`port_forward_dev`, the only lever that model leaves is the address itself.
+The agent therefore treats such a VIP as **dormant**: it **withholds the VIP
+address** from `port_forward_dev` (so no connected route exists to export),
+installs no `<vip>/32` kernel route, and reports the condition once at INFO
+level:
 
 ```
 port-forward VIPs are dormant on this node — no locally active routers,
-so they cannot be advertised and no routes are installed
+so they cannot be advertised and their address is withheld from the
+port-forward device
 ```
 
-The DNAT plane is *not* withheld. The nftables rules, the VIP address on
-`port_forward_dev`, the conntrack zones, and the policy routing are all
-still asserted, so a gateway that later gains a local router only needs the
-announce — the data path is already in place. When that happens the agent
-logs `port-forward VIPs are no longer dormant` and installs the routes on
-the next reconcile.
+The DNAT plane is *not* withheld. The nftables rules, the conntrack zones,
+and the policy routing are all still asserted, so a gateway that later gains
+a local router only needs the address and the announce — the DNAT data path
+is already in place. When that happens the agent logs `port-forward VIPs are
+no longer dormant` and restores the address (and its kernel route) on the
+next reconcile.
 
 Port-forward-only mode never takes the standby path, so its VIPs are never
 dormant — a pure VIP-service node serves them without any OVN state at all.
 
-::: tip Why not install the route anyway?
-It was installed unconditionally before, and the result was an FRR static
-route that zebra never selected: not advertised, but present. That held
-`ovn_network_agent_inactive_routes` at a non-zero value — which the shipped
-`OVNNetworkAgentInactiveRoutes` alert fires on — and logged
+::: tip Why withhold the address rather than the route?
+The connected route of a local address always wins over a static to the same
+`/32`, so the agent no longer writes a VIP static at all — the connected
+route is the single announce path. That leaves the address as the only thing
+to withhold. Withholding it is also belt-and-suspenders with the BGP config:
+`redistribute connected` runs through a route-map matching `ANNOUNCED-NETWORKS`,
+and on a standby that list is empty, so even a briefly-present address would
+not be exported. The earlier design installed an FRR static unconditionally,
+which zebra never selected (the connected route shadowed it): not advertised,
+but present. That held `ovn_network_agent_inactive_routes` at a non-zero value
+— which the shipped `OVNNetworkAgentInactiveRoutes` alert fires on — and logged
 `FRR static routes are configured but inactive` at ERROR level on every
 reconcile, indefinitely.
 :::

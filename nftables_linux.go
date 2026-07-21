@@ -50,9 +50,20 @@ func (rm *RouteManager) SetupPortForward() error {
 		return fmt.Errorf("nft binary not found in PATH (required for port forwarding): %w", err)
 	}
 
-	// 1. Manage VIP addresses on loopback device.
-	if err := rm.reconcilePortForwardVIPs(); err != nil {
-		return fmt.Errorf("manage VIP addresses: %w", err)
+	// 1. Manage VIP addresses on the port-forward device. In port-forward-only
+	// mode the VIPs are always announceable, so ensure them at startup. In full
+	// mode announceability is unknown before the first OVN snapshot, so only
+	// verify the device exists — preserving the fail-fast the gwnode entrypoint
+	// documents — and neither add nor remove addresses: deleting one would blip
+	// the VIP across an agent restart on an active gateway, adding one would
+	// announce from a standby. The first reconcile settles the address once the
+	// OVN view is in.
+	if rm.cfg.PortForwardOnly {
+		if err := rm.reconcilePortForwardVIPs(true); err != nil {
+			return fmt.Errorf("manage VIP addresses: %w", err)
+		}
+	} else if _, err := netlink.LinkByName(rm.cfg.PortForwardDev); err != nil {
+		return fmt.Errorf("find device %s: %w", rm.cfg.PortForwardDev, err)
 	}
 
 	// 2. Apply nftables ruleset (initial, without provider networks or SNAT IPs).
@@ -84,16 +95,20 @@ func (rm *RouteManager) SetupPortForward() error {
 // veth leak return traffic in addition to DNAT return traffic).
 // snatIPs are the router SNAT external IPs from OVN state, used for
 // router_masquerade rules.
-func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snatIPs []string) error {
+// announceVIPs gates the managed VIP addresses: true adds any missing /32 so
+// its connected route is exported, false withholds them (dormancy, #206). The
+// caller derives it from vipRoutesAnnounceable, the same value it hands
+// computeDesiredState, so the address and the route plane never disagree.
+func (rm *RouteManager) ReconcilePortForward(providerNetworks []*net.IPNet, snatIPs []string, announceVIPs bool) error {
 	if !rm.cfg.PortForwardEnabled {
 		return nil
 	}
 	if rm.cfg.DryRun {
-		slog.Info("[dry-run] would reconcile port forwarding", "vips", len(rm.cfg.PortForwards))
+		slog.Info("[dry-run] would reconcile port forwarding", "vips", len(rm.cfg.PortForwards), "announce_vips", announceVIPs)
 		return nil
 	}
 
-	if err := rm.reconcilePortForwardVIPs(); err != nil {
+	if err := rm.reconcilePortForwardVIPs(announceVIPs); err != nil {
 		return fmt.Errorf("reconcile VIP addresses: %w", err)
 	}
 	if err := rm.applyNftRuleset(providerNetworks, snatIPs); err != nil {
@@ -278,12 +293,36 @@ func (rm *RouteManager) cleanupDNATRouting() {
 	}
 }
 
-// reconcilePortForwardVIPs ensures managed VIP /32 addresses are present on the
-// loopback device. Uses AddrReplace for idempotency.
-func (rm *RouteManager) reconcilePortForwardVIPs() error {
+// reconcilePortForwardVIPs brings the managed VIP /32 addresses on
+// port_forward_dev into line with announceVIPs.
+//
+// The VIP's own connected route on this device (administrative distance 0) is
+// its BGP announce path — it always wins over a static to the same /32 — so the
+// address is the only dormancy lever the model leaves (#206). When announceVIPs
+// is true it adds any missing ManageVIP address and leaves present ones alone:
+// add-if-missing, not the per-cycle AddrReplace it used to run, which recreated
+// zebra's connected route on every reconcile (the ~2s route ages seen in
+// artifact dumps). When false it deletes each managed address, treating an
+// already-absent one (EADDRNOTAVAIL) as done; any other delete error is a real
+// one and is surfaced. VIPs with ManageVIP off are never touched either way.
+func (rm *RouteManager) reconcilePortForwardVIPs(announceVIPs bool) error {
 	link, err := netlink.LinkByName(rm.cfg.PortForwardDev)
 	if err != nil {
 		return fmt.Errorf("find device %s: %w", rm.cfg.PortForwardDev, err)
+	}
+
+	// On the announce path, list the device's addresses once so we only write
+	// the genuinely missing /32s (the check-then-add shape of ensureIPOnDev).
+	var present map[string]bool
+	if announceVIPs {
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		if err != nil {
+			return fmt.Errorf("list addrs on %s: %w", rm.cfg.PortForwardDev, err)
+		}
+		present = make(map[string]bool, len(addrs))
+		for _, a := range addrs {
+			present[a.IP.String()] = true
+		}
 	}
 
 	for _, pf := range rm.cfg.PortForwards {
@@ -294,10 +333,22 @@ func (rm *RouteManager) reconcilePortForwardVIPs() error {
 		addr := &netlink.Addr{
 			IPNet: &net.IPNet{IP: vipIP, Mask: net.CIDRMask(32, 32)},
 		}
-		if err := netlink.AddrReplace(link, addr); err != nil {
+		if !announceVIPs {
+			// Dormant: withhold the address. Already absent is the end state.
+			if err := netlink.AddrDel(link, addr); err != nil && !isNoSuchAddr(err) {
+				return fmt.Errorf("remove VIP %s: %w", pf.VIP, err)
+			}
+			slog.Debug("VIP address withheld while dormant", "vip", pf.VIP, "dev", rm.cfg.PortForwardDev)
+			continue
+		}
+		if present[vipIP.String()] {
+			slog.Debug("VIP address already present", "vip", pf.VIP, "dev", rm.cfg.PortForwardDev)
+			continue
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil && !isFileExists(err) {
 			return fmt.Errorf("add VIP %s/32 to %s: %w", pf.VIP, rm.cfg.PortForwardDev, err)
 		}
-		slog.Debug("VIP address ensured", "vip", pf.VIP, "dev", rm.cfg.PortForwardDev)
+		slog.Info("VIP address added", "vip", pf.VIP, "dev", rm.cfg.PortForwardDev)
 	}
 	return nil
 }

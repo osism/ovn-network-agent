@@ -39,9 +39,25 @@ type desiredState struct {
 	// because they are not IPv4, sorted. Reported by reconcile at debug level.
 	ExcludedNonV4 []string
 
-	// DesiredIPs is HairpinIPs plus the port-forward VIPs, deduplicated and
-	// sorted. This is the set that gets kernel routes and FRR announcements.
+	// DesiredIPs is HairpinIPs plus the announceable port-forward VIPs,
+	// deduplicated and sorted. This is the set that gets a kernel /32 route on
+	// the provider bridge. The VIPs are announced through their own connected
+	// route on port_forward_dev (a local address, administrative distance 0),
+	// not through an FRR static — the static would be shadowed by that
+	// connected route and never selected — so DesiredIPs is a superset of
+	// FRRStaticIPs by exactly the announceable VIPs.
 	DesiredIPs []string
+
+	// FRRStaticIPs is the subset of DesiredIPs that gets an FRR static route
+	// via the agent's veth next-hop: the OVN-derived IPv4 addresses
+	// (HairpinIPs) only, deduplicated and sorted. Port-forward VIPs are
+	// deliberately excluded — a VIP's connected route on port_forward_dev
+	// always wins over a static to the same /32, so the static would sit in
+	// FRR unadvertised and hold ovn_network_agent_inactive_routes non-zero.
+	// The VIP announces through the connected route instead, and dormancy
+	// (#206) is enforced by withholding the address, not the route. Empty in
+	// port-forward-only mode, where the zero OVNState yields no HairpinIPs.
+	FRRStaticIPs []string
 
 	// DormantVIPs lists the configured port-forward VIPs left out of
 	// DesiredIPs because this node cannot advertise them, sorted. Reported by
@@ -136,15 +152,20 @@ func splitIPv4(targets map[string]HairpinTarget) (v4, nonV4 []string) {
 // announceVIPs decides whether the configured port-forward VIPs join the route
 // plane this cycle; reconcile derives it from whether this node maintains the
 // FRR prefix-list that would permit them (see vipRoutesAnnounceable). When it is
-// false the VIPs are reported as DormantVIPs instead: no kernel route, no FRR
-// static route, and nothing for the inactive-route check to alarm on.
+// false the VIPs are reported as DormantVIPs instead — their address is withheld
+// from port_forward_dev (see nftables_linux.go), so nothing is announced. The
+// VIPs never join FRRStaticIPs in either case: they announce through their
+// connected route, not a static.
 func computeDesiredState(state OVNState, portForwards []PortForwardVIP, announceVIPs bool) desiredState {
 	targets := buildHairpinTargets(state)
 	hairpinIPs, excludedNonV4 := splitIPv4(targets)
 	segments, segmentByName := buildDesiredSegments(state.LocalRouters)
 
-	// desiredIPs extends hairpinIPs with the port-forward VIPs — these need
-	// kernel routes on br-ex and FRR static routes for BGP announcement.
+	// desiredIPs extends hairpinIPs with the announceable port-forward VIPs.
+	// hairpinIPs (the OVN-derived FIP/SNAT/gateway addresses) get both a kernel
+	// route on the provider bridge and an FRR static route; the VIPs get a
+	// kernel /32 on the bridge but announce through their connected route on
+	// port_forward_dev, so they join DesiredIPs but never FRRStaticIPs.
 	desiredIPs := make([]string, 0, len(hairpinIPs)+len(portForwards))
 	desiredIPs = append(desiredIPs, hairpinIPs...)
 	var dormantVIPs []string
@@ -163,6 +184,7 @@ func computeDesiredState(state OVNState, portForwards []PortForwardVIP, announce
 		HairpinIPs:     hairpinIPs,
 		ExcludedNonV4:  excludedNonV4,
 		DesiredIPs:     uniqueIPs(desiredIPs),
+		FRRStaticIPs:   uniqueIPs(hairpinIPs),
 		DormantVIPs:    uniqueIPs(dormantVIPs),
 	}
 }

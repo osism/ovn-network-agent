@@ -109,7 +109,7 @@ func TestVerifyRoutesDryRun(t *testing.T) {
 	// lists (nil, nil). This means verifyRoutes sees every desired IP as
 	// missing and attempts re-adds — but those are also dry-run no-ops.
 	// This is by design: we exercise the full code path without side effects.
-	n := a.verifyRoutes([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil)
+	n := a.verifyRoutes([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil)
 	if n != 6 { // 3 FRR + 3 kernel
 		t.Errorf("expected 6 re-adds in dry-run, got %d", n)
 	}
@@ -129,7 +129,7 @@ func TestVerifyRoutesVerifiesDesiredRegardlessOfFilters(t *testing.T) {
 
 	// Two IPs outside the manual filter. In dry-run every list call returns
 	// empty, so each desired IP is seen as missing → 2 FRR + 2 kernel re-adds.
-	n := a.verifyRoutes([]string{"192.168.1.1", "172.16.0.1"}, nil, nil)
+	n := a.verifyRoutes([]string{"192.168.1.1", "172.16.0.1"}, []string{"192.168.1.1", "172.16.0.1"}, nil, nil)
 	if n != 4 {
 		t.Errorf("expected 4 re-adds for desired IPs outside the filter, got %d", n)
 	}
@@ -140,10 +140,10 @@ func TestVerifyRoutesEmptyDesired(t *testing.T) {
 	a := &Agent{routing: rm}
 
 	// Empty desired list should be a no-op.
-	if n := a.verifyRoutes(nil, nil, nil); n != 0 {
+	if n := a.verifyRoutes(nil, nil, nil, nil); n != 0 {
 		t.Errorf("expected 0 re-adds for nil desired, got %d", n)
 	}
-	if n := a.verifyRoutes([]string{}, nil, nil); n != 0 {
+	if n := a.verifyRoutes([]string{}, nil, nil, nil); n != 0 {
 		t.Errorf("expected 0 re-adds for empty desired, got %d", n)
 	}
 }
@@ -160,14 +160,14 @@ func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
 	// always reports all routes as missing since list calls return nil).
 	desired := []string{"10.0.0.1"}
 	for i := 1; i <= 5; i++ {
-		a.verifyRoutes(desired, nil, nil)
+		a.verifyRoutes(desired, desired, nil, nil)
 		if a.consecutiveReAdds != i {
 			t.Errorf("after cycle %d: expected consecutiveReAdds=%d, got %d", i, i, a.consecutiveReAdds)
 		}
 	}
 
 	// A cycle with an empty desired set (nothing to re-add) resets the counter.
-	a.verifyRoutes(nil, nil, nil)
+	a.verifyRoutes(nil, nil, nil, nil)
 	if a.consecutiveReAdds != 0 {
 		t.Errorf("expected consecutiveReAdds=0 after clean cycle, got %d", a.consecutiveReAdds)
 	}
@@ -228,13 +228,13 @@ func TestVerifyRoutesRepairsUnresolvableNexthop(t *testing.T) {
 	// Below the threshold the fault is not yet established: a single missing
 	// route is an ordinary race and must not cost an address flap.
 	for i := 1; i < consecutiveReAddThreshold; i++ {
-		a.verifyRoutes(desired, nil, nil)
+		a.verifyRoutes(desired, desired, nil, nil)
 		if len(*refreshed) != 0 {
 			t.Fatalf("repair ran after %d cycle(s), want none before the threshold of %d", i, consecutiveReAddThreshold)
 		}
 	}
 
-	a.verifyRoutes(desired, nil, nil)
+	a.verifyRoutes(desired, desired, nil, nil)
 	if len(*refreshed) != 1 {
 		t.Fatalf("repair ran %d times at the threshold, want 1", len(*refreshed))
 	}
@@ -243,7 +243,7 @@ func TestVerifyRoutesRepairsUnresolvableNexthop(t *testing.T) {
 	}
 
 	// Still broken on the next cycle: the diagnosis repeats, the flap does not.
-	a.verifyRoutes(desired, nil, nil)
+	a.verifyRoutes(desired, desired, nil, nil)
 	if len(*refreshed) != 1 {
 		t.Errorf("repair ran %d times, want 1 — the cooldown must suppress the second attempt", len(*refreshed))
 	}
@@ -251,7 +251,7 @@ func TestVerifyRoutesRepairsUnresolvableNexthop(t *testing.T) {
 	// Once the cooldown has elapsed the agent tries again: a flap that did not
 	// take must not leave the data plane down for good.
 	a.lastNexthopRepair = time.Now().Add(-2 * nexthopRepairCooldown)
-	a.verifyRoutes(desired, nil, nil)
+	a.verifyRoutes(desired, desired, nil, nil)
 	if len(*refreshed) != 2 {
 		t.Errorf("repair ran %d times after the cooldown elapsed, want 2", len(*refreshed))
 	}
@@ -266,7 +266,7 @@ func TestVerifyRoutesLeavesResolvableNexthopAlone(t *testing.T) {
 	desired := []string{"192.0.2.1"}
 
 	for i := 0; i < consecutiveReAddThreshold+2; i++ {
-		a.verifyRoutes(desired, nil, nil)
+		a.verifyRoutes(desired, desired, nil, nil)
 	}
 	if a.consecutiveReAdds < consecutiveReAddThreshold {
 		t.Fatalf("consecutiveReAdds = %d, want the instability detector to have fired", a.consecutiveReAdds)
@@ -284,7 +284,7 @@ func TestRepairUnresolvableNexthopSkipsWhenVethLeakDisabled(t *testing.T) {
 	a.cfg.VethLeakEnabled = false
 
 	for i := 0; i < consecutiveReAddThreshold+1; i++ {
-		a.verifyRoutes([]string{"192.0.2.1"}, nil, nil)
+		a.verifyRoutes([]string{"192.0.2.1"}, []string{"192.0.2.1"}, nil, nil)
 	}
 	if len(*refreshed) != 0 {
 		t.Errorf("repair ran %d times with veth leak disabled, want 0", len(*refreshed))
@@ -320,7 +320,7 @@ func TestEnsureRoutesDevMismatchDoesNotWithdrawFRR(t *testing.T) {
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
-	a.ensureRoutes([]string{"198.51.100.10"}, map[string]string{"198.51.100.10": "br-ex.101"}, nil)
+	a.ensureRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, map[string]string{"198.51.100.10": "br-ex.101"}, nil)
 
 	for _, c := range rec.calls {
 		joined := strings.Join(c, " ")
@@ -349,7 +349,7 @@ func TestEnsureRoutesStaleEntryRemovedWithItsDevice(t *testing.T) {
 	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
 	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
-	a.ensureRoutes(nil, nil, nil)
+	a.ensureRoutes(nil, nil, nil, nil)
 
 	sawDel := false
 	for _, c := range rec.calls {
@@ -381,13 +381,13 @@ func TestVerifyRoutesDetectsDevMismatch(t *testing.T) {
 	// The route exists but on the wrong device — one kernel re-add expected
 	// (the AddKernelRoute itself fails on the synthetic bridge, which is
 	// fine: the count is what matters).
-	n := a.verifyRoutes([]string{"198.51.100.10"}, map[string]string{"198.51.100.10": "br-ex.101"}, nil)
+	n := a.verifyRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, map[string]string{"198.51.100.10": "br-ex.101"}, nil)
 	if n != 1 {
 		t.Errorf("expected 1 re-add for dev mismatch, got %d", n)
 	}
 
 	// With the device matching, no re-adds.
-	n = a.verifyRoutes([]string{"198.51.100.10"}, nil, nil)
+	n = a.verifyRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, nil, nil)
 	if n != 0 {
 		t.Errorf("expected 0 re-adds when device matches, got %d", n)
 	}
@@ -502,7 +502,7 @@ func TestVerifyRoutesLeavesUnresolvedVLANRouteInPlace(t *testing.T) {
 	a := &Agent{cfg: Config{BridgeDev: "ovnagent-nonexistent-br"}, routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
 	skip := map[string]bool{"198.51.100.10": true}
-	if n := a.verifyRoutes([]string{"198.51.100.10"}, nil, skip); n != 0 {
+	if n := a.verifyRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, nil, skip); n != 0 {
 		t.Errorf("unresolved VLAN segment must leave the FIP route in place, got %d re-adds", n)
 	}
 }
@@ -566,6 +566,104 @@ func TestReconcileWritesMarkerAfterSuccessfulAnnounce(t *testing.T) {
 	if !hasMarkerUpdate(nb.writeTransacts(), "host-a") {
 		t.Fatalf("reconcile did not stamp the takeover marker for host-a; writes: %v", nb.writeTransacts())
 	}
+}
+
+// TestReconcileWithdrawsPreUpgradeVIPStaticAndAddsNoVIPStatic pins the
+// announce-path switch (#223). A port-forward VIP is advertised through its
+// connected route on port_forward_dev, never an FRR static — the static a
+// pre-upgrade agent wrote is permanently shadowed by that connected route and
+// so was never advertised. On the first cycle after the upgrade the agent must
+// therefore (a) issue no `ip route <vip>/32` add — the VIP is no longer in the
+// FRR-static set — and (b) withdraw the stale static through the orphan path
+// that compares ListFRRRoutes against FRRStaticIPs. The VIP's kernel /32 is
+// pre-seeded so AddKernelRoute is never called and the route is kept.
+//
+// Both modes are covered: full mode, where the VIP is announceable because a
+// local router is active, and port-forward-only mode, where FRRStaticIPs is
+// empty so every listed static is an orphan and withdrawn.
+func TestReconcileWithdrawsPreUpgradeVIPStaticAndAddsNoVIPStatic(t *testing.T) {
+	const (
+		vip    = "203.0.113.10"
+		bridge = "ovnagent-nonexistent-br"
+	)
+
+	assertNoAddButWithdraw := func(t *testing.T, rec *vtyshRecorder) {
+		t.Helper()
+		var added, withdrew bool
+		for _, call := range rec.calls {
+			joined := strings.Join(call, " ")
+			if strings.Contains(joined, "ip route "+vip+"/32") && !strings.Contains(joined, "no ip route") {
+				added = true
+			}
+			if strings.Contains(joined, "no ip route "+vip+"/32") {
+				withdrew = true
+			}
+		}
+		if added {
+			t.Errorf("a VIP must never get an FRR static (it announces through its connected route); calls: %v", rec.calls)
+		}
+		if !withdrew {
+			t.Errorf("the pre-upgrade VIP static must be withdrawn on the first cycle; calls: %v", rec.calls)
+		}
+	}
+
+	newRM := func(rec *vtyshRecorder) *RouteManager {
+		return &RouteManager{
+			cfg:           Config{BridgeDev: bridge, VRFName: "vrf-provider", VethNexthop: "169.254.0.1"},
+			execVtyshHook: rec.hook(),
+			execOVSHook: func(*exec.Cmd) ([]byte, error) {
+				return nil, errors.New("test: no ovs available")
+			},
+			// The VIP's /32 already sits on the bridge, so ensureRoutes never
+			// calls the Linux-only AddKernelRoute and the kernel route is kept.
+			listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+				return []kernelRouteEntry{{IP: vip, Dev: bridge}}, nil
+			},
+		}
+	}
+
+	seedStatic := func(rec *vtyshRecorder) {
+		// A pre-upgrade agent left the VIP's static via the agent's veth nexthop.
+		rec.on(
+			[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+			frrStaticRoutesJSON("169.254.0.1", vip),
+			nil,
+		)
+	}
+
+	t.Run("full mode", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		seedStatic(rec)
+		c, _, _ := newOVNClientWithFakes(t, "host-a")
+		c.state.Replace(OVNState{
+			LocalRouters:    []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1"}},
+			HasLocalRouters: true,
+		})
+		a := &Agent{
+			cfg:            Config{BridgeDev: bridge, PortForwards: []PortForwardVIP{{VIP: vip, ManageVIP: true}}},
+			ovn:            c,
+			routing:        newRM(rec),
+			reconcileCh:    make(chan struct{}, 1),
+			missingChassis: make(map[string]time.Time),
+		}
+		a.reconcile(context.Background(), "test")
+		assertNoAddButWithdraw(t, rec)
+	})
+
+	t.Run("port-forward-only mode", func(t *testing.T) {
+		rec := newVtyshRecorder()
+		seedStatic(rec)
+		rm := newRM(rec)
+		rm.cfg.PortForwardOnly = true
+		a := &Agent{
+			cfg:            Config{PortForwardOnly: true, BridgeDev: bridge, PortForwards: []PortForwardVIP{{VIP: vip, ManageVIP: true}}},
+			routing:        rm,
+			reconcileCh:    make(chan struct{}, 1),
+			missingChassis: make(map[string]time.Time),
+		}
+		a.reconcile(context.Background(), "test")
+		assertNoAddButWithdraw(t, rec)
+	})
 }
 
 // TestReconcileMixedFamilyAnnouncesV4AndWritesMarker drives a non-dry-run
@@ -943,7 +1041,7 @@ func TestEnsureRoutesAddsMissingAndRemovesStale(t *testing.T) {
 	a := &Agent{routing: rm, effectiveFilters: []*net.IPNet{cidr}}
 
 	// Desired: 198.51.100.10 (new) and 198.51.100.20 (already in FRR).
-	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, nil, nil)
+	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, []string{"198.51.100.10", "198.51.100.20"}, nil, nil)
 	if !res.changed {
 		t.Error("routeSyncResult.changed = false, want true (routes were added and removed)")
 	}
@@ -994,7 +1092,7 @@ func TestEnsureRoutesReportsReadyOutcome(t *testing.T) {
 		rec := newVtyshRecorder()
 		// FRR reports no routes, so the desired IP is added and BGP refreshed;
 		// the recorder returns success for both.
-		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, nil, nil).ready {
 			t.Errorf("clean add cycle: ready = false, want true (calls: %v)", rec.calls)
 		}
 	})
@@ -1005,7 +1103,7 @@ func TestEnsureRoutesReportsReadyOutcome(t *testing.T) {
 		// removed, so no BGP refresh runs and the cycle is still ready.
 		rec.on([]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
 			frrStaticRoutesJSON("169.254.0.1", "198.51.100.10"), nil)
-		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+		if !newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, nil, nil).ready {
 			t.Errorf("no-change cycle: ready = false, want true (calls: %v)", rec.calls)
 		}
 	})
@@ -1015,7 +1113,7 @@ func TestEnsureRoutesReportsReadyOutcome(t *testing.T) {
 		rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
 			"-c", "ip route 198.51.100.10/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
 			"", errors.New("vtysh add failed"))
-		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, nil, nil).ready {
 			t.Errorf("FRR add failure: ready = true, want false")
 		}
 	})
@@ -1024,7 +1122,7 @@ func TestEnsureRoutesReportsReadyOutcome(t *testing.T) {
 		rec := newVtyshRecorder()
 		rec.on([]string{"vtysh", "-c", "clear ip bgp vrf vrf-provider * soft out"},
 			"", errors.New("bgp refresh failed"))
-		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, nil, nil).ready {
+		if newAgent(rec).ensureRoutes([]string{"198.51.100.10"}, []string{"198.51.100.10"}, nil, nil).ready {
 			t.Errorf("BGP refresh failure: ready = true, want false")
 		}
 	})
@@ -1061,6 +1159,7 @@ func inactiveRoutesGauge(t *testing.T, m *metricsRegistry) float64 {
 // caught by the "vtysh error keeps gauge" subtest.
 func TestCheckFRRRouteActivity(t *testing.T) {
 	const fip = "198.51.100.10"
+	const vip = "203.0.113.10"
 	const jsonCmd = "show ip route vrf vrf-provider static json"
 	newAgent := func(rec *vtyshRecorder) *Agent {
 		rm := &RouteManager{cfg: Config{VRFName: "vrf-provider"}, execVtyshHook: rec.hook()}
@@ -1118,6 +1217,32 @@ func TestCheckFRRRouteActivity(t *testing.T) {
 			t.Errorf("gauge with a healthy route = %v, want 0", got)
 		}
 	})
+
+	// #223: the activity check runs on the FRR-static set, never on a VIP. A
+	// pre-upgrade agent may have left an inactive static for the VIP in FRR, but
+	// reconcile passes only frrStaticIPs (the OVN-derived set) here — the VIP is
+	// announced through its connected route, so it is not in that set and can
+	// never reach InactiveFRRRoutes to hold the gauge non-zero.
+	t.Run("announceable VIP is not in the FRR set and never alarms", func(t *testing.T) {
+		m := withTestMetrics(t)
+		logs := captureSlog(t)
+
+		rec := newVtyshRecorder()
+		// FRR still carries an inactive static for the VIP; the OVN-derived FIP
+		// the reconcile actually checks is healthy.
+		rec.on([]string{"vtysh", "-c", jsonCmd},
+			`{"`+vip+`/32":[{"prefix":"`+vip+`/32","protocol":"static"}],`+
+				`"`+fip+`/32":[{"prefix":"`+fip+`/32","protocol":"static","selected":true,"installed":true}]}`, nil)
+		// The set passed is frrStaticIPs — the FIP only, never the VIP.
+		newAgent(rec).checkFRRRouteActivity([]string{fip})
+
+		if got := inactiveRoutesGauge(t, m); got != 0 {
+			t.Errorf("gauge = %v, want 0 — the VIP's static is not in the checked set", got)
+		}
+		if strings.Contains(logs.String(), "FRR static routes are configured but inactive") {
+			t.Errorf("an announceable VIP must never raise the inactive-route alarm; logs:\n%s", logs.String())
+		}
+	})
 }
 
 // TestEnsureRoutesKeepsAnnounceSeparateFromRouteAdd verifies that a takeover
@@ -1136,7 +1261,7 @@ func TestEnsureRoutesKeepsAnnounceSeparateFromRouteAdd(t *testing.T) {
 	rm := &RouteManager{cfg: Config{BridgeDev: "ovnagent-nonexistent-br", VRFName: "vrf-provider", VethNexthop: "169.254.0.1"}, execVtyshHook: rec.hook()}
 	a := &Agent{routing: rm}
 
-	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, nil, nil)
+	res := a.ensureRoutes([]string{"198.51.100.10", "198.51.100.20"}, []string{"198.51.100.10", "198.51.100.20"}, nil, nil)
 	if !res.announced || !res.changed {
 		t.Fatalf("routeSyncResult = %+v, want changed+announced", res)
 	}
@@ -1907,7 +2032,7 @@ func TestEnsureRoutesRemovalOnlyIsNotAnnounce(t *testing.T) {
 	}
 
 	// Disjoint desired set: the stale /32 is withdrawn, nothing is added.
-	res := a.ensureRoutes(nil, nil, nil)
+	res := a.ensureRoutes(nil, nil, nil, nil)
 	if !res.changed {
 		t.Errorf("changed = false, want true — the stale /32 was withdrawn")
 	}
@@ -1959,7 +2084,7 @@ func TestEnsureRoutesAnnounceReportsOutcomeNotIntent(t *testing.T) {
 				missingChassis: make(map[string]time.Time),
 			}
 
-			res := a.ensureRoutes([]string{"198.51.100.7"}, nil, nil)
+			res := a.ensureRoutes([]string{"198.51.100.7"}, []string{"198.51.100.7"}, nil, nil)
 			if !res.changed {
 				t.Error("changed = false, want true — the cycle still touched FRR, so verification must run")
 			}

@@ -583,8 +583,19 @@ configure_gateway_frr() {
         local node="clab-${LAB_NAME}-${gw}"
         local upstream_ip="${upstream_cidr%/*}"
         log "configuring ${gw} FRR (BGP neighbor ${upstream_ip} in vrf-provider)"
+        # redistribute connected via ANNOUNCE-CONNECTED is the port-forward
+        # VIP's announce path (#223): the VIP is a local /32 on
+        # port_forward_dev, so its connected route — filtered through a
+        # route-map matching ANNOUNCED-NETWORKS — is what BGP exports. The
+        # route-map form is deliberate: on a standby the agent deletes
+        # ANNOUNCED-NETWORKS, and an undefined list inside a route-map `match`
+        # is a no-match that hits the terminal deny (exporting nothing),
+        # whereas a bare `redistribute connected` would leak the underlay /30s.
         docker exec -i "${node}" vtysh <<EOF
 configure terminal
+route-map ANNOUNCE-CONNECTED permit 10
+ match ip address prefix-list ANNOUNCED-NETWORKS
+exit
 no router bgp ${BGP_ASN_GATEWAYS} vrf vrf-provider
 router bgp ${BGP_ASN_GATEWAYS} vrf vrf-provider
  bgp router-id ${upstream_ip%.*}.2
@@ -593,6 +604,7 @@ router bgp ${BGP_ASN_GATEWAYS} vrf vrf-provider
  neighbor ${upstream_ip} remote-as ${BGP_ASN_UPSTREAM}
  address-family ipv4 unicast
   redistribute static
+  redistribute connected route-map ANNOUNCE-CONNECTED
   neighbor ${upstream_ip} activate
   neighbor ${upstream_ip} prefix-list ANNOUNCED-NETWORKS out
  exit-address-family

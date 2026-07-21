@@ -167,6 +167,19 @@ func TestComputeDesiredState(t *testing.T) {
 	if want := []string{"198.51.100.50"}; !reflect.DeepEqual(got.HairpinIPs, want) {
 		t.Errorf("HairpinIPs = %v, want %v (VIPs excluded, v6 excluded)", got.HairpinIPs, want)
 	}
+	// #223: the VIP is in DesiredIPs (kernel plane) but never in FRRStaticIPs —
+	// it announces through its connected route, not an FRR static. FRRStaticIPs
+	// equals HairpinIPs (the OVN-derived set).
+	if want := []string{"198.51.100.50"}; !reflect.DeepEqual(got.FRRStaticIPs, want) {
+		t.Errorf("FRRStaticIPs = %v, want %v (VIPs excluded, equal to HairpinIPs)", got.FRRStaticIPs, want)
+	}
+	for _, vip := range []string{"203.0.113.10"} {
+		for _, ip := range got.FRRStaticIPs {
+			if ip == vip {
+				t.Errorf("an announceable VIP %s must not appear in FRRStaticIPs %v", vip, got.FRRStaticIPs)
+			}
+		}
+	}
 	if want := []string{"2001:db8::50"}; !reflect.DeepEqual(got.ExcludedNonV4, want) {
 		t.Errorf("ExcludedNonV4 = %v, want %v", got.ExcludedNonV4, want)
 	}
@@ -176,6 +189,14 @@ func TestComputeDesiredState(t *testing.T) {
 	}
 	if len(got.Segments) != 1 || got.Segments[0].LocalnetPort != "physnet1-port" {
 		t.Errorf("Segments = %+v, want the single physnet1-port segment", got.Segments)
+	}
+
+	// With no port forwards at all, FRRStaticIPs equals HairpinIPs — there is no
+	// VIP to exclude, and the OVN-derived set is exactly what gets a static.
+	noForwards := computeDesiredState(state, nil, true)
+	if !reflect.DeepEqual(noForwards.FRRStaticIPs, noForwards.HairpinIPs) {
+		t.Errorf("FRRStaticIPs = %v, want it to equal HairpinIPs %v when portForwards is empty",
+			noForwards.FRRStaticIPs, noForwards.HairpinIPs)
 	}
 }
 
@@ -187,6 +208,11 @@ func TestComputeDesiredStatePortForwardOnly(t *testing.T) {
 
 	if want := []string{"203.0.113.10"}; !reflect.DeepEqual(got.DesiredIPs, want) {
 		t.Errorf("DesiredIPs = %v, want %v", got.DesiredIPs, want)
+	}
+	// #223: in port-forward-only mode the zero OVNState yields no HairpinIPs, so
+	// FRRStaticIPs is empty — the VIP announces through its connected route.
+	if len(got.FRRStaticIPs) != 0 {
+		t.Errorf("FRRStaticIPs = %v, want empty in port-forward-only mode", got.FRRStaticIPs)
 	}
 	if len(got.HairpinTargets) != 0 {
 		t.Errorf("HairpinTargets = %v, want empty with no OVN state", got.HairpinTargets)
@@ -213,6 +239,11 @@ func TestComputeDesiredStateDormantVIPs(t *testing.T) {
 	if len(got.DesiredIPs) != 0 {
 		t.Errorf("DesiredIPs = %v, want empty — dormant VIPs get no routes", got.DesiredIPs)
 	}
+	// A dormant VIP is never an FRR static either — it is withheld by address,
+	// not by route (#223), and FRRStaticIPs is the OVN-derived set, empty here.
+	if len(got.FRRStaticIPs) != 0 {
+		t.Errorf("FRRStaticIPs = %v, want empty — a dormant VIP gets no static", got.FRRStaticIPs)
+	}
 	if want := []string{"192.0.2.99", "203.0.113.10"}; !reflect.DeepEqual(got.DormantVIPs, want) {
 		t.Errorf("DormantVIPs = %v, want %v (deduped, sorted)", got.DormantVIPs, want)
 	}
@@ -230,6 +261,11 @@ func TestComputeDesiredStateDormantVIPsKeepFIPs(t *testing.T) {
 
 	if want := []string{"198.51.100.50"}; !reflect.DeepEqual(got.DesiredIPs, want) {
 		t.Errorf("DesiredIPs = %v, want %v — the FIP stays, only the VIP is dormant", got.DesiredIPs, want)
+	}
+	// The FIP keeps its FRR static; the dormant VIP was never one. FRRStaticIPs
+	// equals HairpinIPs (the FIP alone).
+	if want := []string{"198.51.100.50"}; !reflect.DeepEqual(got.FRRStaticIPs, want) {
+		t.Errorf("FRRStaticIPs = %v, want %v — the FIP static stays, the VIP is not one", got.FRRStaticIPs, want)
 	}
 	if want := []string{"203.0.113.10"}; !reflect.DeepEqual(got.DormantVIPs, want) {
 		t.Errorf("DormantVIPs = %v, want %v", got.DormantVIPs, want)

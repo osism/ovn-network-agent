@@ -146,10 +146,12 @@ type gatewayExpectation struct {
 	SkipKernel     bool
 
 	// FRRStatic is the set of /32 IPs expected as FRR static routes via the
-	// veth nexthop. It equals DesiredIPs in both modes: ensureRoutes manages
-	// FRR for every desired IP, active or standby, full or pf-only. On a
-	// full-mode standby that set is empty — the dormant VIPs are not in it,
-	// which is what keeps inactive_routes at 0 there (#206).
+	// veth nexthop: the OVN-derived hairpin set (NAT external IPs + LRP gateway
+	// IPs) only, never a port-forward VIP. A VIP announces through its connected
+	// route on PortForwardDev, not a static (#223) — a static to the same /32
+	// would be shadowed by that connected route and sit unadvertised, holding
+	// inactive_routes non-zero. Empty in pf-only mode (no OVN view) and on a
+	// full-mode standby (no locally-active routers).
 	FRRStatic []string
 
 	// PrefixList is the sorted set of CIDR strings the ANNOUNCED-NETWORKS
@@ -184,8 +186,12 @@ type gatewayExpectation struct {
 	// non-empty provider-network set, per buildNftRuleset's writeSNATChain).
 	HairpinMasquerade []string
 
-	// ManagedVIPs is the set of VIP addresses expected as /32 on
-	// PortForwardDev, for VIPs with manage_vip on. Empty otherwise.
+	// ManagedVIPs is the set of VIP addresses expected as /32 on PortForwardDev,
+	// for VIPs with manage_vip on — but only where the agent announces them:
+	// always in pf-only mode, in full mode only on an active gateway. On a
+	// full-mode standby the address is withheld (dormancy is now enforced by the
+	// address, not the route — #223/#206), so this is nil there. The connected
+	// route of a present address is the VIP's announce path.
 	ManagedVIPs    []string
 	PortForwardDev string
 
@@ -243,13 +249,15 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 	natIPs, lrpIPs, ipTag := ovnDesired(local, effective)
 	hairpin := sortedUnique(append(append([]string{}, natIPs...), lrpIPs...))
 
-	// Rule 4b (#206) — a port-forward VIP joins the route plane only where the
+	// Rule 4b (#206/#223) — a port-forward VIP is announceable only where the
 	// agent also maintains the prefix-list that would permit it: always in
 	// pf-only mode, in full mode only on an active gateway. On a full-mode
-	// standby the VIPs are dormant (agent.go vipRoutesAnnounceable): no kernel
-	// route, no FRR static route, so nothing can sit in FRR unadvertised and
-	// hold the inactive-routes gauge non-zero. The DNAT plane below is
-	// unaffected — dormancy withholds the routes, not the nftables rules.
+	// standby the VIP is dormant (agent.go vipRoutesAnnounceable): its address
+	// is withheld from PortForwardDev (see rule 11 ManagedVIPs) and it gets no
+	// kernel route, so nothing announces it. The FRR-static plane never carried
+	// the VIP in the first place — it announces through the connected route of
+	// its address, not a static. The DNAT plane below is unaffected: dormancy
+	// withholds the address, not the nftables rules.
 	routableVIPs := vips
 	if !pfOnly && !active {
 		routableVIPs = nil
@@ -257,10 +265,14 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 	desired := sortedUnique(append(append([]string{}, hairpin...), routableVIPs...))
 
 	exp := gatewayExpectation{
-		Mode:           mode,
-		Active:         active,
-		DesiredIPs:     desired,
-		FRRStatic:      desired, // rule 6 — FRR static routes are exactly the desired IPs, in both modes.
+		Mode:   mode,
+		Active: active,
+		// rule 5/12 — the kernel-route and announce-staleness plane: the
+		// OVN-derived IPs plus the announceable VIPs.
+		DesiredIPs: desired,
+		// rule 6 — FRR static routes are exactly the OVN-derived set; a VIP is
+		// never a static, it announces through its connected route (#223).
+		FRRStatic:      hairpin,
 		PortForwardDev: docString(doc, "port_forward_dev", "loopback1"),
 		MACTweakFlows:  -1,
 		AnnounceBound:  desired, // rule 12 — announced ⊆ desired always.
@@ -308,12 +320,16 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 		exp.MACTweakFlows = 2 * distinctSegments(local)
 	}
 
-	// Rules 10+11 — nftables. DNAT rules and managed-VIP addresses are managed
-	// independently of OVN state (ReconcilePortForward runs every cycle), so
-	// they follow the config alone.
+	// Rules 10+11 — nftables. The DNAT rules follow the config alone: they are
+	// managed independently of OVN state (ReconcilePortForward runs every
+	// cycle). The managed-VIP address is now the VIP's announce path (#223), so
+	// it is gated by announceability like the routes: present in pf-only mode or
+	// on a full-mode active gateway, withheld on a full-mode standby.
 	exp.DNAT = dnatExpectations(forwards)
 	exp.HairpinMasquerade = hairpinMasqueradeVIPs(forwards, effective)
-	exp.ManagedVIPs = managedVIPs(forwards)
+	if pfOnly || active {
+		exp.ManagedVIPs = managedVIPs(forwards)
+	}
 
 	// Rule 12 — announced presence bound.
 	switch {
