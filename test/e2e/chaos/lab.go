@@ -668,10 +668,14 @@ func (l *lab) verifyUnderlay(ctx context.Context, gw string, link underlayLink) 
 }
 
 // configureGatewayBGP replaces the placeholder BGP config the gwnode
-// entrypoint pushes on every container start with the real session
+// entrypoint seeds into a gateway that has none with the real session
 // against this gateway's upstream /30 — configure_gateway_frr in
 // bootstrap.sh. The block opens with `no router bgp ...`, so re-applying
 // it is self-cleaning.
+//
+// It no longer races the entrypoint for the last word: configure_frr
+// skips its placeholder whenever the VRF already carries a BGP router
+// (issue #218), so this config survives whichever of the two runs second.
 func (l *lab) configureGatewayBGP(ctx context.Context, gw string, link underlayLink) error {
 	upstreamIP := addrOf(link.upstreamCIDR)
 	routerID := addrOf(link.gatewayCIDR)

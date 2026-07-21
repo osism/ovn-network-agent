@@ -568,10 +568,15 @@ EOF
 }
 
 configure_gateway_frr() {
-    # The gwnode entrypoint pushes a placeholder BGP config with the
+    # The gwnode entrypoint seeds a placeholder BGP config with the
     # neighbour pinned to 192.0.2.1 (OVN's own LR port IP, which doesn't
     # speak BGP). That session can't establish; replace it now that the
     # underlay is up so each gateway peers with its specific upstream /30.
+    #
+    # The `write memory` below is what makes this the *last* word on the
+    # gateway's BGP config: a restarted container reloads it from
+    # /etc/frr/frr.conf, and the entrypoint only seeds the placeholder when
+    # it finds the VRF without a BGP router (issue #218).
     for entry in "${UNDERLAY_LINKS[@]}"; do
         local gw _gw_cidr _upstream_iface upstream_cidr
         read -r gw _gw_cidr _upstream_iface upstream_cidr <<<"${entry}"

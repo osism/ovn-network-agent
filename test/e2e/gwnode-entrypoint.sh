@@ -255,6 +255,11 @@ setup_loopback() {
 
 FRR_READY_ATTEMPTS="${FRR_READY_ATTEMPTS:-30}"
 FRR_CONFIG_ATTEMPTS="${FRR_CONFIG_ATTEMPTS:-30}"
+# The daemons the entrypoint's config is addressed to. configure_frr reads
+# the running config before it decides what to push, and vtysh renders that
+# config from the daemons it happened to reach — so all of these must be in
+# `show daemons` before the answer means anything. See frr_config_daemons_ready.
+FRR_CONFIG_DAEMONS="${FRR_CONFIG_DAEMONS:-zebra bgpd staticd}"
 # How many times start_frr may run the whole clean + start + probe cycle
 # before it gives up and lets PID 1 die. See the retry loop for why the
 # second attempt is worth its own FRR_READY_ATTEMPTS budget.
@@ -353,17 +358,81 @@ start_frr() {
     exit 1
 }
 
+# The daemons this vtysh invocation reached, one per line. `show daemons`
+# prints them space-separated on a single line.
+frr_connected_daemons() {
+    vtysh -c 'show daemons' 2>/dev/null | tr ' ' '\n' | sed '/^$/d'
+}
+
+# Whether vtysh reached every daemon in FRR_CONFIG_DAEMONS.
+#
+# This is the gate in front of the running-config read, and the whole
+# reason the read can be trusted. `show running-config` renders the config
+# of the daemons vtysh connected to at that moment: zebra answers first,
+# bgpd registers its vty socket a moment later — and a read that lands in
+# between reports no BGP block no matter what bgpd is at that instant
+# loading out of /etc/frr/frr.conf. Deciding "nothing configured, push the
+# placeholder" on that answer is exactly the clobber frr_config exists to
+# avoid, so the caller's retry loop waits the daemons out instead.
+frr_config_daemons_ready() {
+    local connected d
+    connected="$(frr_connected_daemons)" || return 1
+    for d in ${FRR_CONFIG_DAEMONS}; do
+        grep -qxF -- "${d}" <<<"${connected}" || return 1
+    done
+    return 0
+}
+
 # The config the agent expects, on stdin for vtysh: the prefix-list it
 # writes /32 entries into, and a vrf-provider BGP router with a
 # placeholder upstream neighbour. The neighbour does not need to
 # establish a session for the lab to come up — per issue #44 the upstream
 # peer may stay idle.
+#
+# Both of those are seeds for a container that has neither — not
+# assertions. This function runs on *every* container start, including the
+# ones that come back up with the real config already loaded (issue #218):
+# `write memory` in bootstrap.sh's configure_gateway_frr persists the real
+# BGP session into /etc/frr/frr.conf, the container filesystem survives
+# `docker restart`, so FRR reloads it long before the entrypoint gets
+# here. The push is additive — it never issues `no router bgp` first — so
+# landing it on top of the real config merges the two: the router-id is
+# reset to 127.0.0.1 (dropping and re-forming every established session)
+# and the dead 192.0.2.1 placeholder neighbour is re-added beside the real
+# one. Same story when the chaos harness's rewireUnderlay
+# (test/e2e/chaos/lab.go) reaches vtysh first after a gateway restart.
+#
+# So whatever the running config already carries wins, and only the
+# genuinely missing pieces are emitted. Opening the placeholder with `no
+# router bgp ... vrf ${VRF_NAME}` instead — self-cleaning, the way the two
+# writers of the real config are — was the alternative and is worse: it
+# would destroy the real config deterministically on every restart rather
+# than merging into it.
+#
+# `$1` is the current running config, read by configure_frr once the
+# daemons that own it are all up.
 frr_config() {
-    cat <<EOF
-configure terminal
-ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 0.0.0.0/0 ge 32 le 32
-vrf ${VRF_NAME}
-exit-vrf
+    local running="$1"
+    printf 'configure terminal\n'
+    # An empty vrf node renders as nothing in the running config, so there
+    # is no state to probe for here — and re-asserting it is a no-op.
+    printf 'vrf %s\nexit-vrf\n' "${VRF_NAME}"
+    if grep -q '^ip prefix-list ANNOUNCED-NETWORKS ' <<<"${running}"; then
+        # The agent owns the entries at runtime and replaces this seed with
+        # the real /32s, so re-seeding would put a permit-everything entry
+        # back underneath them until the next reconcile removes it again.
+        log "ANNOUNCED-NETWORKS already exists; leaving its entries to the agent"
+    else
+        printf 'ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 0.0.0.0/0 ge 32 le 32\n'
+    fi
+    # The ASN is a wildcard on purpose: the question is whether *any* BGP
+    # router already owns this VRF, and the two writers that install the
+    # real one (configure_gateway_frr in bootstrap.sh, configureGatewayBGP
+    # in test/e2e/chaos/lab.go) take their ASN from their own variables.
+    if grep -qE "^router bgp [0-9]+ vrf ${VRF_NAME}$" <<<"${running}"; then
+        log "BGP is already configured in vrf ${VRF_NAME}; not pushing the placeholder over it"
+    else
+        cat <<EOF
 router bgp 65000 vrf ${VRF_NAME}
  bgp router-id 127.0.0.1
  no bgp default ipv4-unicast
@@ -373,28 +442,35 @@ router bgp 65000 vrf ${VRF_NAME}
   neighbor 192.0.2.1 activate
   neighbor 192.0.2.1 prefix-list ANNOUNCED-NETWORKS out
  exit-address-family
-end
 EOF
+    fi
+    printf 'end\n'
 }
 
 configure_frr() {
-    log "pushing minimal FRR config (vrf ${VRF_NAME} + ANNOUNCED-NETWORKS)"
+    log "ensuring the FRR config the agent expects (vrf ${VRF_NAME} + ANNOUNCED-NETWORKS)"
     # `show version` answering does not mean bgpd and staticd have both
-    # finished registering with zebra, so the push is retried rather than
-    # trusted on the first try. The config is idempotent, so re-running it
-    # after a partial apply is safe. vtysh's output is captured so the last
-    # failure can be reported: it went to the container's stdout before,
-    # which the caller never saw once `set -e` had already killed PID 1.
-    local attempt out
+    # finished registering with zebra, so both halves — the running-config
+    # read that decides what is missing and the push that fills it in — are
+    # retried rather than trusted on the first try. What gets pushed is
+    # idempotent, so re-running it after a partial apply is safe. The
+    # reason for the last failure is captured so it can be reported: vtysh's
+    # output went to the container's stdout before, which the caller never
+    # saw once `set -e` had already killed PID 1.
+    local attempt out="" running
     for attempt in $(seq 1 "${FRR_CONFIG_ATTEMPTS}"); do
-        if out="$(frr_config | vtysh 2>&1)"; then
+        if ! frr_config_daemons_ready; then
+            out="vtysh has not reached all of [${FRR_CONFIG_DAEMONS}] yet; connected: $(frr_connected_daemons | tr '\n' ' ')"
+        elif ! running="$(vtysh -c 'show running-config' 2>&1)"; then
+            out="${running}"
+        elif out="$(frr_config "${running}" | vtysh 2>&1)"; then
             return 0
         fi
-        log "vtysh config push failed (attempt ${attempt}/${FRR_CONFIG_ATTEMPTS}), retrying"
+        log "FRR config not applied yet (attempt ${attempt}/${FRR_CONFIG_ATTEMPTS}), retrying"
         sleep 1
     done
-    log "ERROR: vtysh never accepted the FRR config after ${FRR_CONFIG_ATTEMPTS} attempts"
-    log "last vtysh output:"
+    log "ERROR: the FRR config was not applied after ${FRR_CONFIG_ATTEMPTS} attempts"
+    log "last failure:"
     printf '%s\n' "${out}" | sed 's/^/[gwnode]   /' >&2
     dump_frr_diagnostics
     exit 1
