@@ -419,8 +419,12 @@ requires an explicit `network_cidr`.
 ## Dormant VIPs on a gateway without local routers
 
 A VIP is only announceable on a node where the agent also maintains the FRR
-prefix-list that permits it. On a gateway that hosts no locally active
-router — a standby chassis, or one whose routers have failed over
+prefix-list that permits it — and "permits it" means an entry of the VIP's
+own: on an active gateway the agent writes an exact `permit <vip>/32`
+alongside the per-network entries, so the VIP's connected route is exported
+even when no hosted network covers the VIP (a flat-range VIP on a chassis
+hosting only VLAN routers, for example). On a gateway that hosts no locally
+active router — a standby chassis, or one whose routers have failed over
 elsewhere — reconcile takes the standby path and empties both that
 prefix-list and the veth-leak network routes. A VIP announced there could
 never be advertised.

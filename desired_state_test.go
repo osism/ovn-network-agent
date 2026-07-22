@@ -161,6 +161,12 @@ func TestComputeDesiredState(t *testing.T) {
 	if len(got.DormantVIPs) != 0 {
 		t.Errorf("DormantVIPs = %v, want empty when the VIPs are announceable", got.DormantVIPs)
 	}
+	// #226: the announceable VIPs are exposed for the prefix-list — including
+	// one that duplicates a FIP, since its /32 entry is what permits the
+	// connected route regardless of network coverage.
+	if want := []string{"198.51.100.50", "203.0.113.10"}; !reflect.DeepEqual(got.AnnouncedVIPs, want) {
+		t.Errorf("AnnouncedVIPs = %v, want %v (deduped, sorted)", got.AnnouncedVIPs, want)
+	}
 	if want := []string{"198.51.100.50", "203.0.113.10"}; !reflect.DeepEqual(got.DesiredIPs, want) {
 		t.Errorf("DesiredIPs = %v, want %v (VIPs merged, deduped, sorted)", got.DesiredIPs, want)
 	}
@@ -246,6 +252,10 @@ func TestComputeDesiredStateDormantVIPs(t *testing.T) {
 	}
 	if want := []string{"192.0.2.99", "203.0.113.10"}; !reflect.DeepEqual(got.DormantVIPs, want) {
 		t.Errorf("DormantVIPs = %v, want %v (deduped, sorted)", got.DormantVIPs, want)
+	}
+	// A dormant VIP gets no prefix-list entry either (#226).
+	if len(got.AnnouncedVIPs) != 0 {
+		t.Errorf("AnnouncedVIPs = %v, want empty when the VIPs are dormant", got.AnnouncedVIPs)
 	}
 }
 

@@ -466,10 +466,18 @@ func (rm *RouteManager) RefreshBGP() error {
 // FRR prefix-list management
 // =============================================================================
 
-// prefixListEntry represents a single entry in an FRR ip prefix-list.
+// prefixListEntry represents a single entry in an FRR ip prefix-list. The
+// agent manages two entry shapes: "permit <network> ge 32 le 32" for a
+// provider network (Exact false) and "permit <vip>/32" for a port-forward VIP
+// (Exact true). The exact form is FRR's canonical spelling for a single /32
+// (ge/le qualifiers add nothing at full length, and Cisco-style prefix-list
+// semantics require len < ge), and the distinct shape lets reconcile tell a
+// VIP entry from a network entry: removal must regenerate the config line the
+// entry was created with, which is why the shape is carried here.
 type prefixListEntry struct {
 	Seq     int
-	Network string // e.g. "198.51.100.0/24"
+	Network string // e.g. "198.51.100.0/24" or "192.0.2.80/32"
+	Exact   bool   // true: "permit <p>"; false: "permit <p> ge 32 le 32"
 }
 
 // frrPrefixList is the subset of an FRR `show ip prefix-list <name> json`
@@ -492,9 +500,10 @@ type frrPrefixListEntry struct {
 	MaxPrefixLen   int    `json:"maximumPrefixLength"`
 }
 
-// ListFRRPrefixListEntries returns the current "permit ... ge 32 le 32" entries
-// in the configured FRR prefix-list. Returns nil if no prefix-list is configured
-// or the list does not exist yet.
+// ListFRRPrefixListEntries returns the current entries of the configured FRR
+// prefix-list in the two agent-managed shapes: "permit <network> ge 32 le 32"
+// and exact "permit <vip>/32". Returns nil if no prefix-list is configured or
+// the list does not exist yet.
 //
 // Read as JSON rather than by parsing the human-readable table: the entries
 // drive add/remove of the announced-networks list, so a change to FRR's text
@@ -545,30 +554,56 @@ func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 				continue
 			}
 			for _, e := range list.Entries {
-				// Only the agent-managed shape: permit <network> ge 32 le 32.
-				if e.Type != "permit" || e.MinPrefixLen != 32 || e.MaxPrefixLen != 32 {
+				// Only the agent-managed shapes: "permit <network> ge 32
+				// le 32" (min and max both present as 32) and the exact
+				// "permit <vip>/32", whose JSON carries no
+				// minimumPrefixLength/maximumPrefixLength keys at all
+				// (verified against the shipped FRR), so both decode to 0.
+				if e.Type != "permit" {
+					continue
+				}
+				exact := e.MinPrefixLen == 0 && e.MaxPrefixLen == 0
+				if !exact && (e.MinPrefixLen != 32 || e.MaxPrefixLen != 32) {
+					continue
+				}
+				if exact && !strings.HasSuffix(e.Prefix, "/32") {
 					continue
 				}
 				if seen[e.SequenceNumber] {
 					continue
 				}
 				seen[e.SequenceNumber] = true
-				entries = append(entries, prefixListEntry{Seq: e.SequenceNumber, Network: e.Prefix})
+				entries = append(entries, prefixListEntry{Seq: e.SequenceNumber, Network: e.Prefix, Exact: exact})
 			}
 		}
 	}
 	return entries, nil
 }
 
+// prefixListLine renders the config line body shared by add and remove:
+// "ip prefix-list <name> seq <n> permit <p>[ ge 32 le 32]".
+func (rm *RouteManager) prefixListLine(seq int, network string, exact bool) string {
+	line := fmt.Sprintf("ip prefix-list %s seq %d permit %s", rm.cfg.FRRPrefixList, seq, network)
+	if !exact {
+		line += " ge 32 le 32"
+	}
+	return line
+}
+
 // ReconcileFRRPrefixList ensures the managed prefix-list contains exactly one
-// "permit <network> ge 32 le 32" entry per desired network.
-// Pass nil to remove all managed entries (cleanup).
-func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
+// "permit <network> ge 32 le 32" entry per desired network and one exact
+// "permit <vip>/32" entry per announceable port-forward VIP. The VIP entries
+// exist because a VIP need not lie inside any hosted network: the connected
+// route it announces through is filtered by this list, and relying on a
+// network entry to cover it silently blackholes the VIP as soon as the flat
+// and VLAN planes land on different chassis (#226).
+// Pass nil, nil to remove all managed entries (cleanup).
+func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet, vips []string) error {
 	if rm.cfg.FRRPrefixList == "" {
 		return nil
 	}
 	if rm.cfg.DryRun {
-		slog.Info("[dry-run] would reconcile FRR prefix-list", "name", rm.cfg.FRRPrefixList, "networks", len(networks))
+		slog.Info("[dry-run] would reconcile FRR prefix-list", "name", rm.cfg.FRRPrefixList, "networks", len(networks), "vips", len(vips))
 		return nil
 	}
 
@@ -577,49 +612,57 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet) error {
 		return fmt.Errorf("list prefix-list entries: %w", err)
 	}
 
-	// Build current and desired maps.
-	currentByNetwork := make(map[string]int, len(current)) // network → seq
+	// Key current and desired by prefix + shape: the same prefix string in the
+	// other shape is a different config line and must not satisfy the check.
+	type entryKey struct {
+		network string
+		exact   bool
+	}
+	currentByKey := make(map[entryKey]int, len(current)) // → seq
 	maxSeq := 0
 	for _, e := range current {
-		currentByNetwork[e.Network] = e.Seq
+		currentByKey[entryKey{e.Network, e.Exact}] = e.Seq
 		if e.Seq > maxSeq {
 			maxSeq = e.Seq
 		}
 	}
 
-	desired := make(map[string]bool, len(networks))
+	desired := make(map[entryKey]bool, len(networks)+len(vips))
 	for _, n := range networks {
-		desired[n.String()] = true
+		desired[entryKey{n.String(), false}] = true
+	}
+	for _, vip := range vips {
+		desired[entryKey{vip + "/32", true}] = true
 	}
 
 	// Add missing entries (before removing stale ones, to avoid a window with no entries).
-	for network := range desired {
-		if _, exists := currentByNetwork[network]; !exists {
+	for key := range desired {
+		if _, exists := currentByKey[key]; !exists {
 			maxSeq += 5
 			output, err := rm.runVtysh(
 				"-c", "conf t",
-				"-c", fmt.Sprintf("ip prefix-list %s seq %d permit %s ge 32 le 32", rm.cfg.FRRPrefixList, maxSeq, network),
+				"-c", rm.prefixListLine(maxSeq, key.network, key.exact),
 				"-c", "end",
 			)
 			if err != nil {
-				return fmt.Errorf("add prefix-list entry %s seq %d: %w (output: %s)", network, maxSeq, err, strings.TrimSpace(string(output)))
+				return fmt.Errorf("add prefix-list entry %s seq %d: %w (output: %s)", key.network, maxSeq, err, strings.TrimSpace(string(output)))
 			}
-			slog.Info("FRR prefix-list entry added", "name", rm.cfg.FRRPrefixList, "network", network, "seq", maxSeq)
+			slog.Info("FRR prefix-list entry added", "name", rm.cfg.FRRPrefixList, "network", key.network, "seq", maxSeq)
 		}
 	}
 
 	// Remove stale entries.
-	for network, seq := range currentByNetwork {
-		if !desired[network] {
+	for key, seq := range currentByKey {
+		if !desired[key] {
 			output, err := rm.runVtysh(
 				"-c", "conf t",
-				"-c", fmt.Sprintf("no ip prefix-list %s seq %d permit %s ge 32 le 32", rm.cfg.FRRPrefixList, seq, network),
+				"-c", "no "+rm.prefixListLine(seq, key.network, key.exact),
 				"-c", "end",
 			)
 			if err != nil {
-				return fmt.Errorf("remove prefix-list entry %s seq %d: %w (output: %s)", network, seq, err, strings.TrimSpace(string(output)))
+				return fmt.Errorf("remove prefix-list entry %s seq %d: %w (output: %s)", key.network, seq, err, strings.TrimSpace(string(output)))
 			}
-			slog.Info("FRR prefix-list entry removed", "name", rm.cfg.FRRPrefixList, "network", network, "seq", seq)
+			slog.Info("FRR prefix-list entry removed", "name", rm.cfg.FRRPrefixList, "network", key.network, "seq", seq)
 		}
 	}
 

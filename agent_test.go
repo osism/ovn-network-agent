@@ -2018,6 +2018,68 @@ func TestReconcileSkipsFailoverMetricOnStartup(t *testing.T) {
 // withdraws routes reports changed (so verification still runs) but not
 // announced: withdrawing a /32 attracts no traffic, so it is not a takeover
 // announce and must not feed the failover-latency metric.
+// TestReconcilePrefixListCarriesVIPOutsideHostedNetworks pins #226: a
+// port-forward VIP outside every hosted network must still get its own exact
+// "permit <vip>/32" prefix-list entry. The VIP announces through its connected
+// route filtered by that list; before the fix the list held only the hosted
+// networks' CIDRs, so a flat-range VIP on a chassis hosting only VLAN routers
+// passed the announceability gate (HasLocalRouters), had its address and DNAT
+// installed — and was silently never exported. The nightly heterogeneous chaos
+// profile blackholed its API VIP exactly this way the moment a priority flip
+// moved the flat router elsewhere.
+func TestReconcilePrefixListCarriesVIPOutsideHostedNetworks(t *testing.T) {
+	rec := newVtyshRecorder()
+	rm := &RouteManager{
+		cfg:                  Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", FRRPrefixList: "fip-out"},
+		execVtyshHook:        rec.hook(),
+		execOVSHook:          newOVSRecorder().hook(),
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) { return nil, nil },
+	}
+
+	// One locally-active VLAN router; the VIP 192.0.2.80 lies outside its
+	// 198.51.100.0/24 network — the heterogeneous split.
+	_, cidr, _ := net.ParseCIDR("198.51.100.0/24")
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{{
+			RouterName:  "router-vlan101",
+			LRPName:     "lrp-vlan101",
+			LRPMAC:      "aa:aa:aa:aa:aa:aa",
+			LRPNetworks: []string{"198.51.100.0/24"},
+		}},
+		HasLocalRouters:    true,
+		DiscoveredNetworks: []*net.IPNet{cidr},
+	})
+	a := &Agent{
+		cfg:            Config{PortForwards: []PortForwardVIP{{VIP: "192.0.2.80", ManageVIP: true}}},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	a.reconcile(context.Background(), "test")
+
+	var sawVIP, sawNetwork bool
+	for _, args := range rec.calls {
+		j := strings.Join(args, " ")
+		if strings.Contains(j, "ip prefix-list fip-out seq") &&
+			strings.HasSuffix(j, "permit 192.0.2.80/32 -c end") &&
+			!strings.Contains(j, "no ip prefix-list") {
+			sawVIP = true
+		}
+		if strings.Contains(j, "permit 198.51.100.0/24 ge 32 le 32") {
+			sawNetwork = true
+		}
+	}
+	if !sawVIP {
+		t.Errorf("reconcile must add an exact permit for the VIP /32 even though no hosted network covers it; calls: %v", rec.calls)
+	}
+	if !sawNetwork {
+		t.Errorf("the hosted network's ge/le entry must still be added; calls: %v", rec.calls)
+	}
+}
+
 func TestEnsureRoutesRemovalOnlyIsNotAnnounce(t *testing.T) {
 	rec := newVtyshRecorder()
 	// FRR still carries a /32 that is no longer desired.

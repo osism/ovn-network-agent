@@ -63,6 +63,14 @@ type desiredState struct {
 	// DesiredIPs because this node cannot advertise them, sorted. Reported by
 	// reconcile at info level on change.
 	DormantVIPs []string
+
+	// AnnouncedVIPs is the complement of DormantVIPs: the configured
+	// port-forward VIPs that join the announce plane this cycle, sorted.
+	// Each gets an exact "permit <vip>/32" entry in the FRR prefix-list
+	// (ReconcileFRRPrefixList) so its connected route is exported even when
+	// no hosted network covers the VIP (#226). Empty when the VIPs are
+	// dormant.
+	AnnouncedVIPs []string
 }
 
 // buildHairpinTargets collects every IP that needs a hairpin flow: the NAT
@@ -168,13 +176,14 @@ func computeDesiredState(state OVNState, portForwards []PortForwardVIP, announce
 	// port_forward_dev, so they join DesiredIPs but never FRRStaticIPs.
 	desiredIPs := make([]string, 0, len(hairpinIPs)+len(portForwards))
 	desiredIPs = append(desiredIPs, hairpinIPs...)
-	var dormantVIPs []string
+	var dormantVIPs, announcedVIPs []string
 	for _, pf := range portForwards {
 		if !announceVIPs {
 			dormantVIPs = append(dormantVIPs, pf.VIP)
 			continue
 		}
 		desiredIPs = append(desiredIPs, pf.VIP)
+		announcedVIPs = append(announcedVIPs, pf.VIP)
 	}
 
 	return desiredState{
@@ -186,5 +195,6 @@ func computeDesiredState(state OVNState, portForwards []PortForwardVIP, announce
 		DesiredIPs:     uniqueIPs(desiredIPs),
 		FRRStaticIPs:   uniqueIPs(hairpinIPs),
 		DormantVIPs:    uniqueIPs(dormantVIPs),
+		AnnouncedVIPs:  uniqueIPs(announcedVIPs),
 	}
 }

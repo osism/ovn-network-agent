@@ -56,6 +56,14 @@ func frrStaticRoutesJSON(nexthop string, ips ...string) string {
 func frrPrefixListDoc(daemon, name string, entries ...prefixListEntry) string {
 	rows := make([]string, 0, len(entries))
 	for _, e := range entries {
+		if e.Exact {
+			// FRR omits minimumPrefixLength/maximumPrefixLength entirely
+			// for an exact entry (verified against the shipped FRR 8.4.4).
+			rows = append(rows, fmt.Sprintf(
+				`{"sequenceNumber":%d,"type":"permit","prefix":%q}`,
+				e.Seq, e.Network))
+			continue
+		}
 		rows = append(rows, fmt.Sprintf(
 			`{"sequenceNumber":%d,"type":"permit","prefix":%q,`+
 				`"minimumPrefixLength":32,"maximumPrefixLength":32}`,
@@ -550,7 +558,7 @@ func TestNewRouteManagerFRRPrefixList(t *testing.T) {
 func TestReconcileFRRPrefixListDisabled(t *testing.T) {
 	rm := &RouteManager{cfg: Config{FRRPrefixList: ""}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
-	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}); err != nil {
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}, nil); err != nil {
 		t.Errorf("ReconcileFRRPrefixList() with empty name should be no-op, got: %v", err)
 	}
 }
@@ -558,7 +566,7 @@ func TestReconcileFRRPrefixListDisabled(t *testing.T) {
 func TestReconcileFRRPrefixListDryRun(t *testing.T) {
 	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS", DryRun: true}}
 	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
-	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}); err != nil {
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{cidr}, []string{"192.0.2.80"}); err != nil {
 		t.Errorf("ReconcileFRRPrefixList() in dry-run should not error, got: %v", err)
 	}
 }
@@ -1263,7 +1271,7 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 
 	_, desired1, _ := net.ParseCIDR("198.51.100.0/24")
 	_, desired2, _ := net.ParseCIDR("203.0.113.0/24") // new
-	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{desired1, desired2}); err != nil {
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{desired1, desired2}, nil); err != nil {
 		t.Fatalf("ReconcileFRRPrefixList: %v", err)
 	}
 
@@ -1293,6 +1301,121 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 	}
 }
 
+// TestListFRRPrefixListEntries_ExactVIPShape pins the second managed entry
+// shape (#226): an exact "permit <vip>/32" comes back from FRR with no
+// minimumPrefixLength/maximumPrefixLength keys and must be parsed with
+// Exact set, while a foreign exact entry that is not a /32 stays invisible
+// to reconcile.
+func TestListFRRPrefixListEntries_ExactVIPShape(t *testing.T) {
+	vip := prefixListEntry{Seq: 20, Network: "192.0.2.80/32", Exact: true}
+	network := prefixListEntry{Seq: 10, Network: "198.51.100.0/24"}
+	foreign := prefixListEntry{Seq: 30, Network: "10.0.0.0/8", Exact: true}
+
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListJSON("ANNOUNCED-NETWORKS", network, vip, foreign),
+		nil,
+	)
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+	got, err := rm.ListFRRPrefixListEntries()
+	if err != nil {
+		t.Fatalf("ListFRRPrefixListEntries: %v", err)
+	}
+	want := []prefixListEntry{network, vip}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("entries = %+v, want %+v", got, want)
+	}
+}
+
+// TestReconcileFRRPrefixList_VIPEntries pins the announceable-VIP half of the
+// reconcile (#226): a missing VIP gets an exact "permit <vip>/32" entry with
+// no ge/le qualifier, a stale VIP entry is removed with the exact form it was
+// created with, and a present VIP entry is left alone.
+func TestReconcileFRRPrefixList_VIPEntries(t *testing.T) {
+	rec := newVtyshRecorder()
+	// Initial state: the desired network, a kept VIP, and a stale VIP.
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListJSON("ANNOUNCED-NETWORKS",
+			prefixListEntry{Seq: 10, Network: "198.51.100.0/24"},
+			prefixListEntry{Seq: 15, Network: "192.0.2.80/32", Exact: true},
+			prefixListEntry{Seq: 20, Network: "192.0.2.99/32", Exact: true},
+		),
+		nil,
+	)
+
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+
+	_, network, _ := net.ParseCIDR("198.51.100.0/24")
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{network}, []string{"192.0.2.80", "192.0.2.81"}); err != nil {
+		t.Fatalf("ReconcileFRRPrefixList: %v", err)
+	}
+
+	// Expect: 1 list call + 1 add (192.0.2.81/32) + 1 remove (192.0.2.99/32).
+	if len(rec.calls) != 3 {
+		t.Fatalf("expected 3 vtysh calls (list+add+remove), got %d: %v", len(rec.calls), rec.calls)
+	}
+
+	var sawAdd, sawRemove bool
+	for _, c := range rec.calls {
+		j := strings.Join(c, " ")
+		if strings.HasSuffix(j, "permit 192.0.2.81/32 -c end") &&
+			strings.Contains(j, "ip prefix-list ANNOUNCED-NETWORKS seq") &&
+			!strings.Contains(j, "no ip prefix-list") {
+			sawAdd = true
+		}
+		if strings.HasSuffix(j, "permit 192.0.2.99/32 -c end") &&
+			strings.Contains(j, "no ip prefix-list ANNOUNCED-NETWORKS seq 20") {
+			sawRemove = true
+		}
+	}
+	if !sawAdd {
+		t.Errorf("expected an exact-form add for 192.0.2.81/32, got: %v", rec.calls)
+	}
+	if !sawRemove {
+		t.Errorf("expected an exact-form remove for 192.0.2.99/32, got: %v", rec.calls)
+	}
+}
+
+// TestReconcileFRRPrefixList_ShapeMismatchConverges pins the shape keying: the
+// same prefix string in the wrong shape (a leftover "permit <vip>/32 ge 32 le
+// 32") does not satisfy the desired exact entry — reconcile adds the exact
+// form and removes the ge/le form, regenerating each config line in the shape
+// it was created with.
+func TestReconcileFRRPrefixList_ShapeMismatchConverges(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListJSON("ANNOUNCED-NETWORKS",
+			prefixListEntry{Seq: 5, Network: "192.0.2.80/32"}, // ge/le shape
+		),
+		nil,
+	)
+
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+	if err := rm.ReconcileFRRPrefixList(nil, []string{"192.0.2.80"}); err != nil {
+		t.Fatalf("ReconcileFRRPrefixList: %v", err)
+	}
+
+	var sawExactAdd, sawGeLeRemove bool
+	for _, c := range rec.calls {
+		j := strings.Join(c, " ")
+		if strings.HasSuffix(j, "permit 192.0.2.80/32 -c end") && !strings.Contains(j, "no ip prefix-list") {
+			sawExactAdd = true
+		}
+		if strings.Contains(j, "no ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 192.0.2.80/32 ge 32 le 32") {
+			sawGeLeRemove = true
+		}
+	}
+	if !sawExactAdd {
+		t.Errorf("expected an exact-form add for 192.0.2.80/32, got: %v", rec.calls)
+	}
+	if !sawGeLeRemove {
+		t.Errorf("expected a ge/le-form remove for 192.0.2.80/32, got: %v", rec.calls)
+	}
+}
+
 func TestReconcileFRRPrefixList_AddFailureBailsOut(t *testing.T) {
 	calls := 0
 	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: func(cmd *exec.Cmd) ([]byte, error) {
@@ -1304,7 +1427,7 @@ func TestReconcileFRRPrefixList_AddFailureBailsOut(t *testing.T) {
 		return []byte("error output"), errors.New("vtysh add failed")
 	}}
 	_, n, _ := net.ParseCIDR("198.51.100.0/24")
-	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n}); err == nil {
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n}, nil); err == nil {
 		t.Fatal("expected error when add command fails, got nil")
 	}
 }

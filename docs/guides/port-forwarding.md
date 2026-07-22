@@ -118,6 +118,15 @@ whereas a bare `redistribute connected`, or only a neighbor `prefix-list … out
 naming an undefined list, would treat the missing list as permit-all and leak
 the underlay `/30`s.
 
+The agent itself keeps the prefix-list entries the VIPs need: alongside the
+per-network `permit <network> ge 32 le 32` entries, every announceable VIP
+gets its own exact `permit <vip>/32` entry. The VIP entry is load-bearing, not
+redundancy — a VIP need not lie inside any network the gateway currently
+hosts (a flat-range VIP on a chassis that hosts only VLAN routers has no
+covering network entry), and without its own entry the connected route would
+be silently filtered while the address, DNAT, and kernel route all look
+healthy.
+
 On a full-mode gateway that hosts no local routers the agent **removes** the
 managed VIP address (see the dormancy section in the port-forwarding
 explanation). The reasoning: on such a standby the agent has emptied

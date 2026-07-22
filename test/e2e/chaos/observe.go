@@ -490,9 +490,11 @@ func observeFRRStatic(ctx context.Context, l *lab, gw string, obs *observedGatew
 	return nil
 }
 
-// observePrefixList reads the ANNOUNCED-NETWORKS prefix-list, keeping the CIDR
-// of each `permit <cidr> ge 32 le 32` entry and distinguishing a list that
-// does not exist at all (which the agent cleans on a standby gateway).
+// observePrefixList reads the ANNOUNCED-NETWORKS prefix-list, keeping the
+// prefix of each permit entry — `permit <cidr> ge 32 le 32` for a network,
+// exact `permit <vip>/32` for an announceable VIP (#226) — and distinguishing
+// a list that does not exist at all (which the agent cleans on a standby
+// gateway).
 func observePrefixList(ctx context.Context, l *lab, gw string, obs *observedGateway) error {
 	out, err := l.exec(ctx, gw, "vtysh", "-c", "show ip prefix-list "+announcedPrefixList)
 	if err != nil {
