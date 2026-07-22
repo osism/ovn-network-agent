@@ -392,14 +392,18 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 			slog.Error("failed to ensure gateway routing", "error", err)
 		}
 
-		// Reconcile FRR prefix-list entries for discovered networks. The
-		// prefix-list is the BGP outbound filter (neighbor ... prefix-list
-		// ... out) and it is what permits the FIP /32s, so the announce
-		// below advertises nothing until it is populated. A standby chassis
-		// empties it via the default: branch, so on a takeover this must run
-		// BEFORE the announce — it is reachability-critical, not a stability
-		// step.
-		if err := a.routing.ReconcileFRRPrefixList(a.effectiveFilters); err != nil {
+		// Reconcile FRR prefix-list entries for discovered networks plus an
+		// exact /32 per announceable port-forward VIP. The prefix-list is the
+		// BGP outbound filter (neighbor ... prefix-list ... out) and the
+		// route-map filter on redistribute connected, so the announce below
+		// advertises nothing until it is populated. The VIP entries are
+		// load-bearing, not redundant: a VIP outside every hosted network
+		// (flat-range VIP on a chassis hosting only VLAN routers) has no
+		// network entry covering its connected route (#226). A standby
+		// chassis empties the list via the default: branch, so on a takeover
+		// this must run BEFORE the announce — it is reachability-critical,
+		// not a stability step.
+		if err := a.routing.ReconcileFRRPrefixList(a.effectiveFilters, desired.AnnouncedVIPs); err != nil {
 			slog.Error("failed to reconcile FRR prefix-list", "error", err)
 		}
 	default:
@@ -407,7 +411,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		if err := a.routing.ReconcileVethLeakNetworks(nil); err != nil {
 			slog.Error("failed to clean veth leak networks", "error", err)
 		}
-		if err := a.routing.ReconcileFRRPrefixList(nil); err != nil {
+		if err := a.routing.ReconcileFRRPrefixList(nil, nil); err != nil {
 			slog.Error("failed to clean FRR prefix-list", "error", err)
 		}
 		if err := a.routing.ReconcileOVSHairpinFlows(nil); err != nil {
@@ -622,7 +626,10 @@ func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
 // they join the kernel-route plane.
 //
 // A VIP is only announceable where the agent also maintains the FRR prefix-list
-// that permits it. Without local routers reconcile takes the standby path,
+// that permits it — and maintaining it means writing an exact "permit <vip>/32"
+// entry per announceable VIP, not relying on a hosted network's entry to cover
+// the VIP (#226: a flat-range VIP on a chassis hosting only VLAN routers has no
+// covering network). Without local routers reconcile takes the standby path,
 // which empties that prefix-list and the veth-leak network routes — a VIP
 // announced anyway could never be advertised, and with the route-map on
 // redistribute connected the deleted prefix-list stops the connected export
@@ -931,7 +938,7 @@ func (a *Agent) cleanup() {
 	a.removeAllRoutes("shutdown cleanup")
 
 	// Clean up FRR prefix-list entries.
-	if err := a.routing.ReconcileFRRPrefixList(nil); err != nil {
+	if err := a.routing.ReconcileFRRPrefixList(nil, nil); err != nil {
 		slog.Error("failed to cleanup FRR prefix-list", "error", err)
 	}
 

@@ -29,8 +29,12 @@ When set to an empty string the agent does not touch the prefix list at all
 Once provider networks are known (auto-discovered from
 `Logical_Router_Port.Networks` or specified via `network_cidr`), the agent
 keeps the prefix list synchronised with `permit <network> ge 32 le 32`
-entries for each network. Entries for networks the agent no longer manages
-are removed during the next reconciliation.
+entries for each network. In addition, every announceable port-forward VIP
+gets its own exact `permit <vip>/32` entry — the VIP announces through its
+connected route filtered by this list, and its address need not lie inside
+any network the gateway currently hosts, so a network entry cannot be relied
+on to cover it. Entries the agent no longer manages (removed networks,
+dormant VIPs) are removed during the next reconciliation.
 
 The prefix list itself must already be referenced from your BGP configuration.
 There are two reference points, and a complete gateway config uses both:

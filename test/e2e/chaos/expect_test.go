@@ -271,6 +271,69 @@ func TestExpectationDormantVIPOnStandbyGateway(t *testing.T) {
 	}
 }
 
+// A port-forward VIP outside every hosted network must still be announced by
+// an active gateway (#226): its own exact /32 prefix-list entry permits the
+// connected route, so neither the entry nor the announce may depend on a
+// hosted network covering the VIP. This is the heterogeneous blackhole — the
+// flat router moves to another chassis, the VIP-carrying gateway keeps only
+// its VLAN routers, and before #226 nothing exported the VIP anywhere.
+func TestExpectationVIPOutsideHostedNetworksIsStillAnnounced(t *testing.T) {
+	// gateway-1 is active for the VLAN-101 router alone; the flat router
+	// lr0-public lives on gateway-3. gateway-1 carries the API VIP
+	// (192.0.2.80), which no VLAN network covers.
+	snap := ovnSnapshot{
+		CRPortChassis: map[string]string{
+			"cr-lr0-public":        "gateway-3",
+			"cr-lr-vlan101-public": "gateway-1",
+		},
+		LRPs: map[string]lrpRow{
+			"lr0-public":        {Networks: []string{"192.0.2.1/24"}},
+			"lr-vlan101-public": {Networks: []string{"198.51.100.1/24"}},
+		},
+		LRPNameByUUID: map[string]string{
+			"uuid-lr0-public":        "lr0-public",
+			"uuid-lr-vlan101-public": "lr-vlan101-public",
+		},
+		Routers: map[string]routerRow{
+			"lr0": {LRPUUIDs: []string{"uuid-lr0-public"}},
+			"lr-vlan101": {
+				LRPUUIDs: []string{"uuid-lr-vlan101-public"},
+				NATs:     []natRow{{ExternalIP: "198.51.100.10", Type: "dnat_and_snat"}},
+			},
+		},
+		Chassis:         map[string]bool{"gateway-1": true, "gateway-3": true},
+		SegmentTagByLRP: map[string]int{"lr0-public": 0, "lr-vlan101-public": 101},
+	}
+	// The heterogeneous profile puts the API VIP on gateway-1 (#225).
+	doc := render(t, profileGateway(t, "heterogeneous", "gateway-1"), "172.20.20.4")
+
+	exp := computeExpectation(snap, "gateway-1", doc, "172.20.20.4")
+
+	if exp.Mode != "full" || !exp.Active {
+		t.Fatalf("mode=%q active=%v, want a full-mode active gateway", exp.Mode, exp.Active)
+	}
+	// Rule 7: the prefix-list holds the hosted VLAN network plus the VIP's own
+	// exact /32 — and no entry for the flat network hosted elsewhere.
+	if !containsStr(exp.PrefixList, apiVIPAddr+"/32") {
+		t.Fatalf("PrefixList = %v, want the VIP's own /32 entry", exp.PrefixList)
+	}
+	if !containsStr(exp.PrefixList, "198.51.100.0/24") {
+		t.Fatalf("PrefixList = %v, want the hosted VLAN network entry", exp.PrefixList)
+	}
+	if containsStr(exp.PrefixList, "192.0.2.0/24") {
+		t.Fatalf("PrefixList = %v, must not expect the flat network hosted on gateway-3", exp.PrefixList)
+	}
+	// Rule 12: the VIP must be announced although no effective network covers
+	// it — the bound that turns the heterogeneous blackhole into a sweep
+	// violation instead of a probe-only failure.
+	if !containsStr(exp.MustAnnounce, apiVIPAddr) {
+		t.Fatalf("MustAnnounce = %v, want the VIP required regardless of network coverage", exp.MustAnnounce)
+	}
+	if !containsStr(exp.DesiredIPs, apiVIPAddr) {
+		t.Fatalf("DesiredIPs = %v, want the VIP on an active gateway", exp.DesiredIPs)
+	}
+}
+
 // With no port_forwards the agent's nftables table carries no DNAT chains and
 // manages no VIP address; with the API VIP it carries exactly the one DNAT rule
 // to the gateway's mgmtIP, and the hairpin-masquerade set follows the flag.

@@ -154,11 +154,14 @@ type gatewayExpectation struct {
 	// full-mode standby (no locally-active routers).
 	FRRStatic []string
 
-	// PrefixList is the sorted set of CIDR strings the ANNOUNCED-NETWORKS
-	// prefix-list is reconciled to (the effective networks) on a full-mode
-	// active gateway. nil means the list is expected absent — the agent cleans
-	// it on a full-mode standby. SkipPrefixList is set in pf-only, where the
-	// agent never touches the list (the entrypoint placeholder survives).
+	// PrefixList is the sorted set of prefix strings the ANNOUNCED-NETWORKS
+	// prefix-list is reconciled to on a full-mode active gateway: the
+	// effective networks plus one exact <vip>/32 per announceable
+	// port-forward VIP (#226 — the VIP entry is what exports the VIP's
+	// connected route when no hosted network covers it). nil means the list
+	// is expected absent — the agent cleans it on a full-mode standby.
+	// SkipPrefixList is set in pf-only, where the agent never touches the
+	// list (the entrypoint placeholder survives).
 	PrefixList     []string
 	SkipPrefixList bool
 
@@ -197,9 +200,10 @@ type gatewayExpectation struct {
 
 	// MustAnnounce is the presence bound: the IPs the upstream must currently
 	// be announcing. On a full-mode active gateway it is the desired IPs that
-	// fall inside an effective network (the only ones the prefix-list permits);
-	// in pf-only it is the VIPs (the entrypoint placeholder permits all /32s);
-	// on a full-mode standby it is empty.
+	// fall inside an effective network plus the announceable VIPs — a VIP is
+	// permitted by its own /32 prefix-list entry regardless of network
+	// coverage (#226); in pf-only it is the VIPs (the entrypoint placeholder
+	// permits all /32s); on a full-mode standby it is empty.
 	MustAnnounce []string
 
 	// AnnounceBound is the staleness bound: announced ⊆ this set must hold in
@@ -295,14 +299,18 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 		exp.KernelRouteDev = dev
 	}
 
-	// Rule 7 — prefix-list: reconciled to the effective networks on a full-mode
-	// active gateway, cleaned (nil) on a full-mode standby, never touched in
-	// pf-only.
+	// Rule 7 — prefix-list: reconciled to the effective networks plus an exact
+	// /32 per announceable VIP on a full-mode active gateway (#226), cleaned
+	// (nil) on a full-mode standby, never touched in pf-only.
 	switch {
 	case pfOnly:
 		exp.SkipPrefixList = true
 	case active:
-		exp.PrefixList = networkStrings(effective)
+		entries := networkStrings(effective)
+		for _, vip := range routableVIPs {
+			entries = append(entries, vip+"/32")
+		}
+		exp.PrefixList = sortedUnique(entries)
 	}
 
 	// Rule 8 — hairpin flows: the hairpin targets when active, removed on
@@ -331,12 +339,17 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 		exp.ManagedVIPs = managedVIPs(forwards)
 	}
 
-	// Rule 12 — announced presence bound.
+	// Rule 12 — announced presence bound. On an active gateway the
+	// OVN-derived IPs are bounded by network coverage (only covered NAT IPs
+	// have a permitting entry), while the announceable VIPs are present
+	// unconditionally — their own /32 entry permits them (#226). This is the
+	// bound that catches a VIP silently filtered by the prefix-list, which
+	// before #226 only the black-box probe could see.
 	switch {
 	case pfOnly:
 		exp.MustAnnounce = desired // = VIPs
 	case active:
-		exp.MustAnnounce = coveredBy(desired, effective)
+		exp.MustAnnounce = sortedUnique(append(coveredBy(desired, effective), routableVIPs...))
 	}
 
 	return exp
