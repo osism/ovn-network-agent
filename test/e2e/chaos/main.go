@@ -36,8 +36,11 @@
 //	make e2e-chaos CHAOS_FLAGS="-profile pf-only"
 //
 // Exit codes: 0 the run passed, 1 the run recorded a violation, 2 the
-// runner could not set the run up. On a non-zero exit the lab's existing
-// artifact collector is invoked into <out>/lab-state.
+// runner could not set the run up. A harness-fault run — every violation
+// is the runner's own inject or restore command failing — also exits 1,
+// because the fault parked a node and cut the run's coverage short. On a
+// non-zero exit the lab's existing artifact collector is invoked into
+// <out>/lab-state.
 package main
 
 import (
@@ -248,7 +251,7 @@ func run(cfg config) (int, error) {
 	if err := writeRecord(rec, filepath.Join(cfg.outDir, summaryFile)); err != nil {
 		return exitFatal, err
 	}
-	if rec.Result == resultFail && code == exitPass {
+	if rec.Result != resultPass && code == exitPass {
 		code = exitViolations
 	}
 	fmt.Fprintf(os.Stderr, "[chaos] %s: %d ticks, %d executed, %d skipped, %d violations (%s, %s)\n",

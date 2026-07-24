@@ -128,7 +128,12 @@ func (c *churner) lbVIPChurn(ctx context.Context, _ *lab, _ string, _ int) error
 	}
 	from, to := "present", "absent"
 	if strings.Contains(vips, churnLBVIP) {
-		if _, err := c.lab.nbctl(ctx, "remove", "load_balancer", "pf-external", "vips", churnLBVIP); err != nil {
+		// The key is an OVSDB string atom holding a colon, so it only parses
+		// in its double-quoted form — the same quoting the add branch below
+		// puts around it. nbctl runs argv-style with no shell in between, so
+		// the quotes have to be in the argument itself.
+		if _, err := c.lab.nbctl(ctx, "remove", "load_balancer", "pf-external", "vips",
+			`"`+churnLBVIP+`"`); err != nil {
 			return fmt.Errorf("remove the churn VIP entry: %w", err)
 		}
 	} else {

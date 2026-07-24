@@ -1466,12 +1466,19 @@ loss buckets, the per-action recovery durations, a `settles` section (one
 entry per settle window: its tick, `converged_ms`, whether it passed, and
 how many violations it raised), and every violation — each now stamped
 with the `journal_offset` of the last executed action, so it points back
-into `journal.jsonl`.
+into `journal.jsonl`. Its `result` is one of `pass` (no violation),
+`harness-fault` (there are violations and every one of them is an
+`action-failed` — the runner's own inject or restore command failed, so
+the defect is in the harness rather than in the agent) or `fail` (any
+other violation, including a run that mixed an `action-failed` with one).
 
 **Exit codes:** `0` the run passed, `1` the run recorded a violation,
 `2` the runner could not set the run up (bad flags, an unknown profile, a
 configuration the agent rejected, a start state that never went green, an
-oracle that could not prime against it).
+oracle that could not prime against it). A `harness-fault` run also exits
+`1`: the failing action parks its node and aborts injection, so the run's
+fault coverage was cut short whoever's defect it was — the verdict tells
+the two apart, the exit code keeps the job red.
 On any non-zero exit the lab's existing `collect-artifacts.sh` bundle is
 dumped into `<out>/lab-state`.
 

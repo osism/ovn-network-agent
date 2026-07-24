@@ -95,6 +95,24 @@ func TestRenderReportCoversTheRecord(t *testing.T) {
 	}
 }
 
+// A run that failed on its own tooling renders its verdict verbatim, so
+// the headline alone tells a harness defect from an agent regression.
+func TestRenderReportNamesTheHarnessFault(t *testing.T) {
+	t.Parallel()
+	rec := reportRecord(t)
+	rec.Violations = []violationRecord{{
+		Kind: violationActionFailed, Tick: 3, Action: "lb-vip-churn", Target: centralNode,
+		Detail: "remove the churn VIP entry: exit status 1",
+	}}
+	rec.finalize(time.Date(2026, 7, 16, 19, 3, 30, 0, time.UTC))
+
+	out := renderToString(t, rec, nil)
+
+	if !strings.Contains(out, "## Chaos run — ❌ harness-fault") {
+		t.Fatalf("the harness fault did not reach the headline:\n%s", out)
+	}
+}
+
 func TestRenderReportNamesTheViolations(t *testing.T) {
 	t.Parallel()
 	rec := reportRecord(t)

@@ -141,8 +141,81 @@ func TestLBVIPChurnTogglesTheVIPSEntry(t *testing.T) {
 	if err := act.inject(context.Background(), ch.lab, centralNode, 0); err != nil {
 		t.Fatalf("inject (present): %v", err)
 	}
-	if !cmd.called("remove load_balancer pf-external vips 192.0.2.50:81") {
+	// The key carries its double quotes into the argv: an OVSDB string atom
+	// holding a colon is unparsable bare, and nbctl gets no shell to add them.
+	if !cmd.called(`remove load_balancer pf-external vips "192.0.2.50:81"`) {
 		t.Fatalf("the churn did not remove the vips entry: %v", cmd.lines())
+	}
+}
+
+// A vips lookup the runner cannot answer must fail the churn rather than
+// guess which way to toggle, exactly as the FIP churn's does.
+func TestLBVIPChurnReportsAFailedLookup(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "find Load_Balancer name=pf-external") {
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+	ch, _ := newTestChurner(cmd)
+	act := churnActionNamed(t, defaultTestProfile(t), ch, "lb-vip-churn")
+
+	err := act.inject(context.Background(), ch.lab, centralNode, 0)
+	if err == nil {
+		t.Fatal("a failed vips lookup was swallowed")
+	}
+	if !strings.Contains(err.Error(), "look up the port-forward Load_Balancer vips") {
+		t.Fatalf("error = %v, want it wrapped as the vips lookup", err)
+	}
+}
+
+// A remove the runner cannot issue must surface as an error — this is the
+// path a malformed command takes, and the engine turns it into the
+// action-failed violation that says the harness, not the agent, failed.
+func TestLBVIPChurnReportsAFailedRemove(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(line, "find Load_Balancer name=pf-external"):
+			return "{192.0.2.50:80=192.168.10.10:8080, 192.0.2.50:81=192.168.10.10:8080}\n", nil
+		case strings.Contains(line, "remove load_balancer"):
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+	ch, _ := newTestChurner(cmd)
+	act := churnActionNamed(t, defaultTestProfile(t), ch, "lb-vip-churn")
+
+	err := act.inject(context.Background(), ch.lab, centralNode, 0)
+	if err == nil {
+		t.Fatal("a failed vips remove was swallowed")
+	}
+	if !strings.Contains(err.Error(), "remove the churn VIP entry") {
+		t.Fatalf("error = %v, want it wrapped as the churn VIP removal", err)
+	}
+}
+
+// An empty vips column is the absent case: the Load_Balancer exists with no
+// entries at all, so the churn adds rather than removes.
+func TestLBVIPChurnAddsWhenTheVIPSColumnIsEmpty(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "find Load_Balancer name=pf-external") {
+			return "", nil
+		}
+		return healthyLabResponses(argv)
+	}}
+	ch, buf := newTestChurner(cmd)
+	act := churnActionNamed(t, defaultTestProfile(t), ch, "lb-vip-churn")
+
+	if err := act.inject(context.Background(), ch.lab, centralNode, 0); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	if !cmd.called(`set load_balancer pf-external vips:"192.0.2.50:81"="192.168.10.10:8080"`) {
+		t.Fatalf("an empty vips column did not take the add branch: %v", cmd.lines())
+	}
+	churns := churnEventsIn(t, buf.String())
+	if len(churns) != 1 || churns[0].From != "absent" || churns[0].To != "present" {
+		t.Fatalf("the churn did not journal absent→present: %+v", churns)
 	}
 }
 

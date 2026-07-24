@@ -434,8 +434,9 @@ func TestCancelDuringTheRestoreDoesNotKillIt(t *testing.T) {
 }
 
 // An action the runner cannot undo is worse than one it cannot inject:
-// the lab is left genuinely broken. The node is parked and the run fails.
-func TestFailedRestoreParksTheNodeAndFailsTheRun(t *testing.T) {
+// the lab is left genuinely broken. The node is parked and the run is
+// stamped a harness fault — the failing command was the runner's own.
+func TestFailedRestoreParksTheNodeAndFaultsTheHarness(t *testing.T) {
 	actions := noopActions("controller-restart")
 	actions[0].restore = func(context.Context, *lab, string) error {
 		return errBoom
@@ -443,8 +444,8 @@ func TestFailedRestoreParksTheNodeAndFailsTheRun(t *testing.T) {
 
 	journal, rec := runEngine(t, 42, 5*time.Minute, actions, nil)
 
-	if rec.Result != resultFail {
-		t.Fatalf("result = %q, want %q", rec.Result, resultFail)
+	if rec.Result != resultHarnessFault {
+		t.Fatalf("result = %q, want %q", rec.Result, resultHarnessFault)
 	}
 	if len(rec.Violations) == 0 || rec.Violations[0].Kind != violationActionFailed {
 		t.Fatalf("violations = %+v, want a %s", rec.Violations, violationActionFailed)
@@ -636,9 +637,9 @@ func parkedIn(t *testing.T, journal, gw string) bool {
 }
 
 // An action the runner cannot inject leaves the lab in a state it cannot
-// reason about: the node is parked, never targeted again, and the run
-// fails.
-func TestFailedInjectParksTheNodeAndFailsTheRun(t *testing.T) {
+// reason about: the node is parked, never targeted again, and the run is
+// stamped a harness fault.
+func TestFailedInjectParksTheNodeAndFaultsTheHarness(t *testing.T) {
 	actions := noopActions("controller-restart")
 	actions[0].inject = func(context.Context, *lab, string, int) error {
 		return errBoom
@@ -646,8 +647,8 @@ func TestFailedInjectParksTheNodeAndFailsTheRun(t *testing.T) {
 
 	_, rec := runEngine(t, 42, 5*time.Minute, actions, nil)
 
-	if rec.Result != resultFail {
-		t.Fatalf("result = %q, want %q", rec.Result, resultFail)
+	if rec.Result != resultHarnessFault {
+		t.Fatalf("result = %q, want %q", rec.Result, resultHarnessFault)
 	}
 	if len(rec.Violations) == 0 || rec.Violations[0].Kind != violationActionFailed {
 		t.Fatalf("violations = %+v, want a %s", rec.Violations, violationActionFailed)
