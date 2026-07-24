@@ -252,15 +252,30 @@ type runRecord struct {
 const (
 	resultPass = "pass"
 	resultFail = "fail"
+	// resultHarnessFault is a run whose only violations came from the
+	// runner's own inject or restore command failing — a defect in the
+	// harness, not in the agent. It still exits non-zero: the fault parks
+	// its node and aborts injection, so the run's fault coverage was cut
+	// short either way.
+	resultHarnessFault = "harness-fault"
 )
 
-// finalize stamps the result: any violation fails the run.
+// finalize stamps the result: no violation passes; violations that are all
+// action-failed — the only kind failAction produces, and both of its call
+// sites are the runner's own command failing — are a harness fault; any
+// other violation fails the run, because a product violation dominates.
 func (r *runRecord) finalize(endedAt time.Time) {
 	r.Schema = recordSchema
 	r.EndedAt = endedAt.UTC().Format(time.RFC3339Nano)
 	r.Result = resultPass
 	if len(r.Violations) > 0 {
-		r.Result = resultFail
+		r.Result = resultHarnessFault
+		for _, v := range r.Violations {
+			if v.Kind != violationActionFailed {
+				r.Result = resultFail
+				break
+			}
+		}
 	}
 	if r.ActionsByName == nil {
 		r.ActionsByName = map[string]int{}

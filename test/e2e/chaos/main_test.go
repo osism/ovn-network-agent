@@ -327,8 +327,11 @@ func TestDriveRunsTheFinalSettle(t *testing.T) {
 		if code != exitPass {
 			t.Fatalf("exit code = %d, want %d", code, exitPass)
 		}
-		if rec.Result != resultFail {
-			t.Fatalf("result = %q, want %q — the run parked a node", rec.Result, resultFail)
+		// The violation is the runner's own restore failing, so the verdict
+		// names the harness — the run still parked a node and aborted.
+		if rec.Result != resultHarnessFault {
+			t.Fatalf("result = %q, want %q — the run parked a node on its own failed restore",
+				rec.Result, resultHarnessFault)
 		}
 		if len(rec.Settles) != 0 || settleStartsIn(t, buf.String()) != 0 {
 			t.Fatalf("an aborted run still settled: settles=%+v, journal=%s", rec.Settles, buf.String())

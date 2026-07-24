@@ -119,6 +119,28 @@ func TestSummaryFailsOnViolation(t *testing.T) {
 		t.Fatalf("schema = %q, want %q", dirty.Schema, recordSchema)
 	}
 
+	// A run whose only violations are the runner's own commands failing is
+	// a harness fault, not an agent regression — the verdict says which of
+	// the two a triager is looking at.
+	harness := &runRecord{Violations: []violationRecord{
+		{Kind: violationActionFailed, Detail: "remove the churn VIP entry"},
+		{Kind: violationActionFailed, Detail: "restore gateway-2"},
+	}}
+	harness.finalize(clock.now())
+	if harness.Result != resultHarnessFault {
+		t.Fatalf("result = %q, want %q", harness.Result, resultHarnessFault)
+	}
+
+	// A product violation dominates: a run that hit both is a failed run.
+	mixed := &runRecord{Violations: []violationRecord{
+		{Kind: violationActionFailed, Detail: "restore gateway-2"},
+		{Kind: violationRecoveryTimeout, Target: "gateway-2", Detail: "budget"},
+	}}
+	mixed.finalize(clock.now())
+	if mixed.Result != resultFail {
+		t.Fatalf("result = %q, want %q — a product violation dominates", mixed.Result, resultFail)
+	}
+
 	var buf bytes.Buffer
 	if err := dirty.write(&buf); err != nil {
 		t.Fatalf("write run record: %v", err)
