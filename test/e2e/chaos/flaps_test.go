@@ -116,7 +116,7 @@ func TestUpstreamBGPRestartNeverRecyclesTheContainer(t *testing.T) {
 	if err := act.inject(context.Background(), l, upstreamNode, 0); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
-	if !cmd.called("exec clab-ovn-e2e-upstream pkill -x bgpd") {
+	if !cmd.called("exec clab-ovn-e2e-upstream pkill -f " + bgpdMatchPattern) {
 		t.Fatalf("the inject did not stop bgpd on the upstream: %v", cmd.lines())
 	}
 
@@ -146,7 +146,7 @@ func TestUpstreamBGPRestartNeverRecyclesTheContainer(t *testing.T) {
 // fault in place — not a failure. Any other pkill failure must surface.
 func TestKillUpstreamBGPDToleratesNoMatchButNotRealFailure(t *testing.T) {
 	noMatch := &fakeCommander{respond: func(argv []string) (string, error) {
-		if strings.Contains(strings.Join(argv, " "), "pkill -x bgpd") {
+		if strings.Contains(strings.Join(argv, " "), "pkill -f "+bgpdMatchPattern) {
 			return "", errExit(t, 1)
 		}
 		return healthyLabResponses(argv)
@@ -156,7 +156,7 @@ func TestKillUpstreamBGPDToleratesNoMatchButNotRealFailure(t *testing.T) {
 	}
 
 	broken := &fakeCommander{respond: func(argv []string) (string, error) {
-		if strings.Contains(strings.Join(argv, " "), "pkill -x bgpd") {
+		if strings.Contains(strings.Join(argv, " "), "pkill -f "+bgpdMatchPattern) {
 			return "", errBoom
 		}
 		return healthyLabResponses(argv)

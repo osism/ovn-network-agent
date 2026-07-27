@@ -1105,7 +1105,7 @@ func TestConvergenceDispatchesPerNodeKind(t *testing.T) {
 			name:  "upstream action never converges while bgpd is down",
 			scope: scopeUpstream,
 			respond: func(argv []string) (string, error) {
-				if strings.Contains(strings.Join(argv, " "), "pgrep -x bgpd") {
+				if strings.Contains(strings.Join(argv, " "), "pgrep -f "+bgpdMatchPattern) {
 					return "", errExit(t, 1)
 				}
 				return healthyLabResponses(argv)
