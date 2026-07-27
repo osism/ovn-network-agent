@@ -128,7 +128,7 @@ func healthyLabResponses(argv []string) (string, error) {
 		return "", nil
 	case strings.Contains(line, "pgrep -f /usr/local/bin/ovn-network-agent"):
 		return "1\n", nil
-	case strings.Contains(line, "pgrep -x bgpd"):
+	case strings.Contains(line, "pgrep -f") && strings.Contains(line, bgpdMatchPattern):
 		return "1\n", nil // a healthy upstream runs bgpd
 	case strings.Contains(line, "find Chassis name="):
 		return strings.TrimPrefix(argv[len(argv)-1], "name=") + "\n", nil

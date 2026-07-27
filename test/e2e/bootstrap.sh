@@ -493,8 +493,12 @@ start_upstream_bgpd() {
 if grep -q "^bgpd=no" /etc/frr/daemons 2>/dev/null; then
     sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
 fi
+# The upstream image's pgrep/pkill are BusyBox applets that match against
+# argv[0] — the full path — never the comm name, so `-x bgpd` finds
+# nothing even while bgpd runs. Anchor the full path under -f (same
+# reading on BusyBox and procps).
 start_out=""
-if ! pgrep -x bgpd >/dev/null; then
+if ! pgrep -f '^/usr/lib/frr/bgpd' >/dev/null; then
     if start_out=$(/usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr 2>&1); then
         :
     else
@@ -530,7 +534,7 @@ configure_upstream_frr() {
             break
         fi
         log "bgpd start attempt ${attempt}/${BGPD_START_ATTEMPTS} failed on ${UPSTREAM_NODE}"
-        docker exec "${UPSTREAM_NODE}" pkill -x bgpd || true
+        docker exec "${UPSTREAM_NODE}" pkill -f '^/usr/lib/frr/bgpd' || true
         if [ "${attempt}" -eq "${BGPD_START_ATTEMPTS}" ]; then
             dump_upstream_frr_state
             echo "bgpd did not come up on ${UPSTREAM_NODE} after ${BGPD_START_ATTEMPTS} attempts" >&2

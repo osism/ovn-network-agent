@@ -711,7 +711,7 @@ func (e *engine) nodeConverged(ctx context.Context, d decision, node string) boo
 // still in place; any other failure is a question that could not be asked,
 // and reads here as "not yet back" so convergence keeps polling.
 func bgpdAlive(ctx context.Context, l *lab) bool {
-	out, err := l.exec(ctx, upstreamNode, "pgrep", "-x", "bgpd")
+	out, err := l.exec(ctx, upstreamNode, "pgrep", "-f", bgpdMatchPattern)
 	return err == nil && strings.TrimSpace(out) != ""
 }
 

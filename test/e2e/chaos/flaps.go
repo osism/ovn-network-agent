@@ -20,6 +20,17 @@ import (
 const bgpdReadyProbe = "for _ in $(seq 1 30); do " +
 	"if vtysh -c 'show daemons' 2>/dev/null | grep -qw bgpd; then break; fi; sleep 1; done"
 
+// bgpdMatchPattern selects the upstream bgpd for pgrep/pkill. The upstream
+// runs the Alpine FRR image, whose pgrep/pkill are BusyBox applets that
+// match the pattern against argv[0] — the full path `/usr/lib/frr/bgpd` —
+// never the comm name, so `-x bgpd` matches nothing there: run 30243638392
+// no-op'd the kill (exit 1, read as "already down"), the restore's guard
+// then saw no bgpd and its second bgpd died on the pid-file lock the live
+// one still held. The anchored path under -f reads the same for BusyBox
+// (argv0) and procps (full cmdline), and cannot match the `sh -euc`
+// wrapper that carries the pattern on its own command line.
+const bgpdMatchPattern = "^/usr/lib/frr/bgpd"
+
 // frrRestartDoneMarker is touched inside a gateway container as the last
 // step of the backgrounded FRR recycle. It is the only signal that tells
 // the restore the new FRR is the one answering vtysh rather than the old
@@ -123,7 +134,7 @@ func restoreGatewayFRR(ctx context.Context, l *lab, gw string) error {
 // pkill that matches nothing means bgpd was already down — which is the
 // fault in place — so its exit 1 is not an error.
 func killUpstreamBGPD(ctx context.Context, l *lab) error {
-	if _, err := l.exec(ctx, upstreamNode, "pkill", "-x", "bgpd"); err != nil {
+	if _, err := l.exec(ctx, upstreamNode, "pkill", "-f", bgpdMatchPattern); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return nil
@@ -139,7 +150,7 @@ func killUpstreamBGPD(ctx context.Context, l *lab) error {
 // start_upstream_bgpd in bootstrap.sh.
 func restoreUpstreamBGPD(ctx context.Context, l *lab) error {
 	script := strings.Join([]string{
-		"pgrep -x bgpd >/dev/null 2>&1 || /usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr",
+		"pgrep -f '" + bgpdMatchPattern + "' >/dev/null 2>&1 || /usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr",
 		bgpdReadyProbe,
 		"vtysh -b",
 	}, "; ")
