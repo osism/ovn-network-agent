@@ -145,14 +145,22 @@ func killUpstreamBGPD(ctx context.Context, l *lab) error {
 }
 
 // restoreUpstreamBGPD starts bgpd in place — never `frrinit.sh restart`,
-// never a docker restart — polls for it to register with watchfrr, then
-// reloads the write-memory'd config with `vtysh -b`, mirroring
-// start_upstream_bgpd in bootstrap.sh.
+// never a docker restart — and polls for it to register with watchfrr.
+// The restarted bgpd reloads its config itself: the upstream image's
+// vtysh has no integrated-config support ("this version of vtysh never
+// writes vtysh.conf"), so bootstrap's `write memory` persisted
+// /etc/frr/bgpd.conf — which bgpd reads at startup — and /etc/frr/frr.conf
+// never exists there. `vtysh -b` reads exactly that integrated file, so it
+// only runs when the file is present (a future image bump), the same guard
+// the image's own init applies ("/etc/frr/frr.conf does not exist;
+// skipping config apply"). Unconditional, it exited 11 on the missing file
+// in run 30261099950 and parked the node over a bgpd that was already
+// back up, configured and re-established.
 func restoreUpstreamBGPD(ctx context.Context, l *lab) error {
 	script := strings.Join([]string{
 		"pgrep -f '" + bgpdMatchPattern + "' >/dev/null 2>&1 || /usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr",
 		bgpdReadyProbe,
-		"vtysh -b",
+		"[ ! -r /etc/frr/frr.conf ] || vtysh -b",
 	}, "; ")
 	if _, err := l.sh(ctx, upstreamNode, script); err != nil {
 		return fmt.Errorf("restart bgpd on %s: %w", upstreamNode, err)
