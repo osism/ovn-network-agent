@@ -126,7 +126,12 @@ func TestUpstreamBGPRestartNeverRecyclesTheContainer(t *testing.T) {
 	for _, want := range []string{
 		"bgpd -d -A 127.0.0.1 -u frr -g frr",
 		"grep -qw bgpd",
-		"vtysh -b",
+		// The reload must stay guarded: the upstream image has no
+		// integrated /etc/frr/frr.conf (write memory persists per-daemon
+		// files), and an unguarded `vtysh -b` exits 11 on the missing
+		// file — run 30261099950 parked the node over it while bgpd was
+		// already back up and configured from /etc/frr/bgpd.conf.
+		"[ ! -r /etc/frr/frr.conf ] || vtysh -b",
 	} {
 		if !cmd.called(want) {
 			t.Fatalf("the restore did not start bgpd in place and reload: missing %q in %v", want, cmd.lines())
