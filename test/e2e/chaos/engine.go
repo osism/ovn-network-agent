@@ -716,10 +716,16 @@ func bgpdAlive(ctx context.Context, l *lab) bool {
 }
 
 // followMaster keeps the port-forward VIP's hand-plumbed routes pointed
-// at whichever chassis currently owns cr-lr0-public. Re-election is the
-// whole point of the fault set, and the agent does not manage
-// Load_Balancer VIP routes — so without this the VIP probe would stay
-// red for the rest of the run after the first migration.
+// at whichever chassis currently owns cr-lr0-public. Re-election is one
+// half of the job; the other is the master coming back from a container
+// recycle with its claim intact: the scope-link route lives in the
+// container's netns, so a stop/start wipes it, and skipping the re-plumb
+// because the owner "never moved" leaves the VIP probe red for the rest
+// of the run. Run 30272920820 hit exactly that — double-failover on the
+// owner, whose priority put it straight back in charge before converge's
+// first poll, so the old owner-cache short-circuit never re-issued the
+// routes. Both routes are `ip route replace`, so re-plumbing on every
+// call is idempotent; the journal still only records actual movement.
 //
 // A profile without the port-forward layer has no Load_Balancer VIP at
 // all: there are no routes to re-point, and issuing them would plumb a
@@ -729,11 +735,14 @@ func (e *engine) followMaster(ctx context.Context) {
 		return
 	}
 	master := e.lab.currentMaster(ctx)
-	if master == "" || master == e.vipOwner {
+	if master == "" {
 		return
 	}
 	if err := e.lab.ensureVIPRouting(ctx, master); err != nil {
 		e.jrnl.emit(event{Event: evVIPRepoint, Target: master, Detail: err.Error()})
+		return
+	}
+	if master == e.vipOwner {
 		return
 	}
 	e.vipOwner = master

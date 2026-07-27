@@ -556,10 +556,12 @@ func TestAParkedNodeStopsTheRun(t *testing.T) {
 	}
 }
 
-// The VIP's routes are re-pointed at whichever chassis owns
-// cr-lr0-public, and only when it moves — the agent does not manage them,
-// so without the re-point the VIP probe goes permanently red on the first
-// re-election and every later violation is noise.
+// The VIP's routes are re-plumbed at whichever chassis owns
+// cr-lr0-public on every call — the agent does not manage them, and the
+// master's scope-link route dies with its container netns, so an owner
+// that comes back from a recycle with an unchanged claim needs the routes
+// again just as much as a new owner does (run 30272920820). The journal
+// still only records actual movement.
 func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 	master := "gateway-1"
 	var routesFail bool
@@ -589,12 +591,15 @@ func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 			"the scope-link route on the master: %v", got, cmd.lines())
 	}
 
-	// The master has not moved: nothing is issued and nothing is
+	// The master has not moved: the routes are still re-issued — a
+	// recycled owner's netns came back without its scope-link route, and
+	// this call is the only thing that puts it back — but nothing is
 	// journaled, which is what keeps the journal readable.
 	e.followMaster(context.Background())
 
-	if got := cmd.count("ip route replace"); got != 2 {
-		t.Fatalf("re-pointed the VIP at a master that never moved: %v", cmd.lines())
+	if got := cmd.count("ip route replace"); got != 4 {
+		t.Fatalf("issued %d route commands after an unmoved master, want the re-plumb "+
+			"(a recycled owner has no scope-link route): %v", got, cmd.lines())
 	}
 
 	// Re-election, and the re-point fails: the owner must stay where the
