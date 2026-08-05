@@ -208,7 +208,7 @@ func TestRunInputsSerializeTheSettleSchedule(t *testing.T) {
 // recovery is dated from the moment the target came back.
 func TestSummaryAggregatesLossBucketsAndRecoveries(t *testing.T) {
 	clock := newFakeClock()
-	p := newProber(nil, []probeTarget{{"pf-vip", probeHTTP, vipURL}},
+	p := newProber(nil, []probeTarget{{name: "pf-vip", kind: probeHTTP, addr: vipURL}},
 		newJournal(&bytes.Buffer{}, clock.now), clock.now)
 
 	anchor := clock.now()
@@ -252,7 +252,10 @@ func TestSummaryAggregatesLossBucketsAndRecoveries(t *testing.T) {
 
 func TestProberReportsRedTargets(t *testing.T) {
 	clock := newFakeClock()
-	targets := []probeTarget{{"fip-vm1", probePing, "192.0.2.10"}, {"pf-vip", probeHTTP, vipURL}}
+	targets := []probeTarget{
+		{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"},
+		{name: "pf-vip", kind: probeHTTP, addr: vipURL},
+	}
 	p := newProber(nil, targets, newJournal(&bytes.Buffer{}, clock.now), clock.now)
 
 	p.record("fip-vm1", false)

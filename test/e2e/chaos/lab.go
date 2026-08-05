@@ -766,10 +766,29 @@ func (l *lab) ensureVIPRouting(ctx context.Context, master string) error {
 	return nil
 }
 
-// ping / httpGet are the two probe primitives, both sourced from
-// client-1 — the external vantage point every scenario probes from.
-func (l *lab) ping(ctx context.Context, addr string) error {
-	_, err := l.exec(ctx, clientNode, "ping", "-c", "1", "-W", "1", addr)
+// The probe primitives. A vantage is a lab node and, optionally, a netns
+// inside it; the zero vantage is client-1's default namespace, the
+// external vantage point every scenario probes from, and it renders the
+// exact argv these probes used before vantages existed.
+func (l *lab) pingFrom(ctx context.Context, node, netns, addr string) error {
+	_, err := l.exec(ctx, vantageNode(node),
+		vantageArgv(netns, "ping", "-c", "1", "-W", "1", addr)...)
+	return err
+}
+
+// tcpConnectFrom completes a TCP handshake to host:port and closes it.
+// The gateway image carries no curl, so this is bash's /dev/tcp redirect
+// under `timeout` — the form pf-hairpin.sh probes its VIP with. It exits
+// 0 only when the handshake completed; on RST or timeout bash exits
+// non-zero (timeout itself exits 124 on the upper bound).
+func (l *lab) tcpConnectFrom(ctx context.Context, node, netns, hostPort string) error {
+	host, port, ok := strings.Cut(hostPort, ":")
+	if !ok {
+		return fmt.Errorf("tcp probe target %q is not host:port", hostPort)
+	}
+	_, err := l.exec(ctx, vantageNode(node), vantageArgv(netns,
+		"timeout", "3", "bash", "-c",
+		fmt.Sprintf("exec 3<>/dev/tcp/%s/%s", host, port))...)
 	return err
 }
 
@@ -777,6 +796,24 @@ func (l *lab) httpGet(ctx context.Context, url string) error {
 	_, err := l.exec(ctx, clientNode, "curl", "--silent", "--max-time", "3",
 		"--output", "/dev/null", url)
 	return err
+}
+
+// vantageNode resolves a probe's node, defaulting to client-1.
+func vantageNode(node string) string {
+	if node == "" {
+		return clientNode
+	}
+	return node
+}
+
+// vantageArgv prefixes argv with `ip netns exec <netns>` when the probe
+// names a namespace. An unnamed one leaves argv untouched, which is what
+// keeps a client-1 probe byte-identical to what it was.
+func vantageArgv(netns string, argv ...string) []string {
+	if netns == "" {
+		return argv
+	}
+	return append([]string{"ip", "netns", "exec", netns}, argv...)
 }
 
 // addrOf strips the prefix length from one of the table's CIDRs.

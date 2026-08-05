@@ -17,14 +17,41 @@ type probeKind int
 const (
 	probePing probeKind = iota
 	probeHTTP
+	// probeTCP completes a TCP handshake and nothing more. It is what a
+	// vantage inside the lab can do without curl, which the gateway image
+	// does not carry.
+	probeTCP
 )
 
-// probeTarget is one continuously-measured reachability check from
-// client-1.
+// probeTarget is one continuously-measured reachability check.
+//
+// The zero vantage — empty node and netns — is client-1's default
+// namespace, the external vantage every scenario probes from, so a target
+// that names neither is measured exactly as it was before vantages
+// existed. Naming a node and a netns instead measures a path from inside
+// the lab: same-chassis FIP-to-FIP and FIP-to-VIP traffic never leaves
+// the chassis, so client-1 cannot see it at all.
 type probeTarget struct {
-	name string
-	kind probeKind
-	addr string
+	name  string
+	kind  probeKind
+	addr  string
+	node  string
+	netns string
+}
+
+// probeOnce runs one reachability check from its target's vantage. It is
+// the single dispatch both the continuous prober and the start-state gate
+// go through, so a target neither of them can measure is impossible to
+// add.
+func probeOnce(ctx context.Context, l *lab, t probeTarget) error {
+	switch t.kind {
+	case probeHTTP:
+		return l.httpGet(ctx, t.addr)
+	case probeTCP:
+		return l.tcpConnectFrom(ctx, t.node, t.netns, t.addr)
+	default:
+		return l.pingFrom(ctx, t.node, t.netns, t.addr)
+	}
 }
 
 // targetState is one probe's live status and history.
@@ -97,14 +124,12 @@ func (p *prober) start(ctx context.Context) {
 func (p *prober) stop() { p.wg.Wait() }
 
 // sample runs one probe and folds the result into the target's state.
+//
+// A `docker exec` that could not run at all — the node is down, the netns
+// went with it mid-fault — is loss, not an error to report: the path
+// really is down, which is what the probe measures.
 func (p *prober) sample(ctx context.Context, t probeTarget) {
-	var err error
-	switch t.kind {
-	case probeHTTP:
-		err = p.lab.httpGet(ctx, t.addr)
-	case probePing:
-		err = p.lab.ping(ctx, t.addr)
-	}
+	err := probeOnce(ctx, p.lab, t)
 	if ctx.Err() != nil {
 		// The run is over; a probe cancelled mid-flight is not loss.
 		return

@@ -474,14 +474,7 @@ func waitStartStateGreen(ctx context.Context, l *lab, p *profile) error {
 func redStartTargets(ctx context.Context, l *lab, p *profile) []string {
 	var red []string
 	for _, t := range p.probes {
-		var err error
-		switch t.kind {
-		case probeHTTP:
-			err = l.httpGet(ctx, t.addr)
-		case probePing:
-			err = l.ping(ctx, t.addr)
-		}
-		if err != nil {
+		if err := probeOnce(ctx, l, t); err != nil {
 			red = append(red, t.name)
 		}
 	}
