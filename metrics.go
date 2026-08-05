@@ -68,6 +68,11 @@ type metricsRegistry struct {
 	staleChassisCleanupTotal *prometheus.CounterVec
 	missingChassis           prometheus.Gauge
 
+	// OVS flow planes
+	hairpinFlowsDesired   prometheus.Gauge
+	hairpinFlowsInstalled prometheus.Gauge
+	ovsFlowApplyErrors    *prometheus.CounterVec
+
 	// Readiness signals backing the /readyz endpoint
 	readiness readinessState
 }
@@ -206,6 +211,24 @@ func newMetricsRegistry() *metricsRegistry {
 			Name:      "missing_chassis",
 			Help:      "Number of chassis currently tracked as missing from the SB Chassis table.",
 		}),
+
+		hairpinFlowsDesired: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "hairpin_flows_desired",
+			Help:      "Number of locally-managed IPs the last reconcile wanted a same-chassis hairpin flow for (FIPs, SNAT IPs, router gateway IPs).",
+		}),
+
+		hairpinFlowsInstalled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "hairpin_flows_installed",
+			Help:      "Number of hairpin flows found on the provider bridge at the start of the last reconcile, before the agent touched them. Below desired means same-chassis peers cannot reach those IPs.",
+		}),
+
+		ovsFlowApplyErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "ovs_flow_apply_errors_total",
+			Help:      "Total failed OVS flow mutations, labelled by flow plane (hairpin, mactweak).",
+		}, []string{"plane"}),
 	}
 
 	reg.MustRegister(
@@ -227,6 +250,9 @@ func newMetricsRegistry() *metricsRegistry {
 		m.drainTotal,
 		m.staleChassisCleanupTotal,
 		m.missingChassis,
+		m.hairpinFlowsDesired,
+		m.hairpinFlowsInstalled,
+		m.ovsFlowApplyErrors,
 	)
 
 	// Initialise label series so they appear in /metrics with a zero value
@@ -246,6 +272,8 @@ func newMetricsRegistry() *metricsRegistry {
 	m.staleChassisCleanupTotal.WithLabelValues("error").Add(0)
 	m.ovnConnectionState.WithLabelValues("nb").Set(0)
 	m.ovnConnectionState.WithLabelValues("sb").Set(0)
+	m.ovsFlowApplyErrors.WithLabelValues("hairpin").Add(0)
+	m.ovsFlowApplyErrors.WithLabelValues("mactweak").Add(0)
 
 	return m
 }
@@ -456,6 +484,26 @@ func setMissingChassis(n int) {
 		return
 	}
 	metrics.missingChassis.Set(float64(n))
+}
+
+// setHairpinFlowPlane records what one reconcile wanted of the hairpin flow
+// plane and what it found there before touching it. Both gauges move together
+// so a scrape can never read a fresh desired against a stale installed.
+func setHairpinFlowPlane(desired, installed int) {
+	if metrics == nil {
+		return
+	}
+	metrics.hairpinFlowsDesired.Set(float64(desired))
+	metrics.hairpinFlowsInstalled.Set(float64(installed))
+}
+
+// recordOVSFlowApplyError counts one failed flow mutation on the named plane
+// (hairpin, mactweak).
+func recordOVSFlowApplyError(plane string) {
+	if metrics == nil {
+		return
+	}
+	metrics.ovsFlowApplyErrors.WithLabelValues(plane).Inc()
 }
 
 // setLastReconcileStatus records the outcome of the most recent reconcile
