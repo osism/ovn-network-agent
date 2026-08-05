@@ -44,6 +44,9 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_drain_total` | counter (vec) | `outcome`={`completed`,`timeout`,`error`,`noop`} | Total drain operations, labelled by outcome (completed, timeout, error, noop). |
 | `ovn_network_agent_stale_chassis_cleanup_total` | counter (vec) | `outcome`={`success`,`error`} | Total stale chassis cleanup events, labelled by outcome (success, error). |
 | `ovn_network_agent_missing_chassis` | gauge | — | Number of chassis currently tracked as missing from the SB Chassis table. |
+| `ovn_network_agent_hairpin_flows_desired` | gauge | — | Number of locally-managed IPs the last reconcile wanted a same-chassis hairpin flow for (FIPs, SNAT IPs, router gateway IPs). |
+| `ovn_network_agent_hairpin_flows_installed` | gauge | — | Number of hairpin flows found on the provider bridge at the start of the last reconcile, before the agent touched them. Below desired means same-chassis peers cannot reach those IPs. |
+| `ovn_network_agent_ovs_flow_apply_errors_total` | counter (vec) | `plane`={`hairpin`,`mactweak`} | Total failed OVS flow mutations, labelled by flow plane (hairpin, mactweak). |
 
 ## Suggested alerts
 
@@ -60,6 +63,9 @@ and each alert has a cause→diagnosis→remediation section in the
 - `inactive_routes > 0` for >2m — FIP `/32`s configured in FRR but not
   advertised via BGP (e.g. an unresolvable next-hop); those FIPs are
   unreachable from outside.
+- `hairpin_flows_installed < hairpin_flows_desired` for >1m — same-chassis
+  hairpin flows are missing, so those FIPs are unreachable from workloads on
+  the same chassis while remote clients still reach them.
 - `rate(nexthop_repairs_total[1h]) > 0` — zebra was missing the connected
   route for the veth next-hop, so no FIP route could resolve. The agent
   repaired it; the alert says it happened.

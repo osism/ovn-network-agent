@@ -282,6 +282,46 @@ appear](#agent-up-but-no-routes-appear) and check that the veth-leak plumbing
 VRF membership, and confirm the nexthop is reachable in the VRF. Once the
 next-hop resolves, FRR selects and advertises the routes on the next cycle.
 
+## Alert: OVNNetworkAgentHairpinFlowsMissing
+
+Fires on `hairpin_flows_installed < hairpin_flows_desired` for 1m.
+
+**Meaning.** The provider bridge carries fewer `cookie=0x998` hairpin flows than
+the agent computed targets for. The FIPs behind the missing flows are
+unreachable **from workloads on this same chassis**, while clients elsewhere
+still reach them over the physical network — the asymmetry that makes this
+class of fault hard to recognise from a user report.
+
+`hairpin_flows_installed` is read from a dump taken at the start of a reconcile,
+before the agent touches anything, so a one-cycle deficit is the normal shape of
+a flow the agent is about to heal. The `for: 1m` is what separates that from a
+flow the agent cannot install at all.
+
+**Likely causes.** An `ovs-ofctl add-flow` that keeps failing (check
+`ovs_flow_apply_errors_total{plane="hairpin"}`); ovn-controller recreating the
+provider-bridge patch port, which drops every flow bound to the old OpenFlow
+port number; or a hairpin target the agent cannot render — an unparseable
+external IP on a NAT row, or a localnet segment with no patch port on the
+bridge, both of which it counts as desired and warns about.
+
+**Diagnosis.** Compare the two gauges against the bridge:
+
+```bash
+ovs-ofctl --no-stats dump-flows br-ex cookie=0x998/-1
+```
+
+Then read the agent log for `skipping hairpin flow for invalid IP`, `no segment
+binding for hairpin IP, skipping`, and `skipping OVS hairpin flow reconcile:
+segment bindings not yet discovered`. A non-zero
+`ovs_flow_apply_errors_total{plane="hairpin"}` names the failing mutation in the
+log line right before it.
+
+**Remediation.** A segment with no binding needs its localnet port back on the
+provider bridge (`ovs-vsctl list-ports br-ex` and the `ovn-localnet-port`
+`external_ids` on each patch port). A NAT row with an unparseable external IP is
+fixed in OVN NB. When neither applies, the flows heal on the next reconcile
+once `ovs-ofctl` stops rejecting them.
+
 ## Alert: OVNNetworkAgentSlowFailoverAnnounce
 
 Fires on

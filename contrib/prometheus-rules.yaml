@@ -54,6 +54,19 @@ groups:
             an unresolvable next-hop) on {{ $labels.instance }}; those FIPs
             are unreachable from outside.
           runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentinactiveroutes"
+      - alert: OVNNetworkAgentHairpinFlowsMissing
+        expr: 'ovn_network_agent_hairpin_flows_installed < ovn_network_agent_hairpin_flows_desired'
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Hairpin flows missing on {{ $labels.instance }}"
+          description: >-
+            Fewer same-chassis hairpin flows are installed on
+            {{ $labels.instance }} than the agent wants. The FIPs behind the
+            missing flows are unreachable from workloads on this same chassis,
+            while remote clients still reach them.
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagenthairpinflowsmissing"
       - alert: OVNNetworkAgentNexthopRepaired
         expr: 'rate(ovn_network_agent_nexthop_repairs_total[1h]) > 0'
         labels:
