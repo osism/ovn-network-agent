@@ -3,6 +3,8 @@
 package integration
 
 import (
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -154,4 +156,98 @@ func TestScenario_MultiRouterOnOneChassis(t *testing.T) {
 		func(line string) bool {
 			return strings.Contains(line, "nw_dst="+fipB) && strings.Contains(line, "mod_dl_dst:"+r2.LRPMAC)
 		}, 15*time.Second, "hairpin flow for FIP B → router B MAC")
+}
+
+// TestScenario_HairpinFlowSelfHeal (#241):
+//
+// The differential apply has to be self-healing in one direction and
+// completely still in the other. Both halves are checked here against real
+// OVS:
+//
+//   - A flow that disappears out-of-band (someone runs del-flows, or OVS
+//     restarts) is missing from the dump the next reconcile takes, lands in
+//     that reconcile's add set, and is back within one interval.
+//   - A flow that is already correct is never touched. The reconciles that
+//     follow leave the installed entry alone, which shows up as a duration=
+//     counter that keeps running instead of resetting to zero. The old
+//     sweep-and-re-add reconcile reset it on every cycle, and with it the
+//     packet counters this flow's traffic is debugged by.
+func TestScenario_HairpinFlowSelfHeal(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "healr1",
+		LRPMAC:      "fa:16:3e:cc:00:01",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	// A 2s reconcile interval, so the repair and the two quiet cycles after
+	// it fit into a test without a long wait.
+	const reconcileInterval = 2 * time.Second
+	cfg := testenv.FastDefaults()
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	const fip = "198.51.100.77"
+	testenv.AddFIP(t, ctx, nb, router, fip, "10.0.0.77")
+
+	isFlow := func(line string) bool {
+		return strings.Contains(line, "nw_dst="+fip) && strings.Contains(line, "mod_dl_dst:"+router.LRPMAC)
+	}
+	testenv.AssertOVSFlowMatches(t, "0x998", isFlow, 15*time.Second, "hairpin flow for the FIP")
+
+	// Blow the plane away behind the agent's back.
+	if out, err := exec.Command("ovs-ofctl", "del-flows", testenv.DefaultBridgeDev, "cookie=0x998/-1").CombinedOutput(); err != nil {
+		t.Fatalf("out-of-band del-flows: %v (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	// The next reconcile sees the flow missing and re-adds it.
+	testenv.AssertOVSFlowMatches(t, "0x998", isFlow, 5*reconcileInterval, "hairpin flow repaired after an out-of-band delete")
+	repaired := time.Now()
+
+	// Now let two further reconciles pass with nothing changing in OVN. The
+	// entry must survive them: its duration counts from the repair, so it
+	// exceeds two intervals only if no reconcile replaced it in between.
+	quiet := 3 * reconcileInterval
+	time.Sleep(quiet)
+
+	out, err := exec.Command("ovs-ofctl", "dump-flows", testenv.DefaultBridgeDev, "cookie=0x998/-1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("dump-flows: %v (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	var duration time.Duration
+	for _, line := range strings.Split(string(out), "\n") {
+		if !isFlow(line) {
+			continue
+		}
+		duration = flowDuration(t, line)
+	}
+	if duration == 0 {
+		t.Fatalf("hairpin flow for %s gone after %s of quiet reconciles; dump:\n%s", fip, quiet, strings.TrimSpace(string(out)))
+	}
+	if duration < 2*reconcileInterval {
+		t.Errorf("hairpin flow duration = %s after %s (installed at %s), want more than two reconcile intervals: the flow was rewritten instead of left alone",
+			duration, quiet, repaired.Format(time.TimeOnly))
+	}
+}
+
+// flowDuration reads the duration= field ovs-ofctl reports for a flow, e.g.
+// "duration=7.481s". It is how long the entry has been installed, so a
+// reconcile that replaces the flow resets it.
+func flowDuration(t *testing.T, line string) time.Duration {
+	t.Helper()
+	for _, field := range strings.Fields(strings.ReplaceAll(line, ",", " ")) {
+		value, ok := strings.CutPrefix(field, "duration=")
+		if !ok {
+			continue
+		}
+		seconds, err := strconv.ParseFloat(strings.TrimSuffix(value, "s"), 64)
+		if err != nil {
+			t.Fatalf("unparseable duration %q in flow line %q: %v", value, line, err)
+		}
+		return time.Duration(seconds * float64(time.Second))
+	}
+	t.Fatalf("no duration= field in flow line %q", line)
+	return 0
 }
