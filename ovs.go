@@ -1,17 +1,30 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 )
 
 const (
 	ovsCookieMACTweak = "0x999"
 	ovsCookieHairpin  = "0x998"
+)
+
+// Priorities of the two agent-managed flow planes. Hairpin fires first so
+// locally-managed IPs are reflected into OVN while everything else falls
+// through to the MAC-tweak flow. The constants feed both the rendered flow
+// spec and the diff key, so the two can never disagree.
+const (
+	macTweakFlowPriority = 900
+	hairpinFlowPriority  = 910
 )
 
 // ovsLocalnetPortKey is the external_ids key ovn-controller sets on the
@@ -53,8 +66,8 @@ func MACTweakFlow(cookie, ofport, mac string, ipv6 bool) string {
 	if ipv6 {
 		proto = "ipv6"
 	}
-	return fmt.Sprintf("cookie=%s,priority=900,%s,in_port=%s,actions=mod_dl_dst:%s,NORMAL",
-		cookie, proto, ofport, mac)
+	return fmt.Sprintf("cookie=%s,priority=%d,%s,in_port=%s,actions=mod_dl_dst:%s,NORMAL",
+		cookie, macTweakFlowPriority, proto, ofport, mac)
 }
 
 // ovsCmd builds an exec.Cmd for an OVS command, prepending the configured
@@ -72,6 +85,18 @@ func (rm *RouteManager) ovsCmd(binary string, args ...string) *exec.Cmd {
 // command is dispatched through it instead of being executed.
 func (rm *RouteManager) runOVS(binary string, args ...string) ([]byte, error) {
 	cmd := rm.ovsCmd(binary, args...)
+	if rm.execOVSHook != nil {
+		return rm.execOVSHook(cmd)
+	}
+	return cmd.CombinedOutput()
+}
+
+// runOVSStdin runs an OVS command with input on its stdin. It mirrors runOVS,
+// including the execOVSHook seam, so tests read a batch back off the captured
+// command.
+func (rm *RouteManager) runOVSStdin(input []byte, binary string, args ...string) ([]byte, error) {
+	cmd := rm.ovsCmd(binary, args...)
+	cmd.Stdin = bytes.NewReader(input)
 	if rm.execOVSHook != nil {
 		return rm.execOVSHook(cmd)
 	}
@@ -109,14 +134,19 @@ func (rm *RouteManager) EnsureSegments(desired []DesiredSegment) error {
 		slog.Warn("failed to prune stale segment interfaces", "error", err)
 	}
 
-	// Delete existing agent-managed flows (idempotent replace).
-	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.cfg.BridgeDev,
-		fmt.Sprintf("cookie=%s/-1", ovsCookieMACTweak)); err != nil {
-		slog.Warn("failed to delete old OVS flows", "error", err, "output", strings.TrimSpace(string(out)))
+	if err := rm.reconcileFlowPlane(ovsCookieMACTweak, rm.desiredMACTweakFlows()); err != nil {
+		return err
 	}
 
-	// Add IPv4 and IPv6 MAC-tweak flows per patch port. Several segments
-	// may share one binding (fallback), so dedup by ofport.
+	slog.Debug("OVS MAC-tweak flows ensured", "dev", rm.cfg.BridgeDev, "segments", len(rm.segments))
+	return nil
+}
+
+// desiredMACTweakFlows renders the MAC-tweak plane the current segment
+// bindings ask for: an IPv4 and an IPv6 flow per patch port. Several segments
+// may share one binding (the legacy fallback), so the ofports are deduplicated.
+func (rm *RouteManager) desiredMACTweakFlows() []desiredFlow {
+	desired := make([]desiredFlow, 0, 2*len(rm.segments))
 	seenOfports := make(map[string]bool, len(rm.segments))
 	for _, key := range sortedSegmentKeys(rm.segments) {
 		b := rm.segments[key]
@@ -125,25 +155,16 @@ func (rm *RouteManager) EnsureSegments(desired []DesiredSegment) error {
 		}
 		seenOfports[b.ofport] = true
 
-		// Install both flows best-effort: the up-front del-flows already
-		// swept every segment's old flows, so a failed re-add on one patch
-		// port must not abort the loop and leave the remaining segments
-		// without any MAC-tweak flow at all. Log and move on.
-		ipv4Flow := MACTweakFlow(ovsCookieMACTweak, b.ofport, b.kernelMAC, false)
-		if err := rm.addOVSFlow(ipv4Flow); err != nil {
-			slog.Warn("failed to add IPv4 MAC-tweak flow, skipping",
-				"patch_port", b.patchPort, "ofport", b.ofport, "error", err)
-		}
-
-		ipv6Flow := MACTweakFlow(ovsCookieMACTweak, b.ofport, b.kernelMAC, true)
-		if err := rm.addOVSFlow(ipv6Flow); err != nil {
-			slog.Warn("failed to add IPv6 MAC-tweak flow, skipping",
-				"patch_port", b.patchPort, "ofport", b.ofport, "error", err)
+		for _, ipv6 := range []bool{false, true} {
+			spec := MACTweakFlow(ovsCookieMACTweak, b.ofport, b.kernelMAC, ipv6)
+			desired = append(desired, desiredFlow{
+				key:     flowKey{priority: macTweakFlowPriority, ipv6: ipv6, inPort: b.ofport},
+				actions: normalizeActions(flowActions(spec)),
+				spec:    spec,
+			})
 		}
 	}
-
-	slog.Debug("OVS MAC-tweak flows ensured", "dev", rm.cfg.BridgeDev, "segments", len(rm.segments))
-	return nil
+	return desired
 }
 
 // sortedSegmentKeys returns the segment map keys in deterministic order.
@@ -398,11 +419,11 @@ func (rm *RouteManager) SegmentMAC(localnetPort string) string {
 // physical network normally.
 func HairpinFlow(cookie, ofport, ip, bridgeMAC, routerMAC string, ipv6 bool) string {
 	if ipv6 {
-		return fmt.Sprintf("cookie=%s,priority=910,ipv6,in_port=%s,ipv6_dst=%s/128,actions=mod_dl_src:%s,mod_dl_dst:%s,output:in_port",
-			cookie, ofport, ip, bridgeMAC, routerMAC)
+		return fmt.Sprintf("cookie=%s,priority=%d,ipv6,in_port=%s,ipv6_dst=%s/128,actions=mod_dl_src:%s,mod_dl_dst:%s,output:in_port",
+			cookie, hairpinFlowPriority, ofport, ip, bridgeMAC, routerMAC)
 	}
-	return fmt.Sprintf("cookie=%s,priority=910,ip,in_port=%s,ip_dst=%s/32,actions=mod_dl_src:%s,mod_dl_dst:%s,output:in_port",
-		cookie, ofport, ip, bridgeMAC, routerMAC)
+	return fmt.Sprintf("cookie=%s,priority=%d,ip,in_port=%s,ip_dst=%s/32,actions=mod_dl_src:%s,mod_dl_dst:%s,output:in_port",
+		cookie, hairpinFlowPriority, ofport, ip, bridgeMAC, routerMAC)
 }
 
 // ReconcileOVSHairpinFlows installs per-IP hairpin flows on the bridge device.
@@ -426,29 +447,35 @@ func HairpinFlow(cookie, ofport, ip, bridgeMAC, routerMAC string, ipv6 bool) str
 // Pass nil or an empty map to remove all hairpin flows (e.g. when no
 // locally-active routers remain).
 //
-// The up-front del-flows sweep is a hard precondition: if it fails the method
-// returns without touching the plane. Per-flow failures thereafter (an invalid
-// IP or a failed add-flow) are logged and skipped so one bad row never leaves
-// the hairpin plane empty for every other FIP — the delete-then-abort behaviour
-// this replaces.
+// The plane is never blanked: reconcileFlowPlane adds what is missing before
+// it deletes what is stale, so a flow that is already correct is not touched
+// at all. A row the agent cannot render (an invalid IP, a segment with no
+// binding) is warned about and left out of the desired set, which retires its
+// flow like any other flow that is no longer wanted.
 func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarget) error {
 	if rm.cfg.DryRun {
 		slog.Info("[dry-run] would reconcile OVS hairpin flows", "count", len(targets))
 		return nil
 	}
 	if len(rm.segments) == 0 {
-		// Segments not yet discovered; EnsureSegments must run first.
+		// Segments not yet discovered; EnsureSegments must run first. The
+		// existing flows stay installed until it does.
 		slog.Warn("skipping OVS hairpin flow reconcile: segment bindings not yet discovered")
 		return nil
 	}
 
-	// Full replace: delete all current hairpin flows then reinstall.
-	// The replacement window is sub-millisecond and tolerable.
-	if out, err := rm.runOVS("ovs-ofctl", "del-flows", rm.cfg.BridgeDev,
-		fmt.Sprintf("cookie=%s/-1", ovsCookieHairpin)); err != nil {
-		return fmt.Errorf("del hairpin OVS flows on %s: %w (output: %s)", rm.cfg.BridgeDev, err, strings.TrimSpace(string(out)))
+	if err := rm.reconcileFlowPlane(ovsCookieHairpin, rm.desiredHairpinFlows(targets)); err != nil {
+		return err
 	}
 
+	slog.Debug("OVS hairpin flows reconciled", "count", len(targets))
+	return nil
+}
+
+// desiredHairpinFlows renders the hairpin plane the given targets ask for,
+// one flow per target IP bound to its own segment's patch port.
+func (rm *RouteManager) desiredHairpinFlows(targets map[string]HairpinTarget) []desiredFlow {
+	desired := make([]desiredFlow, 0, len(targets))
 	for ip, target := range targets {
 		parsed := net.ParseIP(ip)
 		if parsed == nil {
@@ -462,16 +489,14 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 			continue
 		}
 		isIPv6 := parsed.To4() == nil
-		flow := HairpinFlow(ovsCookieHairpin, b.ofport, ip, b.kernelMAC, target.RouterMAC, isIPv6)
-		if err := rm.addOVSFlow(flow); err != nil {
-			slog.Warn("failed to add hairpin flow, skipping",
-				"ip", ip, "segment", target.Segment, "error", err)
-			continue
-		}
+		spec := HairpinFlow(ovsCookieHairpin, b.ofport, ip, b.kernelMAC, target.RouterMAC, isIPv6)
+		desired = append(desired, desiredFlow{
+			key:     flowKey{priority: hairpinFlowPriority, ipv6: isIPv6, inPort: b.ofport, dst: parsed.String()},
+			actions: normalizeActions(flowActions(spec)),
+			spec:    spec,
+		})
 	}
-
-	slog.Debug("OVS hairpin flows reconciled", "count", len(targets))
-	return nil
+	return desired
 }
 
 // RemoveOVSFlows removes all agent-managed OVS flows from the bridge device.
@@ -538,4 +563,346 @@ func (rm *RouteManager) addOVSFlow(flow string) error {
 		return fmt.Errorf("ovs-ofctl add-flow %s %q: %w (output: %s)", rm.cfg.BridgeDev, flow, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// flowKey identifies one agent-managed flow by everything OpenFlow uses to
+// tell two entries apart: the priority and the match. Two flows with the same
+// key are the same entry, so adding a flow whose key is already installed
+// replaces it in place instead of opening a window where neither is there.
+type flowKey struct {
+	priority int
+	ipv6     bool
+	inPort   string
+	dst      string // canonical destination IP; "" for MAC-tweak flows
+}
+
+// desiredFlow is one flow the agent wants installed: its identity, its
+// normalized actions for comparison against a dump, and the exact add-flow
+// spec handed to ovs-ofctl.
+type desiredFlow struct {
+	key     flowKey
+	actions string
+	spec    string
+}
+
+// parsedFlow is one flow read back from ovs-ofctl dump-flows.
+type parsedFlow struct {
+	key     flowKey
+	actions string
+}
+
+// deleteMatch renders the --strict del-flows match that removes exactly this
+// entry: the agent cookie, the priority, and the full match. Strict deletion
+// keys on the priority as well as the match, so it can never take out a
+// neighbouring flow that happens to share the in_port.
+func (k flowKey) deleteMatch(cookie string) string {
+	proto, dstField := "ip", "nw_dst"
+	if k.ipv6 {
+		proto, dstField = "ipv6", "ipv6_dst"
+	}
+	match := fmt.Sprintf("cookie=%s/-1,priority=%d,%s,in_port=%s", cookie, k.priority, proto, k.inPort)
+	if k.dst != "" {
+		match += fmt.Sprintf(",%s=%s", dstField, k.dst)
+	}
+	return match
+}
+
+// canonicalIP renders an IP the way ovs-ofctl dumps it, so a desired address
+// and the same address read back compare equal. OVS canonicalizes IPv6
+// (lowercase, :: compressed) exactly as net.IP.String does; without this an
+// expanded or uppercase address would diff unequal on every cycle and rewrite
+// its own flow forever. Returns "" for an address that does not parse.
+func canonicalIP(s string) string {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+// flowActions returns the action list of an add-flow spec, so a desired
+// flow's comparison actions are always derived from the spec that is actually
+// installed rather than spelled out a second time.
+func flowActions(spec string) string {
+	_, actions, _ := strings.Cut(spec, ",actions=")
+	return actions
+}
+
+// normalizeActions renders an action list in one spelling, so a desired flow
+// and its dumped counterpart compare equal. ovs-ofctl echoes back what it
+// canonicalized: output:in_port comes back as IN_PORT, a MAC rewrite may come
+// back in OXM set_field form, and MACs come back lowercase.
+func normalizeActions(actions string) string {
+	parts := strings.Split(strings.ToLower(actions), ",")
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		switch {
+		case p == "in_port":
+			p = "output:in_port"
+		case strings.HasPrefix(p, "set_field:") && strings.HasSuffix(p, "->eth_src"):
+			p = "mod_dl_src:" + strings.TrimSuffix(strings.TrimPrefix(p, "set_field:"), "->eth_src")
+		case strings.HasPrefix(p, "set_field:") && strings.HasSuffix(p, "->eth_dst"):
+			p = "mod_dl_dst:" + strings.TrimSuffix(strings.TrimPrefix(p, "set_field:"), "->eth_dst")
+		}
+		parts[i] = p
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseFlowDump turns ovs-ofctl dump-flows output into the flows currently
+// installed. Only lines carrying a cookie are flows; the "NXST_FLOW reply"
+// header is not.
+//
+// A line the agent cannot key — no priority, no protocol keyword, or a
+// non-numeric in_port — is logged and dropped rather than guessed at.
+// Dropping it can only cause a harmless re-add of a flow that is already
+// installed, while a wrong key would synthesize a delete for an entry that
+// does not exist. Port names in place of numbers do not occur here: runOVS
+// captures output through a pipe and ovs-ofctl prints names only on a
+// terminal.
+func parseFlowDump(out []byte) []parsedFlow {
+	var flows []parsedFlow
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "cookie=") {
+			continue
+		}
+		match, actions, ok := strings.Cut(line, " actions=")
+		if !ok {
+			slog.Warn("ignoring OVS flow dump line without actions", "line", strings.TrimSpace(line))
+			continue
+		}
+
+		var (
+			key           flowKey
+			havePriority  bool
+			haveProto     bool
+			haveInPort    bool
+			malformedPort bool
+			malformedDst  bool
+		)
+		fields := strings.FieldsFunc(match, func(r rune) bool {
+			return r == ',' || unicode.IsSpace(r)
+		})
+		for _, f := range fields {
+			switch {
+			case f == "ip":
+				haveProto = true
+			case f == "ipv6":
+				haveProto, key.ipv6 = true, true
+			case strings.HasPrefix(f, "priority="):
+				p, err := strconv.Atoi(strings.TrimPrefix(f, "priority="))
+				if err != nil {
+					continue
+				}
+				key.priority, havePriority = p, true
+			case strings.HasPrefix(f, "in_port="):
+				port := strings.TrimPrefix(f, "in_port=")
+				if _, err := strconv.Atoi(port); err != nil {
+					malformedPort = true
+					continue
+				}
+				key.inPort, haveInPort = port, true
+			case strings.HasPrefix(f, "nw_dst="), strings.HasPrefix(f, "ip_dst="), strings.HasPrefix(f, "ipv6_dst="):
+				_, value, _ := strings.Cut(f, "=")
+				addr, _, _ := strings.Cut(value, "/") // the host mask is elided in some dumps, present in others
+				key.dst = canonicalIP(addr)
+				if key.dst == "" {
+					malformedDst = true
+				}
+			}
+		}
+		if !havePriority || !haveProto || !haveInPort || malformedPort || malformedDst {
+			slog.Warn("ignoring unparseable OVS flow dump line", "line", strings.TrimSpace(line))
+			continue
+		}
+
+		flows = append(flows, parsedFlow{key: key, actions: normalizeActions(actions)})
+	}
+	return flows
+}
+
+// reconcileFlowPlane brings one agent-managed flow plane — the flows carrying
+// the given cookie — to the desired set without ever blanking it.
+//
+// The plane is dumped once, diffed, and only the difference is applied: adds
+// first, then the deletes of what is no longer wanted. A flow whose actions
+// changed is re-added under the identical match and priority, which OpenFlow
+// replaces in place, so no packet ever sees a gap. When desired and installed
+// agree, the dump is the only command that runs and the cycle costs one exec.
+//
+// A failed add returns before the delete phase: a plane whose grow failed must
+// never be shrunk on top of that.
+func (rm *RouteManager) reconcileFlowPlane(cookie string, desired []desiredFlow) error {
+	out, err := rm.runOVS("ovs-ofctl", "--no-stats", "dump-flows", rm.cfg.BridgeDev,
+		fmt.Sprintf("cookie=%s/-1", cookie))
+	if err != nil {
+		return fmt.Errorf("dump cookie=%s flows on %s: %w (output: %s)",
+			cookie, rm.cfg.BridgeDev, err, strings.TrimSpace(string(out)))
+	}
+
+	current := make(map[flowKey]string)
+	for _, f := range parseFlowDump(out) {
+		current[f.key] = f.actions
+	}
+
+	wanted := make(map[flowKey]bool, len(desired))
+	var adds []desiredFlow
+	for _, d := range desired {
+		wanted[d.key] = true
+		if actions, ok := current[d.key]; ok && actions == d.actions {
+			continue
+		}
+		adds = append(adds, d)
+	}
+	var dels []flowKey
+	for k := range current {
+		if !wanted[k] {
+			dels = append(dels, k)
+		}
+	}
+	if len(adds) == 0 && len(dels) == 0 {
+		slog.Debug("OVS flow plane already in sync", "cookie", cookie, "flows", len(desired))
+		return nil
+	}
+
+	// Deterministic order, so a batch and a test read the same both times.
+	sort.Slice(adds, func(i, j int) bool { return adds[i].spec < adds[j].spec })
+	sort.Slice(dels, func(i, j int) bool { return dels[i].deleteMatch(cookie) < dels[j].deleteMatch(cookie) })
+
+	if err := rm.applyFlowAdds(adds); err != nil {
+		return err
+	}
+
+	var delErrs []error
+	for _, k := range dels {
+		match := k.deleteMatch(cookie)
+		if out, err := rm.runOVS("ovs-ofctl", "--strict", "del-flows", rm.cfg.BridgeDev, match); err != nil {
+			// Keep going: a stale flow matches nothing the agent wants, so
+			// retrying it on the next cycle costs nothing, while stopping
+			// here would leave the later stale flows in place as well.
+			slog.Warn("failed to delete stale OVS flow", "cookie", cookie, "match", match,
+				"error", err, "output", strings.TrimSpace(string(out)))
+			delErrs = append(delErrs, fmt.Errorf("ovs-ofctl --strict del-flows %s %q: %w",
+				rm.cfg.BridgeDev, match, err))
+		}
+	}
+
+	slog.Debug("OVS flow plane reconciled", "cookie", cookie,
+		"added", len(adds), "deleted", len(dels), "desired", len(desired))
+	return errors.Join(delErrs...)
+}
+
+// applyFlowAdds installs the given flows, preferring one exec for the whole
+// batch: the specs go to `ovs-ofctl add-flows <bridge> -` on stdin, inside an
+// OpenFlow 1.4 bundle where both the wrapper and ovs-ofctl support one.
+//
+// Falls back to one add-flow exec per spec where stdin does not reach
+// ovs-ofctl. Every spec is attempted in that mode and the failures are
+// returned together, so a bad flow never hides the ones behind it.
+func (rm *RouteManager) applyFlowAdds(adds []desiredFlow) error {
+	if len(adds) == 0 {
+		return nil
+	}
+
+	if !rm.stdinForwardingOK() {
+		var errs []error
+		for _, a := range adds {
+			if err := rm.addOVSFlow(a.spec); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
+
+	var input bytes.Buffer
+	for _, a := range adds {
+		input.WriteString(a.spec)
+		input.WriteByte('\n')
+	}
+
+	bundle := rm.bundleSupported()
+	args := []string{"add-flows", rm.cfg.BridgeDev, "-"}
+	if bundle {
+		args = append([]string{"--bundle"}, args...)
+	}
+	out, err := rm.runOVSStdin(input.Bytes(), "ovs-ofctl", args...)
+	if err != nil {
+		if bundle {
+			// The cached verdict may be wrong or stale (an OVS downgrade, a
+			// probe that passed on an empty bundle where a real one cannot).
+			// Drop it so the next cycle re-probes and can fall back, instead
+			// of failing every apply from here on.
+			rm.ofctlBundleOK = nil
+		}
+		return fmt.Errorf("ovs-ofctl %s (%d flows): %w (output: %s)",
+			strings.Join(args, " "), len(adds), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ovsStdinProbe is the payload the wrapper stdin probe echoes through `cat`.
+const ovsStdinProbe = "ovn-network-agent-stdin-probe"
+
+// stdinForwardingOK reports whether the configured OVS wrapper forwards stdin
+// into the wrapped command, which decides whether a batch of flow adds can be
+// piped in at all.
+//
+// The documented wrapper `docker exec <container>` does not: without -i the
+// wrapped command reads EOF immediately, so a batch would install nothing and
+// still exit 0. No string inspection can tell — a wrapper is an arbitrary
+// command — so the check runs `cat` through the wrapper and looks for its own
+// payload coming back.
+func (rm *RouteManager) stdinForwardingOK() bool {
+	if len(rm.ovsWrapper) == 0 {
+		return true
+	}
+	if rm.wrapperStdinOK != nil {
+		return *rm.wrapperStdinOK
+	}
+
+	out, err := rm.runOVSStdin([]byte(ovsStdinProbe+"\n"), "cat")
+	if err != nil {
+		// The wrapper itself could not run (container gone, daemon down).
+		// That says nothing about stdin, so cache nothing and probe again on
+		// the next apply; the per-flow adds below will report the real error.
+		slog.Warn("OVS wrapper stdin probe could not run, adding flows one by one this cycle",
+			"wrapper", rm.cfg.OVSWrapper, "error", err, "output", strings.TrimSpace(string(out)))
+		return false
+	}
+
+	ok := strings.Contains(string(out), ovsStdinProbe)
+	rm.wrapperStdinOK = &ok
+	if !ok && !rm.warnedWrapperStdin {
+		rm.warnedWrapperStdin = true
+		slog.Warn("OVS wrapper does not forward stdin, falling back to one exec per flow; add -i to it (e.g. \"docker exec -i openvswitch_vswitchd\") to batch flow programming",
+			"wrapper", rm.cfg.OVSWrapper)
+	}
+	return ok
+}
+
+// bundleSupported reports whether this ovs-ofctl can apply a batch as an
+// OpenFlow 1.4 bundle, which makes the adds land as one transaction.
+//
+// The probe sends an empty bundle: it installs nothing and exercises only the
+// protocol negotiation the real batch depends on. A negative verdict is never
+// cached, so a one-cycle ovs-ofctl outage cannot degrade every later apply to
+// the non-transactional path.
+func (rm *RouteManager) bundleSupported() bool {
+	if rm.ofctlBundleOK != nil {
+		return *rm.ofctlBundleOK
+	}
+
+	out, err := rm.runOVSStdin(nil, "ovs-ofctl", "--bundle", "add-flows", rm.cfg.BridgeDev, "-")
+	if err != nil {
+		if !rm.warnedOfctlBundle {
+			rm.warnedOfctlBundle = true
+			slog.Warn("ovs-ofctl --bundle unavailable, applying flow adds without a bundle",
+				"error", err, "output", strings.TrimSpace(string(out)))
+		}
+		return false
+	}
+
+	ok := true
+	rm.ofctlBundleOK = &ok
+	return true
 }
