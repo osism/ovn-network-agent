@@ -65,6 +65,25 @@ type RouteManager struct {
 	// which networks, without touching netlink.
 	refreshVethNexthopHook func(networks []*net.IPNet) error
 
+	// wrapperStdinOK caches whether the configured OVS wrapper forwards
+	// stdin into the wrapped command, and ofctlBundleOK whether this
+	// ovs-ofctl speaks OpenFlow 1.4 bundles. Both are nil until probed and
+	// decide how a batch of flow adds is applied (see applyFlowAdds). Only
+	// verdicts the agent actually observed are cached: a probe that could
+	// not run leaves the field nil so the next apply probes again.
+	//
+	// Plain fields are safe for the same reason frrRouteCache below is: the
+	// reconcile loop is single-goroutine.
+	wrapperStdinOK *bool
+	ofctlBundleOK  *bool
+
+	// warnedWrapperStdin and warnedOfctlBundle keep the two degradation
+	// warnings to one line per agent lifetime. Without them the bundle
+	// warning would repeat on every apply, since a negative bundle verdict
+	// is deliberately never cached.
+	warnedWrapperStdin bool
+	warnedOfctlBundle  bool
+
 	// frrRouteCache memoizes FRR's static-route document for the current
 	// reconcile cycle. ListFRRRoutes and InactiveFRRRoutes now issue the
 	// identical `show ip route ... static json` query, so without this a
