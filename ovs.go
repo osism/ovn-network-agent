@@ -18,6 +18,13 @@ const (
 	ovsCookieHairpin  = "0x998"
 )
 
+// The names the two agent-managed flow planes report themselves under in
+// ovn_network_agent_ovs_flow_apply_errors_total.
+const (
+	flowPlaneMACTweak = "mactweak"
+	flowPlaneHairpin  = "hairpin"
+)
+
 // Priorities of the two agent-managed flow planes. Hairpin fires first so
 // locally-managed IPs are reflected into OVN while everything else falls
 // through to the MAC-tweak flow. The constants feed both the rendered flow
@@ -134,7 +141,7 @@ func (rm *RouteManager) EnsureSegments(desired []DesiredSegment) error {
 		slog.Warn("failed to prune stale segment interfaces", "error", err)
 	}
 
-	if err := rm.reconcileFlowPlane(ovsCookieMACTweak, rm.desiredMACTweakFlows()); err != nil {
+	if err := rm.reconcileFlowPlane(flowPlaneMACTweak, ovsCookieMACTweak, rm.desiredMACTweakFlows(), nil); err != nil {
 		return err
 	}
 
@@ -464,7 +471,12 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 		return nil
 	}
 
-	if err := rm.reconcileFlowPlane(ovsCookieHairpin, rm.desiredHairpinFlows(targets)); err != nil {
+	// The observer runs on the dump the diff is computed from, before any
+	// mutation, so `installed` is what the plane looked like when the agent
+	// arrived. A post-apply count would equal desired in the very cycle that
+	// heals a deleted flow, and the deficit would never be scrapeable.
+	observe := func(installed int) { setHairpinFlowPlane(len(targets), installed) }
+	if err := rm.reconcileFlowPlane(flowPlaneHairpin, ovsCookieHairpin, rm.desiredHairpinFlows(targets), observe); err != nil {
 		return err
 	}
 
@@ -732,7 +744,13 @@ func parseFlowDump(out []byte) []parsedFlow {
 //
 // A failed add returns before the delete phase: a plane whose grow failed must
 // never be shrunk on top of that.
-func (rm *RouteManager) reconcileFlowPlane(cookie string, desired []desiredFlow) error {
+//
+// observe, when non-nil, is handed the number of flows the dump found, before
+// anything is applied. It is the plane's own observation of itself and the
+// dump is the only place it exists, so a plane that wants a metric gets it
+// from here rather than paying for a second exec. A failed dump calls it not
+// at all: there is nothing to report, and no apply happens either.
+func (rm *RouteManager) reconcileFlowPlane(plane, cookie string, desired []desiredFlow, observe func(installed int)) error {
 	out, err := rm.runOVS("ovs-ofctl", "--no-stats", "dump-flows", rm.cfg.BridgeDev,
 		fmt.Sprintf("cookie=%s/-1", cookie))
 	if err != nil {
@@ -743,6 +761,9 @@ func (rm *RouteManager) reconcileFlowPlane(cookie string, desired []desiredFlow)
 	current := make(map[flowKey]string)
 	for _, f := range parseFlowDump(out) {
 		current[f.key] = f.actions
+	}
+	if observe != nil {
+		observe(len(current))
 	}
 
 	wanted := make(map[flowKey]bool, len(desired))
@@ -769,7 +790,7 @@ func (rm *RouteManager) reconcileFlowPlane(cookie string, desired []desiredFlow)
 	sort.Slice(adds, func(i, j int) bool { return adds[i].spec < adds[j].spec })
 	sort.Slice(dels, func(i, j int) bool { return dels[i].deleteMatch(cookie) < dels[j].deleteMatch(cookie) })
 
-	if err := rm.applyFlowAdds(adds); err != nil {
+	if err := rm.applyFlowAdds(plane, adds); err != nil {
 		return err
 	}
 
@@ -780,6 +801,7 @@ func (rm *RouteManager) reconcileFlowPlane(cookie string, desired []desiredFlow)
 			// Keep going: a stale flow matches nothing the agent wants, so
 			// retrying it on the next cycle costs nothing, while stopping
 			// here would leave the later stale flows in place as well.
+			recordOVSFlowApplyError(plane)
 			slog.Warn("failed to delete stale OVS flow", "cookie", cookie, "match", match,
 				"error", err, "output", strings.TrimSpace(string(out)))
 			delErrs = append(delErrs, fmt.Errorf("ovs-ofctl --strict del-flows %s %q: %w",
@@ -799,7 +821,7 @@ func (rm *RouteManager) reconcileFlowPlane(cookie string, desired []desiredFlow)
 // Falls back to one add-flow exec per spec where stdin does not reach
 // ovs-ofctl. Every spec is attempted in that mode and the failures are
 // returned together, so a bad flow never hides the ones behind it.
-func (rm *RouteManager) applyFlowAdds(adds []desiredFlow) error {
+func (rm *RouteManager) applyFlowAdds(plane string, adds []desiredFlow) error {
 	if len(adds) == 0 {
 		return nil
 	}
@@ -808,6 +830,7 @@ func (rm *RouteManager) applyFlowAdds(adds []desiredFlow) error {
 		var errs []error
 		for _, a := range adds {
 			if err := rm.addOVSFlow(a.spec); err != nil {
+				recordOVSFlowApplyError(plane)
 				errs = append(errs, err)
 			}
 		}
@@ -827,6 +850,10 @@ func (rm *RouteManager) applyFlowAdds(adds []desiredFlow) error {
 	}
 	out, err := rm.runOVSStdin(input.Bytes(), "ovs-ofctl", args...)
 	if err != nil {
+		// One exec, one failure: a bundle either lands whole or not at all,
+		// and a non-bundle batch that failed says nothing about which spec
+		// inside it was refused.
+		recordOVSFlowApplyError(plane)
 		if bundle {
 			// The cached verdict may be wrong or stale (an OVS downgrade, a
 			// probe that passed on an empty bundle where a real one cannot).

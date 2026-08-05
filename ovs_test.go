@@ -729,6 +729,7 @@ func TestEnsureSegmentsDumpFailureIsSurfaced(t *testing.T) {
 // previously installed flows are still forwarding, and the error reaches the
 // caller instead of being swallowed the way the per-flow re-adds were.
 func TestEnsureSegmentsBatchedAddFailureIsSurfaced(t *testing.T) {
+	m := withTestMetrics(t)
 	rec := newOVSRecorder()
 	rec.on(
 		[]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"},
@@ -745,6 +746,9 @@ func TestEnsureSegmentsBatchedAddFailureIsSurfaced(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ofctl exit 1") {
 		t.Fatalf("expected the batched add failure to surface, got: %v", err)
 	}
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "mactweak"); v != 1 {
+		t.Errorf("ovs_flow_apply_errors_total{plane=\"mactweak\"} = %v, want 1 for the failed batch", v)
+	}
 }
 
 // TestEnsureSegmentsAddFailureDoesNotStarveOthers verifies the per-flow
@@ -754,6 +758,7 @@ func TestEnsureSegmentsBatchedAddFailureIsSurfaced(t *testing.T) {
 // and the collected failures are returned naming the flow that broke — never
 // a silent skip.
 func TestEnsureSegmentsAddFailureDoesNotStarveOthers(t *testing.T) {
+	m := withTestMetrics(t)
 	rec := newOVSRecorder()
 	rec.on(
 		[]string{"docker", "exec", "ovs", "ovs-vsctl", "list-ports", "br-ex"},
@@ -818,6 +823,11 @@ func TestEnsureSegmentsAddFailureDoesNotStarveOthers(t *testing.T) {
 	}
 	if got := rec.findBatchedFlows(); len(got) != 0 {
 		t.Errorf("no batch may be piped into a wrapper that eats stdin, got %v", got)
+	}
+	// One failed add, one counted mutation — the three that succeeded are
+	// not errors.
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "mactweak"); v != 1 {
+		t.Errorf("ovs_flow_apply_errors_total{plane=\"mactweak\"} = %v, want 1", v)
 	}
 }
 
@@ -1037,6 +1047,7 @@ func TestReconcileOVSHairpinFlowsIgnoresUnparseableDumpLine(t *testing.T) {
 // failing strict delete neither hides the remaining stale flows nor the error
 // itself.
 func TestReconcileOVSHairpinFlowsDeleteFailureDoesNotStopOthers(t *testing.T) {
+	m := withTestMetrics(t)
 	rec := newOVSRecorder()
 	rec.onDump("br-ex", ovsCookieHairpin,
 		" cookie=0x998, table=0, priority=910,ip,in_port=42,nw_dst=203.0.113.50 actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:00:01:02,IN_PORT\n"+
@@ -1056,6 +1067,9 @@ func TestReconcileOVSHairpinFlowsDeleteFailureDoesNotStopOthers(t *testing.T) {
 	}
 	if got := rec.findStrictDeletes(); !reflect.DeepEqual(got, want) {
 		t.Errorf("strict deletes = %v, want both attempted: %v", got, want)
+	}
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "hairpin"); v != 1 {
+		t.Errorf("ovs_flow_apply_errors_total{plane=\"hairpin\"} = %v, want 1 for the failed sweep", v)
 	}
 }
 
@@ -1184,6 +1198,7 @@ func TestReconcileOVSHairpinFlowsSkipsInvalidIP(t *testing.T) {
 // so shrinking the plane on top of that would take out flows that are still
 // the only ones forwarding. The error reaches the caller.
 func TestReconcileOVSHairpinFlowsBatchedAddFailureSkipsDeletes(t *testing.T) {
+	m := withTestMetrics(t)
 	rec := newOVSRecorder()
 	rec.onDump("br-ex", ovsCookieHairpin,
 		" cookie=0x998, table=0, priority=910,ip,in_port=42,nw_dst=203.0.113.50 actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:00:01:02,IN_PORT\n")
@@ -1203,6 +1218,9 @@ func TestReconcileOVSHairpinFlowsBatchedAddFailureSkipsDeletes(t *testing.T) {
 	if rm.ofctlBundleOK != nil {
 		t.Error("a bundle-mode failure must drop the cached verdict so the next cycle re-probes")
 	}
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "hairpin"); v != 1 {
+		t.Errorf("ovs_flow_apply_errors_total{plane=\"hairpin\"} = %v, want 1 for the failed batch", v)
+	}
 }
 
 // TestReconcileOVSHairpinFlowsPerFlowFallbackJoinsFailures covers the same
@@ -1210,6 +1228,7 @@ func TestReconcileOVSHairpinFlowsBatchedAddFailureSkipsDeletes(t *testing.T) {
 // flow is still attempted and the failures come back together, each naming its
 // own flow.
 func TestReconcileOVSHairpinFlowsPerFlowFallbackJoinsFailures(t *testing.T) {
+	m := withTestMetrics(t)
 	rec := newOVSRecorder()
 	rec.on([]string{"docker", "exec", "ovs", "ovs-ofctl", "--no-stats", "dump-flows", "br-ex", "cookie=0x998/-1"},
 		" NXST_FLOW reply (xid=0x4):\n", nil)
@@ -1238,6 +1257,9 @@ func TestReconcileOVSHairpinFlowsPerFlowFallbackJoinsFailures(t *testing.T) {
 	if !containsFlow(rec.findAddFlows(), wantSurviving) {
 		t.Errorf("healthy flow not installed after the sibling's add-flow failure; got %v", rec.findAddFlows())
 	}
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "hairpin"); v != 1 {
+		t.Errorf("ovs_flow_apply_errors_total{plane=\"hairpin\"} = %v, want 1 for the one failed add", v)
+	}
 }
 
 func TestReconcileOVSHairpinFlowsDryRun(t *testing.T) {
@@ -1249,6 +1271,138 @@ func TestReconcileOVSHairpinFlowsDryRun(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("dry-run should issue no commands, got: %v", rec.calls)
+	}
+}
+
+// hairpinPlaneGauges reads the pair back as (desired, installed), which is
+// how every assertion below wants them.
+func hairpinPlaneGauges(t *testing.T, m *metricsRegistry) (float64, float64) {
+	t.Helper()
+	return gaugeValue(t, m, "ovn_network_agent_hairpin_flows_desired"),
+		gaugeValue(t, m, "ovn_network_agent_hairpin_flows_installed")
+}
+
+// TestReconcileOVSHairpinFlowsReportsThePlaneItFound pins the observation
+// point: `installed` is the pre-apply dump, not a post-apply count. A flow
+// deleted out from under the agent therefore shows as a deficit for the cycle
+// that heals it — which is the only window the alert can fire in.
+func TestReconcileOVSHairpinFlowsReportsThePlaneItFound(t *testing.T) {
+	m := withTestMetrics(t)
+	rec := newOVSRecorder()
+	rec.onDump("br-ex", ovsCookieHairpin,
+		" cookie=0x998, table=0, priority=910,ip,in_port=42,nw_dst=5.182.234.199 actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:6f:a1:64,IN_PORT\n")
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
+
+	targets := map[string]HairpinTarget{
+		"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"},
+		"203.0.113.50":  {RouterMAC: "fa:16:3e:00:01:02"},
+	}
+	if err := rm.ReconcileOVSHairpinFlows(targets); err != nil {
+		t.Fatalf("ReconcileOVSHairpinFlows() error: %v", err)
+	}
+
+	desired, installed := hairpinPlaneGauges(t, m)
+	if desired != 2 || installed != 1 {
+		t.Errorf("hairpin plane = %v desired / %v installed, want 2/1 from the pre-apply dump", desired, installed)
+	}
+}
+
+// Nil targets want nothing; the plane still reports what the dump found, and
+// the cycle after the sweep reports the cleared plane as 0/0.
+func TestReconcileOVSHairpinFlowsEmptyTargetsReportZeroDesired(t *testing.T) {
+	m := withTestMetrics(t)
+	rec := newOVSRecorder()
+	rec.onDump("br-ex", ovsCookieHairpin,
+		" cookie=0x998, table=0, priority=910,ip,in_port=42,nw_dst=5.182.234.199 actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:6f:a1:64,IN_PORT\n")
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
+
+	if err := rm.ReconcileOVSHairpinFlows(nil); err != nil {
+		t.Fatalf("ReconcileOVSHairpinFlows(nil) error: %v", err)
+	}
+	if desired, installed := hairpinPlaneGauges(t, m); desired != 0 || installed != 1 {
+		t.Errorf("hairpin plane = %v/%v after the sweep cycle, want 0 desired / 1 installed", desired, installed)
+	}
+
+	// Next cycle: the plane the sweep emptied.
+	rec.onDump("br-ex", ovsCookieHairpin, " NXST_FLOW reply (xid=0x4):\n")
+	if err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{}); err != nil {
+		t.Fatalf("ReconcileOVSHairpinFlows(empty) error: %v", err)
+	}
+	if desired, installed := hairpinPlaneGauges(t, m); desired != 0 || installed != 0 {
+		t.Errorf("hairpin plane = %v/%v on the cleared plane, want 0/0", desired, installed)
+	}
+}
+
+// A just-started agent has no segment bindings yet and touches no flows, so
+// it must not publish a 0/N deficit the alert would fire on.
+func TestReconcileOVSHairpinFlowsNoBindingsLeavesGaugesUntouched(t *testing.T) {
+	m := withTestMetrics(t)
+	setHairpinFlowPlane(3, 3)
+	rec := newOVSRecorder()
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, execOVSHook: rec.hook()}
+
+	if err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"10.0.0.1": {RouterMAC: "aa:aa:aa:aa:aa:aa"}}); err != nil {
+		t.Fatalf("expected a no-op, got: %v", err)
+	}
+	if desired, installed := hairpinPlaneGauges(t, m); desired != 3 || installed != 3 {
+		t.Errorf("hairpin plane = %v/%v, want the previous 3/3 left alone", desired, installed)
+	}
+}
+
+// The dump is the differential apply's own input, so a failed dump aborts the
+// cycle (issue #241's behaviour, unchanged here). What this pins is that the
+// observation does not lie about it: neither gauge moves, so the last good
+// reading stands rather than a fabricated 0.
+func TestReconcileOVSHairpinFlowsDumpFailureLeavesGaugesUntouched(t *testing.T) {
+	m := withTestMetrics(t)
+	setHairpinFlowPlane(4, 4)
+	rec := newOVSRecorder()
+	rec.on([]string{"ovs-ofctl", "--no-stats", "dump-flows", "br-ex", "cookie=0x998/-1"},
+		"some output", errors.New("transient ofctl error"))
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
+
+	err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"}})
+	if err == nil || !strings.Contains(err.Error(), "dump cookie=0x998 flows on br-ex") {
+		t.Fatalf("expected the wrapped dump error, got: %v", err)
+	}
+	if desired, installed := hairpinPlaneGauges(t, m); desired != 4 || installed != 4 {
+		t.Errorf("hairpin plane = %v/%v after a failed dump, want the previous 4/4", desired, installed)
+	}
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "hairpin"); v != 0 {
+		t.Errorf("a failed dump is not a failed mutation, got %v apply errors", v)
+	}
+}
+
+// Dry-run reconciles nothing, so it must observe nothing either.
+func TestReconcileOVSHairpinFlowsDryRunLeavesGaugesUntouched(t *testing.T) {
+	m := withTestMetrics(t)
+	setHairpinFlowPlane(2, 2)
+	rec := newOVSRecorder()
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", DryRun: true}, execOVSHook: rec.hook()}
+
+	if err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"10.0.0.1": {RouterMAC: "aa:aa:aa:aa:aa:aa"}}); err != nil {
+		t.Fatalf("dry-run should not error: %v", err)
+	}
+	if desired, installed := hairpinPlaneGauges(t, m); desired != 2 || installed != 2 {
+		t.Errorf("hairpin plane = %v/%v in dry-run, want the previous 2/2", desired, installed)
+	}
+}
+
+// The MAC-tweak plane shares reconcileFlowPlane but has no gauges of its own,
+// so its cycles must never move the hairpin pair.
+func TestEnsureSegmentsLeavesTheHairpinGaugesAlone(t *testing.T) {
+	m := withTestMetrics(t)
+	setHairpinFlowPlane(5, 5)
+	rec := newOVSRecorder()
+	rec.on([]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"}, "42\n", nil)
+	rec.onDump("br-ex", ovsCookieMACTweak, " NXST_FLOW reply (xid=0x4):\n")
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, segments: fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"), execOVSHook: rec.hook()}
+
+	if err := rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}}); err != nil {
+		t.Fatalf("EnsureSegments() error: %v", err)
+	}
+	if desired, installed := hairpinPlaneGauges(t, m); desired != 5 || installed != 5 {
+		t.Errorf("hairpin plane = %v/%v after a MAC-tweak reconcile, want the previous 5/5", desired, installed)
 	}
 }
 

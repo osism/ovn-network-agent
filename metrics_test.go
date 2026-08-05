@@ -23,6 +23,48 @@ func withTestMetrics(t *testing.T) *metricsRegistry {
 	return m
 }
 
+// gaugeValue reads one unlabelled gauge back out of a registry. It fails the
+// test when the metric is absent, so a renamed collector is a failure rather
+// than a silent zero.
+func gaugeValue(t *testing.T, m *metricsRegistry, name string) float64 {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error: %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() == name {
+			return mf.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("gauge %s missing from the registry", name)
+	return 0
+}
+
+// counterValue reads one label series of a counter vector back out of a
+// registry, failing the test when the series is absent.
+func counterValue(t *testing.T, m *metricsRegistry, name, label, value string) float64 {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error: %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, item := range mf.GetMetric() {
+			for _, l := range item.GetLabel() {
+				if l.GetName() == label && l.GetValue() == value {
+					return item.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("counter %s{%s=%q} missing from the registry", name, label, value)
+	return 0
+}
+
 func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	prev := metrics
 	metrics = nil
@@ -42,6 +84,8 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	recordDrain("completed", time.Second)
 	recordStaleChassisCleanup("success", 2)
 	setMissingChassis(1)
+	setHairpinFlowPlane(3, 2)
+	recordOVSFlowApplyError("hairpin")
 	setLastReconcileStatus(true)
 }
 
@@ -70,6 +114,9 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_drain_total",
 		"ovn_network_agent_stale_chassis_cleanup_total",
 		"ovn_network_agent_missing_chassis",
+		"ovn_network_agent_hairpin_flows_desired",
+		"ovn_network_agent_hairpin_flows_installed",
+		"ovn_network_agent_ovs_flow_apply_errors_total",
 	}
 	gotNames := make(map[string]bool, len(got))
 	for _, mf := range got {
@@ -603,6 +650,51 @@ func TestSetMissingChassisSetsGauge(t *testing.T) {
 		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 2 {
 			t.Errorf("missing_chassis = %v, want 2", v)
 		}
+	}
+}
+
+func TestSetHairpinFlowPlaneMovesBothGaugesTogether(t *testing.T) {
+	m := withTestMetrics(t)
+	setHairpinFlowPlane(4, 2)
+
+	if v := gaugeValue(t, m, "ovn_network_agent_hairpin_flows_desired"); v != 4 {
+		t.Errorf("hairpin_flows_desired = %v, want 4", v)
+	}
+	if v := gaugeValue(t, m, "ovn_network_agent_hairpin_flows_installed"); v != 2 {
+		t.Errorf("hairpin_flows_installed = %v, want 2", v)
+	}
+
+	// The heal: the next cycle finds the plane whole again.
+	setHairpinFlowPlane(4, 4)
+	if v := gaugeValue(t, m, "ovn_network_agent_hairpin_flows_installed"); v != 4 {
+		t.Errorf("hairpin_flows_installed = %v after the heal, want 4", v)
+	}
+}
+
+// Both label series must exist at zero on a fresh registry, or the alert's
+// `installed < desired` comparison would have nothing to evaluate until the
+// first failure — and a scraper could not tell "no errors" from "no agent".
+func TestOVSFlowApplyErrorSeriesStartAtZero(t *testing.T) {
+	m := newMetricsRegistry()
+
+	for _, plane := range []string{"hairpin", "mactweak"} {
+		if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", plane); v != 0 {
+			t.Errorf("ovs_flow_apply_errors_total{plane=%q} = %v on a fresh registry, want 0", plane, v)
+		}
+	}
+}
+
+func TestRecordOVSFlowApplyErrorCountsByPlane(t *testing.T) {
+	m := withTestMetrics(t)
+	recordOVSFlowApplyError("hairpin")
+	recordOVSFlowApplyError("hairpin")
+	recordOVSFlowApplyError("mactweak")
+
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "hairpin"); v != 2 {
+		t.Errorf("hairpin apply errors = %v, want 2", v)
+	}
+	if v := counterValue(t, m, "ovn_network_agent_ovs_flow_apply_errors_total", "plane", "mactweak"); v != 1 {
+		t.Errorf("mactweak apply errors = %v, want 1", v)
 	}
 }
 
