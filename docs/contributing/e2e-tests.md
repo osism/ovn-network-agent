@@ -35,6 +35,8 @@ test/e2e/
     baseline.sh             — baseline reachability scenario (issue #45)
     failover.sh             — HA failover scenario, master chassis loss (issue #105)
     hairpin.sh              — same-chassis hairpin scenario, two FIPs on master (issue #108)
+    hairpin-churn.sh        — zero loss on the hairpin path under reconcile churn (issue #243)
+    lib/hairpin-topology.sh — the FIP_B topology both hairpin scenarios source
     multi-vlan.sh           — multi-VLAN provider networks, two segments on master (issue #147)
     pf-external.sh          — port-forward / DNAT scenario, source IP preserved (issue #109)
     pf-hairpin.sh           — port-forward hairpin masquerade scenario (issue #110)
@@ -404,6 +406,92 @@ nothing behind for other scenarios to trip over.
 
 **Overrides for triage:** `FIP_B`, `FIP_B_INTERNAL`, `MASTER`,
 `WORKLOAD_HOST`, `RECONCILE_TIMEOUT`, `SANITY_GATE`.
+
+### Hairpin churn
+
+```sh
+make e2e-hairpin-churn
+```
+
+[`hairpin-churn.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/hairpin-churn.sh)
+measures the same path as `hairpin.sh`, but while the agent is
+reconciling the flow plane over and over. Five pings after the plane has
+settled cannot see a hole that opens between two reconciles, and before
+[#241](https://github.com/osism/ovn-network-agent/issues/241) every
+reconcile blanked the `cookie=0x998` plane before rebuilding it. This
+scenario turns that class of defect into a failed pull request.
+
+Both scenarios lay down the same FIP_B topology, from
+[`lib/hairpin-topology.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/lib/hairpin-topology.sh)
+— the LSP, the NAT, the `vm2` responder, the two flow observers,
+`write_artifact` and `parse_ping_loss`. The library is sourced, never
+executed, and defines no `log`, so each scenario's own prefix stays on
+its lines.
+
+The scenario:
+
+1. Runs the baseline as a sanity gate and lays down FIP_B.
+2. **Metrics phase**, still on the baked 5 s cadence. It scrapes the
+   master's agent over `docker exec` (the gwnode image has no HTTP
+   client, so it uses bash's `/dev/tcp` — the same snippet the chaos
+   runner scrapes with), asserts `hairpin_flows_desired ==
+   hairpin_flows_installed` with both at least 2, then wipes the plane
+   out of band with `ovs-ofctl del-flows br-ex cookie=0x998/-1` and
+   polls once a second: `installed` must drop below `desired` within two
+   reconcile intervals and equality must return within two more, with
+   `ovs_flow_apply_errors_total{plane="hairpin"}` unchanged — an
+   out-of-band deletion is not a failed mutation. That is the
+   `OVNNetworkAgentHairpinFlowsMissing` alert firing and clearing against
+   a real agent. A scrape carrying no `hairpin_flows_` series fails the
+   phase at once rather than retrying into the timeout.
+3. Rewrites `reconcile_interval` to `1s` in the master's config and
+   restarts it. The key is replaced, never appended: the agent parses the
+   file with yaml.v3, which rejects a duplicated mapping key.
+4. Starts a **churn driver** on the central container: a NAT row for
+   `192.0.2.99` added and removed every `CHURN_INTERVAL` (2 s). No
+   backing LSP is needed — the agent keys hairpin flows off the NAT row
+   alone — so every edit really changes the desired plane, and each is an
+   event reconcile on top of the 1 s cadence. The driver records one line
+   per completed cycle, and fewer than half the expected cycles fails the
+   run as `churn driver starved`, so a driver that died cannot produce a
+   hollow green.
+5. Probes: `ping -i 0.2` from the `vm1` netns to FIP_B for
+   `PROBE_DURATION` seconds (default 120, so 600 packets), while a
+   background sampler snapshots the plane every 10 s. **Zero** lost
+   packets is the pass criterion, taken from ping's own summary. A
+   missing or truncated summary is a parse error and fails the run; it is
+   never read as zero loss.
+
+::: details Why the master can be restarted at all, and what has to be put back
+The probe rides the geneve tunnels between `gateway-3` and the master,
+and geneve is encapsulated on `eth0`, the management network
+(`ENCAP_IP` in `gwnode-entrypoint.sh`) — which `docker restart`
+preserves. What it does not preserve is the containerlab veth
+`gateway-1:eth1 ↔ upstream:eth1`: any container exit destroys it with
+the old netns (see `report_container_restarts` in `bootstrap.sh`), and
+with it the underlay address and the BGP session that advertises every
+FIP.
+
+So the scenario captures that link off the live lab before the first
+restart — `eth1`'s address, and the `upstream` interface on the same
+`/30` — and puts both back after each restart, mirroring
+`wire_gateway_underlay` and `configure_upstream` in `bootstrap.sh` for
+this one link. FRR keeps its written config across a restart, so the
+session comes back on its own once the addresses are in place. Without
+this the master would return unable to advertise anything and a
+following `make e2e-baseline` would fail.
+:::
+
+On failure the artifacts directory carries the before, during and after
+`cookie=0x998` dumps, the probe output, and the master's container log —
+the agent runs in the container foreground, so `docker logs` is its log.
+The EXIT trap stops the driver, removes the churn NAT row, tears down
+FIP_B, restores the baseline config, restarts the master and waits for
+`cr-lr0-public` to bind back.
+
+**Overrides for triage:** `PROBE_DURATION`, `PROBE_INTERVAL`,
+`CHURN_INTERVAL`, `CHURN_RECONCILE`, `METRICS_INTERVALS`, `MASTER`,
+`SANITY_GATE`.
 
 ### Multi-VLAN
 
@@ -1617,6 +1705,13 @@ composite action:
   root so the before/after `cookie=0x998` `dump-flows` snapshots are
   bundled with the lab-state dump. On failure the artifact bundle
   is uploaded as `e2e-artifacts-hairpin-<run id>-<attempt>`.
+- **`hairpin-churn`** (`needs: baseline`, runs in parallel with the
+  other baseline-gated jobs) — same shape, but executes
+  `test/e2e/scenarios/hairpin-churn.sh`. The job points the scenario's
+  `ARTIFACTS_DIR` at the same artifact root so the before/during/after
+  `cookie=0x998` snapshots, the probe output and the master's agent log
+  are bundled with the lab-state dump. On failure the artifact bundle is
+  uploaded as `e2e-artifacts-hairpin-churn-<run id>-<attempt>`.
 - **`multi-vlan`** (`needs: baseline`, runs in parallel with the other
   baseline-gated jobs) — same shape, but executes
   `test/e2e/scenarios/multi-vlan.sh`. The job points the scenario's
@@ -1661,14 +1756,18 @@ composite action:
   failure the artifact bundle is uploaded as
   `e2e-artifacts-drain-hitless-<run id>-<attempt>`.
 
-Every job except `drain-hitless` is capped at 15 minutes — matching
-the budgets in issues
+Every job except `hairpin-churn` and `drain-hitless` is capped at 15
+minutes — matching the budgets in issues
 [#45](https://github.com/osism/ovn-network-agent/issues/45),
 [#105](https://github.com/osism/ovn-network-agent/issues/105),
 [#108](https://github.com/osism/ovn-network-agent/issues/108),
 [#109](https://github.com/osism/ovn-network-agent/issues/109),
 [#111](https://github.com/osism/ovn-network-agent/issues/111), and
 [#131](https://github.com/osism/ovn-network-agent/issues/131).
+[`hairpin-churn`](https://github.com/osism/ovn-network-agent/issues/243)
+is capped at 20: on top of one bootstrap and the baseline gate it spends
+a 120-second probe window and two `docker restart` cycles of the master,
+each followed by a wait for `cr-lr0-public` to bind back.
 [`drain-hitless`](https://github.com/osism/ovn-network-agent/issues/113)
 is capped at 25: it deploys the lab twice and runs `baseline.sh` twice
 (sanity gate, then the gate on the recycled lab), so its green path is
