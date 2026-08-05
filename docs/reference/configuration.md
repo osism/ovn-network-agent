@@ -33,7 +33,7 @@ regenerate this page with `go generate ./...`.
 | `--gateway-port` | `OVN_NETWORK_GATEWAY_PORT` | `gateway_port` |  | Chassisredirect port filter; empty = track all routers automatically |
 | `--route-table-id` | `OVN_NETWORK_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
 | `--bridge-ip` | `OVN_NETWORK_BRIDGE_IP` | `bridge_ip` | `169.254.169.254` | IP to add to bridge device for ARP resolution (default: 169.254.169.254) |
-| `--ovs-wrapper` | `OVN_NETWORK_OVS_WRAPPER` | `ovs_wrapper` |  | Command prefix for ovs-vsctl/ovs-ofctl (e.g. 'docker exec openvswitch_vswitchd') |
+| `--ovs-wrapper` | `OVN_NETWORK_OVS_WRAPPER` | `ovs_wrapper` |  | Command prefix for ovs-vsctl/ovs-ofctl, must forward stdin for batched flow programming (e.g. 'docker exec -i openvswitch_vswitchd') |
 | `--reconcile-interval` | `OVN_NETWORK_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval (e.g. 60s, 5m) |
 | `--log-level` | `OVN_NETWORK_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_NETWORK_DRY_RUN` | `dry_run` | `false` | Dry-run mode: connect and reconcile but only log what would be done |

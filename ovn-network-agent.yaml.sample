@@ -72,7 +72,10 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 
 # Command prefix for ovs-vsctl/ovs-ofctl when OVS runs in a container.
 # Set this if ovs-vsctl is not in PATH (e.g. containerized OVS in OSISM/Kolla).
-# ovs_wrapper: "docker exec openvswitch_vswitchd"
+# The wrapper must forward stdin (docker exec needs -i): flow programming is
+# batched through "ovs-ofctl add-flows <bridge> -", and a wrapper that drops
+# stdin falls back to one exec per flow.
+# ovs_wrapper: "docker exec -i openvswitch_vswitchd"
 
 # Chassisredirect port filter (default: empty = track all routers)
 # When empty, the agent automatically discovers all chassisredirect port bindings
