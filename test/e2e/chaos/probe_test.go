@@ -8,16 +8,20 @@ import (
 	"time"
 )
 
-// The probe primitives are what every reachability verdict in the run
-// rests on: both are sourced from client-1, the external vantage point
-// the scenarios probe from.
+// Every target that names no vantage is sourced from client-1, the
+// external vantage point the scenarios probe from. The same-node targets
+// carry their own node and netns and are covered below.
 func TestProbesAreSourcedFromTheClient(t *testing.T) {
 	cmd := &fakeCommander{}
 	l := newTestLab(cmd, newFakeClock())
 	p := newProber(l, defaultProbes, newJournal(&bytes.Buffer{}, newFakeClock().now), newFakeClock().now)
 
+	var external []probeTarget
 	for _, target := range defaultProbes {
-		p.sample(context.Background(), target)
+		if target.node == "" && target.netns == "" {
+			external = append(external, target)
+			p.sample(context.Background(), target)
+		}
 	}
 
 	want := []string{
@@ -26,6 +30,9 @@ func TestProbesAreSourcedFromTheClient(t *testing.T) {
 		"docker exec clab-ovn-e2e-client-1 ping -c 1 -W 1 198.51.100.10",
 		"docker exec clab-ovn-e2e-client-1 ping -c 1 -W 1 203.0.113.10",
 		"docker exec clab-ovn-e2e-client-1 curl --silent --max-time 3 --output /dev/null http://192.0.2.50:80/",
+	}
+	if len(external) != len(want) {
+		t.Fatalf("%d default probes name no vantage, want %d", len(external), len(want))
 	}
 	got := cmd.lines()
 	if len(got) != len(want) {

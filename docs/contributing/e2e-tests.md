@@ -1008,6 +1008,34 @@ the replay contract outright, and the run needs concurrent probing plus
 structured artifacts. Its unit tests run under `make test` on any
 platform (they drive the real engine against a fake `docker`).
 
+**Probe vantages.** Most targets are measured from `client-1`, the
+external vantage the scenarios probe from. A target may instead name a
+**node and a netns**, and is then measured with `docker exec <node> ip
+netns exec <netns> …` from inside the lab. That is the only way to see
+same-chassis traffic at all: a FIP reached from `client-1` arrives over
+the physical network and keeps working while the hairpin plane is broken,
+so a run without an internal vantage records no loss for exactly the
+traffic class the hairpin flows exist for.
+
+Two targets use it, both from `vm1`'s namespace on `gateway-3`:
+
+| Target | Kind | Address | What it rides |
+| --- | --- | --- | --- |
+| `hairpin-fip` | ping | `192.0.2.12` | the `cookie=0x998` reflect path on whichever chassis holds `cr-lr0-public` |
+| `hairpin-vip` | TCP | `198.18.0.50:8080` | OVN egress SNAT → `br-ex` → the chassis kernel's nftables DNAT → the API VIP's own backend, and the reply steered back into OVN |
+
+The third probe kind, TCP, is a handshake through bash's `/dev/tcp`
+redirect: the gateway image carries no curl, and `pf-hairpin.sh` probes
+its VIP the same way. A `docker exec` that cannot run — the node is down,
+the netns went with it mid-fault — records as loss, which is correct: the
+path is down. After a `gateway-3` recycle the restore re-provisions the
+responder namespaces (`ensureResponders`), so the vantage comes back with
+the node and the existing recovery gate applies unchanged.
+
+The journal records probes by name, so both targets appear in
+`journal.jsonl` and in the run record's per-target loss buckets, and
+`.claude/skills/chaos-analysis/analyze.py` picks them up with no change.
+
 **Inputs — and the replay contract.** The profile, the seed, the
 duration, the tick bounds, the settle schedule and the action weights
 are the *only* inputs, and every decision the engine makes is drawn from
@@ -1113,12 +1141,16 @@ The set is curated, not combinatorial:
 
 | `-profile` | Start topology | Agent configuration | Probes |
 | --- | --- | --- | --- |
-| `everything-on` (default) | hairpin + VLAN + port-forward | the baked lab config, unchanged | the four FIPs + `pf-vip` |
+| `everything-on` (default) | hairpin + VLAN + port-forward | the baked lab config, unchanged | the four FIPs + `pf-vip` + `hairpin-fip` |
 | `flat-minimal` | baseline only | `cleanup_on_shutdown: true` | `fip-vm1` |
-| `flat-dnat` | hairpin + port-forward | the API VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip` |
-| `vlan-no-dnat` | hairpin + VLAN | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs |
+| `flat-dnat` | hairpin + port-forward | the API VIP and the hairpin VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip`, `hairpin-fip`, `hairpin-vip` |
+| `vlan-no-dnat` | hairpin + VLAN | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip` |
 | `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
-| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` API VIP, `gateway-2` API VIP + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` |
+| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` |
+
+`pf-only` and `flat-minimal` carry neither same-node target: `pf-only`
+has no OVN connection, so the agent manages no FIP path at all, and
+`flat-minimal` puts up no hairpin layer.
 
 The **API VIP** (`192.0.2.80:8080`) is the agent's own DNAT path, as
 opposed to `pf-vip`, which is an OVN `Load_Balancer`. Its backend is a
@@ -1130,6 +1162,23 @@ VRF while the VIP traffic ingresses `vrf-provider`). It lives inside
 exactly the effective networks: a VIP outside every covered prefix is
 never announced. In `pf-only` that filter has to be set by hand
 (`network_cidr`) — without OVN there is nothing to discover it from.
+
+The **hairpin VIP** (`198.18.0.50:8080`) is the API VIP's counterpart for
+a client *inside* OVN, and it needs an address of its own for the reason
+`pf-hairpin.sh` documents: `192.0.2.80` is in the provider subnet, a
+connected route on `lr0`, so OVN would ARP for it on the public logical
+switch and the chassis kernel's DNAT would never see the packet. Out of
+every subnet the lab connects, `198.18.0.50` follows `lr0`'s default route
+onto `br-ex` instead, where the MAC-tweak flow hands it to the kernel.
+`198.18.0.0/15` is the RFC 2544 benchmark range; all three TEST-NET
+ranges are already lab networks.
+
+It reuses the API VIP's backend rather than bringing its own, so it is
+only ever configured on gateways that already carry the API VIP, and only
+the VIP a client asks for differs between the two. The full
+remote-backend topology — per-gateway tenant shims and a load-bearing
+masquerade — was deliberately not built for one probe target, so the
+masquerade postrouting chain stays covered by `pf-hairpin.sh` alone.
 
 Under `heterogeneous`, the API VIP sits on `gateway-1` *and*
 `gateway-2`: a full-mode gateway only announces its port-forward VIPs

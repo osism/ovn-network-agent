@@ -1,7 +1,10 @@
 package main
 
 import (
+	"reflect"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // The whitelist order is part of the replay contract — the engine draws a
@@ -118,11 +121,12 @@ func TestInapplicableFlips(t *testing.T) {
 	}
 }
 
-// The port-forward flip carries a VIP of its own. Touching the API VIP's
-// rules instead would take the probed data path down on a gateway that is
-// meant to keep serving it.
-func TestPortForwardFlipLeavesTheProbedVIPAlone(t *testing.T) {
+// The port-forward flip carries a VIP of its own. Touching either probed
+// VIP's rules instead would take a measured data path down on a gateway
+// that is meant to keep serving it.
+func TestPortForwardFlipLeavesTheProbedVIPsAlone(t *testing.T) {
 	c := flipContext(t, "flat-dnat", "gateway-2")
+	before := vipEntry(t, c.doc, hairpinVIPAddr)
 
 	if _, to := flipNamed(t, "pf-rule-toggle").apply(c); to != flipVIPAddr {
 		t.Fatalf("pf-rule-toggle added %q, want the unprobed flip VIP %s", to, flipVIPAddr)
@@ -130,9 +134,53 @@ func TestPortForwardFlipLeavesTheProbedVIPAlone(t *testing.T) {
 	if apiVIPIn(c.doc) == nil {
 		t.Fatalf("the probed API VIP was removed by the flip: %v", c.doc["port_forwards"])
 	}
-	if len(vipsOf(c.doc)) != 2 {
-		t.Fatalf("port_forwards = %v, want the API VIP alongside the flip's own", c.doc["port_forwards"])
+	if got := vipEntry(t, c.doc, hairpinVIPAddr); !reflect.DeepEqual(got, before) {
+		t.Fatalf("the hairpin VIP entry changed across the flip:\n got %v\nwant %v", got, before)
 	}
+	if len(vipsOf(c.doc)) != 3 {
+		t.Fatalf("port_forwards = %v, want both probed VIPs alongside the flip's own", c.doc["port_forwards"])
+	}
+}
+
+// The masquerade flip selects the API VIP by address, so the hairpin VIP
+// beside it must come through both the apply and the revert untouched —
+// a flipped hairpin_masquerade on it would SNAT traffic to a same-host
+// backend and break the reply path the hairpin-vip probe rides.
+func TestMasqueradeFlipLeavesTheHairpinVIPAlone(t *testing.T) {
+	c := flipContext(t, "flat-dnat", "gateway-1")
+	before := vipEntry(t, c.doc, hairpinVIPAddr)
+	flip := flipNamed(t, "masquerade-toggle")
+
+	flip.apply(c)
+	if got := vipEntry(t, c.doc, hairpinVIPAddr); !reflect.DeepEqual(got, before) {
+		t.Fatalf("the hairpin VIP entry changed on apply:\n got %v\nwant %v", got, before)
+	}
+	flip.apply(c)
+	if got := vipEntry(t, c.doc, hairpinVIPAddr); !reflect.DeepEqual(got, before) {
+		t.Fatalf("the hairpin VIP entry changed on revert:\n got %v\nwant %v", got, before)
+	}
+}
+
+// vipEntry is one port_forwards entry by VIP address, deep-copied so a
+// later mutation of the document cannot change what a test captured.
+func vipEntry(t *testing.T, doc map[string]any, addr string) map[string]any {
+	t.Helper()
+	for _, entry := range vipsOf(doc) {
+		if vipAddrOf(entry) != addr {
+			continue
+		}
+		raw, err := yaml.Marshal(entry)
+		if err != nil {
+			t.Fatalf("marshal the %s entry: %v", addr, err)
+		}
+		var copied map[string]any
+		if err := yaml.Unmarshal(raw, &copied); err != nil {
+			t.Fatalf("copy the %s entry: %v", addr, err)
+		}
+		return copied
+	}
+	t.Fatalf("no port_forwards entry for %s in %v", addr, doc["port_forwards"])
+	return nil
 }
 
 // flipContext renders one gateway's profile configuration and hands back
