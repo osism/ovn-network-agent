@@ -38,6 +38,101 @@ func TestProbesAreSourcedFromTheClient(t *testing.T) {
 	}
 }
 
+// A target that names neither a node nor a netns must still probe from
+// client-1, with the argv it had before vantages existed — otherwise
+// every recorded run's probe stream would change meaning.
+func TestZeroVantageProbesAreUnchanged(t *testing.T) {
+	cmd := &fakeCommander{}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := probeOnce(context.Background(),
+		l, probeTarget{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}); err != nil {
+		t.Fatalf("probeOnce() error: %v", err)
+	}
+
+	want := "docker exec clab-ovn-e2e-client-1 ping -c 1 -W 1 192.0.2.10"
+	if got := cmd.lines(); len(got) != 1 || got[0] != want {
+		t.Fatalf("zero-vantage probe = %v, want exactly %q", got, want)
+	}
+}
+
+// A vantage inside the lab enters the target's node and namespace. The
+// TCP form is bash's /dev/tcp redirect because the gateway image has no
+// curl.
+func TestVantageProbesEnterTheirNodeAndNetns(t *testing.T) {
+	cases := []struct {
+		name   string
+		target probeTarget
+		want   string
+	}{
+		{
+			name:   "ping",
+			target: probeTarget{name: "hairpin-fip", kind: probePing, addr: "192.0.2.12", node: "gateway-3", netns: "vm1"},
+			want:   "docker exec clab-ovn-e2e-gateway-3 ip netns exec vm1 ping -c 1 -W 1 192.0.2.12",
+		},
+		{
+			name:   "tcp",
+			target: probeTarget{name: "hairpin-vip", kind: probeTCP, addr: "198.18.0.50:8080", node: "gateway-3", netns: "vm1"},
+			want:   "docker exec clab-ovn-e2e-gateway-3 ip netns exec vm1 timeout 3 bash -c exec 3<>/dev/tcp/198.18.0.50/8080",
+		},
+		{
+			name:   "tcp without a netns stays in the node's default namespace",
+			target: probeTarget{name: "tcp-node", kind: probeTCP, addr: "198.18.0.50:8080", node: "gateway-1"},
+			want:   "docker exec clab-ovn-e2e-gateway-1 timeout 3 bash -c exec 3<>/dev/tcp/198.18.0.50/8080",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &fakeCommander{}
+			l := newTestLab(cmd, newFakeClock())
+
+			if err := probeOnce(context.Background(), l, tc.target); err != nil {
+				t.Fatalf("probeOnce() error: %v", err)
+			}
+			if got := cmd.lines(); len(got) != 1 || got[0] != tc.want {
+				t.Fatalf("probe = %v, want exactly %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A `docker exec` that could not run at all — the node is down, the netns
+// went with it mid-fault — is the path being down, so it must record as
+// loss rather than stopping the sampler.
+func TestVantageProbeExecFailureIsLoss(t *testing.T) {
+	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
+	clock := newFakeClock()
+	target := probeTarget{name: "hairpin-fip", kind: probePing, addr: "192.0.2.12", node: "gateway-3", netns: "vm1"}
+	p := newProber(newTestLab(cmd, clock), []probeTarget{target},
+		newJournal(&bytes.Buffer{}, clock.now), clock.now)
+
+	p.sample(context.Background(), target)
+	p.sample(context.Background(), target)
+
+	if sum := p.summary()["hairpin-fip"]; sum.Sent != 2 || sum.Lost != 2 {
+		t.Fatalf("sent/lost = %d/%d, want 2/2 — a failed exec is loss", sum.Sent, sum.Lost)
+	}
+	if p.allGreen() {
+		t.Error("a target whose every probe failed must not read as green")
+	}
+}
+
+// A malformed TCP target is a programming error in the registry, not a
+// dead path, so it must not be silently probed as something else.
+func TestTCPProbeRejectsATargetWithoutAPort(t *testing.T) {
+	cmd := &fakeCommander{}
+	l := newTestLab(cmd, newFakeClock())
+
+	err := probeOnce(context.Background(),
+		l, probeTarget{name: "broken", kind: probeTCP, addr: "198.18.0.50", node: "gateway-3"})
+	if err == nil || !strings.Contains(err.Error(), "not host:port") {
+		t.Fatalf("expected a host:port error, got %v", err)
+	}
+	if got := cmd.lines(); len(got) != 0 {
+		t.Fatalf("a malformed target must exec nothing, got %v", got)
+	}
+}
+
 // A failing probe is loss, and the red→green edge is journaled so a
 // reader can line the outage up against the fault that caused it.
 func TestSampleRecordsLossAndJournalsTransitions(t *testing.T) {
@@ -50,7 +145,7 @@ func TestSampleRecordsLossAndJournalsTransitions(t *testing.T) {
 	}}
 	clock := newFakeClock()
 	var buf bytes.Buffer
-	target := probeTarget{"fip-vm1", probePing, "192.0.2.10"}
+	target := probeTarget{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}
 	p := newProber(newTestLab(cmd, clock), []probeTarget{target},
 		newJournal(&buf, clock.now), clock.now)
 
@@ -88,7 +183,7 @@ func TestSampleRecordsLossAndJournalsTransitions(t *testing.T) {
 func TestSampleIgnoresACancelledProbe(t *testing.T) {
 	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
 	clock := newFakeClock()
-	target := probeTarget{"fip-vm1", probePing, "192.0.2.10"}
+	target := probeTarget{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}
 	p := newProber(newTestLab(cmd, clock), []probeTarget{target},
 		newJournal(&bytes.Buffer{}, clock.now), clock.now)
 

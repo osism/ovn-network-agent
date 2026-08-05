@@ -56,12 +56,12 @@ var explicitCIDRs = []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"
 // measures is the profile's call: a layer that is off has no responder
 // behind its target, so probing it would be red for the whole run.
 var (
-	probeVM1     = probeTarget{"fip-vm1", probePing, "192.0.2.10"}
-	probeVM2     = probeTarget{"fip-vm2", probePing, "192.0.2.12"}
-	probeVLAN101 = probeTarget{"fip-vlan101", probePing, "198.51.100.10"}
-	probeVLAN102 = probeTarget{"fip-vlan102", probePing, "203.0.113.10"}
-	probeLBVIP   = probeTarget{"pf-vip", probeHTTP, vipURL}
-	probeAPIVIP  = probeTarget{"api-vip", probeHTTP, apiVIPURL}
+	probeVM1     = probeTarget{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}
+	probeVM2     = probeTarget{name: "fip-vm2", kind: probePing, addr: "192.0.2.12"}
+	probeVLAN101 = probeTarget{name: "fip-vlan101", kind: probePing, addr: "198.51.100.10"}
+	probeVLAN102 = probeTarget{name: "fip-vlan102", kind: probePing, addr: "203.0.113.10"}
+	probeLBVIP   = probeTarget{name: "pf-vip", kind: probeHTTP, addr: vipURL}
+	probeAPIVIP  = probeTarget{name: "api-vip", kind: probeHTTP, addr: apiVIPURL}
 )
 
 // defaultProbes is what a full-topology run measures: the four FIPs and
