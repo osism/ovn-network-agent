@@ -183,10 +183,12 @@ func TestScenario_FailureInjection_OvsOfctlFailsOnce(t *testing.T) {
 	const fipA = "198.51.100.55"
 	testenv.AddFIP(t, ctx, nb, router, fipA, "10.0.0.55")
 
-	// failCount must exceed the ovs-ofctl call count in a single reconcile
-	// (del-flows MAC-tweak + add-flow v4 + add-flow v6 + del-flows hairpin
-	// + add-flow hairpin = 5). Setting it to 10 leaves headroom for any
-	// future call added inside the same cycle.
+	// failCount must exceed the ovs-ofctl call count in a single reconcile.
+	// Since #241 a cycle costs at most a dump, a bundle probe and one
+	// batched add per plane (2 planes × 3 = 6); a cycle whose dump already
+	// fails costs just the two dumps, so an armed shim is consumed over
+	// several cycles rather than one. Setting failCount to 10 keeps the
+	// window above a single healthy cycle either way.
 	shim := testenv.WithFailingTool(t, "ovs-ofctl", 10)
 	cfg := testenv.FastDefaults()
 	cfg.ExtraEnv = append(cfg.ExtraEnv, shim.Env())
