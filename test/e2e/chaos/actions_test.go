@@ -360,8 +360,8 @@ func TestProbeTargetsExcludeTheBackendlessFIP(t *testing.T) {
 			t.Fatalf("probe target %q has no responder behind it", target.name)
 		}
 	}
-	if len(defaultProbes) != 5 {
-		t.Fatalf("probe set = %v, want the four FIPs plus the port-forward VIP", defaultProbes)
+	if len(defaultProbes) != 6 {
+		t.Fatalf("probe set = %v, want the four FIPs, the port-forward VIP and the same-node hairpin FIP", defaultProbes)
 	}
 }
 

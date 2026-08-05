@@ -165,6 +165,117 @@ func TestAPIVIPBlockPointsAtTheGatewaysOwnBackend(t *testing.T) {
 	}
 }
 
+// The hairpin VIP renders as a second port_forwards entry after the API
+// VIP's. Order matters to the flips, which select an entry by address out
+// of the list they find.
+func TestHairpinVIPRendersBesideTheAPIVIP(t *testing.T) {
+	doc := render(t, gwConfig{apiVIP: true, hairpinVIP: true}, "172.20.20.7")
+
+	entries, ok := doc["port_forwards"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("port_forwards = %v, want both VIPs", doc["port_forwards"])
+	}
+	if got := vipAddrOf(entries[0]); got != apiVIPAddr {
+		t.Fatalf("first entry is %s, want the API VIP %s", got, apiVIPAddr)
+	}
+	if got := vipAddrOf(entries[1]); got != hairpinVIPAddr {
+		t.Fatalf("second entry is %s, want the hairpin VIP %s", got, hairpinVIPAddr)
+	}
+
+	vip := vipsIn(t, doc)[hairpinVIPAddr]
+	if vip["manage_vip"] != true {
+		t.Fatal("the agent has to own the hairpin VIP address for the probe to reach it")
+	}
+	// A same-host backend must not be masqueraded, and the key is spelled
+	// out so the masquerade flip toggling it twice lands back on exactly
+	// this document.
+	if vip["masquerade"] != false || vip["hairpin_masquerade"] != false {
+		t.Fatalf("hairpin VIP = %v, want both masquerade keys present and false", vip)
+	}
+	rules, ok := vip["rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("rules = %v, want exactly the one TCP rule", vip["rules"])
+	}
+	rule, _ := rules[0].(map[string]any)
+	if rule["port"] != hairpinVIPPort || rule["dest_addr"] != "172.20.20.7" || rule["dest_port"] != apiVIPPort {
+		t.Fatalf("rule = %v, want tcp/%d to the gateway's own backend on %d",
+			rule, hairpinVIPPort, apiVIPPort)
+	}
+}
+
+// A hairpinVIP-only overlay changes the document, so it must not be
+// mistaken for the zero value — renderConfig hands the base bytes back
+// verbatim for an empty overlay, and the applier reads that byte identity
+// as "nothing to do, no restart".
+func TestHairpinVIPOnlyOverlayIsNotEmpty(t *testing.T) {
+	if (gwConfig{hairpinVIP: true}).empty() {
+		t.Fatal("a hairpinVIP overlay reports empty, so renderConfig would drop it")
+	}
+	got, err := renderConfig(baseConfig(t), gwConfig{hairpinVIP: true}, "172.20.20.7")
+	if err != nil {
+		t.Fatalf("renderConfig: %v", err)
+	}
+	if bytes.Equal(got, baseConfig(t)) {
+		t.Fatal("the hairpinVIP overlay rendered the base bytes verbatim")
+	}
+}
+
+// The hairpin VIP's backend is the responder startAPIBackend puts up on
+// API-VIP gateways, and nothing else starts one. A gateway carrying the
+// VIP without it would be a DNAT rule with nothing behind it, and its
+// probe would be red for the whole run.
+func TestHairpinVIPNeverAppearsWithoutItsBackend(t *testing.T) {
+	for _, p := range profiles() {
+		for _, gw := range gatewayNames() {
+			c := p.gwConfig(gw)
+			if c.hairpinVIP && !c.apiVIP {
+				t.Fatalf("%s gives %s the hairpin VIP without the API VIP's backend", p.name, gw)
+			}
+		}
+	}
+}
+
+// Which profiles measure the same-node paths. hairpin-fip needs the
+// hairpin layer's second FIP; hairpin-vip additionally needs a gateway
+// configured with the VIP, which is why it is not in every profile that
+// carries the layer.
+func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
+	wantFIP := map[string]bool{
+		"everything-on": true, "flat-dnat": true,
+		"vlan-no-dnat": true, "heterogeneous": true,
+	}
+	wantVIP := map[string]bool{"flat-dnat": true, "heterogeneous": true}
+
+	for _, p := range profiles() {
+		if got := hasProbe(p.probes, probeHairpinFIP.name); got != wantFIP[p.name] {
+			t.Errorf("%s probes hairpin-fip = %v, want %v", p.name, got, wantFIP[p.name])
+		}
+		if got := hasProbe(p.probes, probeHairpinVIP.name); got != wantVIP[p.name] {
+			t.Errorf("%s probes hairpin-vip = %v, want %v", p.name, got, wantVIP[p.name])
+		}
+		// Both ride vm1's namespace on the workload host, and both need
+		// the hairpin layer's FIP_B or the VIP behind them.
+		for _, target := range p.probes {
+			switch target.name {
+			case probeHairpinFIP.name:
+				if !p.hairpin {
+					t.Errorf("%s probes the same-node hairpin FIP without the hairpin layer", p.name)
+				}
+			case probeHairpinVIP.name:
+				if !anyGatewayHasHairpinVIP(p) {
+					t.Errorf("%s probes the hairpin VIP but no gateway is configured with it", p.name)
+				}
+			}
+			if target.name == probeHairpinFIP.name || target.name == probeHairpinVIP.name {
+				if target.node != workloadHost || target.netns != "vm1" {
+					t.Errorf("%s: %s probes from %q/%q, want the workload host's vm1",
+						p.name, target.name, target.node, target.netns)
+				}
+			}
+		}
+	}
+}
+
 // The heterogeneous profile is the point of the per-gateway overlay: the
 // three gateways run three different configurations at once.
 func TestHeterogeneousProfileRendersOneConfigPerGateway(t *testing.T) {
@@ -340,6 +451,18 @@ func vipsIn(t *testing.T, doc map[string]any) map[string]map[string]any {
 		out[addr] = vip
 	}
 	return out
+}
+
+// anyGatewayHasHairpinVIP reports whether the profile configures the
+// hairpin VIP anywhere — without it there is no DNAT rule for the
+// hairpin-vip probe to reach.
+func anyGatewayHasHairpinVIP(p *profile) bool {
+	for _, gw := range gatewayNames() {
+		if p.gwConfig(gw).hairpinVIP {
+			return true
+		}
+	}
+	return false
 }
 
 func hasProbe(targets []probeTarget, name string) bool {

@@ -259,9 +259,11 @@ func TestExpectationDormantVIPOnStandbyGateway(t *testing.T) {
 		t.Fatalf("MustAnnounce = %v, want nothing announced from a standby", exp.MustAnnounce)
 	}
 	// The DNAT plane still follows the config alone, so a gateway that later
-	// wins the CR port only needs the announce.
+	// wins the CR port only needs the announce. flat-dnat carries the hairpin
+	// VIP beside the API VIP, and both rules are programmed here.
 	assertDNAT(t, exp.DNAT, []dnatExpectation{
 		{VIP: apiVIPAddr, Proto: "tcp", Port: apiVIPPort, Backend: "172.20.20.5", DestPort: apiVIPPort},
+		{VIP: hairpinVIPAddr, Proto: "tcp", Port: hairpinVIPPort, Backend: "172.20.20.5", DestPort: apiVIPPort},
 	})
 	// #223: the VIP address is the announce path, so a full-mode standby
 	// withholds it — the managed-VIP set is empty even though the config carries
