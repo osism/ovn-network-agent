@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -12,6 +12,7 @@ E2E_BOOTSTRAP   := test/e2e/bootstrap.sh
 E2E_BASELINE    := test/e2e/scenarios/baseline.sh
 E2E_FAILOVER    := test/e2e/scenarios/failover.sh
 E2E_HAIRPIN     := test/e2e/scenarios/hairpin.sh
+E2E_HAIRPIN_CHURN := test/e2e/scenarios/hairpin-churn.sh
 E2E_MULTI_VLAN  := test/e2e/scenarios/multi-vlan.sh
 E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
@@ -221,6 +222,21 @@ e2e-failover-strict:
 # `make e2e-baseline` works without tearing the lab down.
 e2e-hairpin:
 	$(E2E_HAIRPIN)
+
+# Run the same-chassis hairpin churn scenario (issue #243) against a lab
+# that is already up. Lays down the same second FIP hairpin.sh uses, then
+# asserts the agent's flow-plane gauges report a plane wiped out of band
+# and the heal that follows, rewrites the master's reconcile_interval to
+# 1s and restarts it, and pings FIP_B from the vm1 netns for 120s while a
+# NB churn driver adds and removes a NAT row every 2s. Any lost packet
+# fails the run: the hairpin plane must never have a hole between two
+# reconciles. Costs two master restarts on top of the probe window, which
+# is why its CI job carries a wider budget than the other scenarios. The
+# EXIT trap restores the config, the master's underlay and the baseline
+# topology, so a subsequent `make e2e-baseline` works without tearing the
+# lab down.
+e2e-hairpin-churn:
+	$(E2E_HAIRPIN_CHURN)
 
 # Run the multi-VLAN provider-network scenario (issue #147) against a
 # lab that is already up. Adds two VLAN provider networks (tags 101/102
