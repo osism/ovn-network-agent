@@ -136,7 +136,7 @@ type Config struct {
 	GatewayPort       string
 	RouteTableID      int
 	BridgeIP          string // IP to add to br-ex for ARP resolution (default: 169.254.169.254)
-	OVSWrapper        string // e.g. "docker exec openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl calls
+	OVSWrapper        string // e.g. "docker exec -i openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl calls; must forward stdin, or flow adds fall back to one exec per flow
 	ReconcileInterval time.Duration
 	LogLevel          string
 	DryRun            bool
@@ -445,7 +445,7 @@ func configOptions() []configOption {
 			func(c *Config) *int { return &c.RouteTableID }),
 		stringOpt("bridge-ip", "169.254.169.254", "IP to add to bridge device for ARP resolution (default: 169.254.169.254)",
 			func(c *Config) *string { return &c.BridgeIP }),
-		stringOpt("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl (e.g. 'docker exec openvswitch_vswitchd')",
+		stringOpt("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl, must forward stdin for batched flow programming (e.g. 'docker exec -i openvswitch_vswitchd')",
 			func(c *Config) *string { return &c.OVSWrapper }),
 		durationOpt("reconcile-interval", 60*time.Second, "Full reconciliation interval (e.g. 60s, 5m)",
 			func(c *Config) *time.Duration { return &c.ReconcileInterval }),
