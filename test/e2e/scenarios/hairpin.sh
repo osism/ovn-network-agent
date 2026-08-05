@@ -50,6 +50,12 @@
 # `if: always()` so a fatal interpreter error here (which skips the
 # trap) is still cleaned up.
 #
+# The FIP_B topology itself — the LSP, the NAT, the responder, the
+# teardown, and the two flow observers — lives in
+# lib/hairpin-topology.sh, which hairpin-churn.sh (issue #243) sources
+# too. What stays here is this scenario's own measurement: the sanity
+# gate, the per-FIP flow assertion, and the five-packet probe.
+#
 # Environment overrides (used by the CI workflow):
 #   LAB                 container-name prefix (defaults to the topology name "ovn-e2e")
 #   MASTER              chassis owning cr-lr0-public (defaults to gateway-1)
@@ -76,29 +82,10 @@
 
 set -euo pipefail
 
-LAB="${LAB:-ovn-e2e}"
-MASTER="${MASTER:-gateway-1}"
-MASTER_NODE="clab-${LAB}-${MASTER}"
-WORKLOAD_HOST="${WORKLOAD_HOST:-gateway-3}"
-WORKLOAD_NODE="clab-${LAB}-${WORKLOAD_HOST}"
-CENTRAL="${CENTRAL:-clab-${LAB}-central}"
-LR_NAME="${LR_NAME:-lr0}"
-LS_NAME="${LS_NAME:-ls0}"
 FIP_A="${FIP_A:-192.0.2.10}"
-FIP_B="${FIP_B:-192.0.2.12}"
-FIP_B_INTERNAL="${FIP_B_INTERNAL:-192.168.10.12}"
-FIP_B_LSP="${FIP_B_LSP:-ls0-vm2}"
-FIP_B_MAC="${FIP_B_MAC:-02:00:00:00:0a:0b}"
-FIP_B_NETNS="${FIP_B_NETNS:-vm2}"
-FIP_B_HOST_VETH="${FIP_B_HOST_VETH:-vm2-host}"
-FIP_B_NS_VETH="${FIP_B_NS_VETH:-vm2-eth0}"
 WORKLOAD_NETNS="${WORKLOAD_NETNS:-vm1}"
-WORKLOAD_GW="${WORKLOAD_GW:-192.168.10.1}"
-WORKLOAD_CIDR_LEN="${WORKLOAD_CIDR_LEN:-24}"
-RECONCILE_TIMEOUT="${RECONCILE_TIMEOUT:-60}"
 PING_COUNT="${PING_COUNT:-5}"
 PING_TIMEOUT="${PING_TIMEOUT:-2}"
-ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
 SANITY_GATE="${SANITY_GATE:-1}"
 
 SCENARIOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,20 +93,11 @@ BASELINE="${BASELINE:-${SCENARIOS_DIR}/baseline.sh}"
 
 log() { printf '[hairpin] %s\n' "$*" >&2; }
 
-nbctl() { docker exec "${CENTRAL}" ovn-nbctl "$@"; }
-
-# Write `content` (read from stdin) to `path` under ARTIFACTS_DIR when
-# it is set; quietly no-op otherwise. Mirrors the helper used by
-# stale-chassis.sh so the CI-side ARTIFACTS_DIR plumbing is uniform.
-write_artifact() {
-    local path="$1"
-    if [ -z "${ARTIFACTS_DIR}" ]; then
-        cat >/dev/null
-        return 0
-    fi
-    mkdir -p "${ARTIFACTS_DIR}"
-    cat >"${ARTIFACTS_DIR}/${path}"
-}
+# The shared FIP_B topology, its two flow observers, and write_artifact.
+# It defines no log of its own, so the prefix above is what its lines
+# carry — source it after the definition.
+# shellcheck source=test/e2e/scenarios/lib/hairpin-topology.sh
+. "${SCENARIOS_DIR}/lib/hairpin-topology.sh"
 
 # Run baseline.sh as a sanity gate so a broken green path fails fast
 # under the right label. Disabled by SANITY_GATE=0 — useful when
@@ -135,124 +113,6 @@ sanity_gate() {
     fi
     log "running baseline.sh as a sanity gate (set SANITY_GATE=0 to skip)"
     "${BASELINE}"
-}
-
-# Dump the cookie=0x998 lines from MASTER's br-ex. Empty stdout when
-# the agent has not (yet) installed any hairpin flows. Used both for
-# the polling wait and for the artifact snapshot.
-dump_hairpin_flows() {
-    docker exec "${MASTER_NODE}" \
-        ovs-ofctl --no-stats dump-flows br-ex 2>/dev/null \
-        | grep 'cookie=0x998' || true
-}
-
-# Add the LSP for the FIP_B backend on the tenant switch. Idempotent
-# via --may-exist; lsp-set-addresses replaces any prior value.
-ensure_fip_b_lsp() {
-    log "ensuring LSP ${FIP_B_LSP} on ${LS_NAME} (${FIP_B_MAC} ${FIP_B_INTERNAL})"
-    nbctl --may-exist lsp-add "${LS_NAME}" "${FIP_B_LSP}"
-    nbctl lsp-set-addresses "${FIP_B_LSP}" \
-        "${FIP_B_MAC} ${FIP_B_INTERNAL}"
-}
-
-# Add the dnat_and_snat NAT for FIP_B → FIP_B_INTERNAL on lr0.
-# Idempotent via --may-exist.
-ensure_fip_b_nat() {
-    log "ensuring FIP ${FIP_B} → ${FIP_B_INTERNAL} on ${LR_NAME}"
-    nbctl --may-exist lr-nat-add "${LR_NAME}" \
-        dnat_and_snat "${FIP_B}" "${FIP_B_INTERNAL}"
-}
-
-# Provision the FIP_B responder on WORKLOAD_HOST: a veth pair with one
-# end attached to br-int (carrying iface-id=ls0-vm2 so ovn-controller
-# binds the LSP to this chassis), the other end placed in a netns with
-# the workload IP and a default route to the LR. Mirrors the
-# ensure_workload_netns pattern from bootstrap.sh.
-ensure_fip_b_responder() {
-    log "provisioning ${FIP_B_NETNS} responder on ${WORKLOAD_HOST} (${FIP_B_INTERNAL}/${WORKLOAD_CIDR_LEN})"
-    docker exec -i \
-        --env "FIP_B_NETNS=${FIP_B_NETNS}" \
-        --env "FIP_B_LSP=${FIP_B_LSP}" \
-        --env "FIP_B_MAC=${FIP_B_MAC}" \
-        --env "FIP_B_INTERNAL=${FIP_B_INTERNAL}" \
-        --env "WORKLOAD_GW=${WORKLOAD_GW}" \
-        --env "WORKLOAD_CIDR_LEN=${WORKLOAD_CIDR_LEN}" \
-        --env "FIP_B_HOST_VETH=${FIP_B_HOST_VETH}" \
-        --env "FIP_B_NS_VETH=${FIP_B_NS_VETH}" \
-        "${WORKLOAD_NODE}" sh -eu <<'EOSH'
-if ! ip link show "${FIP_B_HOST_VETH}" >/dev/null 2>&1; then
-    ip link add "${FIP_B_HOST_VETH}" type veth peer name "${FIP_B_NS_VETH}"
-fi
-ovs-vsctl --may-exist add-port br-int "${FIP_B_HOST_VETH}" \
-    -- set Interface "${FIP_B_HOST_VETH}" external_ids:iface-id="${FIP_B_LSP}"
-ip link set "${FIP_B_HOST_VETH}" up
-
-# Enter the namespace rather than asking `ip netns list` whether it exists:
-# a container restart leaves a dead anchor under /run/netns that keeps it
-# listed while every use of it fails. See ensure_workload_netns in
-# bootstrap.sh for the full rationale.
-if ! ip netns exec "${FIP_B_NETNS}" true 2>/dev/null; then
-    ip netns delete "${FIP_B_NETNS}" 2>/dev/null || true
-    ip netns add "${FIP_B_NETNS}"
-fi
-if ! ip -n "${FIP_B_NETNS}" link show "${FIP_B_NS_VETH}" >/dev/null 2>&1; then
-    ip link set "${FIP_B_NS_VETH}" netns "${FIP_B_NETNS}"
-fi
-ip -n "${FIP_B_NETNS}" link set lo up
-ip -n "${FIP_B_NETNS}" link set "${FIP_B_NS_VETH}" address "${FIP_B_MAC}"
-ip -n "${FIP_B_NETNS}" link set "${FIP_B_NS_VETH}" up
-ip -n "${FIP_B_NETNS}" addr replace \
-    "${FIP_B_INTERNAL}/${WORKLOAD_CIDR_LEN}" dev "${FIP_B_NS_VETH}"
-ip -n "${FIP_B_NETNS}" route replace default via "${WORKLOAD_GW}"
-EOSH
-}
-
-# Tear down everything ensure_fip_b_* added. Best-effort and
-# idempotent: a teardown failure must not mask the scenario's own
-# pass/fail signal, so every step is independently allowed to fail.
-teardown_fip_b() {
-    log "teardown: removing ${FIP_B_NETNS} responder + LSP + NAT for ${FIP_B}"
-    docker exec -i \
-        --env "FIP_B_NETNS=${FIP_B_NETNS}" \
-        --env "FIP_B_HOST_VETH=${FIP_B_HOST_VETH}" \
-        "${WORKLOAD_NODE}" sh -u <<'EOSH' || true
-ovs-vsctl --if-exists del-port br-int "${FIP_B_HOST_VETH}" || true
-if ip link show "${FIP_B_HOST_VETH}" >/dev/null 2>&1; then
-    ip link delete "${FIP_B_HOST_VETH}" || true
-fi
-if ip netns list | awk '{print $1}' | grep -qx "${FIP_B_NETNS}"; then
-    ip netns delete "${FIP_B_NETNS}" || true
-fi
-EOSH
-    nbctl --if-exists lsp-del "${FIP_B_LSP}" || true
-    nbctl --if-exists lr-nat-del "${LR_NAME}" dnat_and_snat "${FIP_B}" || true
-}
-
-# Poll for the agent's hairpin flow tagged with FIP_B's destination IP
-# on MASTER's br-ex. Returns 0 once a matching flow appears and 1 if
-# the deadline expires. The agent installs hairpin flows on each
-# reconcile cycle once the new NAT is observed in OVN; with a 5s
-# reconcile_interval (gwnode-config.yaml) the flow lands well within
-# RECONCILE_TIMEOUT in the green case.
-wait_for_hairpin_flow() {
-    local target="$1"
-    local deadline
-    deadline=$(( $(date +%s) + RECONCILE_TIMEOUT ))
-    log "waiting up to ${RECONCILE_TIMEOUT}s for hairpin flow dst=${target} on ${MASTER}:br-ex"
-    while (( $(date +%s) < deadline )); do
-        # OVS dumps the L3 destination match as either `nw_dst=` (legacy
-        # form, what the OVS shipped with Ubuntu 24.04 cloud-archive
-        # flamingo emits) or `ip_dst=` (OXM-style, newer OVS). Accept
-        # both so the match does not depend on which OVS the gwnode
-        # image happens to bundle.
-        if dump_hairpin_flows | grep -Eq "(nw_dst|ip_dst)=${target}([^0-9]|$)"; then
-            return 0
-        fi
-        sleep 2
-    done
-    log "no hairpin flow appeared within ${RECONCILE_TIMEOUT}s; current cookie=0x998 dump:"
-    dump_hairpin_flows | sed 's/^/    /' >&2
-    return 1
 }
 
 # Assert that MASTER's br-ex has at least one cookie=0x998 flow with
