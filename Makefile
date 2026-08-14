@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -16,6 +16,7 @@ E2E_HAIRPIN_CHURN := test/e2e/scenarios/hairpin-churn.sh
 E2E_MULTI_VLAN  := test/e2e/scenarios/multi-vlan.sh
 E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
+E2E_PF_SPLIT_OWNER := test/e2e/scenarios/pf-split-owner.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
 E2E_DRAIN       := test/e2e/scenarios/drain-hitless.sh
 E2E_CHAOS       := go run ./test/e2e/chaos
@@ -276,6 +277,22 @@ e2e-pf-external:
 # row added here so a subsequent `make e2e-baseline` keeps passing.
 e2e-pf-hairpin:
 	$(E2E_PF_HAIRPIN)
+
+# Run the split-owner port-forward scenario (issue #247) against a lab
+# that is already up. Puts a VIP on gateway-1 alone — the shape of a
+# rollout that has reached some gateways but not all — and probes it
+# from the vm1 netns on gateway-3 in two phases: first with gateway-1
+# owning cr-lr0-public, where the path never leaves the VIP carrier,
+# then with gateway-3 owning it, where the request and the reply each
+# have to cross the fabric through a provider VRF that hosts neither
+# end. The second phase is dark unless the upstream originates a
+# default route into every gateway's vrf-provider. An anchor router
+# pinned to gateway-1 keeps its VIPs announceable after it loses lr0
+# (#206 holds a router-less node's VIPs dormant); the EXIT trap removes
+# it, restores the agent config and the underlay, and puts the
+# lr0-public priorities back.
+e2e-pf-split-owner:
+	$(E2E_PF_SPLIT_OWNER)
 
 # Run the stale-chassis cleanup scenario (issue #111) against a lab
 # that is already up. Hard-kills the priority-30 chassis (SIGKILL, no
