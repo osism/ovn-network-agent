@@ -154,9 +154,33 @@ recorded by the runner in the uploaded `summary.json` and
 `e2e-chaos.yml` with the seed, profile and duration read back from that
 job's artifacts and the run reproduces exactly.
 
+Both the nightly and the dispatch path run on the org's **self-hosted
+runners** (`runs-on: self-hosted`), which is where a 40-minute session
+over a real containerlab lab has the headroom it wants. The runner
+label is resolved per trigger by the workflow's `params` job, not
+hard-coded on the chaos job, so the PR smoke below can stay hosted. A
+runner joining that pool has to satisfy two things the hosted images
+gave for free:
+
+- **Root on a real kernel.** The `e2e-lab-setup` action modprobes
+  `openvswitch`, `vrf` and `sch_netem` on the host, because the gwnode
+  containers only get `CAP_NET_ADMIN`. A containerised runner therefore
+  has to run privileged.
+- **One chaos job per machine.** The lab name `ovn-e2e` is fixed in the
+  topology, so two concurrent chaos jobs on one host collide at
+  `containerlab deploy`. The pool is sized one runner process per
+  machine; the nightly's six-profile fan-out relies on that. A job that
+  dies outside its own teardown still leaves a lab behind, which the
+  workflow's pre-run `make e2e-down || true` sweep clears before
+  deploying.
+
 A pull request opts into a short chaos smoke by carrying the
 `chaos-smoke` label, which keeps chaos off the default PR gate;
-applying the label needs triage permission. The label is not created
+applying the label needs triage permission. That smoke stays on
+`ubuntu-latest`. This repository is public and a `pull_request` run
+builds and runs the PR's own images with sudo, so the label is a cost
+gate, not a trust boundary — it is not what should stand between a
+fork's Dockerfile and a persistent org machine. The label is not created
 automatically — as a one-time repository-admin action (like applying
 the rulesets above), create it once with:
 

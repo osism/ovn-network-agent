@@ -24,6 +24,24 @@ name: E2E Chaos
 #     opts a single PR into a 3-minute seed-42 `everything-on` smoke,
 #     rather than adding chaos to every PR in the suite.
 #
+# The nightly and dispatch paths run on the org's self-hosted runners.
+# A chaos session is a 40-minute budget over a real containerlab lab,
+# and the pool has headroom the hosted runners do not. Two prerequisites
+# come with that. The runners need root on a real kernel — the
+# `e2e-lab-setup` action modprobes `openvswitch`, `vrf` and `sch_netem`
+# on the host — so a containerised runner has to be privileged. And the
+# lab name `ovn-e2e` is fixed in the topology, so two chaos jobs must
+# never share a machine: the pool is sized one job per host, and the
+# leftover-lab sweep below covers the case where a hard-killed job left
+# the previous lab behind.
+#
+# The PR smoke stays on `ubuntu-latest`. This repository is public, and
+# a `pull_request` run builds and runs the PR's own images with sudo; on
+# a throwaway VM that is contained, on a persistent org machine it would
+# not be. The `chaos-smoke` label gate is a cost gate, not a trust
+# boundary, so it is not what should be standing between a fork's
+# Dockerfile and the runner pool.
+#
 # Unlike the e2e.yml jobs there is no separate baseline gate here: the
 # runner refuses to start against a lab whose combined start state (a
 # superset of the baseline) never goes green, and reports that as exit
@@ -73,9 +91,11 @@ permissions:
   contents: read
 
 jobs:
-  # Resolve the three run inputs — the profile matrix, the seed and the
-  # duration — once, per trigger, so the chaos job below reads them the
-  # same way on every path. No checkout: the job only writes strings.
+  # Resolve the run inputs — the profile matrix, the seed, the duration
+  # and the runner label — once, per trigger, so the chaos job below
+  # reads them the same way on every path. No checkout: the job only
+  # writes strings, which is also why this job stays on `ubuntu-latest`
+  # rather than occupying a lab machine for a `case` statement.
   params:
     name: Resolve run inputs
     runs-on: ubuntu-latest
@@ -87,6 +107,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.label.name == 'chaos-smoke'
     outputs:
       profiles: ${{ steps.resolve.outputs.profiles }}
+      runner: ${{ steps.resolve.outputs.runner }}
       seed: ${{ steps.resolve.outputs.seed }}
       duration: ${{ steps.resolve.outputs.duration }}
     steps:
@@ -111,6 +132,7 @@ jobs:
             # Nightly: sweep every curated profile, seed = the run id so
             # each night is a different (recorded, replayable) sequence.
             profiles='["everything-on","flat-minimal","flat-dnat","vlan-no-dnat","pf-only","heterogeneous"]'
+            runner="self-hosted"
             seed="${GITHUB_RUN_ID}"
             duration="10m"
             ;;
@@ -118,12 +140,16 @@ jobs:
             # Replay/ad-hoc: a single chosen profile at the dispatched
             # seed and duration.
             profiles="[\"${INPUT_PROFILE}\"]"
+            runner="self-hosted"
             seed="${INPUT_SEED}"
             duration="${INPUT_DURATION}"
             ;;
           pull_request)
-            # PR smoke: one profile, a fixed seed, a short fault window.
+            # PR smoke: one profile, a fixed seed, a short fault window —
+            # and a throwaway hosted VM, because this is the one trigger
+            # that runs a fork's own code (see the header).
             profiles='["everything-on"]'
+            runner="ubuntu-latest"
             seed="42"
             duration="3m"
             ;;
@@ -132,12 +158,13 @@ jobs:
           # the dispatch path they are free-form inputs. Passing them
           # through env blocks shell injection but not GITHUB_OUTPUT
           # injection: a newline in the value opens a second `key=value`
-          # line. Since profiles= is written before seed=, an injected
-          # `profiles=[...]` line lands after the constrained one, wins as
-          # the last value for the key, and fans the matrix out to
-          # attacker-chosen values. Reject anything but a bare non-negative
-          # integer seed, and forbid a newline in duration. The schedule
-          # and PR paths set literals that pass unchanged.
+          # line. Since profiles= and runner= are written before seed=, an
+          # injected `profiles=[...]` or `runner=...` line lands after the
+          # constrained one, wins as the last value for the key, and either
+          # fans the matrix out to attacker-chosen values or picks the
+          # machine the chaos job lands on. Reject anything but a bare
+          # non-negative integer seed, and forbid a newline in duration.
+          # The schedule and PR paths set literals that pass unchanged.
           case "${seed}" in
           ''|*[!0-9]*)
             echo "seed must be a non-negative integer, got: ${seed}" >&2
@@ -152,20 +179,26 @@ jobs:
           esac
           # Echoing to the run log is what records the resolved nightly
           # seed there; the runner also records it in the uploaded
-          # summary.json and journal.jsonl. Writing the same three values
-          # to GITHUB_OUTPUT is what the matrix and the chaos job read.
+          # summary.json and journal.jsonl. Writing the same four values
+          # to GITHUB_OUTPUT is what the matrix, the chaos job's runs-on
+          # and the chaos job's run step read.
           echo "profiles: ${profiles}"
+          echo "runner: ${runner}"
           echo "seed: ${seed}"
           echo "duration: ${duration}"
           {
             echo "profiles=${profiles}"
+            echo "runner=${runner}"
             echo "seed=${seed}"
             echo "duration=${duration}"
           } >> "${GITHUB_OUTPUT}"
 
   chaos:
     name: Seeded chaos session (${{ matrix.profile }})
-    runs-on: ubuntu-latest
+    # Resolved per trigger by `params`: `self-hosted` for the nightly and
+    # dispatch paths, `ubuntu-latest` for the PR smoke. The header
+    # explains why the PR path is the one that stays hosted.
+    runs-on: ${{ needs.params.outputs.runner }}
     needs: params
     # fail-fast: false keeps one profile's failure from cancelling the
     # other five nightly jobs — each profile's run is worth its own
@@ -201,6 +234,18 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
+
+      # A hosted runner hands every job a fresh VM; a self-hosted one
+      # hands it whatever the last job left behind. A chaos job that died
+      # outside its own teardown — runner restart, OOM, a cancellation
+      # that outran the grace period — leaves `clab-ovn-e2e-*` containers
+      # and the topology's docker networks in place, and `containerlab
+      # deploy` will not deploy over them. Without this sweep that machine
+      # stays red every night until someone logs in. `|| true` because
+      # having nothing to destroy is the normal case, and always the case
+      # on the hosted PR path.
+      - name: Destroy a lab left behind by an earlier run
+        run: make e2e-down || true
 
       - name: Bring the lab up
         run: make e2e-up
@@ -259,8 +304,11 @@ jobs:
           retention-days: 7
 
       # Always tear the lab down so a partial-failure run does not leak
-      # docker networks/containers on a self-hosted runner. `if:
-      # always()` runs this step even when an earlier step failed.
+      # docker networks/containers on the self-hosted machine. `if:
+      # always()` runs this step even when an earlier step failed — and
+      # even on cancellation, which is why it, not the pre-run sweep
+      # above, is the primary cleanup. The sweep only has to cover the
+      # deaths that skip this step entirely.
       - name: Tear the lab down
         if: always()
         run: make e2e-down
