@@ -322,6 +322,53 @@ provider bridge (`ovs-vsctl list-ports br-ex` and the `ovn-localnet-port`
 fixed in OVN NB. When neither applies, the flows heal on the next reconcile
 once `ovs-ofctl` stops rejecting them.
 
+## Alert: OVNNetworkAgentVRFDefaultRouteMissing
+
+Fires on `vrf_default_route_present == 0` together with `announced_vips > 0` or
+`local_routers > 0`, for 5m.
+
+**Meaning.** The provider VRF holds no default route, so traffic to any
+destination the VRF does not already route is dropped inside it. The agent
+never installs this route — it comes from the fabric — but several of its data
+paths depend on it.
+
+The path that breaks first is a port-forward VIP whose gateway port lives
+elsewhere. The chassis holding a router's chassisredirect port is where OVN
+client traffic leaves, and the chassis holding the VIP's DNAT rules is where
+that VIP is answered; on a fleet where only some nodes carry the VIP
+configuration those are different nodes. The request then has to leave the
+owner's VRF towards the peer that announces the VIP, and the reply has to leave
+the announcing node's VRF towards a client behind a FIP the owner announces.
+Neither destination is connected or redistributed, so without a default both
+are dropped while the VIP address, the DNAT ruleset and the BGP announce all
+look healthy.
+
+**Likely causes.** The fabric stopped originating the default (a peer
+reconfigured, a session down), the BGP session in the VRF is down, or the VRF
+was never given one. On a node whose only peer withdrew the default, the FIP
+`/32`s it learns still arrive, so the session looks alive at a glance.
+
+**Diagnosis.** Ask the kernel first — that is what the gauge reads — then BGP:
+
+```bash
+ip route show vrf vrf-provider default          # empty is the alert's condition
+vtysh -c 'show bgp vrf vrf-provider ipv4 summary'
+vtysh -c 'show bgp vrf vrf-provider ipv4 0.0.0.0/0'
+```
+
+When the VIP is the symptom, confirm the split first: the chassis in
+`ovn-sbctl find Port_Binding logical_port=cr-<router>-<net>` is the one that
+must reach the VIP, and it is a different node from the one whose
+`nft list table ip ovn-network-agent` holds the DNAT rule.
+
+**Remediation.** Restore the default in the fabric — on an FRR upstream that is
+`neighbor <gateway> default-originate` in the VRF's `address-family ipv4
+unicast`. Routes covering every client network work equally well; the agent
+checks for a default because that is what a provider VRF normally receives.
+Giving every gateway the same `port_forwards` configuration removes the split
+that makes this visible, but not the dependency: OVN client egress to anything
+outside the VRF's routed networks still needs the route.
+
 ## Alert: OVNNetworkAgentSlowFailoverAnnounce
 
 Fires on

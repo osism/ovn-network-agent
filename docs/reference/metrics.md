@@ -71,6 +71,9 @@ and each alert has a cause→diagnosis→remediation section in the
 - `rate(nexthop_repairs_total[1h]) > 0` — zebra was missing the connected
   route for the veth next-hop, so no FIP route could resolve. The agent
   repaired it; the alert says it happened.
+- `vrf_default_route_present == 0` with `announced_vips > 0` or
+  `local_routers > 0` for >5m — the provider VRF has no default route, so
+  traffic to anything it does not already route is dropped inside it.
 - `histogram_quantile(0.95, rate(failover_announce_seconds_bucket[1h])) > 2`
   — failover announces slower than the ~2s failover budget.
 - `histogram_quantile(0.95, rate(reconcile_duration_seconds_bucket[5m])) > 5`
