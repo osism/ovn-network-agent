@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -450,6 +451,150 @@ func TestReportDormantVIPsLogsOnChange(t *testing.T) {
 	a.reportDormantVIPs(nil)
 	if a.dormantVIPs != "" {
 		t.Errorf("dormantVIPs = %q, want cleared on recovery", a.dormantVIPs)
+	}
+}
+
+// countLevel returns how many records in a captured slog buffer were emitted at
+// the given level.
+func countLevel(buf *bytes.Buffer, level string) int {
+	return strings.Count(buf.String(), "level="+level+" ")
+}
+
+// A missing VRF default route is loud in proportion to what the node has riding
+// on it: an outage where VIPs are announced, a narrower limitation where only
+// OVN clients egress, and nothing at all on a node using neither (#247).
+func TestReportVRFDefaultRouteLogsBySeverity(t *testing.T) {
+	tests := []struct {
+		name            string
+		present         bool
+		checkErr        error
+		announcedVIPs   int
+		hasLocalRouters bool
+		wantLevel       string
+		wantState       string
+	}{
+		{
+			name: "absent while announcing VIPs is an outage",
+			// A VIP whose replies cannot be routed is dark for every client
+			// outside the VRF's own networks.
+			announcedVIPs: 2, hasLocalRouters: true,
+			wantLevel: "ERROR", wantState: vrfDefaultOutage,
+		},
+		{
+			name:            "absent while only hosting routers is a limitation",
+			hasLocalRouters: true,
+			wantLevel:       "WARN", wantState: vrfDefaultLimited,
+		},
+		{
+			name: "absent with nothing riding on it is silent",
+			// A standby announcing nothing and hosting nothing loses no
+			// traffic to the missing route; the gauge still records it.
+			wantLevel: "", wantState: vrfDefaultIdle,
+		},
+		{
+			name:     "an unanswerable check warns rather than claiming absence",
+			checkErr: errors.New("find VRF vrf-provider: no such network interface"),
+			// The VIPs would make this an outage if the answer were known.
+			announcedVIPs: 2, hasLocalRouters: true,
+			wantLevel: "WARN", wantState: vrfDefaultUnknown,
+		},
+		{
+			name:    "present is silent on a node that never reported a problem",
+			present: true, hasLocalRouters: true,
+			wantLevel: "", wantState: vrfDefaultPresent,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureSlog(t)
+			a := &Agent{cfg: Config{VRFName: "vrf-provider"}}
+
+			a.reportVRFDefaultRoute(tc.present, tc.checkErr, tc.announcedVIPs, tc.hasLocalRouters)
+
+			if a.vrfDefaultRoute != tc.wantState {
+				t.Errorf("vrfDefaultRoute = %q, want %q", a.vrfDefaultRoute, tc.wantState)
+			}
+			for _, level := range []string{"ERROR", "WARN", "INFO"} {
+				want := 0
+				if level == tc.wantLevel {
+					want = 1
+				}
+				if got := countLevel(buf, level); got != want {
+					t.Errorf("%s lines = %d, want %d; log was:\n%s", level, got, want, buf.String())
+				}
+			}
+		})
+	}
+}
+
+// The condition persists for as long as the fabric withholds the route, so it
+// is reported on entry and on recovery — never once per reconcile.
+func TestReportVRFDefaultRouteLogsOncePerTransition(t *testing.T) {
+	buf := captureSlog(t)
+	a := &Agent{cfg: Config{VRFName: "vrf-provider"}}
+
+	for range 3 {
+		a.reportVRFDefaultRoute(false, nil, 1, true)
+	}
+	if got := countLevel(buf, "ERROR"); got != 1 {
+		t.Errorf("ERROR lines = %d, want exactly 1 across three identical cycles; log was:\n%s", got, buf.String())
+	}
+
+	// The route coming back pairs the outage with a resolution.
+	a.reportVRFDefaultRoute(true, nil, 1, true)
+	if got := countLevel(buf, "INFO"); got != 1 {
+		t.Errorf("INFO lines = %d, want the recovery reported once; log was:\n%s", got, buf.String())
+	}
+	if a.vrfDefaultRoute != vrfDefaultPresent {
+		t.Errorf("vrfDefaultRoute = %q, want %q", a.vrfDefaultRoute, vrfDefaultPresent)
+	}
+}
+
+// A node that takes on routers while the route is still missing has entered a
+// reportable condition, even though the route itself did not change. Keying the
+// memo on the route alone would keep that silent forever.
+func TestReportVRFDefaultRouteReportsAChangeOfStake(t *testing.T) {
+	buf := captureSlog(t)
+	a := &Agent{cfg: Config{VRFName: "vrf-provider"}}
+
+	a.reportVRFDefaultRoute(false, nil, 0, false)
+	if got := countLevel(buf, "WARN"); got != 0 {
+		t.Fatalf("WARN lines = %d, want none while nothing rides on the route; log was:\n%s", got, buf.String())
+	}
+
+	a.reportVRFDefaultRoute(false, nil, 0, true)
+	if got := countLevel(buf, "WARN"); got != 1 {
+		t.Errorf("WARN lines = %d, want the node gaining routers reported; log was:\n%s", got, buf.String())
+	}
+
+	a.reportVRFDefaultRoute(false, nil, 3, true)
+	if got := countLevel(buf, "ERROR"); got != 1 {
+		t.Errorf("ERROR lines = %d, want the node starting to announce reported; log was:\n%s", got, buf.String())
+	}
+}
+
+// The gauge tracks the check every cycle, but a failed check must leave the
+// last real answer standing rather than report a zero it never established.
+func TestReportVRFDefaultRouteGauge(t *testing.T) {
+	m := withTestMetrics(t)
+	captureSlog(t)
+	a := &Agent{cfg: Config{VRFName: "vrf-provider"}}
+
+	a.reportVRFDefaultRoute(true, nil, 1, true)
+	if got := gaugeValue(t, m, "ovn_network_agent_vrf_default_route_present"); got != 1 {
+		t.Errorf("gauge = %v, want 1 while the route is present", got)
+	}
+
+	a.reportVRFDefaultRoute(false, nil, 0, false)
+	if got := gaugeValue(t, m, "ovn_network_agent_vrf_default_route_present"); got != 0 {
+		t.Errorf("gauge = %v, want 0 on a silent absence", got)
+	}
+
+	a.reportVRFDefaultRoute(true, nil, 1, true)
+	a.reportVRFDefaultRoute(false, errors.New("boom"), 1, true)
+	if got := gaugeValue(t, m, "ovn_network_agent_vrf_default_route_present"); got != 1 {
+		t.Errorf("gauge = %v, want the last known answer held across a failed check", got)
 	}
 }
 

@@ -52,6 +52,11 @@ type Agent struct {
 	// dormantVIPs is the comma-joined set of port-forward VIPs last reported
 	// as dormant, so reportDormantVIPs logs a change rather than every cycle.
 	dormantVIPs string
+
+	// vrfDefaultRoute is the last state reportVRFDefaultRoute logged, so a
+	// condition that persists across cycles is reported once rather than on
+	// every reconcile. The empty string means nothing has been reported yet.
+	vrfDefaultRoute string
 }
 
 // maxStaleCleanupJitter is the maximum random jitter added to the stale
@@ -327,6 +332,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	}
 	a.reportDormantVIPs(desired.DormantVIPs)
 
+	setAnnouncedVIPs(len(desired.AnnouncedVIPs))
 	setDesiredState(len(desiredIPs), len(state.LocalRouters), len(a.effectiveFilters))
 	setLocalnetSegments(len(desiredSegments))
 
@@ -521,6 +527,13 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	// static for this check to alarm on.
 	a.checkFRRRouteActivity(frrStaticIPs)
 
+	// Surface a provider VRF without a default route. The agent never installs
+	// one, but the split-owner port-forward path depends on it — see
+	// VRFDefaultRoutePresent. Runs in every mode: a pf-only node answers VIPs
+	// without any OVN state and needs the route just as much.
+	vrfDefault, vrfDefaultErr := a.routing.VRFDefaultRoutePresent()
+	a.reportVRFDefaultRoute(vrfDefault, vrfDefaultErr, len(desired.AnnouncedVIPs), state.HasLocalRouters)
+
 	// Check for stale chassis entries from dead nodes (runs on every agent).
 	// This runs after gateway routing reconciliation so that a surviving agent
 	// creates its own routes before removing entries from dead chassis.
@@ -660,6 +673,80 @@ func (a *Agent) reportDormantVIPs(dormant []string) {
 		slog.Info("port-forward VIPs are no longer dormant — restoring their address on the port-forward device")
 	}
 	a.dormantVIPs = key
+}
+
+// reportVRFDefaultRoute records the provider VRF's default route as a gauge and
+// logs each transition once, on the same reasoning as reportDormantVIPs: the
+// condition persists for as long as the fabric withholds the route, and a line
+// per reconcile would bury it.
+//
+// How loud the absence is depends on what this node does with the VRF. A node
+// announcing VIPs is answering traffic it cannot reply to, which is an outage
+// and logs at error. A node hosting routers but announcing nothing still leaks
+// its OVN clients' egress into the VRF, which then reaches only the networks
+// the VRF routes — a real limitation, but a narrower one, so it warns. A node
+// doing neither has nothing riding on the route and stays silent, though the
+// gauge is still set so a scrape sees the state before the node takes over.
+//
+// checkErr is the check failing rather than the route being absent. It leaves
+// the gauge alone: an unanswerable question must not overwrite the last real
+// answer with a fabricated zero.
+func (a *Agent) reportVRFDefaultRoute(present bool, checkErr error, announcedVIPs int, hasLocalRouters bool) {
+	if checkErr == nil {
+		setVRFDefaultRoute(present)
+	}
+
+	state := vrfDefaultState(present, checkErr, announcedVIPs, hasLocalRouters)
+	if state == a.vrfDefaultRoute {
+		return
+	}
+	previous := a.vrfDefaultRoute
+	a.vrfDefaultRoute = state
+
+	switch state {
+	case vrfDefaultUnknown:
+		slog.Warn("cannot determine whether the provider VRF has a default route",
+			"vrf", a.cfg.VRFName, "error", checkErr)
+	case vrfDefaultOutage:
+		slog.Error("the provider VRF has no default route while this node announces port-forward VIPs — replies to clients outside the VRF's routed networks will be dropped",
+			"vrf", a.cfg.VRFName, "announced_vips", announcedVIPs)
+	case vrfDefaultLimited:
+		slog.Warn("the provider VRF has no default route — OVN client egress is limited to the networks the VRF already routes",
+			"vrf", a.cfg.VRFName)
+	case vrfDefaultPresent:
+		// Nothing was wrong to recover from unless something was reported.
+		switch previous {
+		case vrfDefaultUnknown, vrfDefaultOutage, vrfDefaultLimited:
+			slog.Info("the provider VRF has a default route", "vrf", a.cfg.VRFName)
+		}
+	}
+}
+
+// The states reportVRFDefaultRoute memoises. hasLocalRouters and the VIP count
+// are part of the state, not just of the message: a node that gains routers
+// while the route is still missing has entered a condition worth reporting,
+// even though the route itself did not change.
+const (
+	vrfDefaultPresent = "present"
+	vrfDefaultOutage  = "absent-announcing"
+	vrfDefaultLimited = "absent-routing"
+	vrfDefaultIdle    = "absent-idle"
+	vrfDefaultUnknown = "unknown"
+)
+
+func vrfDefaultState(present bool, checkErr error, announcedVIPs int, hasLocalRouters bool) string {
+	switch {
+	case checkErr != nil:
+		return vrfDefaultUnknown
+	case present:
+		return vrfDefaultPresent
+	case announcedVIPs > 0:
+		return vrfDefaultOutage
+	case hasLocalRouters:
+		return vrfDefaultLimited
+	default:
+		return vrfDefaultIdle
+	}
 }
 
 // segmentRouteUnresolved reports whether an IP on the given localnet segment

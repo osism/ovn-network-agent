@@ -1054,3 +1054,53 @@ func (rm *RouteManager) getVRFTableID() (int, error) {
 	}
 	return int(vrf.Table), nil
 }
+
+// VRFDefaultRoutePresent reports whether the VRF's routing table holds a
+// default route.
+//
+// The agent depends on one without ever installing it. A port-forward VIP is
+// answered by whichever chassis holds the DNAT rules, while the traffic reaches
+// the fabric through whichever chassis holds the router's chassisredirect port
+// — and those are not always the same node. When they differ, both legs leave
+// the VRF towards a destination the VRF does not host: the request towards the
+// peer that announces the VIP, the reply towards a client behind a FIP the peer
+// announces. Neither is a connected or redistributed prefix, so only a default
+// carries them. Without it the packets are dropped inside the VRF while the
+// address, the DNAT ruleset and the announce all look healthy (issue #247).
+//
+// Protocol is deliberately not filtered. The route is normally learned over BGP
+// from the fabric, but a statically configured default satisfies the dependency
+// just as well, and this reports the dependency rather than how it was met.
+func (rm *RouteManager) VRFDefaultRoutePresent() (bool, error) {
+	if rm.cfg.DryRun {
+		return true, nil
+	}
+
+	vrfTableID, err := rm.getVRFTableID()
+	if err != nil {
+		return false, err
+	}
+
+	filter := &netlink.Route{Table: vrfTableID}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return false, fmt.Errorf("list VRF default route: %w", err)
+	}
+	return hasDefaultRoute(routes), nil
+}
+
+// hasDefaultRoute reports whether any route in the list is 0.0.0.0/0.
+//
+// netlink encodes a default route as a nil Dst rather than a zero-length
+// prefix — the same encoding SetupVethLeak writes one with — so that is the
+// whole test. Split out from VRFDefaultRoutePresent because the netlink call
+// around it needs root and a real VRF device, while this is the part worth
+// pinning.
+func hasDefaultRoute(routes []netlink.Route) bool {
+	for _, r := range routes {
+		if r.Dst == nil {
+			return true
+		}
+	}
+	return false
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,6 +31,84 @@ func TestEnsureBridgeIPWrapsLinkLookupError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), nonexistentBridge) {
 		t.Errorf("error should mention the bridge name, got: %v", err)
+	}
+}
+
+// A VRF the agent cannot look up is an unanswerable question, not a missing
+// default route: the caller turns a false into an operator-facing outage
+// report, so the lookup failure has to surface as an error instead.
+func TestVRFDefaultRoutePresentWrapsVRFLookupError(t *testing.T) {
+	rm := &RouteManager{cfg: Config{VRFName: nonexistentBridge}}
+	present, err := rm.VRFDefaultRoutePresent()
+	if err == nil {
+		t.Fatal("VRFDefaultRoutePresent should error when the VRF device is missing")
+	}
+	if present {
+		t.Error("VRFDefaultRoutePresent should not report a default route it could not look up")
+	}
+	if !strings.Contains(err.Error(), nonexistentBridge) {
+		t.Errorf("error should mention the VRF name, got: %v", err)
+	}
+}
+
+// A VRF that routes several networks but has no way out of them is the state
+// the whole check exists to name: the table is full, and every destination
+// outside it is still dropped.
+func TestHasDefaultRoute(t *testing.T) {
+	_, provider, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatalf("parse provider CIDR: %v", err)
+	}
+	_, fip, err := net.ParseCIDR("192.0.2.10/32")
+	if err != nil {
+		t.Fatalf("parse FIP CIDR: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		routes []netlink.Route
+		want   bool
+	}{
+		{name: "an empty table has no default"},
+		{
+			name:   "a populated table without a default",
+			routes: []netlink.Route{{Dst: provider}, {Dst: fip}},
+		},
+		{
+			// netlink gives a default route a nil Dst whatever installed it,
+			// so the protocol is not part of the question. 186 is RTPROT_BGP,
+			// which the syscall package does not name.
+			name:   "a BGP-learned default",
+			routes: []netlink.Route{{Dst: provider}, {Dst: nil, Protocol: netlink.RouteProtocol(186)}},
+			want:   true,
+		},
+		{
+			name:   "a statically configured default counts too",
+			routes: []netlink.Route{{Dst: nil, Protocol: netlink.RouteProtocol(syscall.RTPROT_STATIC)}},
+			want:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasDefaultRoute(tc.routes); got != tc.want {
+				t.Errorf("hasDefaultRoute() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Dry-run never touches the system, so it cannot answer the question either —
+// but reporting the dependency as satisfied is the quiet answer, matching
+// VethNexthopResolvable.
+func TestVRFDefaultRoutePresentIsQuietInDryRun(t *testing.T) {
+	rm := &RouteManager{cfg: Config{VRFName: nonexistentBridge, DryRun: true}}
+	present, err := rm.VRFDefaultRoutePresent()
+	if err != nil {
+		t.Fatalf("VRFDefaultRoutePresent in dry-run: %v", err)
+	}
+	if !present {
+		t.Error("dry-run should report the default route as present")
 	}
 }
 
