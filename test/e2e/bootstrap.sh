@@ -408,6 +408,13 @@ wire_gateway_underlay() {
     #   * With eth1 in vrf-provider, vrf-provider has a real underlay
     #     interface and learns the return path (10.0.0.0/24 → upstream)
     #     via BGP, so the leaked traffic finally exits the chassis.
+    #   * It also learns "default via 100.64.N.1" from the upstream's
+    #     per-neighbor default-originate (configure_upstream_frr). That
+    #     default is what carries traffic to anything this chassis does
+    #     not host itself — a port-forward VIP another gateway announces,
+    #     or the reply to a client behind a FIP that moved. Loop
+    #     prevention on the shared gateway ASN means BGP delivers no such
+    #     route, so without the default it dies in the VRF (issue #247).
     #   * For the reverse direction (upstream → FIP), upstream BGP-routes
     #     the FIP /32 to the gateway's vrf-provider IP; the packet enters
     #     on eth1 (in vrf-provider), the agent's table-100 route
@@ -548,14 +555,30 @@ configure_upstream_frr() {
     # producing "router bgp 65001 bgp router-id …" which vtysh silently
     # ignored. The result was an upstream FRR with no BGP instance and
     # gateway sessions permanently stuck in "Active".
+    #
+    # default-originate is what gives each gateway's vrf-provider a route to
+    # everything it does not host itself. The gateways all share
+    # BGP_ASN_GATEWAYS, so the upstream's re-advertisement of one gateway's
+    # prefixes to another is dropped by AS-path loop prevention, and
+    # `redistribute connected` below only exports the upstream's own
+    # networks. Without a default, a chassis that owns cr-lr0-public but
+    # carries no port_forwards has no route for a peer's VIP and drops the
+    # traffic inside the VRF (issue #247). default-originate is
+    # unconditional in FRR — the upstream advertises 0.0.0.0/0 whether or
+    # not it holds one — and the gateways never pass it on: they export via
+    # `redistribute connected` through ANNOUNCE-CONNECTED and filter
+    # outbound with `prefix-list ANNOUNCED-NETWORKS out`, which permits
+    # /32s only.
     local neighbors_remote_as=""
     local neighbors_activate=""
+    local neighbors_default_originate=""
     for entry in "${UNDERLAY_LINKS[@]}"; do
         local _gw gw_cidr _upstream_iface _upstream_cidr
         read -r _gw gw_cidr _upstream_iface _upstream_cidr <<<"${entry}"
         local gw_ip="${gw_cidr%/*}"
         neighbors_remote_as+=" neighbor ${gw_ip} remote-as ${BGP_ASN_GATEWAYS}"$'\n'
         neighbors_activate+="  neighbor ${gw_ip} activate"$'\n'
+        neighbors_default_originate+="  neighbor ${gw_ip} default-originate"$'\n'
     done
     docker exec -i "${UPSTREAM_NODE}" vtysh <<EOF
 configure terminal
@@ -565,7 +588,7 @@ router bgp ${BGP_ASN_UPSTREAM}
  no bgp ebgp-requires-policy
 ${neighbors_remote_as} address-family ipv4 unicast
   redistribute connected
-${neighbors_activate} exit-address-family
+${neighbors_activate}${neighbors_default_originate} exit-address-family
 end
 write memory
 EOF
