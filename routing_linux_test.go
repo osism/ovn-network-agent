@@ -54,6 +54,11 @@ func TestVRFDefaultRoutePresentWrapsVRFLookupError(t *testing.T) {
 // A VRF that routes several networks but has no way out of them is the state
 // the whole check exists to name: the table is full, and every destination
 // outside it is still dropped.
+//
+// The cases below carry the encoding RouteListFiltered actually returns, not
+// the one the write side accepts. Those differ, and an earlier version of this
+// test asserted the write-side shape only — so it passed while the check read
+// every real routing table as empty of defaults.
 func TestHasDefaultRoute(t *testing.T) {
 	_, provider, err := net.ParseCIDR("192.0.2.0/24")
 	if err != nil {
@@ -62,6 +67,13 @@ func TestHasDefaultRoute(t *testing.T) {
 	_, fip, err := net.ParseCIDR("192.0.2.10/32")
 	if err != nil {
 		t.Fatalf("parse FIP CIDR: %v", err)
+	}
+	// What the deserializer hands back for `default via …`: an explicit
+	// 0.0.0.0/0 with a zero-length mask, verified against netlink v1.3.1
+	// reading a real table 100.
+	_, defaultDst, err := net.ParseCIDR("0.0.0.0/0")
+	if err != nil {
+		t.Fatalf("parse default CIDR: %v", err)
 	}
 
 	tests := []struct {
@@ -75,16 +87,26 @@ func TestHasDefaultRoute(t *testing.T) {
 			routes: []netlink.Route{{Dst: provider}, {Dst: fip}},
 		},
 		{
-			// netlink gives a default route a nil Dst whatever installed it,
-			// so the protocol is not part of the question. 186 is RTPROT_BGP,
-			// which the syscall package does not name.
-			name:   "a BGP-learned default",
-			routes: []netlink.Route{{Dst: provider}, {Dst: nil, Protocol: netlink.RouteProtocol(186)}},
-			want:   true,
+			// 186 is RTPROT_BGP, which the syscall package does not name. The
+			// protocol is not part of the question — only the prefix is.
+			name: "a BGP-learned default, as netlink returns it",
+			routes: []netlink.Route{
+				{Dst: provider},
+				{Dst: defaultDst, Protocol: netlink.RouteProtocol(186)},
+			},
+			want: true,
 		},
 		{
 			name:   "a statically configured default counts too",
-			routes: []netlink.Route{{Dst: nil, Protocol: netlink.RouteProtocol(syscall.RTPROT_STATIC)}},
+			routes: []netlink.Route{{Dst: defaultDst, Protocol: netlink.RouteProtocol(syscall.RTPROT_STATIC)}},
+			want:   true,
+		},
+		{
+			// The write-side shape, which SetupVethLeak uses for the leak
+			// table. Kept so the check survives a library that normalises the
+			// other way.
+			name:   "a default with Dst left unset",
+			routes: []netlink.Route{{Dst: nil}},
 			want:   true,
 		},
 	}
