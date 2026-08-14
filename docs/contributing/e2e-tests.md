@@ -44,6 +44,7 @@ test/e2e/
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     drain-hitless.sh        — graceful drain vs hard kill, hitless comparison (issue #113)
     collect-artifacts.sh    — dump lab state for offline triage
+  chaos-random.sh           — dispatch an ad-hoc CI chaos run with a random seed and profile
   chaos/                    — seeded chaos runner, `make e2e-chaos` (issue #176)
     main.go                 — flags, wiring, exit codes, artifact collection
     engine.go               — the seeded tick loop: draw, guardrails, execute, converge
@@ -1755,6 +1756,31 @@ each assert one fault and leave the lab baseline-green, while a chaos
 run is a randomized sequence that deliberately leaves the master
 wherever the last election put it. Dispatch it from the Actions tab
 when you touch the agent's failover, drain or chassis-cleanup paths.
+
+**Ad-hoc exploration.**
+[`chaos-random.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/chaos-random.sh)
+dispatches that workflow from a checkout with a **random seed and a
+random profile**, always at the nightly 10-minute window:
+
+```sh
+make e2e-chaos-random                                # one run against the current branch
+make e2e-chaos-random CHAOS_RANDOM_FLAGS="-n 3"      # three independent draws at once
+make e2e-chaos-random CHAOS_RANDOM_FLAGS="--watch"   # wait, then render each run's report
+make e2e-chaos-random CHAOS_RANDOM_FLAGS="--dry-run" # print the dispatch, send nothing
+```
+
+It exists because dispatching by hand is dispatching seed 42 on
+`everything-on` — the workflow's defaults — which re-walks a sequence the
+nightly matrix already covers, so the ad-hoc run buys no exploration. The
+draw comes from `/dev/urandom`, and the profile list is read out of the
+workflow's own dispatch `choice` options rather than duplicated, so a
+profile added to the registry becomes reachable here as soon as
+`TestChaosWorkflowSweepsEveryProfile` passes. Each dispatch prints the
+seed and profile it drew, the run URL, and the CI and local replay lines
+for it; `--seed` and `--profile` pin either half. It needs `gh`
+authenticated, and it dispatches against the current branch, which must
+exist on the remote (`--ref` overrides). Unlike every other `e2e-*`
+target it runs no lab locally.
 
 ### Manual setup for triage
 

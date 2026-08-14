@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report e2e-chaos-random
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -20,6 +20,7 @@ E2E_PF_SPLIT_OWNER := test/e2e/scenarios/pf-split-owner.sh
 E2E_STALE       := test/e2e/scenarios/stale-chassis.sh
 E2E_DRAIN       := test/e2e/scenarios/drain-hitless.sh
 E2E_CHAOS       := go run ./test/e2e/chaos
+E2E_CHAOS_RANDOM := test/e2e/chaos-random.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
 
@@ -361,3 +362,20 @@ e2e-chaos:
 CHAOS_RUN ?= chaos-artifacts
 e2e-chaos-report:
 	$(E2E_CHAOS) -report $(CHAOS_RUN)
+
+# Dispatch an ad-hoc chaos run in CI with a random seed and a random
+# profile, always at the nightly 10-minute window. Unlike every other
+# e2e target this one runs no lab locally — it needs `gh`, authenticated,
+# and dispatches .github/workflows/e2e-chaos.yml against the current
+# branch (which must be pushed). The point is the draw: a hand-dispatched
+# run defaults to seed 42 / everything-on and re-walks a sequence the
+# nightly already covers, while this explores a fresh one and prints the
+# seed and profile it drew, so a red run replays in CI or locally.
+#
+#   make e2e-chaos-random
+#   make e2e-chaos-random CHAOS_RANDOM_FLAGS="-n 3"
+#   make e2e-chaos-random CHAOS_RANDOM_FLAGS="--watch"
+#   make e2e-chaos-random CHAOS_RANDOM_FLAGS="--dry-run"
+CHAOS_RANDOM_FLAGS ?=
+e2e-chaos-random:
+	$(E2E_CHAOS_RANDOM) $(CHAOS_RANDOM_FLAGS)
