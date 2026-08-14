@@ -216,6 +216,47 @@ func TestExpectationPortForwardOnlySkipsEveryOVNPlane(t *testing.T) {
 	})
 }
 
+// Every other plane is gated on mode and activity; this one is not. A gateway
+// needs a route to the fabric whether it is active, standby, or port-forward
+// only — the request for a peer's VIP and the reply to a client behind a peer's
+// FIP both leave the VRF towards a destination it does not host, and only the
+// default carries them (#247). Gating this on activity would have kept the
+// original incident invisible, since the gateway that lost the route was the
+// one that had just become active.
+func TestExpectationRequiresTheVRFDefaultRouteInEveryMode(t *testing.T) {
+	// gateway-1 owns the CR port, so gateway-2 is a full-mode standby.
+	snap := ovnSnapshot{
+		CRPortChassis: map[string]string{"cr-lr0-public": "gateway-1"},
+		LRPs:          map[string]lrpRow{"lr0-public": {Networks: []string{"192.0.2.1/24"}}},
+		LRPNameByUUID: map[string]string{"uuid-lr0-public": "lr0-public"},
+		Routers: map[string]routerRow{"lr0": {
+			LRPUUIDs: []string{"uuid-lr0-public"},
+			NATs:     []natRow{{ExternalIP: "192.0.2.10", Type: "dnat_and_snat"}},
+		}},
+		SegmentTagByLRP: map[string]int{"lr0-public": 0},
+	}
+
+	for _, tc := range []struct {
+		name    string
+		gw      string
+		profile string
+	}{
+		{name: "active", gw: "gateway-1", profile: "everything-on"},
+		{name: "standby", gw: "gateway-2", profile: "everything-on"},
+		{name: "port-forward only", gw: "gateway-1", profile: "pf-only"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := render(t, profileGateway(t, tc.profile, tc.gw), "172.20.20.5")
+
+			exp := computeExpectation(snap, tc.gw, doc, "172.20.20.5")
+
+			if !exp.VRFDefaultRoute {
+				t.Errorf("VRFDefaultRoute = false on a %s gateway, want it required in every mode", tc.name)
+			}
+		})
+	}
+}
+
 // A port-forward VIP on a full-mode standby gateway is dormant (#206): it gets
 // no kernel route and no FRR static route, because the standby path empties the
 // prefix-list that would advertise it. The route planes must therefore expect

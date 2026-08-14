@@ -84,6 +84,62 @@ func TestSettleDeadlineConvertsDivergenceIntoViolations(t *testing.T) {
 	}
 }
 
+// The plane #247 left invisible. A gateway whose vrf-provider lost its default
+// route drops everything bound for a destination the VRF does not host — the
+// reply to a port-forward VIP whose gateway port lives on another chassis,
+// above all — while every other plane still matches its expectation. Only the
+// probe saw it before; now a sweep does.
+func TestSettleFlagsAGatewayWithoutAVRFDefaultRoute(t *testing.T) {
+	fx := newOracleLab(t)
+	// gateway-3 is a standby here, which is the point: it needs the route to
+	// reach the fabric whether or not it currently announces anything.
+	fx.noVRFDefault["gateway-3"] = true
+	o := oracleFor(t, fx.respond, fullModeDocs(t))
+	ctx := context.Background()
+
+	if err := o.prime(ctx); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	v, convergedMS := o.verify(ctx)
+
+	if convergedMS != -1 {
+		t.Fatalf("convergedMS = %d, want -1 with a gateway missing its VRF default route", convergedMS)
+	}
+	found := false
+	for _, r := range v {
+		if r.Kind == violationExpectedState && r.Target == "gateway-3" &&
+			strings.Contains(r.Detail, "vrf-default") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a gateway without a VRF default route was not flagged: %+v", v)
+	}
+}
+
+// The gauge is the agent's own view of the same plane, so a lab where the route
+// is there and the agent says so passes — the check must not fire on a healthy
+// node just because it now reads one more series.
+func TestSettlePassesWithTheVRFDefaultRoutePresent(t *testing.T) {
+	fx := newOracleLab(t)
+	o := oracleFor(t, fx.respond, fullModeDocs(t))
+	ctx := context.Background()
+
+	if err := o.prime(ctx); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	v, convergedMS := o.verify(ctx)
+
+	for _, r := range v {
+		if strings.Contains(r.Detail, "vrf-default") {
+			t.Fatalf("a healthy lab was flagged for the VRF default route: %+v", r)
+		}
+	}
+	if convergedMS < 0 {
+		t.Fatalf("convergedMS = %d, want >= 0 on a pass", convergedMS)
+	}
+}
+
 // A transient divergence that heals within the window is absorbed: the retries
 // see it clear and the settle passes.
 func TestSettleRetriesAbsorbTransientDivergence(t *testing.T) {
@@ -448,6 +504,11 @@ func TestAnUnreadableDataPlaneIsNotReadAsAbsent(t *testing.T) {
 	}{
 		{name: "nftables ruleset", cmd: "nft list table ip " + agentNftTable},
 		{name: "managed VIP addresses", cmd: "ip -j addr show dev loopback1"},
+		// This one would fail either way, but for the wrong reason: a
+		// swallowed read leaves the plane looking absent, and the oracle
+		// would report a missing default route on a gateway whose routing
+		// table it never managed to read.
+		{name: "VRF default route", cmd: "ip -j route show vrf " + vrfProvider + " default"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

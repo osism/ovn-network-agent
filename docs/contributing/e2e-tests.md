@@ -1477,7 +1477,7 @@ pass. If `-settle-timeout` expires first, the last evaluation's failures
 become violations, and any violation fails the run. Every poll recomputes
 the expectation, so a settle tracks a `config-flip` the instant it lands.
 
-**The seven verified planes.** For each gateway the oracle diffs the
+**The eight verified planes.** For each gateway the oracle diffs the
 live data plane against a per-gateway expectation recomputed from the OVN
 NB/SB snapshot and that gateway's own config:
 
@@ -1485,13 +1485,22 @@ NB/SB snapshot and that gateway's own config:
 | --- | --- |
 | Kernel routes | proto-44 `/32`s on their device (`br-ex`, or `br-ex.<tag>` for a VLAN segment) |
 | FRR statics | `/32` statics in `vrf-provider` via the veth nexthop |
+| VRF default | a default route in `vrf-provider`, on every gateway in every mode |
 | Prefix-list | the `ANNOUNCED-NETWORKS` entries |
 | Hairpin flows | OVS flows under cookie `0x998`, by destination |
 | MAC-tweak flows | the count of cookie `0x999` flows |
 | nftables | DNAT and hairpin-masquerade rules in table `ovn-network-agent` |
 | Managed VIPs | `/32` addresses on `port_forward_dev` |
 
-An eighth check reaches past the gateways to the upstream router: the BGP
+The VRF default is the one plane the agent does not produce — the
+upstream originates it (`configure_upstream_frr`) and the agent only
+consumes it. It is checked unconditionally, unlike every plane gated on
+mode and activity, because a gateway needs a route to the fabric whether
+or not it currently owns anything: without it, traffic bound for a
+destination the VRF does not host dies inside the chassis while every
+other plane still matches (issue #247).
+
+A ninth check reaches past the gateways to the upstream router: the BGP
 announcements `upstream` actually holds, bounded both ways — nothing
 stale (announced ⊆ desired) and nothing missing (every desired IP the
 mode requires must be announced). They are read from the upstream router
@@ -1539,6 +1548,15 @@ and a bash `/dev/tcp` socket) and fails the settle on a non-zero
 `consecutive_readds` or `inactive_routes`, or on any `route_readds_total`
 movement across the 20 s confirmation gap — a flap even when every probe
 stays green.
+
+The same scrape holds `vrf_default_route_present` to 1, which is
+deliberately redundant with the VRF-default plane above: the plane check
+reads the kernel and catches the route going away, while the gauge is the
+agent's own view and catches the agent failing to notice. A detector that
+silently reports healthy is the failure mode the whole plane exists to
+close, so it is checked rather than trusted. A scrape that does not carry
+the series at all is left alone — that means an agent too old to export
+it, which is a different problem from an agent reporting the route gone.
 
 **Violations and triage.** The oracle adds five violation kinds —
 `expected-state`, `route-flap`, `drain-while-disabled`,

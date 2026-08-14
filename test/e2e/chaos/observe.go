@@ -377,6 +377,7 @@ type observedGateway struct {
 	dnat             []observedDNAT    // nftables prerouting_dnat rules
 	masquerade       map[string]bool   // VIPs with a hairpin/router masquerade rule
 	vips             map[string]bool   // /32 addresses on the port-forward device
+	vrfDefaultRoute  bool              // vrf-provider holds a default route
 	metrics          gatewayMetrics
 }
 
@@ -394,6 +395,18 @@ type gatewayMetrics struct {
 	consecutiveReAdds int
 	inactiveRoutes    int
 	routeReAddsTotal  int // summed over the plane labels
+
+	// vrfDefaultGauge is the agent's own view of the plane observeVRFDefault
+	// reads from the kernel, so the gate catches a broken detector as well as
+	// a broken data plane. It is named apart from observedGateway's
+	// vrfDefaultRoute because the two sit side by side in the oracle and are
+	// different answers to the same question, from different vantages.
+	//
+	// vrfDefaultGaugeScraped separates "the agent says zero" from "the
+	// endpoint never emitted the series", which for this gauge are opposite
+	// answers — unlike the counters above, where zero is the healthy value.
+	vrfDefaultGauge        int
+	vrfDefaultGaugeScraped bool
 }
 
 // observeGateway gathers every data plane the oracle verifies on one gateway.
@@ -412,6 +425,9 @@ func observeGateway(ctx context.Context, l *lab, gw, portForwardDev string) (obs
 		return obs, err
 	}
 	if err := observeFRRStatic(ctx, l, gw, &obs); err != nil {
+		return obs, err
+	}
+	if err := observeVRFDefault(ctx, l, gw, &obs); err != nil {
 		return obs, err
 	}
 	if err := observePrefixList(ctx, l, gw, &obs); err != nil {
@@ -451,6 +467,39 @@ func observeKernelRoutes(ctx context.Context, l *lab, gw string, obs *observedGa
 	}
 	for _, r := range routes {
 		obs.kernelRoutes[strings.TrimSuffix(r.Dst, "/32")] = r.Dev
+	}
+	return nil
+}
+
+// observeVRFDefault reads whether vrf-provider holds a default route — the
+// plane the agent depends on but never installs, and the one a split-owner
+// port-forward path dies in when the fabric stops originating it (#247).
+//
+// Reads the kernel rather than FRR on purpose: the kernel FIB is what forwards
+// the packet, and it is the same table the agent's own check consults.
+func observeVRFDefault(ctx context.Context, l *lab, gw string, obs *observedGateway) error {
+	out, err := l.exec(ctx, gw, "ip", "-j", "route", "show", "vrf", vrfProvider, "default")
+	if err != nil {
+		return fmt.Errorf("list the %s default route on %s: %w", vrfProvider, gw, err)
+	}
+	// No default is the answer the oracle is looking for, not a failure to
+	// read: iproute2 prints an empty body on older builds and "[]" on newer
+	// ones, and both mean the same thing.
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" || trimmed == "[]" {
+		return nil
+	}
+	var routes []struct {
+		Dst string `json:"dst"`
+	}
+	if err := json.Unmarshal([]byte(out), &routes); err != nil {
+		return fmt.Errorf("parse the %s default route on %s: %w", vrfProvider, gw, err)
+	}
+	for _, r := range routes {
+		if r.Dst == "default" {
+			obs.vrfDefaultRoute = true
+			break
+		}
 	}
 	return nil
 }
@@ -632,7 +681,7 @@ func observeMetrics(ctx context.Context, l *lab, gw string, obs *observedGateway
 	return nil
 }
 
-// parseMetrics reads the three flap-indicator series from a Prometheus text
+// parseMetrics reads the series the oracle gates on from a Prometheus text
 // scrape (metrics.go), summing route_readds_total across its plane labels.
 func parseMetrics(body string) gatewayMetrics {
 	var m gatewayMetrics
@@ -654,6 +703,9 @@ func parseMetrics(body string) gatewayMetrics {
 			m.inactiveRoutes = value
 		case strings.HasPrefix(name, "ovn_network_agent_route_readds_total"):
 			m.routeReAddsTotal += value
+		case name == "ovn_network_agent_vrf_default_route_present":
+			m.vrfDefaultGauge = value
+			m.vrfDefaultGaugeScraped = true
 		}
 	}
 	return m
