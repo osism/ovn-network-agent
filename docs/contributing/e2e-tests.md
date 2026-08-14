@@ -40,6 +40,7 @@ test/e2e/
     multi-vlan.sh           — multi-VLAN provider networks, two segments on master (issue #147)
     pf-external.sh          — port-forward / DNAT scenario, source IP preserved (issue #109)
     pf-hairpin.sh           — port-forward hairpin masquerade scenario (issue #110)
+    pf-split-owner.sh       — port-forward VIP whose gateway port is on another chassis (issue #247)
     stale-chassis.sh        — stale chassis cleanup scenario, hard kill (issue #111)
     drain-hitless.sh        — graceful drain vs hard kill, hitless comparison (issue #113)
     collect-artifacts.sh    — dump lab state for offline triage
@@ -272,6 +273,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | [Multi-VLAN](#multi-vlan) | `e2e-multi-vlan` | Two VLAN provider networks on one node get per-segment kernel interfaces, flows, and BGP-announced FIPs. | [#147](https://github.com/osism/ovn-network-agent/issues/147) |
 | [Port-forward (external client)](#port-forward-external-client) | `e2e-pf-external` | Inbound DNAT preserves the external client's source IP. | [#109](https://github.com/osism/ovn-network-agent/issues/109) |
 | [Port-forward hairpin masquerade](#port-forward-hairpin-masquerade) | `e2e-pf-hairpin` | The `hairpin_masquerade` flag is load-bearing for a co-located FIP. | [#110](https://github.com/osism/ovn-network-agent/issues/110) |
+| [Port-forward split owner](#port-forward-split-owner) | `e2e-pf-split-owner` | A VIP stays reachable when the chassis answering it is not the one holding the router's gateway port. | [#247](https://github.com/osism/ovn-network-agent/issues/247) |
 | [Stale chassis](#stale-chassis) | `e2e-stale-chassis` | Surviving peers garbage-collect the NB rows of a hard-killed chassis. | [#111](https://github.com/osism/ovn-network-agent/issues/111) |
 
 Every scenario except `baseline` runs the baseline first as a sanity
@@ -705,6 +707,65 @@ exposed as overrides for forward compatibility.
 
 **Overrides for triage:** `VIP`, `VIP_PORT`, `BACKEND_IP`,
 `BACKEND_PORT`, `FIP_C`, `FIP_C_INTERNAL`, `MASTER`, `WORKLOAD_HOST`,
+`RECONCILE_TIMEOUT`, `RESTART_TIMEOUT`, `SANITY_GATE`.
+
+### Port-forward split owner
+
+```sh
+make e2e-pf-split-owner
+```
+
+[`pf-split-owner.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/pf-split-owner.sh)
+pins the outage class the nightly chaos runs kept finding by accident
+(issue #247). A port-forward VIP is answered by whichever chassis holds
+the DNAT rules, while OVN client traffic leaves through whichever
+chassis holds the router's chassisredirect port. On a fleet where only
+some gateways carry the VIP configuration those are different chassis,
+and both legs of the path then cross the fabric.
+
+**Topology the scenario adds.** The VIP `198.18.0.50:8080` on
+`gateway-1` alone, backed by `pf-backend` on that gateway's own
+management address, plus `lr-split-vlan`: a router with no workloads,
+pinned to `gateway-1`. The anchor router is load-bearing rather than
+scenery — [#206](https://github.com/osism/ovn-network-agent/issues/206)
+holds a router-less node's VIPs dormant, so without it `gateway-1`
+would stop announcing the VIP the moment `lr0` moved away and the
+scenario would be measuring dormancy instead of the split path.
+
+The VIP sits in `198.18.0.0/15` (RFC 2544) rather than in a lab subnet
+for the reason `pf-hairpin.sh` documents: an address inside the provider
+network is a connected route on `lr0`, so OVN would deliver it on the
+public logical switch and ARP for it there, and the chassis kernel's
+DNAT would never see the packet.
+
+**The two phases.** Both probe `198.18.0.50:8080` from the `vm1` netns
+on `gateway-3`; what changes between them is who owns `cr-lr0-public`.
+
+1. **Owner `gateway-1`** — the VIP carrier. The path never leaves that
+   chassis, so this passes with or without the fix. It is the sanity
+   gate: a red phase 1 means the VIP wiring is wrong, not the split.
+2. **Owner `gateway-3`** — no VIP configuration at all. The request now
+   leaves `gateway-3`'s `vrf-provider` towards the peer announcing the
+   VIP, and the reply leaves `gateway-1`'s towards a FIP that
+   `gateway-3` announces. Neither destination is connected or
+   redistributed there, so both legs need the default route the upstream
+   originates.
+
+The scenario restarts `gateway-1` to load the injected config and
+repairs its underlay afterwards, the way `hairpin-churn.sh` does:
+`docker restart` destroys the containerlab veth `gateway-1:eth1 ↔
+upstream:eth1`, and unlike `pf-hairpin.sh` — whose data path rides
+geneve — this one cannot do without it. It also waits for a
+`vrf-provider` default route on both gateways before probing, so a
+missing default is reported as itself rather than as a probe timeout.
+
+On a phase-2 failure the per-gateway VRF routes, policy rules and
+`ANNOUNCED-NETWORKS` prefix-lists are written to `ARTIFACTS_DIR` and
+echoed to stderr; the missing route is normally visible in the first of
+the three.
+
+**Overrides for triage:** `VIP`, `VIP_PORT`, `BACKEND_IP`,
+`BACKEND_PORT`, `MASTER`, `SPLIT_OWNER`, `VLAN_PRIORITY`,
 `RECONCILE_TIMEOUT`, `RESTART_TIMEOUT`, `SANITY_GATE`.
 
 ### Stale chassis
@@ -1811,6 +1872,14 @@ composite action:
   phase2-on / teardown `nft` snapshots are bundled with the lab-state
   dump (per issue #110's acceptance criterion). On failure the artifact
   bundle is uploaded as `e2e-artifacts-pf-hairpin-<run id>-<attempt>`.
+- **`pf-split-owner`** (`needs: baseline`) — same shape, but executes
+  `test/e2e/scenarios/pf-split-owner.sh`. The job points the scenario's
+  `ARTIFACTS_DIR` at the same artifact root so the per-gateway routing
+  dumps (VRF routes, policy rules, `ANNOUNCED-NETWORKS`) are bundled
+  with the lab-state dump: a failure here is nearly always a missing
+  route in one of the two provider VRFs, and the dump names which one.
+  On failure the artifact bundle is uploaded as
+  `e2e-artifacts-pf-split-owner-<run id>-<attempt>`.
 - **`stale-chassis`** (`needs: failover`) — same shape, but executes
   `test/e2e/scenarios/stale-chassis.sh`. The job points the
   scenario's `ARTIFACTS_DIR` at the same artifact root so the
