@@ -1091,14 +1091,22 @@ func (rm *RouteManager) VRFDefaultRoutePresent() (bool, error) {
 
 // hasDefaultRoute reports whether any route in the list is 0.0.0.0/0.
 //
-// netlink encodes a default route as a nil Dst rather than a zero-length
-// prefix — the same encoding SetupVethLeak writes one with — so that is the
-// whole test. Split out from VRFDefaultRoutePresent because the netlink call
-// around it needs root and a real VRF device, while this is the part worth
-// pinning.
+// Both encodings count, because the two directions of the netlink API do not
+// agree. Writing a default route means leaving Dst unset — that is how
+// SetupVethLeak installs the leak-table default — but reading one back yields
+// an explicit 0.0.0.0/0 with a zero-length mask, since the deserializer fills
+// Dst in from the message's prefix length rather than from an RTA_DST
+// attribute the kernel never sends for a default. Testing only for a nil Dst
+// reads every real routing table as having no default at all.
+//
+// Split out from VRFDefaultRoutePresent because the netlink call around it
+// needs root and a real VRF device, while this is the part worth pinning.
 func hasDefaultRoute(routes []netlink.Route) bool {
 	for _, r := range routes {
 		if r.Dst == nil {
+			return true
+		}
+		if ones, _ := r.Dst.Mask.Size(); ones == 0 {
 			return true
 		}
 	}
