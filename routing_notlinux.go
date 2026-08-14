@@ -138,3 +138,13 @@ func (rm *RouteManager) TeardownVethLeak() error {
 	}
 	return fmt.Errorf("veth VRF leak is only supported on Linux")
 }
+
+// VRFDefaultRoutePresent reports the dependency as satisfied rather than
+// erroring, the only stub here that does. Its caller turns a false into an
+// operator-facing ERROR about dropped traffic, and a non-Linux build has no VRF
+// to route through in the first place — so reporting absence would be alarming
+// about a data plane that does not exist, and reporting an error would put a
+// permanent warning on every reconcile.
+func (rm *RouteManager) VRFDefaultRoutePresent() (bool, error) {
+	return true, nil
+}

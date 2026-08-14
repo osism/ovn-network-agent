@@ -47,6 +47,10 @@ type metricsRegistry struct {
 	localRouters      prometheus.Gauge
 	effectiveNetworks prometheus.Gauge
 	localnetSegments  prometheus.Gauge
+	announcedVIPs     prometheus.Gauge
+
+	// Provider-VRF prerequisites
+	vrfDefaultRoutePresent prometheus.Gauge
 
 	// Route stability metrics
 	routeReAddsTotal    *prometheus.CounterVec
@@ -168,6 +172,18 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Number of desired FIP/VIP routes that exist as FRR static routes but are not selected/installed — i.e. not advertised via BGP. Non-zero means those FIPs are unreachable from outside.",
 		}),
 
+		announcedVIPs: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "announced_vips",
+			Help:      "Number of configured port-forward VIPs this node announces this cycle. Zero while the VIPs are dormant because the node hosts no local routers.",
+		}),
+
+		vrfDefaultRoutePresent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "vrf_default_route_present",
+			Help:      "1 when the provider VRF's routing table holds a default route, 0 when it does not. A 0 on a node that announces VIPs or hosts routers means traffic to destinations the VRF does not host is dropped inside it.",
+		}),
+
 		nexthopRepairsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "nexthop_repairs_total",
@@ -240,6 +256,8 @@ func newMetricsRegistry() *metricsRegistry {
 		m.localRouters,
 		m.effectiveNetworks,
 		m.localnetSegments,
+		m.announcedVIPs,
+		m.vrfDefaultRoutePresent,
 		m.routeReAddsTotal,
 		m.consecutiveReAdds,
 		m.inactiveRoutes,
@@ -400,6 +418,28 @@ func setLocalnetSegments(n int) {
 		return
 	}
 	metrics.localnetSegments.Set(float64(n))
+}
+
+func setAnnouncedVIPs(n int) {
+	if metrics == nil {
+		return
+	}
+	metrics.announcedVIPs.Set(float64(n))
+}
+
+// setVRFDefaultRoute records whether the provider VRF holds a default route.
+// It is deliberately not called when the check itself failed: an unanswerable
+// question must leave the last real answer standing rather than report the
+// absence it could not establish.
+func setVRFDefaultRoute(present bool) {
+	if metrics == nil {
+		return
+	}
+	v := 0.0
+	if present {
+		v = 1
+	}
+	metrics.vrfDefaultRoutePresent.Set(v)
 }
 
 func recordRouteReAdds(frr, kernel int) {

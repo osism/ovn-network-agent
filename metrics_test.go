@@ -76,6 +76,9 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setReconcileInProgress(false)
 	setDesiredState(5, 2, 3)
 	setLocalnetSegments(2)
+	setAnnouncedVIPs(2)
+	setVRFDefaultRoute(true)
+	setVRFDefaultRoute(false)
 	recordRouteReAdds(1, 2)
 	setConsecutiveReAdds(4)
 	setInactiveRoutes(0)
@@ -560,6 +563,29 @@ func TestSetInactiveRoutesSetsGauge(t *testing.T) {
 		if v := mf.GetMetric()[0].GetGauge().GetValue(); v != 3 {
 			t.Errorf("inactive_routes = %v, want 3", v)
 		}
+	}
+}
+
+func TestSetAnnouncedVIPsSetsGauge(t *testing.T) {
+	m := withTestMetrics(t)
+	setAnnouncedVIPs(2)
+
+	if got := gaugeValue(t, m, "ovn_network_agent_announced_vips"); got != 2 {
+		t.Errorf("announced_vips = %v, want 2", got)
+	}
+}
+
+func TestSetVRFDefaultRouteSetsGaugeBothWays(t *testing.T) {
+	m := withTestMetrics(t)
+
+	setVRFDefaultRoute(true)
+	if got := gaugeValue(t, m, "ovn_network_agent_vrf_default_route_present"); got != 1 {
+		t.Errorf("vrf_default_route_present = %v, want 1", got)
+	}
+
+	setVRFDefaultRoute(false)
+	if got := gaugeValue(t, m, "ovn_network_agent_vrf_default_route_present"); got != 0 {
+		t.Errorf("vrf_default_route_present = %v, want 0", got)
 	}
 }
 
