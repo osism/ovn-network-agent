@@ -20,14 +20,14 @@ import (
 // engine hands it a settle window; the oracle polls until every gateway's live
 // data plane matches computeExpectation (expect.go) or the window expires.
 //
-// It verifies seven per-gateway planes (kernel routes with their device, FRR
-// statics, the ANNOUNCED-NETWORKS prefix-list, hairpin flows, MAC-tweak flow
-// count, nftables DNAT/masquerade, managed VIP addresses) and the upstream
-// announcements, plus four snapshot-wide invariants (chassisredirect priority
-// lead, drain residue, vanished-chassis hygiene, a frozen NB under
-// port-forward-only) and a metrics flap gate. Everything it reads comes through
-// observe.go; it draws nothing from the engine's rng and never touches the
-// run's decision stream.
+// It verifies eight per-gateway planes (kernel routes with their device, FRR
+// statics, the vrf-provider default route, the ANNOUNCED-NETWORKS prefix-list,
+// hairpin flows, MAC-tweak flow count, nftables DNAT/masquerade, managed VIP
+// addresses) and the upstream announcements, plus four snapshot-wide
+// invariants (chassisredirect priority lead, drain residue, vanished-chassis
+// hygiene, a frozen NB under port-forward-only) and a metrics gate. Everything
+// it reads comes through observe.go; it draws nothing from the engine's rng and
+// never touches the run's decision stream.
 
 const (
 	// settlePollInterval is how often the settle loop re-observes the lab.
@@ -336,6 +336,16 @@ func comparePlanes(gw string, exp gatewayExpectation, obs observedGateway, upstr
 		})
 	}
 
+	// A bool plane cannot go through add(): with nothing to list as missing or
+	// unexpected, both its sets are empty and it records nothing.
+	if exp.VRFDefaultRoute && !obs.vrfDefaultRoute {
+		fs = append(fs, settleFailure{
+			kind:   violationExpectedState,
+			target: gw,
+			detail: fmt.Sprintf("vrf-default: want a default route in %s, have none", vrfProvider),
+		})
+	}
+
 	m, u = diffSet(dnatStrings(exp.DNAT), setOf(observedDNATStrings(obs.dnat)))
 	add("dnat", m, u)
 
@@ -370,16 +380,37 @@ func comparePlanes(gw string, exp gatewayExpectation, obs observedGateway, upstr
 // metricsGate holds each gateway to a settled reconcile: no consecutive
 // re-adds and no inactive routes. A sustained non-zero here is route
 // instability the set checks cannot see.
+//
+// It also holds the agent's own view of the VRF default route against the
+// plane comparePlanes reads from the kernel. The two are deliberately
+// redundant: the plane check catches the route going away, and this catches
+// the agent failing to notice — a detector that silently reports healthy is
+// the failure mode #247 was invisible behind in the first place.
 func metricsGate(gw string, obs observedGateway) []settleFailure {
-	if obs.metrics.consecutiveReAdds == 0 && obs.metrics.inactiveRoutes == 0 {
-		return nil
+	var fs []settleFailure
+
+	if obs.metrics.consecutiveReAdds != 0 || obs.metrics.inactiveRoutes != 0 {
+		fs = append(fs, settleFailure{
+			kind:   violationRouteFlap,
+			target: gw,
+			detail: fmt.Sprintf("consecutive_readds=%d inactive_routes=%d",
+				obs.metrics.consecutiveReAdds, obs.metrics.inactiveRoutes),
+		})
 	}
-	return []settleFailure{{
-		kind:   violationRouteFlap,
-		target: gw,
-		detail: fmt.Sprintf("consecutive_readds=%d inactive_routes=%d",
-			obs.metrics.consecutiveReAdds, obs.metrics.inactiveRoutes),
-	}}
+
+	// Only when the series was actually scraped. Its absence means an agent
+	// that does not export it, which is a different problem from an agent
+	// reporting the route gone, and reading the zero value as the latter would
+	// invent a failure.
+	if obs.metrics.vrfDefaultGaugeScraped && obs.metrics.vrfDefaultGauge == 0 {
+		fs = append(fs, settleFailure{
+			kind:   violationExpectedState,
+			target: gw,
+			detail: "vrf-default: the agent reports vrf_default_route_present=0",
+		})
+	}
+
+	return fs
 }
 
 // priorityLeadFailures asserts the elected owner of every bound chassisredirect

@@ -210,6 +210,16 @@ type gatewayExpectation struct {
 	// every mode and state. It is exactly the desired IPs — the upstream can
 	// never legitimately announce an address the agent does not desire.
 	AnnounceBound []string
+
+	// VRFDefaultRoute is the one expectation the agent does not produce: the
+	// upstream originates a default into every gateway's vrf-provider
+	// (bootstrap.sh configure_upstream_frr), and every gateway needs it to
+	// reach anything it does not host itself. It is therefore true in every
+	// mode and state, unlike the planes above — a standby that stops
+	// announcing has not stopped needing a route to the fabric. Nothing the
+	// agent does removes it, so a false here is the lab or the fabric breaking
+	// under the agent, which is exactly the condition #247 left invisible.
+	VRFDefaultRoute bool
 }
 
 // computeExpectation recomputes gw's expected data-plane state from the OVN
@@ -280,6 +290,9 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 		PortForwardDev: docString(doc, "port_forward_dev", "loopback1"),
 		MACTweakFlows:  -1,
 		AnnounceBound:  desired, // rule 12 — announced ⊆ desired always.
+		// rule 13 — the upstream originates a default to every gateway, in
+		// every profile, so this is unconditional.
+		VRFDefaultRoute: true,
 	}
 
 	// Rule 5 — kernel routes: managed only in full mode. Each OVN-derived IP

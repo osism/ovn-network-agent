@@ -316,6 +316,12 @@ type oracleLab struct {
 	consecutive map[string]int    // gw → ovn_network_agent_consecutive_readds
 	inactive    map[string]int    // gw → ovn_network_agent_inactive_routes
 	readds      map[string]int    // gw → ovn_network_agent_route_readds_total
+
+	// noVRFDefault drops the vrf-provider default route on a gateway. It moves
+	// the scraped gauge with it, because the agent reads the same table the
+	// observer does — a lab where only one of the two changed would be testing
+	// a state the real one cannot reach.
+	noVRFDefault map[string]bool
 }
 
 func newOracleLab(t *testing.T) *oracleLab {
@@ -328,12 +334,13 @@ func newOracleLab(t *testing.T) *oracleLab {
 			{uuid: "sr-10", prefix: "192.0.2.10/32", chassis: "gateway-1"},
 			{uuid: "sr-12", prefix: "192.0.2.12/32", chassis: "gateway-1"},
 		},
-		marker:      map[string]bool{},
-		drainEnv:    "false",
-		dropKernel:  map[string]string{},
-		consecutive: map[string]int{},
-		inactive:    map[string]int{},
-		readds:      map[string]int{},
+		marker:       map[string]bool{},
+		drainEnv:     "false",
+		dropKernel:   map[string]string{},
+		consecutive:  map[string]int{},
+		inactive:     map[string]int{},
+		readds:       map[string]int{},
+		noVRFDefault: map[string]bool{},
 	}
 }
 
@@ -373,6 +380,8 @@ func (o *oracleLab) respond(argv []string) (string, error) {
 			return o.kernel(gw), nil
 		case has("show ip route vrf vrf-provider static json"):
 			return o.frr(gw), nil
+		case has("ip -j route show vrf vrf-provider default"):
+			return o.vrfDefault(gw), nil
 		case has("show ip prefix-list ANNOUNCED-NETWORKS"):
 			return o.prefixList(gw), nil
 		case has("dump-flows br-ex cookie=0x998"):
@@ -508,6 +517,17 @@ func (o *oracleLab) frr(gw string) string {
 	return string(b)
 }
 
+// vrfDefault answers the observer's `ip -j route show vrf vrf-provider
+// default`. Absence is an empty JSON array, which is what iproute2 prints.
+func (o *oracleLab) vrfDefault(gw string) string {
+	if o.noVRFDefault[gw] {
+		return "[]"
+	}
+	link := mustLink(o.t, gw)
+	return fmt.Sprintf(`[{"dst":"default","gateway":"%s","dev":"eth1","protocol":"bgp"}]`,
+		addrOf(link.upstreamCIDR))
+}
+
 func (o *oracleLab) prefixList(gw string) string {
 	if !o.active(gw) {
 		return "" // the agent cleans the list on a standby gateway
@@ -538,13 +558,18 @@ func (o *oracleLab) macTweak(gw string) string {
 }
 
 func (o *oracleLab) metrics(gw string) string {
+	vrfDefault := 1
+	if o.noVRFDefault[gw] {
+		vrfDefault = 0
+	}
 	return fmt.Sprintf("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n"+
 		"# HELP ovn_network_agent_consecutive_readds ...\n"+
 		"ovn_network_agent_consecutive_readds %d\n"+
 		"ovn_network_agent_inactive_routes %d\n"+
 		"ovn_network_agent_route_readds_total{plane=\"kernel\"} %d\n"+
-		"ovn_network_agent_route_readds_total{plane=\"frr\"} 0\n",
-		o.consecutive[gw], o.inactive[gw], o.readds[gw])
+		"ovn_network_agent_route_readds_total{plane=\"frr\"} 0\n"+
+		"ovn_network_agent_vrf_default_route_present %d\n",
+		o.consecutive[gw], o.inactive[gw], o.readds[gw], vrfDefault)
 }
 
 func (o *oracleLab) upstreamBGP() string {
