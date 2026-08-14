@@ -18,5 +18,6 @@ make e2e-failover        # run the HA failover scenario (master chassis loss)
 make e2e-failover-strict # run the failover scenario with the strict ~2s outage budget
 make e2e-hairpin-churn   # hold zero loss on the same-chassis hairpin path under reconcile churn
 make e2e-chaos           # run a seeded 10-minute chaos session
+make e2e-chaos-random    # dispatch an ad-hoc CI chaos run, random seed + profile
 make e2e-down            # destroy the lab
 ```
