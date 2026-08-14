@@ -23,7 +23,12 @@ runs:
     # modules must be loaded on the host before lab-up. The Azure kernel on
     # `ubuntu-latest` ships `openvswitch` in the base modules set but `vrf`
     # and `sch_netem` only in `linux-modules-extra-<uname>` — install it on
-    # demand. Without `vrf`, gwnode-entrypoint.sh crash-loops on
+    # demand. Each module is tried before any apt work runs, so a
+    # self-hosted runner whose kernel already ships them skips the install
+    # entirely; what such a runner does have to provide is passwordless
+    # sudo and the ability to load host kernel modules, which a
+    # containerised runner only has when it runs privileged. Without
+    # `vrf`, gwnode-entrypoint.sh crash-loops on
     # `ip link add vrf-provider type vrf table 100` with "Unknown device
     # type"; without `sch_netem` the impairment actions fail to add their
     # qdisc.

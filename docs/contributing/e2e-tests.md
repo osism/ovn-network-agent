@@ -1744,9 +1744,13 @@ runner records it, replayable — fault sequence. `workflow_dispatch`
 takes `seed`/`duration`/`profile` inputs (defaulting to 42 / 10m /
 `everything-on`), so replaying a failing nightly combination is just
 dispatching it with the seed, profile and duration read back from that
-job's artifacts. A pull request opts into a short smoke (3 minutes,
-seed 42, `everything-on`) by carrying the `chaos-smoke` label, rather
-than chaos running on every PR. Each profile's journal and summary
+job's artifacts. Both of those paths run on the org's self-hosted
+runners; the requirements a runner has to meet to join that pool are in
+[CI pipeline](./ci.md#scheduled-and-push-runs). A pull request opts into
+a short smoke (3 minutes, seed 42, `everything-on`) by carrying the
+`chaos-smoke` label, rather than chaos running on every PR — and that
+smoke stays on `ubuntu-latest`, because it is the one trigger that
+builds and runs a fork's own code. Each profile's journal and summary
 upload on every outcome, with the lab-state dump added on failure —
 and each job renders its own `-report` into the Actions job summary,
 so the verdict, the recovery durations and the loss windows are
