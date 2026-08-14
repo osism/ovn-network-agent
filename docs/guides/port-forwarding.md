@@ -15,6 +15,16 @@ fwmarks, VRF crossing, packet-flow diagrams — see
   pair for the return path.
 - **IP forwarding** on the veth interfaces — enabled automatically by the
   agent at startup.
+- **A default route in `vrf-provider`**, or routes covering every network the
+  VIP's clients live in. The agent does not install this one; it comes from the
+  fabric, the way a provider VRF normally receives it. Without it, replies to
+  clients outside the networks the VRF already routes are dropped inside the
+  VRF while the VIP address, the DNAT rules and the BGP announce all look
+  healthy. This bites hardest when the chassis answering the VIP is not the one
+  holding the router's gateway port, which is the normal state during a rollout
+  that has reached only some gateways. The agent reports the route as
+  `vrf_default_route_present`; see
+  [the alert](troubleshooting#alert-ovnnetworkagentvrfdefaultroutemissing).
 
 Port forwarding works whether or not the node is an OVN gateway. A node that
 should *only* expose VIPs can run with no OVN remotes configured at all — see

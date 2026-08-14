@@ -213,6 +213,18 @@ diagnostics and retries.
   `eth3 = 100.64.3.1/30`), `10.0.0.1/24` on `eth4` (towards
   `client-1`), IPv4 forwarding enabled, FRR with `bgpd` enabled and
   one eBGP neighbor per gateway.
+- the upstream also originates a default route to every gateway
+  (`neighbor <gateway> default-originate`), so each `vrf-provider`
+  learns `default via 100.64.N.1`. That default is what carries
+  traffic to anything the chassis does not host itself — a
+  port-forward VIP another gateway announces, or the reply to a
+  client behind a FIP that has moved. The gateways all share
+  AS 65000, so BGP delivers no such route on its own: the upstream's
+  re-advertisement is dropped by AS-path loop prevention. The
+  gateways do not pass the default on either, because they export
+  only through `redistribute connected` filtered by
+  `ANNOUNCE-CONNECTED` and their outbound
+  `prefix-list ANNOUNCED-NETWORKS out` permits `/32`s only.
 - each gateway's FRR (in `vrf-provider`): eBGP against its specific
   upstream `/30` endpoint, redistributing the FIP `/32` static
   routes that the agent installs in `vrf-provider`. The placeholder

@@ -79,6 +79,20 @@ groups:
             advertised via BGP. The agent re-notified the kernel about the
             veth-provider address to repair it.
           runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentnexthoprepaired"
+      - alert: OVNNetworkAgentVRFDefaultRouteMissing
+        expr: 'ovn_network_agent_vrf_default_route_present == 0 and (ovn_network_agent_announced_vips > 0 or ovn_network_agent_local_routers > 0)'
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider VRF has no default route on {{ $labels.instance }}"
+          description: >-
+            The provider VRF on {{ $labels.instance }} holds no default
+            route while the node announces port-forward VIPs or hosts
+            routers. Traffic to any destination the VRF does not already
+            route is dropped inside it — including replies to clients of a
+            VIP whose gateway port lives on another chassis.
+          runbook_url: "https://osism.github.io/ovn-network-agent/guides/troubleshooting#alert-ovnnetworkagentvrfdefaultroutemissing"
       - alert: OVNNetworkAgentSlowFailoverAnnounce
         expr: 'histogram_quantile(0.95, rate(ovn_network_agent_failover_announce_seconds_bucket[1h])) > 2'
         labels:
