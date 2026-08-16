@@ -470,3 +470,72 @@ func TestScenario_RestoreDrainedOnStartup(t *testing.T) {
 		t.Errorf("peer Gateway_Chassis %s disappeared", gcPeer)
 	}
 }
+
+// TestScenario_RestoreDrainedOnStartup_DrainDisabled (#254):
+//
+// NB Gateway_Chassis is already at priority 0 for this chassis — as a
+// previous drain-enabled shutdown leaves it — and the new instance runs
+// with drain_on_shutdown=false. This is the sequence a drain-disabling
+// restart produces (the chaos drain-toggle flip, or a config rollout that
+// turns the flag off): the old instance drains on SIGTERM, the new one
+// cannot know that it did. The startup restore must run regardless of the
+// current drain setting.
+//
+// Unlike TestScenario_RestoreDrainedOnStartup, the chassisredirect port is
+// bound to a peer chassis, so this node is a standby with no local routers —
+// the shape the drain leaves behind. That keeps EnsureActivePriorityLead
+// out of the picture (it returns early without local routers), so only the
+// startup restore can lift the row off 0: with the restore gated on
+// cfg.DrainOnShutdown the row stays at 0 forever and the chassis never
+// rejoins the HA group.
+func TestScenario_RestoreDrainedOnStartup_DrainDisabled(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	peerUUID := testenv.MakeChassis(t, ctx, sb, "restoreoff-peer")
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "restoreoff",
+		LRPNetworks: []string{"198.51.100.11/24"},
+		ChassisUUID: peerUUID,
+		GatewayChassis: []testenv.GatewayChassisEntry{
+			{ChassisName: testenv.LocalHostname(t), Priority: 0},
+			{ChassisName: "restoreoff-peer", Priority: 0},
+		},
+	})
+
+	gcLocal := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
+	gcPeer := "lrp-" + router.Name + "_restoreoff-peer"
+
+	cfg := testenv.Defaults()
+	off := false
+	cfg.DrainOnShutdown = &off
+	cfg.ReconcileInterval = "2s"
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	// The restore lifts the drained row to exactly 1 (standby level). No
+	// boost may follow: this chassis owns no chassisredirect port, and a
+	// standby re-entering above the restore level would risk reverse
+	// failover.
+	testenv.Eventually(t, func() bool {
+		gc, ok := testenv.FindGatewayChassis(t, ctx, nb, gcLocal)
+		return ok && gc.Priority == 1
+	}, 20*time.Second, 200*time.Millisecond,
+		"local Gateway_Chassis must be restored from 0 → 1 even with drain_on_shutdown=false (#254)")
+
+	// The restore itself ran (not some other writer raising the priority):
+	// the standby-restore log line is present.
+	if logs := a.LogTail(100000); !strings.Contains(logs, "restore-drain: gateway chassis priority restored to standby") {
+		t.Errorf("expected the restore-drain log line; tail:\n%s", a.LogTail(40))
+	}
+
+	// Peer entry must be untouched by RestoreDrainedGateways (different chassis).
+	if peer, ok := testenv.FindGatewayChassis(t, ctx, nb, gcPeer); ok {
+		if peer.Priority != 0 {
+			t.Errorf("peer Gateway_Chassis priority changed: got %d, want 0", peer.Priority)
+		}
+	} else {
+		t.Errorf("peer Gateway_Chassis %s disappeared", gcPeer)
+	}
+}
