@@ -179,10 +179,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		defer a.ovn.Close()
 
-		// Restore any gateway chassis priorities that were drained by a previous run.
-		if a.cfg.DrainOnShutdown {
-			a.ovn.RestoreDrainedGateways(ctx, a.ovn.GetState().LocalChassisName)
-		}
+		// Restore any gateway chassis priorities that were drained by a
+		// previous run. Unconditional on purpose: whether a priority-0
+		// residue exists is decided by the previous instance's config (the
+		// one that handled the SIGTERM), which this process cannot see. A
+		// restart that flips drain_on_shutdown off after a drain-enabled
+		// shutdown would otherwise strand the chassis at priority 0 —
+		// EnsureActivePriorityLead only boosts the active chassis, so
+		// nothing else ever lifts a standby off 0 (issue #254). Without
+		// local priority-0 rows the call is a no-op.
+		a.ovn.RestoreDrainedGateways(ctx, a.ovn.GetState().LocalChassisName)
 	}
 
 	// Initial reconciliation
