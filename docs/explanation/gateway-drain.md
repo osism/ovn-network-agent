@@ -43,7 +43,11 @@ agent:
 On the **next startup**, before the first reconciliation, the agent detects
 drained entries (priority 0 on the local chassis) and **restores them to
 priority 1** (standby level). This re-adds the chassis to the HA group as a
-standby. The active chassis maintains a minimum priority of 2 via an
+standby. The restore runs regardless of the current `drain_on_shutdown`
+setting: the priority-0 residue was left by the previous instance's
+configuration, which the new process cannot see, so a restart that turns
+the flag off after a drain-enabled shutdown must still rejoin the HA
+group. The active chassis maintains a minimum priority of 2 via an
 automatic **priority lead boost** during reconciliation (see [Priority
 semantics](#priority-semantics)), which is strictly above the restore level
 of 1 — preventing reverse failover without requiring a priority tie to
@@ -104,7 +108,7 @@ already moved. The result is a hitless shutdown.
           │
           ▼
   ┌───────────────────────────────────────────────────────┐
-  │  RESTORE (if drain_on_shutdown=true)                  │
+  │  RESTORE (always, whatever drain_on_shutdown says)    │
   │                                                       │
   │  For each Gateway_Chassis on this node with           │
   │  priority == 0:                                       │
