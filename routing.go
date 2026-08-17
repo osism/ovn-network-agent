@@ -540,7 +540,15 @@ func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vtysh show prefix-list %s: %w (output: %s)", rm.cfg.FRRPrefixList, err, strings.TrimSpace(string(output)))
 	}
+	return rm.parsePrefixListDocs(output)
+}
 
+// parsePrefixListDocs decodes the body of a `show ip prefix-list <name> json`
+// into the union of every answering daemon's entries. Shared by the
+// all-daemons listing above and the bgpd-only probe below — the union is the
+// right reading for stale removal and seq allocation, while bgpd's lone
+// document trivially unions to bgpd's own copy.
+func (rm *RouteManager) parsePrefixListDocs(output []byte) ([]prefixListEntry, error) {
 	// An empty body (or "{}") means the list does not exist — nothing to
 	// reconcile against, not an error.
 	trimmed := strings.TrimSpace(string(output))
@@ -555,8 +563,10 @@ func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 	// "invalid character '{' after top-level value". Each document nests the
 	// list under the daemon's own name: {"ZEBRA":{"<name>":{…}}}. Decode the
 	// documents in sequence and collect our list's entries from whichever
-	// daemons report it, deduplicating by sequence number since the daemons
-	// carry the same shared configuration.
+	// daemons report it, deduplicating by sequence number. The daemons hold
+	// the same configuration in steady state, but a write that raced an FRR
+	// restart can leave one daemon's copy short — which is why reconcile
+	// additionally checks bgpd's copy on its own (#256).
 	seen := make(map[int]bool)
 	var entries []prefixListEntry
 	dec := json.NewDecoder(strings.NewReader(trimmed))
@@ -597,6 +607,31 @@ func (rm *RouteManager) ListFRRPrefixListEntries() ([]prefixListEntry, error) {
 		}
 	}
 	return entries, nil
+}
+
+// listBGPDPrefixListEntries reads bgpd's own copy of the managed prefix-list
+// (`vtysh -d bgpd`). bgpd is the daemon whose copy gates announcements — the
+// neighbor outbound filter and the route-map on `redistribute connected` are
+// both evaluated there — so it is the copy reconcile verifies (#256).
+//
+// ok is false when the copy could not be read: bgpd not answering (down or
+// still starting) or an unparseable reply. Both mean "cannot verify this
+// cycle", not "the list is empty" — treating them as empty would re-apply
+// every entry against a daemon that cannot take the write. An empty body with
+// a clean exit is bgpd genuinely holding no such list, and is returned as
+// (nil, true) so every entry gets repaired.
+func (rm *RouteManager) listBGPDPrefixListEntries() ([]prefixListEntry, bool) {
+	output, err := rm.runVtysh("-d", "bgpd", "-c", fmt.Sprintf("show ip prefix-list %s json", rm.cfg.FRRPrefixList))
+	if err != nil {
+		slog.Warn("cannot read bgpd's prefix-list copy, skipping the per-daemon check this cycle", "name", rm.cfg.FRRPrefixList, "error", err, "output", strings.TrimSpace(string(output)))
+		return nil, false
+	}
+	entries, err := rm.parsePrefixListDocs(output)
+	if err != nil {
+		slog.Warn("cannot parse bgpd's prefix-list copy, skipping the per-daemon check this cycle", "name", rm.cfg.FRRPrefixList, "error", err)
+		return nil, false
+	}
+	return entries, true
 }
 
 // prefixListLine renders the config line body shared by add and remove:
@@ -667,6 +702,44 @@ func (rm *RouteManager) ReconcileFRRPrefixList(networks []*net.IPNet, vips []str
 				return fmt.Errorf("add prefix-list entry %s seq %d: %w (output: %s)", key.network, maxSeq, err, strings.TrimSpace(string(output)))
 			}
 			slog.Info("FRR prefix-list entry added", "name", rm.cfg.FRRPrefixList, "network", key.network, "seq", maxSeq)
+		}
+	}
+
+	// Repair bgpd's copy where it diverges from the union view. vtysh config
+	// writes reach only the daemons whose sockets already accept connections,
+	// so a write issued while FRR was restarting can land in zebra but miss
+	// bgpd. The union above then reports the entry present although the one
+	// daemon whose copy gates announcements never saw it, permanently
+	// filtering the network's /32s out (#256). Re-applying the line with its
+	// existing seq is a no-op for the daemons that have it and repairs the
+	// one that lost it; a fresh seq would instead duplicate the entry there.
+	var verifyKeys []entryKey
+	for key := range desired {
+		if _, exists := currentByKey[key]; exists {
+			verifyKeys = append(verifyKeys, key)
+		}
+	}
+	if len(verifyKeys) > 0 {
+		if bgpdEntries, ok := rm.listBGPDPrefixListEntries(); ok {
+			bgpdByKey := make(map[entryKey]bool, len(bgpdEntries))
+			for _, e := range bgpdEntries {
+				bgpdByKey[entryKey{e.Network, e.Exact}] = true
+			}
+			for _, key := range verifyKeys {
+				if bgpdByKey[key] {
+					continue
+				}
+				seq := currentByKey[key]
+				output, err := rm.runVtysh(
+					"-c", "conf t",
+					"-c", rm.prefixListLine(seq, key.network, key.exact),
+					"-c", "end",
+				)
+				if err != nil {
+					return fmt.Errorf("repair prefix-list entry %s seq %d: %w (output: %s)", key.network, seq, err, strings.TrimSpace(string(output)))
+				}
+				slog.Info("FRR prefix-list entry repaired", "name", rm.cfg.FRRPrefixList, "network", key.network, "seq", seq)
+			}
 		}
 	}
 
