@@ -1266,6 +1266,14 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 		),
 		nil,
 	)
+	// bgpd's copy matches the union, so the per-daemon check repairs nothing.
+	rec.on(
+		[]string{"vtysh", "-d", "bgpd", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS",
+			prefixListEntry{Seq: 10, Network: "198.51.100.0/24"},
+		),
+		nil,
+	)
 
 	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
 
@@ -1275,9 +1283,9 @@ func TestReconcileFRRPrefixList_AddsMissingAndRemovesStale(t *testing.T) {
 		t.Fatalf("ReconcileFRRPrefixList: %v", err)
 	}
 
-	// Expect: 1 list call + 1 add (203.0.113.0/24) + 1 remove (10.0.0.0/24).
-	if len(rec.calls) != 3 {
-		t.Fatalf("expected 3 vtysh calls (list+add+remove), got %d: %v", len(rec.calls), rec.calls)
+	// Expect: 1 list + 1 add (203.0.113.0/24) + 1 bgpd list + 1 remove (10.0.0.0/24).
+	if len(rec.calls) != 4 {
+		t.Fatalf("expected 4 vtysh calls (list+add+bgpd-list+remove), got %d: %v", len(rec.calls), rec.calls)
 	}
 
 	var sawAdd, sawRemove bool
@@ -1344,6 +1352,15 @@ func TestReconcileFRRPrefixList_VIPEntries(t *testing.T) {
 		),
 		nil,
 	)
+	// bgpd's copy matches the union, so the per-daemon check repairs nothing.
+	rec.on(
+		[]string{"vtysh", "-d", "bgpd", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS",
+			prefixListEntry{Seq: 10, Network: "198.51.100.0/24"},
+			prefixListEntry{Seq: 15, Network: "192.0.2.80/32", Exact: true},
+		),
+		nil,
+	)
 
 	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
 
@@ -1352,9 +1369,9 @@ func TestReconcileFRRPrefixList_VIPEntries(t *testing.T) {
 		t.Fatalf("ReconcileFRRPrefixList: %v", err)
 	}
 
-	// Expect: 1 list call + 1 add (192.0.2.81/32) + 1 remove (192.0.2.99/32).
-	if len(rec.calls) != 3 {
-		t.Fatalf("expected 3 vtysh calls (list+add+remove), got %d: %v", len(rec.calls), rec.calls)
+	// Expect: 1 list + 1 add (192.0.2.81/32) + 1 bgpd list + 1 remove (192.0.2.99/32).
+	if len(rec.calls) != 4 {
+		t.Fatalf("expected 4 vtysh calls (list+add+bgpd-list+remove), got %d: %v", len(rec.calls), rec.calls)
 	}
 
 	var sawAdd, sawRemove bool
@@ -1429,6 +1446,127 @@ func TestReconcileFRRPrefixList_AddFailureBailsOut(t *testing.T) {
 	_, n, _ := net.ParseCIDR("198.51.100.0/24")
 	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n}, nil); err == nil {
 		t.Fatal("expected error when add command fails, got nil")
+	}
+}
+
+// TestReconcileFRRPrefixList_RepairsBGPDDivergence is the regression test for
+// #256: vtysh config writes issued while FRR was still starting land only in
+// the daemons already accepting connections, so an entry can exist in zebra's
+// copy of the list but be missing from bgpd's. The union view reports it
+// present, while bgpd's outbound filter silently blocks the network forever.
+// Reconcile must check bgpd's own copy and re-apply the missing line with its
+// existing seq — not a fresh one, which would duplicate the entry in zebra.
+func TestReconcileFRRPrefixList_RepairsBGPDDivergence(t *testing.T) {
+	kept := prefixListEntry{Seq: 5, Network: "198.51.100.0/24"}
+	lost := prefixListEntry{Seq: 10, Network: "203.0.113.0/24"}
+	rec := newVtyshRecorder()
+	// The incident shape: zebra carries both entries, bgpd's document in the
+	// concatenated reply is missing one — the union still reports both.
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListDoc("ZEBRA", "ANNOUNCED-NETWORKS", kept, lost)+
+			frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS", kept),
+		nil,
+	)
+	rec.on(
+		[]string{"vtysh", "-d", "bgpd", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListDoc("BGP", "ANNOUNCED-NETWORKS", kept),
+		nil,
+	)
+
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+	_, n1, _ := net.ParseCIDR("198.51.100.0/24")
+	_, n2, _ := net.ParseCIDR("203.0.113.0/24")
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n1, n2}, nil); err != nil {
+		t.Fatalf("ReconcileFRRPrefixList: %v", err)
+	}
+
+	// Expect: union list + bgpd list + exactly one repair, nothing else — no
+	// new-seq add (both entries exist in the union) and no remove.
+	if len(rec.calls) != 3 {
+		t.Fatalf("expected 3 vtysh calls (list+bgpd-list+repair), got %d: %v", len(rec.calls), rec.calls)
+	}
+	repair := strings.Join(rec.calls[2], " ")
+	want := "ip prefix-list ANNOUNCED-NETWORKS seq 10 permit 203.0.113.0/24 ge 32 le 32"
+	if !strings.Contains(repair, want) || strings.Contains(repair, "no ip prefix-list") {
+		t.Errorf("expected a repair call re-applying %q, got: %v", want, rec.calls)
+	}
+}
+
+// TestReconcileFRRPrefixList_BGPDUnreachableSkipsRepair pins the degraded
+// path: when bgpd does not answer (vtysh -d bgpd fails), there is no copy to
+// verify and nothing a write could reach, so reconcile keeps the union
+// behavior, issues no repair, and does not fail the cycle — the next cycle
+// after bgpd returns performs the check.
+func TestReconcileFRRPrefixList_BGPDUnreachableSkipsRepair(t *testing.T) {
+	entry := prefixListEntry{Seq: 5, Network: "198.51.100.0/24"}
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListJSON("ANNOUNCED-NETWORKS", entry),
+		nil,
+	)
+	rec.on(
+		[]string{"vtysh", "-d", "bgpd", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		"Exiting: failed to connect to daemon bgpd", errors.New("exit status 1"),
+	)
+
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+	_, n, _ := net.ParseCIDR("198.51.100.0/24")
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n}, nil); err != nil {
+		t.Fatalf("ReconcileFRRPrefixList must not fail on an unreachable bgpd: %v", err)
+	}
+	// A failed probe must not be mistaken for an empty bgpd list: exactly the
+	// union list and the probe ran, no repair writes followed.
+	if len(rec.calls) != 2 {
+		t.Fatalf("expected 2 vtysh calls (list+bgpd-list), got %d: %v", len(rec.calls), rec.calls)
+	}
+}
+
+// TestReconcileFRRPrefixList_BGPDListAbsentRepairsAll covers bgpd holding no
+// copy of the list at all (a restart with a stale frr.conf): every desired
+// entry the union carries is re-applied, each in the shape and with the seq it
+// already has — the network ge/le form and the exact VIP form both.
+func TestReconcileFRRPrefixList_BGPDListAbsentRepairsAll(t *testing.T) {
+	network := prefixListEntry{Seq: 5, Network: "198.51.100.0/24"}
+	vip := prefixListEntry{Seq: 10, Network: "192.0.2.80/32", Exact: true}
+	rec := newVtyshRecorder()
+	rec.on(
+		[]string{"vtysh", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		frrPrefixListJSON("ANNOUNCED-NETWORKS", network, vip),
+		nil,
+	)
+	// A daemon without the list contributes an empty body.
+	rec.on(
+		[]string{"vtysh", "-d", "bgpd", "-c", "show ip prefix-list ANNOUNCED-NETWORKS json"},
+		"", nil,
+	)
+
+	rm := &RouteManager{cfg: Config{FRRPrefixList: "ANNOUNCED-NETWORKS"}, execVtyshHook: rec.hook()}
+	_, n, _ := net.ParseCIDR("198.51.100.0/24")
+	if err := rm.ReconcileFRRPrefixList([]*net.IPNet{n}, []string{"192.0.2.80"}); err != nil {
+		t.Fatalf("ReconcileFRRPrefixList: %v", err)
+	}
+
+	// Expect: union list + bgpd list + one repair per entry.
+	if len(rec.calls) != 4 {
+		t.Fatalf("expected 4 vtysh calls (list+bgpd-list+2 repairs), got %d: %v", len(rec.calls), rec.calls)
+	}
+	var sawNetworkRepair, sawVIPRepair bool
+	for _, c := range rec.calls[2:] {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, "ip prefix-list ANNOUNCED-NETWORKS seq 5 permit 198.51.100.0/24 ge 32 le 32") {
+			sawNetworkRepair = true
+		}
+		if strings.HasSuffix(j, "ip prefix-list ANNOUNCED-NETWORKS seq 10 permit 192.0.2.80/32 -c end") {
+			sawVIPRepair = true
+		}
+	}
+	if !sawNetworkRepair {
+		t.Errorf("expected a ge/le-form repair for 198.51.100.0/24 seq 5, got: %v", rec.calls)
+	}
+	if !sawVIPRepair {
+		t.Errorf("expected an exact-form repair for 192.0.2.80/32 seq 10, got: %v", rec.calls)
 	}
 }
 
