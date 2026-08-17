@@ -36,6 +36,16 @@ any network the gateway currently hosts, so a network entry cannot be relied
 on to cover it. Entries the agent no longer manages (removed networks,
 dormant VIPs) are removed during the next reconciliation.
 
+Each cycle also verifies the entries against bgpd's own copy of the list
+(`vtysh -d bgpd`), not just the merged view across all FRR daemons. The two
+can diverge: a vtysh write issued while FRR was restarting reaches only the
+daemons already accepting connections, and an entry that landed in zebra but
+missed bgpd silently blocks the network's announcements while looking present
+in `show running-config`. A line missing from bgpd's copy is re-applied with
+its existing sequence number, which repairs bgpd and is a no-op for the
+daemons that already have it. When bgpd itself is unreachable the check is
+skipped for that cycle and retried on the next one.
+
 The prefix list itself must already be referenced from your BGP configuration.
 There are two reference points, and a complete gateway config uses both:
 
