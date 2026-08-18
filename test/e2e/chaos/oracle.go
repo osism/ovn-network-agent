@@ -302,6 +302,12 @@ func comparePlanes(gw string, exp gatewayExpectation, obs observedGateway, upstr
 	m, u := diffSet(exp.FRRStatic, obs.frrStatic)
 	add("frr", m, u)
 
+	// #258 — the leak plane must claim exactly the owned networks: an
+	// unexpected entry here is the route that hijacks another chassis's
+	// traffic into the local OVN.
+	m, u = diffSet(exp.LeakRoutes, obs.leakRoutes)
+	add("veth-leak", m, u)
+
 	if !exp.SkipPrefixList {
 		if exp.PrefixList == nil {
 			// A list expected gone but still present is the failure, whether or

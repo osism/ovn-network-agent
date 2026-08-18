@@ -369,6 +369,7 @@ func cellInt(raw json.RawMessage) int {
 // time.
 type observedGateway struct {
 	kernelRoutes     map[string]string // desired IP → kernel device
+	leakRoutes       map[string]bool   // per-network veth-leak routes in the VRF table
 	frrStatic        map[string]bool   // /32 IPs with an agent FRR static
 	prefixList       map[string]bool   // ANNOUNCED-NETWORKS CIDRs
 	prefixListAbsent bool              // the list does not exist at all
@@ -415,6 +416,7 @@ type gatewayMetrics struct {
 func observeGateway(ctx context.Context, l *lab, gw, portForwardDev string) (observedGateway, error) {
 	obs := observedGateway{
 		kernelRoutes: map[string]string{},
+		leakRoutes:   map[string]bool{},
 		frrStatic:    map[string]bool{},
 		prefixList:   map[string]bool{},
 		hairpin:      map[string]bool{},
@@ -422,6 +424,9 @@ func observeGateway(ctx context.Context, l *lab, gw, portForwardDev string) (obs
 		vips:         map[string]bool{},
 	}
 	if err := observeKernelRoutes(ctx, l, gw, &obs); err != nil {
+		return obs, err
+	}
+	if err := observeLeakRoutes(ctx, l, gw, &obs); err != nil {
 		return obs, err
 	}
 	if err := observeFRRStatic(ctx, l, gw, &obs); err != nil {
@@ -467,6 +472,31 @@ func observeKernelRoutes(ctx context.Context, l *lab, gw string, obs *observedGa
 	}
 	for _, r := range routes {
 		obs.kernelRoutes[strings.TrimSuffix(r.Dst, "/32")] = r.Dev
+	}
+	return nil
+}
+
+// observeLeakRoutes reads the agent's per-network veth-leak routes: proto-44
+// network routes in the provider VRF's table (#258). Distinct from
+// observeKernelRoutes, which reads the main table's /32 FIP routes — the same
+// protocol in a different table, invisible to that observer.
+func observeLeakRoutes(ctx context.Context, l *lab, gw string, obs *observedGateway) error {
+	out, err := l.exec(ctx, gw, "ip", "-j", "route", "show", "vrf", vrfProvider, "proto", "44")
+	if err != nil {
+		return fmt.Errorf("list proto-44 routes in %s on %s: %w", vrfProvider, gw, err)
+	}
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" || trimmed == "[]" {
+		return nil
+	}
+	var routes []struct {
+		Dst string `json:"dst"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &routes); err != nil {
+		return fmt.Errorf("parse proto-44 routes in %s on %s: %w", vrfProvider, gw, err)
+	}
+	for _, r := range routes {
+		obs.leakRoutes[r.Dst] = true
 	}
 	return nil
 }

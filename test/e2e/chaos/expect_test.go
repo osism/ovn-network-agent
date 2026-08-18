@@ -67,6 +67,8 @@ func TestExpectationFollowsTheChassisredirectOwner(t *testing.T) {
 			t.Fatal("kernel plane must not be skipped on a full-mode gateway")
 		}
 		assertSet(t, "PrefixList", exp.PrefixList, []string{"192.0.2.0/24", "198.51.100.0/24"})
+		// Auto mode: the leak plane claims exactly the owned networks.
+		assertSet(t, "LeakRoutes", exp.LeakRoutes, []string{"192.0.2.0/24", "198.51.100.0/24"})
 		// Two segments (flat + VLAN-101), two MAC-tweak flows each.
 		if exp.MACTweakFlows != 4 {
 			t.Fatalf("MACTweakFlows = %d, want 4 (two per segment, two segments)", exp.MACTweakFlows)
@@ -100,6 +102,9 @@ func TestExpectationFollowsTheChassisredirectOwner(t *testing.T) {
 		}
 		if exp.PrefixList != nil {
 			t.Fatalf("PrefixList = %v, want it absent (nil) on a standby gateway", exp.PrefixList)
+		}
+		if len(exp.LeakRoutes) != 0 {
+			t.Fatalf("LeakRoutes = %v, want none on a standby gateway", exp.LeakRoutes)
 		}
 		// The agent does not clean MAC-tweak flows on standby, so the count is
 		// unknowable and the check is skipped.
@@ -152,6 +157,9 @@ func TestExpectationExcludesFIPsOutsideTheNetworkCIDRFilter(t *testing.T) {
 	}
 	// The manual filter is exactly the prefix-list.
 	assertSet(t, "PrefixList", exp.PrefixList, []string{"192.0.2.0/24"})
+	// The leak plane keeps only the owned networks the filter covers: the
+	// hosted 203.0.113.0/24 is excluded by the filter (#258).
+	assertSet(t, "LeakRoutes", exp.LeakRoutes, []string{"192.0.2.0/24"})
 	// The presence set keeps only the covered desired IPs.
 	assertSet(t, "MustAnnounce", exp.MustAnnounce, []string{"192.0.2.1", "192.0.2.10"})
 	if containsStr(exp.MustAnnounce, "203.0.113.1") || containsStr(exp.MustAnnounce, "203.0.113.10") {
@@ -159,6 +167,46 @@ func TestExpectationExcludesFIPsOutsideTheNetworkCIDRFilter(t *testing.T) {
 	}
 	// The staleness bound is exactly the desired set.
 	assertSet(t, "AnnounceBound", exp.AnnounceBound, exp.DesiredIPs)
+}
+
+// TestExpectationLeakPlaneClaimsOnlyOwnedNetworks pins #258 in the oracle: a
+// manual network_cidr listing networks whose routers live on another chassis
+// must not put those networks into the leak plane — that route beats the VRF
+// default and steers the peer's traffic into the local OVN. The prefix-list
+// keeps the full manual list; only the leak plane is ownership-gated.
+func TestExpectationLeakPlaneClaimsOnlyOwnedNetworks(t *testing.T) {
+	// gateway-1 owns only the VLAN-101 router; the flat router's CR port is
+	// on gateway-3 — the heterogeneous split after a failover.
+	snap := ovnSnapshot{
+		CRPortChassis: map[string]string{
+			"cr-lr0-public":        "gateway-3",
+			"cr-lr-vlan101-public": "gateway-1",
+		},
+		LRPs: map[string]lrpRow{
+			"lr0-public":        {Networks: []string{"192.0.2.1/24"}},
+			"lr-vlan101-public": {Networks: []string{"198.51.100.1/24"}},
+		},
+		LRPNameByUUID: map[string]string{
+			"uuid-lr0-public":        "lr0-public",
+			"uuid-lr-vlan101-public": "lr-vlan101-public",
+		},
+		Routers: map[string]routerRow{
+			"lr0":        {LRPUUIDs: []string{"uuid-lr0-public"}},
+			"lr-vlan101": {LRPUUIDs: []string{"uuid-lr-vlan101-public"}},
+		},
+		SegmentTagByLRP: map[string]int{"lr0-public": 0, "lr-vlan101-public": 101},
+	}
+	doc := fullModeDoc(t)
+	doc["network_cidr"] = anySlice([]string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"})
+
+	exp := computeExpectation(snap, "gateway-1", doc, "172.20.20.4")
+
+	if !exp.Active {
+		t.Fatal("gateway-1 owns the VLAN router's CR port, it must be active")
+	}
+	assertSet(t, "LeakRoutes", exp.LeakRoutes, []string{"198.51.100.0/24"})
+	assertSet(t, "PrefixList", exp.PrefixList,
+		[]string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"})
 }
 
 // Port-forward-only mode has no OVN view at all: every OVN-driven plane is
@@ -202,6 +250,9 @@ func TestExpectationPortForwardOnlySkipsEveryOVNPlane(t *testing.T) {
 	if exp.PrefixList != nil {
 		t.Fatalf("PrefixList = %v, want it untouched (nil) in pf-only", exp.PrefixList)
 	}
+	// pf-only has no ownership concept: the manual list stays the leak set,
+	// matching SetupVethLeak's startup seeding (#258).
+	assertSet(t, "LeakRoutes", exp.LeakRoutes, []string{"192.0.2.0/24"})
 	if exp.MACTweakFlows != -1 {
 		t.Fatalf("MACTweakFlows = %d, want -1 (skip) in pf-only", exp.MACTweakFlows)
 	}

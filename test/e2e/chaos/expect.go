@@ -220,6 +220,16 @@ type gatewayExpectation struct {
 	// agent does removes it, so a false here is the lab or the fabric breaking
 	// under the agent, which is exactly the condition #247 left invisible.
 	VRFDefaultRoute bool
+
+	// LeakRoutes is the sorted set of per-network veth-leak routes expected in
+	// the provider VRF's table: the locally-owned routers' networks, filtered
+	// by the manual network_cidr when one is set — never the raw filter list.
+	// A leak route for a network whose chassisredirect port lives elsewhere
+	// beats the VRF default above and steers that network's traffic into the
+	// local OVN, where nothing answers (#258). Empty on a full-mode standby
+	// (the agent reconciles the plane to nil); in pf-only mode it is the
+	// manual list itself, matching SetupVethLeak's startup seeding.
+	LeakRoutes []string
 }
 
 // computeExpectation recomputes gw's expected data-plane state from the OVN
@@ -325,6 +335,11 @@ func computeExpectation(snap ovnSnapshot, gw string, doc map[string]any, mgmtIP 
 		}
 		exp.PrefixList = sortedUnique(entries)
 	}
+
+	// Rule 14 (#258) — veth-leak network routes: the owned networks filtered
+	// by the manual list. The raw network_cidr list must never be leaked —
+	// agent.go computeLeakNetworks is the mirror of this rule.
+	exp.LeakRoutes = leakNetworkStrings(doc, local, pfOnly, active)
 
 	// Rule 8 — hairpin flows: the hairpin targets when active, removed on
 	// standby, skipped in pf-only.
@@ -651,6 +666,50 @@ func effectiveNetworks(doc map[string]any, local []localRouter) []*net.IPNet {
 		discovered = append(discovered, lr.networks...)
 	}
 	return parseNetworks(discovered)
+}
+
+// leakNetworkStrings mirrors the agent's computeLeakNetworks (#258): the
+// veth-leak plane claims the locally-owned routers' networks, with the manual
+// network_cidr acting as a coverage filter over them — never as the set
+// itself. Port-forward-only mode has no ownership concept, so the manual list
+// stays the leak set there; a full-mode standby leaks nothing.
+func leakNetworkStrings(doc map[string]any, local []localRouter, pfOnly, active bool) []string {
+	manual := parseNetworks(stringsOf(doc["network_cidr"]))
+	if pfOnly {
+		return networkStrings(manual)
+	}
+	if !active {
+		return nil
+	}
+	var ownedCIDRs []string
+	for _, lr := range local {
+		ownedCIDRs = append(ownedCIDRs, lr.networks...)
+	}
+	owned := parseNetworks(ownedCIDRs)
+	if len(manual) == 0 {
+		return networkStrings(owned)
+	}
+	var leak []*net.IPNet
+	for _, n := range owned {
+		if networkCoveredByAny(n, manual) {
+			leak = append(leak, n)
+		}
+	}
+	return networkStrings(leak)
+}
+
+// networkCoveredByAny reports whether network n is fully covered by one of the
+// filter networks: the filter contains n's base address and is no longer than
+// n's prefix (config.go networkCoveredByAny).
+func networkCoveredByAny(n *net.IPNet, filters []*net.IPNet) bool {
+	nOnes, _ := n.Mask.Size()
+	for _, f := range filters {
+		fOnes, _ := f.Mask.Size()
+		if f.Contains(n.IP) && fOnes <= nOnes {
+			return true
+		}
+	}
+	return false
 }
 
 // parseNetworks parses CIDR strings into their networks, dropping malformed and
