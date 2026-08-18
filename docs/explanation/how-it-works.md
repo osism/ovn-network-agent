@@ -66,7 +66,10 @@ provider bridge).
      [Priority semantics](gateway-drain#priority-semantics).
    - Reconciles **per-network veth-leak routes and policy rules** in the
      veth leak table (default 200) so SNAT reply traffic on the provider
-     subnet crosses into `vrf-provider` for BGP delivery.
+     subnet crosses into `vrf-provider` for BGP delivery. Only networks
+     whose routers are locally active are leaked — a `network_cidr` list
+     filters that set but never extends it, so a network hosted on another
+     chassis keeps following the VRF's default route to its owner (#258).
    - If no routers are locally active: removes all managed routes (port
      forward VIPs still get kernel/FRR routes if any are configured).
 5. **Port forwarding (DNAT)** — optionally forwards traffic from anycast VIP

@@ -193,9 +193,16 @@ VRFs so that:
 
 The agent creates the veth pair and assigns link-local addresses at startup
 (`--veth-leak-enabled`, on by default). Per-network policy rules and routes
-are reconciled dynamically — networks are either auto-discovered from OVN
-`Logical_Router_Port.Networks` or taken from the static `network_cidr`
-configuration. On shutdown, all resources are cleaned up.
+are reconciled dynamically, and only for networks whose routers this chassis
+currently holds: the networks auto-discovered from the locally-active
+`Logical_Router_Port.Networks`, filtered by the `network_cidr` list when one
+is configured. The manual list restricts the leak set but never extends it —
+a leak route for a network whose chassisredirect port lives on another
+chassis would override the provider VRF's default route and pull that
+network's traffic into the local OVN, where no NAT answers (#258). In
+port-forward-only mode there is no OVN and no ownership, so the configured
+`network_cidr` list is leaked as-is. On shutdown, all resources are cleaned
+up.
 
 ### VLAN provider networks
 
