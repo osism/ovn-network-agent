@@ -65,6 +65,11 @@ type RouteManager struct {
 	// which networks, without touching netlink.
 	refreshVethNexthopHook func(networks []*net.IPNet) error
 
+	// reconcileVethLeakHook, when non-nil, replaces ReconcileVethLeakNetworks
+	// in the agent's reconcile. Tests set this to observe which networks the
+	// leak plane is asked to claim, without touching netlink.
+	reconcileVethLeakHook func(desired []*net.IPNet) error
+
 	// wrapperStdinOK caches whether the configured OVS wrapper forwards
 	// stdin into the wrapped command, and ofctlBundleOK whether this
 	// ovs-ofctl speaks OpenFlow 1.4 bundles. Both are nil until probed and
@@ -160,6 +165,15 @@ func (rm *RouteManager) refreshVethNexthop(networks []*net.IPNet) error {
 		return rm.refreshVethNexthopHook(networks)
 	}
 	return rm.RefreshVethNexthop(networks)
+}
+
+// reconcileVethLeakNetworks dispatches to the platform
+// ReconcileVethLeakNetworks, or to the test hook when one is set.
+func (rm *RouteManager) reconcileVethLeakNetworks(desired []*net.IPNet) error {
+	if rm.reconcileVethLeakHook != nil {
+		return rm.reconcileVethLeakHook(desired)
+	}
+	return rm.ReconcileVethLeakNetworks(desired)
 }
 
 // validateIP checks that the given string is a valid IPv4 address. IPv6 is

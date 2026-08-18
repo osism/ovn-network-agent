@@ -79,6 +79,63 @@ func TestComputeEffectiveNetworks(t *testing.T) {
 	})
 }
 
+// TestComputeLeakNetworks pins the #258 gate: the leak plane claims only
+// locally-owned networks, with the manual list acting as a filter over them —
+// never as the set itself.
+func TestComputeLeakNetworks(t *testing.T) {
+	parse := func(cidrs ...string) []*net.IPNet {
+		var out []*net.IPNet
+		for _, s := range cidrs {
+			_, n, err := net.ParseCIDR(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+
+	tests := []struct {
+		name       string
+		cfg        Config
+		discovered []*net.IPNet
+		want       []string
+	}{
+		{"auto mode leaks the discovered set",
+			Config{}, parse("198.51.100.0/24"), []string{"198.51.100.0/24"}},
+		{"manual filter drops the un-owned networks",
+			Config{NetworkFilters: parse("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")},
+			parse("198.51.100.0/24"), []string{"198.51.100.0/24"}},
+		{"broader manual filter keeps the owned network",
+			Config{NetworkFilters: parse("198.51.0.0/16")},
+			parse("198.51.100.0/24"), []string{"198.51.100.0/24"}},
+		{"disjoint manual filter leaks nothing",
+			Config{NetworkFilters: parse("10.0.0.0/24")},
+			parse("198.51.100.0/24"), nil},
+		{"manual filter narrower than the owned network excludes it",
+			Config{NetworkFilters: parse("198.51.100.0/25")},
+			parse("198.51.100.0/24"), nil},
+		{"IPv6 networks are dropped",
+			Config{}, parse("198.51.100.0/24", "2001:db8::/64"), []string{"198.51.100.0/24"}},
+		{"port-forward-only leaks the manual list, ownership unknowable",
+			Config{PortForwardOnly: true, NetworkFilters: parse("192.0.2.0/24")},
+			nil, []string{"192.0.2.0/24"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Agent{cfg: tt.cfg}
+			got := netStrings(a.computeLeakNetworks(tt.discovered))
+			if len(got) == 0 && len(tt.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("computeLeakNetworks = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTriggerReconcile(t *testing.T) {
 	a := &Agent{
 		reconcileCh: make(chan struct{}, 1),
@@ -212,6 +269,9 @@ func unresolvableNexthopAgent(t *testing.T, connected string) (*Agent, *[][]*net
 		cfg:              rm.cfg,
 		routing:          rm,
 		effectiveFilters: []*net.IPNet{cidr},
+		// In port-forward-only mode the leak set is the manual list, so the
+		// reconcile would compute the same value (computeLeakNetworks).
+		leakNetworks: []*net.IPNet{cidr},
 	}, &refreshed
 }
 
@@ -240,7 +300,7 @@ func TestVerifyRoutesRepairsUnresolvableNexthop(t *testing.T) {
 		t.Fatalf("repair ran %d times at the threshold, want 1", len(*refreshed))
 	}
 	if len((*refreshed)[0]) != 1 {
-		t.Errorf("repair got %d networks, want the agent's 1 effective filter", len((*refreshed)[0]))
+		t.Errorf("repair got %d networks, want the agent's 1 leak network", len((*refreshed)[0]))
 	}
 
 	// Still broken on the next cycle: the diagnosis repeats, the flap does not.
@@ -2222,6 +2282,69 @@ func TestReconcilePrefixListCarriesVIPOutsideHostedNetworks(t *testing.T) {
 	}
 	if !sawNetwork {
 		t.Errorf("the hosted network's ge/le entry must still be added; calls: %v", rec.calls)
+	}
+}
+
+// TestReconcileLeakPlaneClaimsOnlyOwnedNetworks pins #258: with a manual
+// network_cidr list, the veth-leak plane must claim only the networks whose
+// routers this chassis actually holds. Before the fix the reconcile handed the
+// leak plane the raw filter list, so a gateway holding only a VLAN router
+// programmed a leak route for the flat provider network too — and that route,
+// more specific than the provider VRF's default (#247), steered split-owner
+// port-forward replies into the local OVN where nothing answers.
+func TestReconcileLeakPlaneClaimsOnlyOwnedNetworks(t *testing.T) {
+	var manual []*net.IPNet
+	for _, s := range []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"} {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manual = append(manual, n)
+	}
+
+	var leakCalls [][]*net.IPNet
+	rm := &RouteManager{
+		cfg:                  Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", NetworkFilters: manual},
+		execVtyshHook:        newVtyshRecorder().hook(),
+		execOVSHook:          newOVSRecorder().hook(),
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) { return nil, nil },
+		reconcileVethLeakHook: func(desired []*net.IPNet) error {
+			leakCalls = append(leakCalls, desired)
+			return nil
+		},
+	}
+
+	// The chassis holds only the VLAN router; the flat network's
+	// chassisredirect port lives on another gateway.
+	_, owned, _ := net.ParseCIDR("198.51.100.0/24")
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{
+		LocalRouters: []LocalRouterInfo{{
+			RouterName:  "router-vlan101",
+			LRPName:     "lrp-vlan101",
+			LRPMAC:      "aa:aa:aa:aa:aa:aa",
+			LRPNetworks: []string{"198.51.100.0/24"},
+		}},
+		HasLocalRouters:    true,
+		DiscoveredNetworks: []*net.IPNet{owned},
+	})
+	a := &Agent{
+		cfg:            rm.cfg,
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	a.reconcile(context.Background(), "test")
+
+	if len(leakCalls) == 0 {
+		t.Fatal("reconcile never reached the veth-leak plane")
+	}
+	got := netStrings(leakCalls[len(leakCalls)-1])
+	want := []string{"198.51.100.0/24"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("leak plane got %v, want only the owned network %v", got, want)
 	}
 }
 

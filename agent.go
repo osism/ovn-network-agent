@@ -29,6 +29,14 @@ type Agent struct {
 	// from OVN Logical_Router_Port.Networks.
 	effectiveFilters []*net.IPNet
 
+	// leakNetworks holds the networks the veth-leak plane may claim this
+	// cycle: the locally-owned routers' networks, filtered by the manual
+	// config when one is set. Distinct from effectiveFilters on purpose — a
+	// leak route for a network whose chassisredirect port lives on another
+	// chassis steers that network's traffic into the local OVN, where
+	// nothing answers (#258).
+	leakNetworks []*net.IPNet
+
 	// consecutiveReAdds tracks how many reconcile cycles in a row the
 	// post-change verification had to re-add missing routes. A sustained
 	// non-zero value indicates persistent route instability (e.g. FRR
@@ -318,6 +326,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 
 	// Compute effective network filters for this cycle.
 	a.effectiveFilters = a.computeEffectiveNetworks(state.DiscoveredNetworks)
+	a.leakNetworks = a.computeLeakNetworks(state.DiscoveredNetworks)
 
 	// Everything the cycle needs to derive from OVN is a pure function of the
 	// snapshot plus the configured VIPs (see desired_state.go). Past this
@@ -420,7 +429,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 		}
 	default:
 		// No locally active routers — remove per-network veth leak and prefix-list entries.
-		if err := a.routing.ReconcileVethLeakNetworks(nil); err != nil {
+		if err := a.routing.reconcileVethLeakNetworks(nil); err != nil {
 			slog.Error("failed to clean veth leak networks", "error", err)
 		}
 		if err := a.routing.ReconcileFRRPrefixList(nil, nil); err != nil {
@@ -514,8 +523,9 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 			slog.Error("failed to ensure active priority lead", "error", err)
 		}
 
-		// Reconcile per-network veth leak routes and policy rules.
-		if err := a.routing.ReconcileVethLeakNetworks(a.effectiveFilters); err != nil {
+		// Reconcile per-network veth leak routes and policy rules — for the
+		// locally-owned networks only, never for the raw filter list (#258).
+		if err := a.routing.reconcileVethLeakNetworks(a.leakNetworks); err != nil {
 			slog.Error("failed to reconcile veth leak networks", "error", err)
 		}
 	}
@@ -624,10 +634,11 @@ func (a *Agent) cleanupStaleChassis(ctx context.Context, allChassis map[string]b
 // computeEffectiveNetworks returns the network filters to use: manual config if
 // set, otherwise auto-discovered networks from OVN Logical_Router_Port. Only
 // IPv4 networks are returned — a.effectiveFilters feeds IPv4-only planes
-// (ReconcileVethLeakNetworks, ReconcileFRRPrefixList, and the "table ip"
-// provider-network rules in ReconcilePortForward), so a v6 network discovered
-// from a dual-stack LRP would otherwise abort those loops mid-way or fail the
-// whole nft ruleset load. Full IPv6 support is tracked in #85/#70.
+// (ReconcileFRRPrefixList and the "table ip" provider-network rules in
+// ReconcilePortForward), so a v6 network discovered from a dual-stack LRP
+// would otherwise abort those loops mid-way or fail the whole nft ruleset
+// load. The veth-leak plane feeds off computeLeakNetworks below instead
+// (#258). Full IPv6 support is tracked in #85/#70.
 func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
 	eff := effectiveNetworkFilters(a.cfg.NetworkFilters, discovered)
 	v4 := make([]*net.IPNet, 0, len(eff))
@@ -637,6 +648,35 @@ func (a *Agent) computeEffectiveNetworks(discovered []*net.IPNet) []*net.IPNet {
 		}
 	}
 	return v4
+}
+
+// computeLeakNetworks returns the networks the veth-leak plane may claim: the
+// locally-owned routers' networks (discovered), filtered by the manual
+// network_cidr list when one is set. It never returns a network this chassis
+// does not host — a leak route for a network whose chassisredirect port lives
+// on another chassis is a trap: it beats the provider VRF's default route and
+// steers that network's traffic into the local OVN, where no NAT answers
+// (#258). Auto mode is unchanged (discovered already tracks ownership); the
+// manual list keeps its exclusion power but stops asserting local presence.
+//
+// Port-forward-only mode has no OVN and no ownership concept; there the manual
+// list stays the leak set, matching what SetupVethLeak seeded at startup.
+// Like computeEffectiveNetworks, the result is IPv4-only.
+func (a *Agent) computeLeakNetworks(discovered []*net.IPNet) []*net.IPNet {
+	if a.cfg.PortForwardOnly {
+		return a.computeEffectiveNetworks(nil)
+	}
+	leak := make([]*net.IPNet, 0, len(discovered))
+	for _, n := range discovered {
+		if n.IP.To4() == nil {
+			continue
+		}
+		if len(a.cfg.NetworkFilters) > 0 && !networkCoveredByAny(n, a.cfg.NetworkFilters) {
+			continue
+		}
+		leak = append(leak, n)
+	}
+	return leak
 }
 
 // vipRoutesAnnounceable reports whether the configured port-forward VIPs should
@@ -1215,7 +1255,7 @@ func (a *Agent) repairUnresolvableNexthop() {
 	a.lastNexthopRepair = time.Now()
 	recordNexthopRepair()
 
-	if err := a.routing.refreshVethNexthop(a.effectiveFilters); err != nil {
+	if err := a.routing.refreshVethNexthop(a.leakNetworks); err != nil {
 		slog.Error("failed to re-notify the kernel about the veth-provider address", "error", err)
 	}
 }

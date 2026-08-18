@@ -711,10 +711,13 @@ func (rm *RouteManager) SetupVethLeak() error {
 	}
 
 	// Per-network routes and policy rules are managed dynamically by
-	// ReconcileVethLeakNetworks() during each reconciliation cycle.
-	// If static network_cidr is configured, set up initial per-network
-	// routes now for backwards compatibility.
-	if len(rm.cfg.NetworkFilters) > 0 {
+	// ReconcileVethLeakNetworks() during each reconciliation cycle, gated on
+	// the locally-owned routers (#258). Ownership is unknown before the OVN
+	// connect, so full mode seeds nothing here — the first reconcile installs
+	// the owned set and prunes leftovers. Port-forward-only mode has no OVN
+	// and never reconciles the leak plane, so the manual network_cidr list is
+	// seeded now, as it always was.
+	if rm.cfg.PortForwardOnly && len(rm.cfg.NetworkFilters) > 0 {
 		if err := rm.ReconcileVethLeakNetworks(rm.cfg.NetworkFilters); err != nil {
 			return fmt.Errorf("initial veth leak network setup: %w", err)
 		}
