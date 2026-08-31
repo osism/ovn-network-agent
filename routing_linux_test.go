@@ -165,6 +165,46 @@ func TestAddKernelRouteRejectsInvalidIP(t *testing.T) {
 	t.Skip("validation happens after link lookup; covered by callers")
 }
 
+func TestLocalIPRuleSpec(t *testing.T) {
+	tests := []struct {
+		name                    string
+		cfg                     Config
+		wantTable, wantPriority int
+		wantEnabled             bool
+	}{
+		{
+			name:         "dedicated route table keeps existing selector",
+			cfg:          Config{RouteTableID: 123, VethLeakEnabled: true, VethLeakRulePriority: 2000},
+			wantTable:    123,
+			wantPriority: 1000,
+			wantEnabled:  true,
+		},
+		{
+			name:         "main table with veth leak bypasses source policy",
+			cfg:          Config{VethLeakEnabled: true, VethLeakRulePriority: 2000},
+			wantTable:    rtTableMain,
+			wantPriority: 1999,
+			wantEnabled:  true,
+		},
+		{
+			name:        "main table without veth leak needs no selector",
+			cfg:         Config{},
+			wantEnabled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rm := &RouteManager{cfg: tt.cfg}
+			table, priority, enabled := rm.localIPRuleSpec()
+			if table != tt.wantTable || priority != tt.wantPriority || enabled != tt.wantEnabled {
+				t.Errorf("localIPRuleSpec() = (%d, %d, %t), want (%d, %d, %t)",
+					table, priority, enabled, tt.wantTable, tt.wantPriority, tt.wantEnabled)
+			}
+		})
+	}
+}
+
 func TestDelKernelRouteWrapsLinkLookupError(t *testing.T) {
 	rm := &RouteManager{cfg: Config{BridgeDev: nonexistentBridge}}
 	err := rm.DelKernelRoute("10.0.0.1", nonexistentBridge)
