@@ -40,7 +40,7 @@ regenerate it with `go generate ./...`.
 | `--veth-leak-enabled` | `true` | Enable veth VRF route leaking |
 | `--veth-provider-ip` |  | IP of the veth-provider side (default: veth-nexthop + 1) |
 | `--veth-leak-table-id` | `200` | Routing table ID for veth leak default route (1-252) |
-| `--veth-leak-rule-priority` | `2000` | Policy rule priority for veth leak rules |
+| `--veth-leak-rule-priority` | `2000` | Policy rule priority for veth leak rules; the veth-default ingress rule uses this priority minus one (must be at least 2) |
 | `--metrics-listen` |  | Address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9273); empty = disabled |
 | `--port-forward-dev` | `loopback1` | Loopback device for VIP addresses in VRF (default: loopback1) |
 | `--port-forward-table-id` | `201` | Routing table ID for DNAT return traffic (1-252) |

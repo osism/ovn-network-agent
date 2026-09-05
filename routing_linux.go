@@ -604,6 +604,7 @@ func (rm *RouteManager) SetupVethLeak() error {
 			"provider_ip", rm.cfg.VethProviderIP,
 			"table", rm.cfg.VethLeakTableID,
 			"priority", rm.cfg.VethLeakRulePriority,
+			"ingress_rule_priority", rm.vethIngressRulePriority(),
 			"networks", rm.cfg.NetworkFilters,
 		)
 		return nil
@@ -708,6 +709,17 @@ func (rm *RouteManager) SetupVethLeak() error {
 		Table:     rm.cfg.VethLeakTableID,
 	}); err != nil {
 		return fmt.Errorf("add default route in table %d: %w", rm.cfg.VethLeakTableID, err)
+	}
+
+	// 7. Ingress exception ahead of the per-network source rules. A packet
+	// arriving on veth-default has already left vrf-provider; without this
+	// rule the source rule would send provider-sourced ingress (cross-chassis
+	// FIP-to-FIP on a shared provider network) straight back into the VRF,
+	// where the FRR static for the /32 points at veth-default again, and the
+	// packet loops until its TTL expires (#265). Installed before the first
+	// per-network rule can exist.
+	if err := rm.ensureVethIngressRule(); err != nil {
+		return fmt.Errorf("veth ingress rule: %w", err)
 	}
 
 	// Per-network routes and policy rules are managed dynamically by
@@ -833,6 +845,9 @@ func (rm *RouteManager) TeardownVethLeak() error {
 			}
 		}
 	}
+	// The ingress exception belongs to the veth pair, not to a network, so it
+	// goes with the leak rules rather than with the per-network sweep.
+	rm.removeVethIngressRules()
 
 	// 2. Remove default route from leak table
 	vethDefault, err := netlink.LinkByName(vethDefaultName)
@@ -888,6 +903,79 @@ func (rm *RouteManager) TeardownVethLeak() error {
 	return nil
 }
 
+// ensureVethIngressRule installs the policy rule that exempts veth-default
+// ingress from the per-network source rules:
+//
+//	iif veth-default lookup main   priority <veth_leak_rule_priority - 1>
+//
+// Everything that arrives on veth-default came out of vrf-provider, and for
+// all of it the right next step is the main-table lookup that delivers to
+// the bridge /32. One rule covers every hosted IP, so the exception is
+// independent of route_table_id and of the FIP count.
+//
+// A rule with the veth-default selector at any other priority or table is a
+// leftover (a changed veth_leak_rule_priority) and is removed first, so that
+// exactly one such rule remains. A concurrent add of the same rule is not an
+// error (EEXIST); a stale rule that vanished underneath is not one either.
+func (rm *RouteManager) ensureVethIngressRule() error {
+	wantPrio := rm.vethIngressRulePriority()
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("list policy rules: %w", err)
+	}
+	present := false
+	for _, r := range rules {
+		if r.IifName != vethDefaultName {
+			continue
+		}
+		if r.Priority == wantPrio && r.Table == rtTableMain {
+			present = true
+			continue
+		}
+		if err := netlink.RuleDel(&r); err != nil && !isNoSuchRule(err) {
+			slog.Warn("failed to remove stale veth ingress rule",
+				"priority", r.Priority, "table", r.Table, "error", err)
+		}
+	}
+	if present {
+		return nil
+	}
+	rule := netlink.NewRule()
+	rule.IifName = vethDefaultName
+	rule.Table = rtTableMain
+	rule.Priority = wantPrio
+	rule.Family = netlink.FAMILY_V4
+	if err := netlink.RuleAdd(rule); err != nil && !isFileExists(err) {
+		return fmt.Errorf("add veth ingress rule: %w", err)
+	}
+	slog.Info("veth ingress rule added", "iif", vethDefaultName, "priority", wantPrio)
+	return nil
+}
+
+// removeVethIngressRules deletes every policy rule carrying the veth-default
+// ingress selector, whatever its priority or table. Best effort, like the
+// rest of TeardownVethLeak: a rule that is already gone is not an error,
+// anything else is logged.
+func (rm *RouteManager) removeVethIngressRules() {
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		slog.Warn("failed to list policy rules for veth ingress rule removal", "error", err)
+		return
+	}
+	for _, r := range rules {
+		if r.IifName != vethDefaultName {
+			continue
+		}
+		if err := netlink.RuleDel(&r); err != nil {
+			if !isNoSuchRule(err) {
+				slog.Warn("failed to remove veth ingress rule", "priority", r.Priority, "error", err)
+			}
+			continue
+		}
+		slog.Debug("removed veth ingress rule", "priority", r.Priority)
+	}
+}
+
 // ReconcileVethLeakNetworks ensures per-network VRF routes and policy rules
 // match the desired set of networks. Pass nil to remove all per-network state.
 func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
@@ -904,6 +992,13 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 	vethProvider, err := netlink.LinkByName(vethProviderName)
 	if err != nil {
 		return fmt.Errorf("find %s: %w", vethProviderName, err)
+	}
+
+	// The ingress exception belongs to the veth pair, not to a network, so
+	// it is repaired on every cycle, the standby path's nil call included,
+	// and before any per-network rule is (re)added below.
+	if err := rm.ensureVethIngressRule(); err != nil {
+		return fmt.Errorf("veth ingress rule: %w", err)
 	}
 
 	vrfTableID, err := rm.getVRFTableID()

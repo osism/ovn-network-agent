@@ -46,7 +46,7 @@ regenerate this page with `go generate ./...`.
 | `--veth-leak-enabled` | `OVN_NETWORK_VETH_LEAK_ENABLED` | `veth_leak_enabled` | `true` | Enable veth VRF route leaking |
 | `--veth-provider-ip` | `OVN_NETWORK_VETH_PROVIDER_IP` | `veth_provider_ip` |  | IP of the veth-provider side (default: veth-nexthop + 1) |
 | `--veth-leak-table-id` | `OVN_NETWORK_VETH_LEAK_TABLE_ID` | `veth_leak_table_id` | `200` | Routing table ID for veth leak default route (1-252) |
-| `--veth-leak-rule-priority` | `OVN_NETWORK_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules |
+| `--veth-leak-rule-priority` | `OVN_NETWORK_VETH_LEAK_RULE_PRIORITY` | `veth_leak_rule_priority` | `2000` | Policy rule priority for veth leak rules; the veth-default ingress rule uses this priority minus one (must be at least 2) |
 | `--metrics-listen` | `OVN_NETWORK_METRICS_LISTEN` | `metrics_listen` |  | Address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9273); empty = disabled |
 | `--port-forward-dev` | `OVN_NETWORK_PORT_FORWARD_DEV` | `port_forward_dev` | `loopback1` | Loopback device for VIP addresses in VRF (default: loopback1) |
 | `--port-forward-table-id` | `OVN_NETWORK_PORT_FORWARD_TABLE_ID` | `port_forward_table_id` | `201` | Routing table ID for DNAT return traffic (1-252) |
