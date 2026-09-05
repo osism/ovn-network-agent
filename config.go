@@ -471,7 +471,7 @@ func configOptions() []configOption {
 			func(c *Config) *string { return &c.VethProviderIP }),
 		intOpt("veth-leak-table-id", 200, "Routing table ID for veth leak default route (1-252)",
 			func(c *Config) *int { return &c.VethLeakTableID }),
-		intOpt("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules",
+		intOpt("veth-leak-rule-priority", 2000, "Policy rule priority for veth leak rules; the veth-default ingress rule uses this priority minus one (must be at least 2)",
 			func(c *Config) *int { return &c.VethLeakRulePriority }),
 		stringOpt("metrics-listen", "", "Address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9273); empty = disabled",
 			func(c *Config) *string { return &c.MetricsListen }),
@@ -824,6 +824,11 @@ func validateConfig(cfg *Config) error {
 	if cfg.VethLeakEnabled {
 		if cfg.VethLeakTableID < 1 || cfg.VethLeakTableID > 252 {
 			return fmt.Errorf("invalid veth-leak-table-id: %d (must be 1-252)", cfg.VethLeakTableID)
+		}
+		// The veth-default ingress rule sits one priority below the leak
+		// rules; priority 1 would put it on the kernel's priority-0 local rule.
+		if cfg.VethLeakRulePriority < 2 {
+			return fmt.Errorf("invalid veth-leak-rule-priority: %d (must be at least 2)", cfg.VethLeakRulePriority)
 		}
 		// RouteTableID 0 means "main table" and cannot conflict with an explicit leak table.
 		if cfg.VethLeakTableID == cfg.RouteTableID && cfg.RouteTableID != 0 {

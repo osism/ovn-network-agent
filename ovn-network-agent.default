@@ -119,7 +119,8 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # Routing table ID for the leak default route (1-252, must differ from ROUTE_TABLE_ID)
 #OVN_NETWORK_VETH_LEAK_TABLE_ID=200
 
-# Policy rule priority for veth leak rules
+# Policy rule priority for veth leak rules (must be at least 2; the
+# veth-default ingress rule uses this priority minus one)
 #OVN_NETWORK_VETH_LEAK_RULE_PRIORITY=2000
 
 # =============================================================================

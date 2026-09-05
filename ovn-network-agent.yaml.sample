@@ -154,7 +154,9 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # Must differ from route_table_id.
 # veth_leak_table_id: 200
 
-# Policy rule priority for veth leak rules (default: 2000)
+# Policy rule priority for veth leak rules (default: 2000, must be at least 2).
+# The veth-default ingress rule (iif veth-default lookup main) uses this
+# priority minus one.
 # veth_leak_rule_priority: 2000
 
 # =============================================================================

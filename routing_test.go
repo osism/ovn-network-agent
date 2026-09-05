@@ -414,6 +414,18 @@ func TestDisabledVethLeak(t *testing.T) {
 	}
 }
 
+// TestVethIngressRulePriority pins the derivation of the veth-default ingress
+// rule's priority (#265): always one below the leak rules, so the config
+// floor of 2 lands the exception at 1, above the kernel's local rule.
+func TestVethIngressRulePriority(t *testing.T) {
+	for _, tt := range []struct{ leak, want int }{{2000, 1999}, {2, 1}} {
+		rm := &RouteManager{cfg: Config{VethLeakRulePriority: tt.leak}}
+		if got := rm.vethIngressRulePriority(); got != tt.want {
+			t.Errorf("vethIngressRulePriority() with leak priority %d = %d, want %d", tt.leak, got, tt.want)
+		}
+	}
+}
+
 // frrConnectedRoutesJSON renders an FRR `show ip route vrf <vrf> connected json`
 // document for the given prefixes, each directly connected via veth-provider.
 func frrConnectedRoutesJSON(prefixes ...string) string {
