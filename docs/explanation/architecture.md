@@ -126,6 +126,7 @@ pair managed by the agent (`--veth-leak-enabled`) bridges the two VRFs.
  │  │   ┌─────────────────┐                                                          │  │
  │  │   │  veth-default   │    ip rule: from <provider-net> → lookup table 200       │  │
  │  │   │  169.254.0.1/30 │    table 200: default via 169.254.0.2                    │  │
+ │  │   │                 │    ip rule: iif veth-default → lookup main (one below)   │  │
  │  │   └────────┬────────┘                                                          │  │
  │  └────────────┼───────────────────────────────────────────────────────────────────┘  │
  │          veth pair                                                                   │
@@ -191,11 +192,26 @@ VRFs so that:
   `192.0.2.0/24 via 169.254.0.1`) send return traffic back through the veth
   pair into the default VRF for normal kernel delivery.
 
+Traffic arriving on `veth-default` is exempt from the source rule: one
+priority below the per-network rules the agent keeps `iif veth-default
+lookup main` (`veth_leak_rule_priority - 1`, 1999 by default). A packet
+that enters the default VRF through the veth pair has already left
+`vrf-provider`; without the exemption a source inside a leaked provider
+network (a FIP behind a router on another gateway, or an external host on
+the provider subnet) would match the source rule, be sent back into
+`vrf-provider`, and loop between the veth ends until its TTL expires,
+because the FRR static for the `/32` points at `veth-default` again. With
+the exemption the main-table `/32` delivers it to `br-ex`. One rule covers
+every hosted IP, so it does not depend on `route_table_id` or on the FIP
+count.
+
 The agent creates the veth pair and assigns link-local addresses at startup
 (`--veth-leak-enabled`, on by default). Per-network policy rules and routes
 are reconciled dynamically — networks are either auto-discovered from OVN
 `Logical_Router_Port.Networks` or taken from the static `network_cidr`
-configuration. On shutdown, all resources are cleaned up.
+configuration. The ingress exemption is installed with the pair, repaired
+on every reconcile, and removed with the pair. On shutdown, all resources
+are cleaned up.
 
 ### VLAN provider networks
 

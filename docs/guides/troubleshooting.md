@@ -124,13 +124,20 @@ Substitute the values you configured for `vrf_name`, `frr_prefix_list`,
    ip route show <fip>/32
    ip route show table 200
    ip route show table 201
+   ip rule show
    ```
 
    Table `200` holds the veth-leak default route (owned by
    `veth_leak_table_id`); table `201` holds the DNAT return route (owned by
    `port_forward_table_id`). The FIP `/32` lives in the main table unless
    `route_table_id` is set to a non-zero table, in which case query that table
-   instead.
+   instead. In the rule listing, `iif veth-default lookup main` must sit one
+   priority below the `from <network> lookup 200` rules (1999 and 2000 by
+   default). If it is missing, traffic between FIPs whose routers live on
+   different gateways is lost while external clients keep working, and the
+   packet counters of `veth-default` (`ip -s link show veth-default`) climb
+   far above the offered load: each packet loops through the veth pair until
+   its TTL expires.
 
 7. **Check the nftables table.** Note the family is `ip`, not `inet`:
 
