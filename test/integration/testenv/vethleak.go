@@ -44,6 +44,12 @@ const (
 	// ReconcileVethLeakNetworks live at this priority.
 	DefaultVethLeakRulePriority = 2000
 
+	// VethIngressRulePriority is where the agent installs the veth-default
+	// ingress exception rule (`iif veth-default lookup main`, #265): one
+	// below the per-network leak rules, mirroring vethIngressRulePriority
+	// in routing.go.
+	VethIngressRulePriority = DefaultVethLeakRulePriority - 1
+
 	// VethLeakRouteProtocol mirrors rtProtoOVNNetworkAgent in routing_linux.go
 	// — the custom rtproto the agent tags its per-network VRF routes with so
 	// they can be distinguished from FRR-installed entries.
@@ -79,14 +85,17 @@ type routeInfo struct {
 }
 
 // ruleInfo is the subset of `ip -j rule show` fields relevant to veth-leak
-// per-network rules: priority, source IP + prefix length, and the destination
-// table. iproute2 splits the CIDR across two fields (`src` is the bare IP,
-// `srclen` is the prefix bits) — srcCIDR reassembles them. When there is no
-// source match, iproute2 emits `"src":"all"` and omits srclen.
+// rules: priority, source IP + prefix length, the incoming-interface selector
+// of the ingress exception rule, and the destination table. iproute2 splits
+// the CIDR across two fields (`src` is the bare IP, `srclen` is the prefix
+// bits) — srcCIDR reassembles them. When there is no source match, iproute2
+// emits `"src":"all"` and omits srclen; when there is no iif selector it omits
+// `iif` altogether.
 type ruleInfo struct {
 	Priority int             `json:"priority"`
 	Src      string          `json:"src,omitempty"`
 	Srclen   int             `json:"srclen,omitempty"`
+	Iif      string          `json:"iif,omitempty"`
 	Table    json.RawMessage `json:"table,omitempty"`
 }
 
@@ -374,6 +383,137 @@ func DeleteIPRule(t *testing.T, priority int, src string) {
 	}
 }
 
+// AssertVethIngressRule waits for the agent's veth-default ingress exception
+// rule (#265): `iif veth-default lookup main` at the given priority. Polls up
+// to timeout so a scenario can assert right after readiness or after a
+// reconcile-driven repair.
+func AssertVethIngressRule(t *testing.T, priority int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastOut string
+	for {
+		out, err := exec.Command("ip", "-j", "rule", "show").CombinedOutput()
+		lastOut = string(out)
+		if err == nil {
+			var rules []ruleInfo
+			if err := json.Unmarshal(out, &rules); err == nil {
+				for _, r := range rules {
+					if r.Priority == priority && r.Iif == VethDefaultName && tableMatches(r.Table, 254) {
+						return
+					}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ip rule priority %d iif %s lookup main not present after %s (last: %q)",
+				priority, VethDefaultName, timeout, strings.TrimSpace(lastOut))
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// AssertNoVethIngressRule waits until no rule with the veth-default iif
+// selector remains at any priority. The mirror of AssertVethIngressRule for
+// the teardown, the disabled, and the drift-injection checks.
+func AssertNoVethIngressRule(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastOut string
+	for {
+		out, err := exec.Command("ip", "-j", "rule", "show").CombinedOutput()
+		lastOut = string(out)
+		if err == nil {
+			var rules []ruleInfo
+			if err := json.Unmarshal(out, &rules); err == nil {
+				present := false
+				for _, r := range rules {
+					if r.Iif == VethDefaultName {
+						present = true
+						break
+					}
+				}
+				if !present {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ip rule iif %s still present after %s (out: %q)",
+				VethDefaultName, timeout, strings.TrimSpace(lastOut))
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// DeleteVethIngressRule removes the ingress exception rule at priority out
+// of band, the way an operator's `ip rule del` would, so a scenario can
+// watch the next reconcile put it back. Errors surface via t.Fatalf — a
+// drift the test could not inject would make the recovery assertion pass
+// trivially.
+func DeleteVethIngressRule(t *testing.T, priority int) {
+	t.Helper()
+	out, err := exec.Command("ip", "rule", "del",
+		"priority", strconv.Itoa(priority), "iif", VethDefaultName, "lookup", "main").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip rule del priority %d iif %s lookup main: %v (%s)",
+			priority, VethDefaultName, err, strings.TrimSpace(string(out)))
+	}
+}
+
+// linkStats is the subset of `ip -j -s link show <name>` the loop check
+// reads: the 64-bit transmit packet counter.
+type linkStats struct {
+	Stats64 struct {
+		TX struct {
+			Packets uint64 `json:"packets"`
+		} `json:"tx"`
+	} `json:"stats64"`
+}
+
+// VethLinkTxPackets returns the TX packet counter of the named link. The
+// veth-default counter is how TestScenario_VethLeakIngressNoLoop tells a
+// packet that left the veth pair once from one that bounced between its
+// ends until its TTL ran out.
+func VethLinkTxPackets(t *testing.T, name string) uint64 {
+	t.Helper()
+	out, err := exec.Command("ip", "-j", "-s", "link", "show", name).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip -j -s link show %s: %v (%s)", name, err, strings.TrimSpace(string(out)))
+	}
+	var links []linkStats
+	if err := json.Unmarshal(out, &links); err != nil || len(links) == 0 {
+		t.Fatalf("ip -j -s link show %s: cannot decode stats64 from %q (err=%v)", name, strings.TrimSpace(string(out)), err)
+	}
+	return links[0].Stats64.TX.Packets
+}
+
+// PingFromVRF sends count ICMP echo requests from inside vrf-provider with
+// the given source address, which it adds to the VRF device for the duration
+// of the call. That is exactly the packet a peer gateway's VRF hands over
+// through the veth pair: it leaves via veth-provider, arrives on veth-default,
+// and its source sits inside the leaked provider prefix (#265). Nothing
+// answers behind br-ex in the harness, so the ping's exit status is ignored;
+// callers read the veth-default TX counter instead.
+//
+// The VRF socket context needs `ip vrf exec` (cgroup v2 + BPF). A harness
+// kernel that cannot provide it skips the caller rather than failing it: the
+// rule lifecycle is asserted elsewhere, only the forwarding proof needs this.
+func PingFromVRF(t *testing.T, src, dst string, count int) {
+	t.Helper()
+	if out, err := exec.Command("ip", "vrf", "exec", DefaultVRFName, "true").CombinedOutput(); err != nil {
+		t.Skipf("ip vrf exec %s is not available on this host: %v (%s)", DefaultVRFName, err, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("ip", "addr", "add", src+"/32", "dev", DefaultVRFName).CombinedOutput(); err != nil {
+		t.Fatalf("ip addr add %s/32 dev %s: %v (%s)", src, DefaultVRFName, err, strings.TrimSpace(string(out)))
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("ip", "addr", "del", src+"/32", "dev", DefaultVRFName).Run()
+	})
+	out, err := exec.Command("ip", "vrf", "exec", DefaultVRFName,
+		"ping", "-I", src, "-c", strconv.Itoa(count), "-W", "1", dst).CombinedOutput()
+	t.Logf("ping from %s to %s in %s (exit=%v): %s", src, dst, DefaultVRFName, err, strings.TrimSpace(string(out)))
+}
+
 // hasFlag reports whether flag appears in flags. Used to fall back to UP
 // detection when iproute2 omits operstate (rare, but seen on some kernels
 // with veth devices that have no carrier).
@@ -425,11 +565,25 @@ func tableMatches(raw json.RawMessage, want int) bool {
 	}
 	var asStr string
 	if err := json.Unmarshal(raw, &asStr); err == nil {
+		// iproute2 prints the reserved tables by the names in
+		// /etc/iproute2/rt_tables, never by number; the agent's ingress
+		// exception rule points at main.
+		if id, ok := reservedTables[asStr]; ok {
+			return id == want
+		}
 		if n, err := strconv.Atoi(asStr); err == nil && n == want {
 			return true
 		}
 	}
 	return false
+}
+
+// reservedTables maps the routing-table names iproute2 prints for the
+// kernel's reserved tables back to their ids (rt_tables(5)).
+var reservedTables = map[string]int{
+	"local":   255,
+	"main":    254,
+	"default": 253,
 }
 
 // scrubVethLeakState removes any veth-leak residue this test (or a previous
@@ -451,6 +605,16 @@ func scrubVethLeakState(t *testing.T) {
 		var rules []ruleInfo
 		if err := json.Unmarshal(out, &rules); err == nil {
 			for _, r := range rules {
+				// The ingress exception rule (#265) carries the veth-default
+				// iif selector; drop it at whatever priority a previous
+				// scenario's agent left it.
+				if r.Iif == VethDefaultName {
+					_ = exec.Command("ip", "rule", "del",
+						"priority", strconv.Itoa(r.Priority),
+						"iif", VethDefaultName,
+					).Run()
+					continue
+				}
 				if r.Priority != DefaultVethLeakRulePriority {
 					continue
 				}

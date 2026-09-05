@@ -105,6 +105,9 @@ func TestScenario_FailureInjection_RouteTableCollisions(t *testing.T) {
 	testenv.AssertRouteInTable(t, vethLeakTblStr, "default", testenv.VethDefaultName, 20*time.Second)
 	testenv.AssertIPRuleAtPriorityTable(t, testenv.DefaultVethLeakRulePriority,
 		providerNet, vethLeakTbl, 20*time.Second)
+	// The veth-default ingress exception (#265) is installed regardless of
+	// the table layout and always points at main — never at 200, 201 or 202.
+	testenv.AssertVethIngressRule(t, testenv.VethIngressRulePriority, 10*time.Second)
 
 	// === Negative: no writer encroached on a sibling's table ===========
 

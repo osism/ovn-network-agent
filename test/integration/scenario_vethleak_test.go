@@ -52,6 +52,9 @@ func TestScenario_VethLeakSetup(t *testing.T) {
 
 	testenv.AssertVethPairPresent(t, 5*time.Second)
 	testenv.AssertVethDefaultRouteInLeakTable(t, 5*time.Second)
+	// The ingress exception (#265) is part of the pair's setup, not of any
+	// network: it must be there before a per-network rule ever is.
+	testenv.AssertVethIngressRule(t, testenv.VethIngressRulePriority, 5*time.Second)
 }
 
 // TestScenario_VethLeakReconcileNetwork (#56 scenario 2):
@@ -207,10 +210,96 @@ func TestScenario_VethLeakTeardownOnSigterm(t *testing.T) {
 		t.Fatalf("agent stop: %v", err)
 	}
 
-	// Veth pair gone, per-network route gone, per-network rule gone.
+	// Veth pair gone, per-network route gone, per-network rule gone, and
+	// the ingress exception rule gone with them.
 	testenv.AssertNoVethPair(t, 5*time.Second)
 	testenv.AssertNoVethRouteInVRF(t, network, 5*time.Second)
 	testenv.AssertNoIPRuleAtPriority(t, testenv.DefaultVethLeakRulePriority, network, 5*time.Second)
+	testenv.AssertNoVethIngressRule(t, 5*time.Second)
+}
+
+// TestScenario_VethLeakIngressRuleDriftRecovery (#265):
+//
+// With a FIP whose /32 lives in the main table (route_table_id unset), the
+// ingress exception rule `iif veth-default lookup main` must be back within
+// a couple of ticks after an out-of-band `ip rule del`, and the repair must
+// not touch the healthy kernel route. The repair path is the
+// ensureVethIngressRule call at the top of ReconcileVethLeakNetworks.
+func TestScenario_VethLeakIngressRuleDriftRecovery(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	const fip = "198.51.100.43"
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "vethingress",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+	testenv.AddFIP(t, ctx, nb, router, fip, "10.0.0.43")
+
+	testenv.WithAgent(t, testenv.FastDefaults())
+
+	testenv.AssertKernelRoute(t, fip, 10*time.Second)
+	testenv.AssertVethIngressRule(t, testenv.VethIngressRulePriority, 10*time.Second)
+
+	// Drift: remove only the rule. Verify the deletion took effect so the
+	// recovery assertion cannot pass trivially.
+	testenv.DeleteVethIngressRule(t, testenv.VethIngressRulePriority)
+	testenv.AssertNoVethIngressRule(t, 1*time.Second)
+
+	// Re-appears within reconcile_interval (2s) + processing slack, and the
+	// route it protects was never replaced.
+	testenv.AssertVethIngressRule(t, testenv.VethIngressRulePriority, 8*time.Second)
+	testenv.AssertKernelRoute(t, fip, 1*time.Second)
+}
+
+// TestScenario_VethLeakIngressNoLoop (#265):
+//
+// The forwarding proof on one host. A packet sourced inside the leaked
+// provider prefix is sent from vrf-provider towards a FIP hosted here; it
+// leaves via veth-provider and enters the default VRF on veth-default, which
+// is exactly what a peer gateway's VRF hands over for cross-chassis
+// FIP-to-FIP traffic. Without the ingress exception the source rule sends it
+// straight back into the VRF and each packet crosses veth-default about 32
+// times before its TTL runs out; with it the packet leaves towards br-ex once
+// and never returns to the veth pair. The veth-default TX counter tells the
+// two apart.
+func TestScenario_VethLeakIngressNoLoop(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	const (
+		network = "198.51.100.0/24"
+		fip     = "198.51.100.43"
+		src     = "198.51.100.99"
+		probes  = 3
+	)
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "vethnoloop",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+	testenv.AddFIP(t, ctx, nb, router, fip, "10.0.0.43")
+
+	testenv.WithAgent(t, testenv.FastDefaults())
+
+	// Every leg of the path the probe takes must be in place first: the /32
+	// in main, the source rule that would capture the packet, and the FRR
+	// static that steers it out of the VRF through the veth pair.
+	testenv.AssertKernelRoute(t, fip, 10*time.Second)
+	testenv.AssertIPRuleAtPriority(t, testenv.DefaultVethLeakRulePriority, network, 10*time.Second)
+	testenv.AssertFRRRoute(t, fip, 15*time.Second)
+	testenv.AssertVethIngressRule(t, testenv.VethIngressRulePriority, 5*time.Second)
+
+	before := testenv.VethLinkTxPackets(t, testenv.VethDefaultName)
+	testenv.PingFromVRF(t, src, fip, probes)
+	after := testenv.VethLinkTxPackets(t, testenv.VethDefaultName)
+
+	// A looping probe packet would add ~32 transmissions on veth-default;
+	// three of them well over 90. Allow a few packets of unrelated chatter.
+	const maxDelta = 3 * probes
+	if delta := after - before; delta > maxDelta {
+		t.Fatalf("veth-default TX grew by %d packets for %d probes (max %d): provider-sourced ingress is looping through the veth pair",
+			delta, probes, maxDelta)
+	}
 }
 
 // TestScenario_VethLeakDisabledSkip (#56 scenario 6 — negative):
@@ -241,6 +330,8 @@ func TestScenario_VethLeakDisabledSkip(t *testing.T) {
 
 	// The agent reached "agent running" without setting up the pair —
 	// hold for a fraction of a reconcile interval to make sure the
-	// negative still holds across the next tick.
+	// negative still holds across the next tick. The ingress exception
+	// rule belongs to the pair and must be absent with it.
 	testenv.AssertNoVethPair(t, 1*time.Second)
+	testenv.AssertNoVethIngressRule(t, 1*time.Second)
 }

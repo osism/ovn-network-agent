@@ -23,7 +23,7 @@ test/integration/
   scenario_port_forward_test.go               — DNAT, sticky multi-backend, VIP mgmt, masquerade, hairpin
   scenario_prefix_list_test.go                — ReconcileFRRPrefixList lifecycle on real FRR (#58)
   scenario_bridge_ip_test.go                  — cold-start bridge IP + proxy_arp housekeeping (#63)
-  scenario_vethleak_test.go                   — SetupVethLeak / ReconcileVethLeakNetworks / TeardownVethLeak (#56)
+  scenario_vethleak_test.go                   — SetupVethLeak / ReconcileVethLeakNetworks / TeardownVethLeak (#56) + veth-default ingress exception rule (#265)
   scenario_ipv6_test.go                       — IPv6-capable OVS flow plumbing on br-ex (#54; kernel/FRR paths are v4-only today)
   scenario_metrics_test.go                    — Prometheus /metrics scrapes (reconcile counter, drain outcome, stale-chassis, desired-state gauges)
   scenario_multi_segment_test.go              — multi-VLAN localnet segments: per-segment interfaces/routes/flows, failover isolation, same-segment hairpin, restart re-adoption (#147)
