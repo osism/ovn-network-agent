@@ -357,13 +357,13 @@ func (rm *RouteManager) AddKernelRoute(ip, dev string) error {
 		return fmt.Errorf("add kernel route %s/32 dev %s: %w", ip, dev, err)
 	}
 
-	// Add ip rule when using a dedicated routing table.
-	// If the rule fails, remove the route to avoid an orphaned route without a matching rule.
-	if rm.cfg.RouteTableID > 0 {
-		if err := rm.ensureIPRule(dst); err != nil {
-			_ = netlink.RouteDel(route)
-			return fmt.Errorf("add ip rule for %s (route rolled back): %w", ip, err)
-		}
+	// Add the per-IP destination rule after the route is present. In the main
+	// table this bypasses the veth-leak source rule for locally-hosted FIPs;
+	// with a dedicated table it selects that table as before. If the rule
+	// fails, remove the route to avoid advertising an unreachable IP.
+	if err := rm.EnsureKernelRouteRule(ip); err != nil {
+		_ = netlink.RouteDel(route)
+		return fmt.Errorf("add ip rule for %s (route rolled back): %w", ip, err)
 	}
 
 	slog.Info("kernel route ensured", "ip", ip, "dev", dev, "table", rm.cfg.RouteTableID)
@@ -388,10 +388,9 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 		return fmt.Errorf("invalid IP: %s", ip)
 	}
 
-	// Remove ip rule first (stop steering traffic before removing route).
-	if rm.cfg.RouteTableID > 0 {
-		rm.removeIPRule(dst)
-	}
+	// Remove the destination exception first so traffic is not steered to a
+	// route that no longer exists.
+	rm.removeIPRule(dst)
 
 	route := &netlink.Route{
 		LinkIndex: link.Attrs().Index,
@@ -511,12 +510,49 @@ func (rm *RouteManager) segmentCandidateLinks() ([]netlink.Link, error) {
 // IP rule helpers (policy routing)
 // =============================================================================
 
-// ensureIPRule adds an ip rule: "to <dst> lookup <table>" if not already present.
+// localIPRuleSpec describes the destination rule accompanying an agent-owned
+// kernel /32. A dedicated route table keeps its long-standing priority-1000
+// selector. When routes are in main, the veth-leak source policy rule would
+// otherwise capture cross-node FIP traffic, so install a selector immediately
+// before it that explicitly looks up main.
+func (rm *RouteManager) localIPRuleSpec() (table, priority int, enabled bool) {
+	if rm.cfg.RouteTableID > 0 {
+		return rm.cfg.RouteTableID, 1000, true
+	}
+	if rm.cfg.VethLeakEnabled {
+		return rtTableMain, rm.cfg.VethLeakRulePriority - 1, true
+	}
+	return 0, 0, false
+}
+
+// EnsureKernelRouteRule repairs the destination rule for an already-present
+// agent-owned kernel route. Reconciliation calls it for existing routes so an
+// upgrade or an out-of-band deletion converges without replacing the route.
+func (rm *RouteManager) EnsureKernelRouteRule(ip string) error {
+	if rm.cfg.DryRun {
+		return nil
+	}
+	dst := &net.IPNet{IP: net.ParseIP(ip), Mask: net.CIDRMask(32, 32)}
+	if dst.IP == nil || dst.IP.To4() == nil {
+		return fmt.Errorf("invalid IPv4 address: %s", ip)
+	}
+	if err := rm.ensureIPRule(dst); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureIPRule adds the configured ip rule: "to <dst> lookup <table>" if not
+// already present.
 func (rm *RouteManager) ensureIPRule(dst *net.IPNet) error {
+	table, priority, enabled := rm.localIPRuleSpec()
+	if !enabled {
+		return nil
+	}
 	rule := netlink.NewRule()
 	rule.Dst = dst
-	rule.Table = rm.cfg.RouteTableID
-	rule.Priority = 1000
+	rule.Table = table
+	rule.Priority = priority
 
 	if err := netlink.RuleAdd(rule); err != nil {
 		// Ignore "already exists".
@@ -529,10 +565,14 @@ func (rm *RouteManager) ensureIPRule(dst *net.IPNet) error {
 
 // removeIPRule removes the ip rule for <dst>.
 func (rm *RouteManager) removeIPRule(dst *net.IPNet) {
+	table, priority, enabled := rm.localIPRuleSpec()
+	if !enabled {
+		return
+	}
 	rule := netlink.NewRule()
 	rule.Dst = dst
-	rule.Table = rm.cfg.RouteTableID
-	rule.Priority = 1000
+	rule.Table = table
+	rule.Priority = priority
 
 	if err := netlink.RuleDel(rule); err != nil {
 		slog.Debug("ip rule already absent or failed to remove", "dst", dst, "error", err)

@@ -52,6 +52,45 @@ func TestScenario_FIPAddRemove(t *testing.T) {
 	}
 }
 
+// TestScenario_FIPMainTableVethLeakException exercises the policy-routing
+// exception needed when the FIP /32 lives in main. The destination rule is
+// one priority ahead of the source-based veth-leak rule, so cross-node FIP
+// traffic for a locally-hosted FIP stays in main instead of looping through
+// veth-default. It must also self-heal and be removed with the FIP.
+func TestScenario_FIPMainTableVethLeakException(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "fipmainrule",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	cfg := testenv.FastDefaults()
+	cfg.RouteTableID = intPtr(0) // Explicitly exercise the main-table path.
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	const fip = "198.51.100.43"
+	const rulePriority = testenv.DefaultVethLeakRulePriority - 1
+	natUUID := testenv.AddFIP(t, ctx, nb, router, fip, "10.0.0.43")
+
+	testenv.AssertKernelRoute(t, fip, 10*time.Second)
+	testenv.AssertIPRuleToPriorityTable(t, rulePriority, fip+"/32", 254, 10*time.Second)
+	testenv.AssertIPRuleAtPriority(t, testenv.DefaultVethLeakRulePriority, "198.51.100.0/24", 10*time.Second)
+
+	// Remove only the rule while retaining the /32 route. The periodic
+	// reconcile must repair this exact upgrade/drift state without replacing
+	// the healthy kernel route.
+	testenv.DeleteIPRuleTo(t, rulePriority, fip+"/32")
+	testenv.AssertNoIPRuleToPriority(t, rulePriority, fip+"/32", time.Second)
+	testenv.AssertIPRuleToPriorityTable(t, rulePriority, fip+"/32", 254, 8*time.Second)
+
+	testenv.RemoveFIP(t, ctx, nb, router, natUUID)
+	testenv.AssertNoKernelRoute(t, fip, 15*time.Second)
+	testenv.AssertNoIPRuleToPriority(t, rulePriority, fip+"/32", 15*time.Second)
+}
+
 // TestScenario_GatewaylessVirtualGateway (#42 scenario 2):
 //
 // A provider net without a real gateway (no pre-existing default route in NB)

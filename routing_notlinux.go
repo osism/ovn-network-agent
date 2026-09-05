@@ -80,6 +80,13 @@ func (rm *RouteManager) DelKernelRoute(ip, dev string) error {
 	return fmt.Errorf("kernel route management is only supported on Linux")
 }
 
+func (rm *RouteManager) EnsureKernelRouteRule(ip string) error {
+	// Non-Linux builds cannot own kernel routes, but unit tests use their
+	// listKernelRoutes hook to model already-present routes. Treat policy-rule
+	// repair as a no-op there so that model remains usable.
+	return nil
+}
+
 func (rm *RouteManager) ListKernelRoutes() ([]kernelRouteEntry, error) {
 	if rm.cfg.DryRun {
 		return nil, nil
