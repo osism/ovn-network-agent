@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// The start state layers the setups of three existing scenarios on top of
+// The start state layers the setups of four existing scenarios on top of
 // the bootstrap baseline, so one chaos run can exercise all of them at
 // once:
 //
@@ -19,6 +19,9 @@ import (
 //     with a router pinned to gateway-1 and a FIP behind a responder.
 //   - pf-external.sh  — a Load_Balancer VIP (192.0.2.50:80) in front of
 //     the vm1 backend, plus the two routes the agent does not manage.
+//   - cross-chassis-fip.sh — a second flat router lr1 on the shared
+//     provider switch, pinned to gateway-2, with FIP 192.0.2.20 behind a
+//     vm3 responder, so a probe can enter another chassis' veth pair.
 //
 // Which of them a run puts up is the profile's call (profiles.go): a
 // profile that configures its gateways without OVN has no use for a
@@ -100,6 +103,10 @@ func responders(p *profile) []netns {
 			})
 		}
 	}
+	if p.crossChassis {
+		// cross-chassis-fip.sh:ensure_responder
+		all = append(all, netns{"vm3", "ls1-vm3", "02:00:00:00:14:0a", "192.168.20.10/24", "192.168.20.1"})
+	}
 	return all
 }
 
@@ -116,6 +123,11 @@ func applyStartState(ctx context.Context, l *lab, p *profile) error {
 			if err := applyVLANLayer(ctx, l, n); err != nil {
 				return err
 			}
+		}
+	}
+	if p.crossChassis {
+		if err := applyCrossChassisLayer(ctx, l); err != nil {
+			return err
 		}
 	}
 	if err := ensureResponders(ctx, l, p); err != nil {
@@ -198,6 +210,47 @@ func applyVLANLayer(ctx context.Context, l *lab, n vlanNetwork) error {
 	for _, args := range steps {
 		if _, err := l.nbctl(ctx, args...); err != nil {
 			return fmt.Errorf("vlan %s layer: %w", n.tag, err)
+		}
+	}
+	return nil
+}
+
+// applyCrossChassisLayer mirrors ensure_router in cross-chassis-fip.sh: a
+// second flat router lr1 on the shared provider switch ls-public, its
+// chassisredirect port pinned to gateway-2 as the only candidate, a tenant
+// switch, a FIP and a backing LSP. The vm3 responder itself is created by
+// ensureResponders. No default route and no Static_MAC_Binding are seeded;
+// the agent on gateway-2 programs both, as it does for lr0.
+//
+// The single candidate is deliberate, like the VLAN routers' pin to
+// gateway-1: a fault on gateway-2 legitimately darkens cross-fip until the
+// node is back, and the action's recovery budget covers it.
+func applyCrossChassisLayer(ctx context.Context, l *lab) error {
+	steps := [][]string{
+		{"--may-exist", "ls-add", "ls1"},
+		{"--may-exist", "lr-add", "lr1"},
+
+		{"--may-exist", "lrp-add", "lr1", "lr1-ls1", "02:00:00:00:14:01", "192.168.20.1/24"},
+		{"--may-exist", "lsp-add", "ls1", "ls1-lr1"},
+		{"lsp-set-type", "ls1-lr1", "router"},
+		{"lsp-set-addresses", "ls1-lr1", "router"},
+		{"lsp-set-options", "ls1-lr1", "router-port=lr1-ls1"},
+
+		{"--may-exist", "lrp-add", "lr1", "lr1-public", "02:00:00:00:14:02", "192.0.2.2/24"},
+		{"--may-exist", "lsp-add", "ls-public", "ls-public-lr1"},
+		{"lsp-set-type", "ls-public-lr1", "router"},
+		{"lsp-set-addresses", "ls-public-lr1", "router"},
+		{"lsp-set-options", "ls-public-lr1", "router-port=lr1-public"},
+
+		{"lrp-set-gateway-chassis", "lr1-public", "gateway-2", "30"},
+
+		{"--may-exist", "lr-nat-add", "lr1", "dnat_and_snat", "192.0.2.20", "192.168.20.10"},
+		{"--may-exist", "lsp-add", "ls1", "ls1-vm3"},
+		{"lsp-set-addresses", "ls1-vm3", "02:00:00:00:14:0a 192.168.20.10"},
+	}
+	for _, args := range steps {
+		if _, err := l.nbctl(ctx, args...); err != nil {
+			return fmt.Errorf("cross-chassis layer: %w", err)
 		}
 	}
 	return nil

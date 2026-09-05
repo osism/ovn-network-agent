@@ -245,6 +245,12 @@ func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
 		"vlan-no-dnat": true, "heterogeneous": true,
 	}
 	wantVIP := map[string]bool{"flat-dnat": true, "heterogeneous": true}
+	// The cross-chassis probe rides every profile that puts the hairpin
+	// layer up: both need OVN and a second router beside lr0 (#265).
+	wantCross := map[string]bool{
+		"everything-on": true, "flat-dnat": true,
+		"vlan-no-dnat": true, "heterogeneous": true,
+	}
 
 	for _, p := range profiles() {
 		if got := hasProbe(p.probes, probeHairpinFIP.name); got != wantFIP[p.name] {
@@ -252,6 +258,9 @@ func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
 		}
 		if got := hasProbe(p.probes, probeHairpinVIP.name); got != wantVIP[p.name] {
 			t.Errorf("%s probes hairpin-vip = %v, want %v", p.name, got, wantVIP[p.name])
+		}
+		if got := hasProbe(p.probes, probeCrossFIP.name); got != wantCross[p.name] {
+			t.Errorf("%s probes cross-fip = %v, want %v", p.name, got, wantCross[p.name])
 		}
 		// Both ride vm1's namespace on the workload host, and both need
 		// the hairpin layer's FIP_B or the VIP behind them.
@@ -265,10 +274,22 @@ func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
 				if !anyGatewayHasHairpinVIP(p) {
 					t.Errorf("%s probes the hairpin VIP but no gateway is configured with it", p.name)
 				}
+			case probeCrossFIP.name:
+				if !p.crossChassis {
+					t.Errorf("%s probes the cross-chassis FIP without the cross-chassis layer", p.name)
+				}
 			}
 			if target.name == probeHairpinFIP.name || target.name == probeHairpinVIP.name {
 				if target.node != workloadHost || target.netns != "vm1" {
 					t.Errorf("%s: %s probes from %q/%q, want the workload host's vm1",
+						p.name, target.name, target.node, target.netns)
+				}
+			}
+			// The cross-chassis probe must leave OVN on gateway-2, which
+			// only a workload behind lr1 does: vm3 on the workload host.
+			if target.name == probeCrossFIP.name {
+				if target.node != workloadHost || target.netns != "vm3" {
+					t.Errorf("%s: %s probes from %q/%q, want the workload host's vm3",
 						p.name, target.name, target.node, target.netns)
 				}
 			}
@@ -335,6 +356,10 @@ func TestProfileProbesOnlyWhatItsLayersPutUp(t *testing.T) {
 			case probeAPIVIP.name:
 				if len(p.apiVIPGateways()) == 0 {
 					t.Fatalf("%s probes the API VIP but no gateway is configured with it", p.name)
+				}
+			case probeCrossFIP.name:
+				if !p.crossChassis {
+					t.Fatalf("%s probes the cross-chassis FIP without the cross-chassis layer", p.name)
 				}
 			}
 		}

@@ -93,16 +93,30 @@ var (
 		name: "hairpin-vip", kind: probeTCP, addr: hairpinVIPHostPort,
 		node: workloadHost, netns: "vm1",
 	}
+
+	// The cross-chassis vantage (#265): vm3 sits behind lr1, whose
+	// chassisredirect port is pinned to gateway-2, and pings the FIP behind
+	// lr0. The packet leaves OVN on gateway-2, crosses that kernel's veth
+	// path into vrf-provider, rides BGP to whichever chassis holds
+	// cr-lr0-public and enters that kernel on veth-default — the one
+	// ingress no other probe exercises, and the one the veth-leak source
+	// rule used to loop.
+	probeCrossFIP = probeTarget{
+		name: "cross-fip", kind: probePing, addr: "192.0.2.10",
+		node: workloadHost, netns: "vm3",
+	}
 )
 
 // defaultProbes is what a full-topology run measures: the four FIPs, the
-// OVN Load_Balancer VIP, and the same-node hairpin FIP.
+// OVN Load_Balancer VIP, the same-node hairpin FIP, and the cross-chassis
+// FIP.
 //
 // The baseline lab's second FIP, 192.0.2.11, is deliberately absent:
 // bootstrap.sh seeds its NAT row but nothing answers behind
 // 192.168.10.11, so probing it would be red for the whole run.
 var defaultProbes = []probeTarget{
 	probeVM1, probeVM2, probeVLAN101, probeVLAN102, probeLBVIP, probeHairpinFIP,
+	probeCrossFIP,
 }
 
 // gwConfig is a profile's agent-configuration overlay for one gateway,
@@ -153,9 +167,10 @@ type profile struct {
 	// The start-state layers. Everything the bootstrap baseline itself
 	// seeds (the HA router, FIP 192.0.2.10, the vm1 workload) is always
 	// there — a profile only decides what is layered on top.
-	hairpin bool // hairpin.sh's second FIP and its vm2 responder
-	vlans   bool // multi-vlan.sh's two VLAN provider networks
-	ovnLB   bool // pf-external.sh's OVN Load_Balancer VIP
+	hairpin      bool // hairpin.sh's second FIP and its vm2 responder
+	vlans        bool // multi-vlan.sh's two VLAN provider networks
+	ovnLB        bool // pf-external.sh's OVN Load_Balancer VIP
+	crossChassis bool // cross-chassis-fip.sh's second flat router on gateway-2 and its vm3 responder
 
 	// gateways carries the per-gateway agent-config overlay. A gateway
 	// absent from the map runs the baked lab config unchanged.
@@ -213,12 +228,13 @@ func everyGateway(c gwConfig) map[string]gwConfig {
 func profiles() []*profile {
 	return []*profile{
 		{
-			name:        defaultProfileName,
-			description: "every topology layer, every gateway on the baked lab config",
-			hairpin:     true,
-			vlans:       true,
-			ovnLB:       true,
-			probes:      defaultProbes,
+			name:         defaultProfileName,
+			description:  "every topology layer, every gateway on the baked lab config",
+			hairpin:      true,
+			vlans:        true,
+			ovnLB:        true,
+			crossChassis: true,
+			probes:       defaultProbes,
 		},
 		{
 			name:        "flat-minimal",
@@ -227,23 +243,26 @@ func profiles() []*profile {
 			probes:      []probeTarget{probeVM1},
 		},
 		{
-			name:        "flat-dnat",
-			description: "no VLAN; the agent's own DNAT on an API VIP, alongside the OVN Load_Balancer VIP",
-			hairpin:     true,
-			ovnLB:       true,
-			gateways:    everyGateway(gwConfig{apiVIP: true, hairpinVIP: true}),
+			name:         "flat-dnat",
+			description:  "no VLAN; the agent's own DNAT on an API VIP, alongside the OVN Load_Balancer VIP",
+			hairpin:      true,
+			ovnLB:        true,
+			crossChassis: true,
+			gateways:     everyGateway(gwConfig{apiVIP: true, hairpinVIP: true}),
 			probes: []probeTarget{
 				probeVM1, probeVM2, probeLBVIP, probeAPIVIP,
-				probeHairpinFIP, probeHairpinVIP,
+				probeHairpinFIP, probeHairpinVIP, probeCrossFIP,
 			},
 		},
 		{
-			name:        "vlan-no-dnat",
-			description: "VLAN provider networks, no DNAT of any kind",
-			hairpin:     true,
-			vlans:       true,
+			name:         "vlan-no-dnat",
+			description:  "VLAN provider networks, no DNAT of any kind",
+			hairpin:      true,
+			vlans:        true,
+			crossChassis: true,
 			probes: []probeTarget{
 				probeVM1, probeVM2, probeVLAN101, probeVLAN102, probeHairpinFIP,
+				probeCrossFIP,
 			},
 		},
 		{
@@ -274,11 +293,12 @@ func profiles() []*profile {
 			// Carried by both, the active chassis announces it from the
 			// start, and losing gateway-1 hands lr0 — and with it the
 			// announce — to gateway-2.
-			name:        "heterogeneous",
-			description: "each gateway on a different configuration, as mid-rollout",
-			hairpin:     true,
-			vlans:       true,
-			ovnLB:       true,
+			name:         "heterogeneous",
+			description:  "each gateway on a different configuration, as mid-rollout",
+			hairpin:      true,
+			vlans:        true,
+			ovnLB:        true,
+			crossChassis: true,
 			gateways: map[string]gwConfig{
 				"gateway-1": {apiVIP: true, hairpinVIP: true},
 				"gateway-2": {apiVIP: true, hairpinVIP: true, drainOnShutdown: true},
