@@ -35,10 +35,12 @@ func (s *StringOrSlice) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// containedInAny returns true if ip is contained in any of the given networks.
 // effectiveNetworkFilters returns manual config if non-empty, otherwise discovered networks.
 // This is the single source of truth for the "manual takes precedence" rule, used by
-// both NAT filtering (ovn.go) and veth-leak/prefix-list reconciliation (agent.go).
+// NAT filtering (ovn.go) and prefix-list reconciliation (agent.go). The veth-leak
+// plane deliberately does not consume it: a manual filter names networks that
+// may be announced, not networks hosted on this chassis, so the leak set is
+// gated on locally-owned routers instead (Agent.computeLeakNetworks, #258).
 func effectiveNetworkFilters(manual, discovered []*net.IPNet) []*net.IPNet {
 	if len(manual) > 0 {
 		return manual
@@ -46,9 +48,25 @@ func effectiveNetworkFilters(manual, discovered []*net.IPNet) []*net.IPNet {
 	return discovered
 }
 
+// containedInAny returns true if ip is contained in any of the given networks.
 func containedInAny(ip net.IP, nets []*net.IPNet) bool {
 	for _, n := range nets {
 		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// networkCoveredByAny returns true if network n is fully covered by one of the
+// filter networks: the filter contains n's base address and is no longer than
+// n's prefix. A filter equal to n covers it; a broader filter (a /16 over a
+// /24) covers it; a narrower or disjoint one does not.
+func networkCoveredByAny(n *net.IPNet, filters []*net.IPNet) bool {
+	nOnes, _ := n.Mask.Size()
+	for _, f := range filters {
+		fOnes, _ := f.Mask.Size()
+		if f.Contains(n.IP) && fOnes <= nOnes {
 			return true
 		}
 	}

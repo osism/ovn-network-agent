@@ -382,6 +382,8 @@ func (o *oracleLab) respond(argv []string) (string, error) {
 			return o.frr(gw), nil
 		case has("ip -j route show vrf vrf-provider default"):
 			return o.vrfDefault(gw), nil
+		case has("ip -j route show vrf vrf-provider proto 44"):
+			return o.leak(gw), nil
 		case has("show ip prefix-list ANNOUNCED-NETWORKS"):
 			return o.prefixList(gw), nil
 		case has("dump-flows br-ex cookie=0x998"):
@@ -515,6 +517,17 @@ func (o *oracleLab) frr(gw string) string {
 	}
 	b, _ := json.Marshal(doc)
 	return string(b)
+}
+
+// leak answers the observer's `ip -j route show vrf vrf-provider proto 44`:
+// the per-network veth-leak routes (#258). The fixture's docs run auto mode,
+// where the leak set is the owned network — present on the active gateway,
+// absent on a standby.
+func (o *oracleLab) leak(gw string) string {
+	if !o.active(gw) {
+		return "[]"
+	}
+	return `[{"dst":"192.0.2.0/24","gateway":"169.254.0.1","dev":"veth-provider"}]`
 }
 
 // vrfDefault answers the observer's `ip -j route show vrf vrf-provider

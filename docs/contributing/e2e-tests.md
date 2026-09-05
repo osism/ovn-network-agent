@@ -1539,13 +1539,14 @@ pass. If `-settle-timeout` expires first, the last evaluation's failures
 become violations, and any violation fails the run. Every poll recomputes
 the expectation, so a settle tracks a `config-flip` the instant it lands.
 
-**The eight verified planes.** For each gateway the oracle diffs the
+**The nine verified planes.** For each gateway the oracle diffs the
 live data plane against a per-gateway expectation recomputed from the OVN
 NB/SB snapshot and that gateway's own config:
 
 | Plane | What the oracle checks |
 | --- | --- |
 | Kernel routes | proto-44 `/32`s on their device (`br-ex`, or `br-ex.<tag>` for a VLAN segment) |
+| Veth-leak routes | proto-44 network routes in `vrf-provider`: exactly the locally-owned networks, filtered by `network_cidr` — never the raw manual list (#258) |
 | FRR statics | `/32` statics in `vrf-provider` via the veth nexthop |
 | VRF default | a default route in `vrf-provider`, on every gateway in every mode |
 | Prefix-list | the `ANNOUNCED-NETWORKS` entries |
@@ -1562,7 +1563,7 @@ or not it currently owns anything: without it, traffic bound for a
 destination the VRF does not host dies inside the chassis while every
 other plane still matches (issue #247).
 
-A ninth check reaches past the gateways to the upstream router: the BGP
+A tenth check reaches past the gateways to the upstream router: the BGP
 announcements `upstream` actually holds, bounded both ways — nothing
 stale (announced ⊆ desired) and nothing missing (every desired IP the
 mode requires must be announced). They are read from the upstream router

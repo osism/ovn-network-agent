@@ -86,7 +86,11 @@ Substitute the values you configured for `vrf_name`, `frr_prefix_list`,
      excluding them, or OVN has not published them yet.
    - `effective_networks=0` — no provider networks are in effect (none
      configured via `network_cidr` and none auto-discovered from OVN). The
-     prefix-list and veth-leak reconciliation then have nothing to populate.
+     prefix-list reconciliation then has nothing to populate. The veth-leak
+     routes track the locally-owned routers' networks, not this count: with
+     a manual `network_cidr` list, `effective_networks` counts the full
+     list while the leak plane still only claims the networks whose routers
+     this chassis holds (#258).
 
 3. **Confirm the chassisredirect port is on this chassis.** A FIP is only
    announced from the node currently hosting the router's gateway:
