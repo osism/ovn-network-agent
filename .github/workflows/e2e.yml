@@ -207,6 +207,56 @@ jobs:
         if: always()
         run: make e2e-down
 
+  cross-chassis-fip:
+    name: Cross-chassis FIP-to-FIP (routers on different gateways)
+    runs-on: ubuntu-latest
+    # Gates on baseline like hairpin: the scenario adds one bootstrap, the
+    # baseline gate, the second router's convergence wait (≤60s) and two
+    # 5-packet probes, well inside the 15-minute budget. It measures the
+    # one path no other scenario enters — provider-sourced ingress through
+    # a second gateway's veth pair (issue #265).
+    needs: baseline
+    timeout-minutes: 15
+
+    env:
+      E2E_TOPOLOGY: test/e2e/topology.clab.yml
+      LAB: ovn-e2e
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # See the baseline job / e2e-lab-setup action for the rationale.
+      - uses: ./.github/actions/e2e-lab-setup
+
+      - name: Bring the lab up
+        run: make e2e-up
+
+      - name: Run cross-chassis FIP-to-FIP scenario
+        # On failure the scenario dumps both gateways' rule, veth-counter
+        # and route state into ARTIFACTS_DIR; collect-artifacts.sh and the
+        # uploader pick it up from the same root.
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts/cross-chassis-fip
+        run: ./test/e2e/scenarios/cross-chassis-fip.sh
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          ./test/e2e/scenarios/collect-artifacts.sh "${RUNNER_TEMP}/e2e-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-artifacts-cross-chassis-fip-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: make e2e-down
+
   hairpin-churn:
     name: Same-chassis hairpin under reconcile churn
     runs-on: ubuntu-latest

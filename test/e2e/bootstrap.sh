@@ -45,7 +45,9 @@
 #          eth4 = 10.0.0.1/24 (client side), IPv4 forwarding enabled.
 #        * FRR with bgpd enabled and one eBGP neighbor per gateway,
 #          redistributing connected so the gateways learn the
-#          10.0.0.0/24 return path.
+#          10.0.0.0/24 return path, originating a default to every
+#          gateway, and re-advertising each gateway's /32s to the
+#          others with as-override (see configure_upstream_frr).
 #   4. Each gateway FRR
 #        * eBGP from vrf-provider against its specific upstream /30
 #          endpoint (replaces the placeholder neighbor pushed by the
@@ -556,21 +558,35 @@ configure_upstream_frr() {
     # ignored. The result was an upstream FRR with no BGP instance and
     # gateway sessions permanently stuck in "Active".
     #
-    # default-originate is what gives each gateway's vrf-provider a route to
-    # everything it does not host itself. The gateways all share
-    # BGP_ASN_GATEWAYS, so the upstream's re-advertisement of one gateway's
-    # prefixes to another is dropped by AS-path loop prevention, and
+    # The gateways all share BGP_ASN_GATEWAYS, so on its own the upstream's
+    # re-advertisement of one gateway's prefixes to another is dropped by
+    # AS-path loop prevention. Two things put a route for "elsewhere" into
+    # every gateway's vrf-provider:
+    #
+    #   * as-override on each neighbor rewrites the gateways' ASN to the
+    #     upstream's own in the AS_PATH it sends, so a sibling gateway's
+    #     FIP /32s are accepted. That is what a fabric carrying host /32s
+    #     does, and cross-chassis FIP-to-FIP on a shared provider network
+    #     depends on it: the agent's per-network leak route in vrf-provider
+    #     (<net> via 169.254.0.1, the return path for the network it hosts)
+    #     is more specific than a default, so without the sibling's /32 it
+    #     would catch traffic for a FIP hosted elsewhere and hand it to a
+    #     default VRF that has no route for it (issue #265).
+    #   * default-originate covers everything no gateway announces at all.
+    #     Without it, a chassis that owns cr-lr0-public but carries no
+    #     port_forwards has no route for a peer's VIP and drops the traffic
+    #     inside the VRF (issue #247). default-originate is unconditional
+    #     in FRR — the upstream advertises 0.0.0.0/0 whether or not it holds
+    #     one — and the gateways never pass it on: they export via
+    #     `redistribute connected` through ANNOUNCE-CONNECTED and filter
+    #     outbound with `prefix-list ANNOUNCED-NETWORKS out`, which permits
+    #     /32s only.
+    #
     # `redistribute connected` below only exports the upstream's own
-    # networks. Without a default, a chassis that owns cr-lr0-public but
-    # carries no port_forwards has no route for a peer's VIP and drops the
-    # traffic inside the VRF (issue #247). default-originate is
-    # unconditional in FRR — the upstream advertises 0.0.0.0/0 whether or
-    # not it holds one — and the gateways never pass it on: they export via
-    # `redistribute connected` through ANNOUNCE-CONNECTED and filter
-    # outbound with `prefix-list ANNOUNCED-NETWORKS out`, which permits
-    # /32s only.
+    # networks.
     local neighbors_remote_as=""
     local neighbors_activate=""
+    local neighbors_as_override=""
     local neighbors_default_originate=""
     for entry in "${UNDERLAY_LINKS[@]}"; do
         local _gw gw_cidr _upstream_iface _upstream_cidr
@@ -578,6 +594,7 @@ configure_upstream_frr() {
         local gw_ip="${gw_cidr%/*}"
         neighbors_remote_as+=" neighbor ${gw_ip} remote-as ${BGP_ASN_GATEWAYS}"$'\n'
         neighbors_activate+="  neighbor ${gw_ip} activate"$'\n'
+        neighbors_as_override+="  neighbor ${gw_ip} as-override"$'\n'
         neighbors_default_originate+="  neighbor ${gw_ip} default-originate"$'\n'
     done
     docker exec -i "${UPSTREAM_NODE}" vtysh <<EOF
@@ -588,7 +605,7 @@ router bgp ${BGP_ASN_UPSTREAM}
  no bgp ebgp-requires-policy
 ${neighbors_remote_as} address-family ipv4 unicast
   redistribute connected
-${neighbors_activate}${neighbors_default_originate} exit-address-family
+${neighbors_activate}${neighbors_as_override}${neighbors_default_originate} exit-address-family
 end
 write memory
 EOF
