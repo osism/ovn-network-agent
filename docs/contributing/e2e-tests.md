@@ -1162,12 +1162,13 @@ the physical network and keeps working while the hairpin plane is broken,
 so a run without an internal vantage records no loss for exactly the
 traffic class the hairpin flows exist for.
 
-Two targets use it, both from `vm1`'s namespace on `gateway-3`:
+Three targets use it, all from workload namespaces on `gateway-3`:
 
 | Target | Kind | Address | What it rides |
 | --- | --- | --- | --- |
-| `hairpin-fip` | ping | `192.0.2.12` | the `cookie=0x998` reflect path on whichever chassis holds `cr-lr0-public` |
-| `hairpin-vip` | TCP | `198.18.0.50:8080` | OVN egress SNAT → `br-ex` → the chassis kernel's nftables DNAT → the API VIP's own backend, and the reply steered back into OVN |
+| `hairpin-fip` | ping | `192.0.2.12` | from `vm1`: the `cookie=0x998` reflect path on whichever chassis holds `cr-lr0-public` |
+| `hairpin-vip` | TCP | `198.18.0.50:8080` | from `vm1`: OVN egress SNAT → `br-ex` → the chassis kernel's nftables DNAT → the API VIP's own backend, and the reply steered back into OVN |
+| `cross-fip` | ping | `192.0.2.10` | from `vm3`: OVN egress on the chassis holding `cr-lr1-public` (`gateway-2`), its kernel veth path into `vrf-provider`, BGP to the chassis holding `cr-lr0-public`, and that kernel's `iif veth-default` ingress into `br-ex` (issue #265) |
 
 The third probe kind, TCP, is a handshake through bash's `/dev/tcp`
 redirect: the gateway image carries no curl, and `pf-hairpin.sh` probes
@@ -1243,8 +1244,10 @@ sequences reproducible.
 the bootstrap baseline, so one run can exercise all of them at once:
 `hairpin.sh`'s second FIP (`192.0.2.12` with a `vm2` responder),
 `multi-vlan.sh`'s two VLAN provider networks (tags 101/102, routers
-pinned to `gateway-1`), and `pf-external.sh`'s `Load_Balancer` VIP
-(`192.0.2.50:80` in front of the `vm1` backend). Which of them a run puts
+pinned to `gateway-1`), `pf-external.sh`'s `Load_Balancer` VIP
+(`192.0.2.50:80` in front of the `vm1` backend), and
+`cross-chassis-fip.sh`'s second flat router `lr1` (pinned to `gateway-2`,
+FIP `192.0.2.20` with a `vm3` responder). Which of them a run puts
 up is the profile's call. The layering is idempotent, which is what makes
 it reusable as the post-fault restore path. If the start state is not
 green within 120 s the run aborts with exit code 2 — a fault injected
@@ -1265,6 +1268,7 @@ up has no responder and would be red for the whole run:
 | `fip-vlan102` | `ping 203.0.113.10` | the VLAN layers |
 | `pf-vip` | `curl http://192.0.2.50:80/` | the port-forward layer (an OVN `Load_Balancer`) |
 | `api-vip` | `curl http://192.0.2.80:8080/` | the **agent's own** DNAT (`port_forwards`), on the gateways a profile configures it on |
+| `cross-fip` | `ping 192.0.2.10` from `vm3` | the cross-chassis layer |
 
 The baseline lab's second FIP, `192.0.2.11`, is deliberately **not**
 probed: `bootstrap.sh` seeds its NAT row but nothing answers behind
@@ -1286,12 +1290,12 @@ The set is curated, not combinatorial:
 
 | `-profile` | Start topology | Agent configuration | Probes |
 | --- | --- | --- | --- |
-| `everything-on` (default) | hairpin + VLAN + port-forward | the baked lab config, unchanged | the four FIPs + `pf-vip` + `hairpin-fip` |
+| `everything-on` (default) | hairpin + VLAN + port-forward + cross-chassis | the baked lab config, unchanged | the four FIPs + `pf-vip` + `hairpin-fip` + `cross-fip` |
 | `flat-minimal` | baseline only | `cleanup_on_shutdown: true` | `fip-vm1` |
-| `flat-dnat` | hairpin + port-forward | the API VIP and the hairpin VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip`, `hairpin-fip`, `hairpin-vip` |
-| `vlan-no-dnat` | hairpin + VLAN | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip` |
+| `flat-dnat` | hairpin + port-forward + cross-chassis | the API VIP and the hairpin VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip`, `hairpin-fip`, `hairpin-vip`, `cross-fip` |
+| `vlan-no-dnat` | hairpin + VLAN + cross-chassis | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip`, `cross-fip` |
 | `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
-| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` |
+| `heterogeneous` | hairpin + VLAN + port-forward + cross-chassis | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` + `cross-fip` |
 
 `pf-only` and `flat-minimal` carry neither same-node target: `pf-only`
 has no OVN connection, so the agent manages no FIP path at all, and
