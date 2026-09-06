@@ -351,6 +351,15 @@ func TestVLANLayerReportsANBFailure(t *testing.T) {
 	}
 }
 
+func TestCrossChassisLayerReportsANBFailure(t *testing.T) {
+	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := applyCrossChassisLayer(context.Background(), l); err == nil {
+		t.Fatal("a failed ovn-nbctl call was swallowed")
+	}
+}
+
 // 192.0.2.11 is seeded by bootstrap.sh as a NAT row with nothing behind
 // it. Probing it would be red for the whole run and every recovery gate
 // would time out, so it must stay out of the probe set.
@@ -360,8 +369,8 @@ func TestProbeTargetsExcludeTheBackendlessFIP(t *testing.T) {
 			t.Fatalf("probe target %q has no responder behind it", target.name)
 		}
 	}
-	if len(defaultProbes) != 6 {
-		t.Fatalf("probe set = %v, want the four FIPs, the port-forward VIP and the same-node hairpin FIP", defaultProbes)
+	if len(defaultProbes) != 7 {
+		t.Fatalf("probe set = %v, want the four FIPs, the port-forward VIP, the same-node hairpin FIP and the cross-chassis FIP", defaultProbes)
 	}
 }
 

@@ -30,10 +30,15 @@ func TestApplyStartStateLayersEveryScenarioSetup(t *testing.T) {
 		"lr-lb-add lr0 pf-external",
 		"ip route replace 192.0.2.50/32 via 100.64.1.2",
 		"ip route replace 192.0.2.50/32 dev br-ex scope link",
+		// cross-chassis-fip.sh: the second router pinned to gateway-2 and
+		// its FIP.
+		"lrp-set-gateway-chassis lr1-public gateway-2 30",
+		"lr-nat-add lr1 dnat_and_snat 192.0.2.20 192.168.20.10",
 		// Every responder behind a probed FIP.
 		"external_ids:iface-id=ls0-vm2",
 		"external_ids:iface-id=vm101",
 		"external_ids:iface-id=vm102",
+		"external_ids:iface-id=ls1-vm3",
 	} {
 		if !cmd.called(want) {
 			t.Fatalf("the start state did not issue %q", want)
@@ -201,7 +206,7 @@ func TestEveryProbedFIPHasARestoredResponder(t *testing.T) {
 	for _, n := range responders(defaultTestProfile(t)) {
 		lsps[n.lsp] = true
 	}
-	for _, want := range []string{"ls0-vm1", "ls0-vm2", "vm101", "vm102"} {
+	for _, want := range []string{"ls0-vm1", "ls0-vm2", "vm101", "vm102", "ls1-vm3"} {
 		if !lsps[want] {
 			t.Fatalf("responder for %s is not rebuilt after its host is recycled", want)
 		}
@@ -256,7 +261,9 @@ func TestApplyStartStateOnlyLayersTheProfilesOwnScenarios(t *testing.T) {
 		"ln-vlan101", // multi-vlan.sh
 		"lr-nat-add lr0 dnat_and_snat 192.0.2.12", // hairpin.sh
 		"lb-add pf-external",                      // pf-external.sh
+		"lr-nat-add lr1",                          // cross-chassis-fip.sh
 		"external_ids:iface-id=ls0-vm2",
+		"external_ids:iface-id=ls1-vm3",
 		"/usr/local/bin/pf-backend",
 	} {
 		if cmd.called(unwanted) {

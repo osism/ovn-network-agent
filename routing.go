@@ -162,6 +162,15 @@ func (rm *RouteManager) refreshVethNexthop(networks []*net.IPNet) error {
 	return rm.RefreshVethNexthop(networks)
 }
 
+// vethIngressRulePriority is the priority of the veth-default ingress
+// exception rule (`iif veth-default lookup main`): one below the per-network
+// leak rules, so the kernel consults it first. validateConfig keeps
+// VethLeakRulePriority at 2 or above, which keeps this rule off the kernel's
+// priority-0 local rule.
+func (rm *RouteManager) vethIngressRulePriority() int {
+	return rm.cfg.VethLeakRulePriority - 1
+}
+
 // validateIP checks that the given string is a valid IPv4 address. IPv6 is
 // rejected: the FRR and kernel route paths that call this are IPv4-only (vtysh
 // "ip route .../32", net.CIDRMask(32, 32)), so a v6 address would produce an

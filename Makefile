@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report e2e-chaos-random
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-cross-chassis-fip e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report e2e-chaos-random
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -13,6 +13,7 @@ E2E_BASELINE    := test/e2e/scenarios/baseline.sh
 E2E_FAILOVER    := test/e2e/scenarios/failover.sh
 E2E_HAIRPIN     := test/e2e/scenarios/hairpin.sh
 E2E_HAIRPIN_CHURN := test/e2e/scenarios/hairpin-churn.sh
+E2E_CROSS_CHASSIS := test/e2e/scenarios/cross-chassis-fip.sh
 E2E_MULTI_VLAN  := test/e2e/scenarios/multi-vlan.sh
 E2E_PF_EXTERNAL := test/e2e/scenarios/pf-external.sh
 E2E_PF_HAIRPIN  := test/e2e/scenarios/pf-hairpin.sh
@@ -239,6 +240,20 @@ e2e-hairpin:
 # lab down.
 e2e-hairpin-churn:
 	$(E2E_HAIRPIN_CHURN)
+
+# Run the cross-chassis FIP-to-FIP scenario (issue #265) against a lab
+# that is already up. Adds a second flat router lr1 on the shared
+# provider switch, pinned to gateway-2 as its only candidate, with a FIP
+# (192.0.2.20) and a vm3 responder on gateway-3; asserts cr-lr1-public
+# and cr-lr0-public sit on different chassis and both gateways carry the
+# veth-default ingress exception rule; then pings each FIP from the
+# workload behind the other and requires zero loss, plus a growing
+# veth-default packet counter on gateway-2 proving the traffic crossed
+# the kernel path. The EXIT trap removes the router, switch, FIP and
+# responder so a subsequent `make e2e-baseline` works without tearing
+# the lab down.
+e2e-cross-chassis-fip:
+	$(E2E_CROSS_CHASSIS)
 
 # Run the multi-VLAN provider-network scenario (issue #147) against a
 # lab that is already up. Adds two VLAN provider networks (tags 101/102

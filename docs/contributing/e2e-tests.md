@@ -37,6 +37,7 @@ test/e2e/
     hairpin.sh              — same-chassis hairpin scenario, two FIPs on master (issue #108)
     hairpin-churn.sh        — zero loss on the hairpin path under reconcile churn (issue #243)
     lib/hairpin-topology.sh — the FIP_B topology both hairpin scenarios source
+    cross-chassis-fip.sh    — cross-chassis FIP-to-FIP through both gateways' veth paths (issue #265)
     multi-vlan.sh           — multi-VLAN provider networks, two segments on master (issue #147)
     pf-external.sh          — port-forward / DNAT scenario, source IP preserved (issue #109)
     pf-hairpin.sh           — port-forward hairpin masquerade scenario (issue #110)
@@ -215,18 +216,26 @@ diagnostics and retries.
   `eth3 = 100.64.3.1/30`), `10.0.0.1/24` on `eth4` (towards
   `client-1`), IPv4 forwarding enabled, FRR with `bgpd` enabled and
   one eBGP neighbor per gateway.
+- the gateways all share AS 65000, so on its own the upstream's
+  re-advertisement of one gateway's prefixes to another would be
+  dropped by AS-path loop prevention. The upstream therefore sets
+  `neighbor <gateway> as-override`, rewriting the gateways' ASN to
+  its own in the AS_PATH it sends, so every gateway's `vrf-provider`
+  learns the other gateways' FIP `/32`s — what a fabric carrying host
+  `/32`s does. Cross-chassis FIP-to-FIP on a shared provider network
+  depends on it: the agent's per-network leak route in
+  `vrf-provider` (`<net> via 169.254.0.1`) is more specific than a
+  default and would otherwise catch traffic for a FIP hosted on
+  another gateway (issue #265).
 - the upstream also originates a default route to every gateway
   (`neighbor <gateway> default-originate`), so each `vrf-provider`
   learns `default via 100.64.N.1`. That default is what carries
-  traffic to anything the chassis does not host itself — a
-  port-forward VIP another gateway announces, or the reply to a
-  client behind a FIP that has moved. The gateways all share
-  AS 65000, so BGP delivers no such route on its own: the upstream's
-  re-advertisement is dropped by AS-path loop prevention. The
-  gateways do not pass the default on either, because they export
-  only through `redistribute connected` filtered by
-  `ANNOUNCE-CONNECTED` and their outbound
-  `prefix-list ANNOUNCED-NETWORKS out` permits `/32`s only.
+  traffic to anything no gateway announces at all — a port-forward
+  VIP another gateway announces before its `/32` has propagated, or
+  the reply to a client behind a FIP that has moved. The gateways do
+  not pass the default on, because they export only through
+  `redistribute connected` filtered by `ANNOUNCE-CONNECTED` and their
+  outbound `prefix-list ANNOUNCED-NETWORKS out` permits `/32`s only.
 - each gateway's FRR (in `vrf-provider`): eBGP against its specific
   upstream `/30` endpoint, redistributing the FIP `/32` static
   routes that the agent installs in `vrf-provider`. The placeholder
@@ -267,6 +276,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | --- | --- | --- | --- |
 | [Baseline](#baseline) | `e2e-baseline` | An external client reaches a FIP once the agent reconciles. | [#45](https://github.com/osism/ovn-network-agent/issues/45) |
 | [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of six agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, no gateway port is claimed twice, and the lab converges to its config-aware expected state in settle windows. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177), [#179](https://github.com/osism/ovn-network-agent/issues/179) |
+| [Cross-chassis FIP-to-FIP](#cross-chassis-fip-to-fip) | `e2e-cross-chassis-fip` | A FIP behind a router on one gateway reaches a FIP behind a router on another gateway through both kernels' veth paths. | [#265](https://github.com/osism/ovn-network-agent/issues/265) |
 | [Drain-hitless](#drain-hitless) | `e2e-drain-hitless` | A graceful `SIGTERM` drain loses fewer packets than a hard `docker kill` of the same chassis. | [#113](https://github.com/osism/ovn-network-agent/issues/113) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
 | [Failover (strict)](#failover) | `e2e-failover-strict` | The data-plane outage across the re-election stays within a ~2s budget. | [#131](https://github.com/osism/ovn-network-agent/issues/131) |
@@ -507,6 +517,67 @@ FIP_B, restores the baseline config, restarts the master and waits for
 **Overrides for triage:** `PROBE_DURATION`, `PROBE_INTERVAL`,
 `CHURN_INTERVAL`, `CHURN_RECONCILE`, `METRICS_INTERVALS`, `MASTER`,
 `SANITY_GATE`.
+
+### Cross-chassis FIP-to-FIP
+
+```sh
+make e2e-cross-chassis-fip
+```
+
+[`cross-chassis-fip.sh`](https://github.com/osism/ovn-network-agent/blob/main/test/e2e/scenarios/cross-chassis-fip.sh)
+measures the one path no other scenario enters: provider-sourced traffic
+arriving through a *second* gateway's veth pair. With FIP routes in the
+main table (the lab's default), the destination gateway's veth-leak
+source rule used to catch such a packet before the main table was
+consulted and send it straight back into `vrf-provider`, where the FRR
+static for the `/32` pointed at `veth-default` again; the packet bounced
+between the veth ends until its TTL expired (issue #265). The agent now
+keeps an ingress exception rule, `iif veth-default lookup main`, one
+priority below the leak rules.
+
+The scenario:
+
+1. Runs the baseline first as a sanity gate.
+2. Adds — scenario-locally — a second flat router `lr1` on the shared
+   provider switch `ls-public` (`lr1-public` `192.0.2.2/24`, pinned to
+   `gateway-2` as its only candidate), a tenant switch `ls1`
+   (`192.168.20.0/24`), the FIP `192.0.2.20` → `192.168.20.10`, and a
+   `vm3` netns + veth on `gateway-3` behind it. No default route and no
+   `Static_MAC_Binding` are seeded for `lr1`; the agent on `gateway-2`
+   programs both, as it does for `lr0`.
+3. Waits until `cr-lr1-public` is bound to `gateway-2` and asserts that
+   `cr-lr0-public` sits on a different chassis (a shared chassis fails the
+   run naming it: it would be measuring the hairpin path); then waits for
+   `192.0.2.20/32` on `gateway-2` and for the ingress rule at priority
+   `1999` on both gateways.
+4. Records `gateway-2`'s `veth-default` packet counters, pings `192.0.2.10`
+   from `vm3` and `192.0.2.20` from `vm1` (`ping -c 5 -W 2`, zero loss
+   required in both directions), and requires the counters to have grown
+   by at least the ping count — proof that the traffic crossed the kernel
+   path on the router's chassis rather than staying inside OVN.
+
+On failure the scenario writes `ip rule show`, `ip -s link show
+veth-default`, `ip route show table 200` and `ip route show` from both
+gateways into `ARTIFACTS_DIR`. The EXIT trap removes the router, its
+ports, the switch, the FIP, the MAC binding the agent programmed for it,
+and the `vm3` responder, returning the lab to baseline. The CI workflow
+runs this scenario as its own `cross-chassis-fip` job gating on
+`baseline`.
+
+::: details Expected packet flow on a green run
+`vm3` (`192.168.20.10` on `gateway-3`) → geneve → `cr-lr1-public` on
+`gateway-2` (egress SNAT to `192.0.2.20`) → `ls-public` localnet →
+`br-ex` on `gateway-2` → kernel: `from 192.0.2.0/24 lookup 200` →
+`veth-default` → `vrf-provider` → BGP → `upstream` → `gateway-1`'s
+`vrf-provider` → FRR static `192.0.2.10/32` via the veth pair →
+`veth-default` on `gateway-1` → `iif veth-default lookup main` →
+`192.0.2.10/32 dev br-ex` → OVN → DNAT → `vm1`. The reply takes the
+mirror image through both kernels.
+:::
+
+**Overrides for triage:** `MASTER`, `PEER`, `WORKLOAD_HOST`, `FIP_A`,
+`FIP_C`, `FIP_C_INTERNAL`, `INGRESS_RULE_PRIORITY`, `PING_COUNT`,
+`PING_TIMEOUT`, `RECONCILE_TIMEOUT`, `SANITY_GATE`.
 
 ### Multi-VLAN
 
@@ -1091,12 +1162,13 @@ the physical network and keeps working while the hairpin plane is broken,
 so a run without an internal vantage records no loss for exactly the
 traffic class the hairpin flows exist for.
 
-Two targets use it, both from `vm1`'s namespace on `gateway-3`:
+Three targets use it, all from workload namespaces on `gateway-3`:
 
 | Target | Kind | Address | What it rides |
 | --- | --- | --- | --- |
-| `hairpin-fip` | ping | `192.0.2.12` | the `cookie=0x998` reflect path on whichever chassis holds `cr-lr0-public` |
-| `hairpin-vip` | TCP | `198.18.0.50:8080` | OVN egress SNAT → `br-ex` → the chassis kernel's nftables DNAT → the API VIP's own backend, and the reply steered back into OVN |
+| `hairpin-fip` | ping | `192.0.2.12` | from `vm1`: the `cookie=0x998` reflect path on whichever chassis holds `cr-lr0-public` |
+| `hairpin-vip` | TCP | `198.18.0.50:8080` | from `vm1`: OVN egress SNAT → `br-ex` → the chassis kernel's nftables DNAT → the API VIP's own backend, and the reply steered back into OVN |
+| `cross-fip` | ping | `192.0.2.10` | from `vm3`: OVN egress on the chassis holding `cr-lr1-public` (`gateway-2`), its kernel veth path into `vrf-provider`, BGP to the chassis holding `cr-lr0-public`, and that kernel's `iif veth-default` ingress into `br-ex` (issue #265) |
 
 The third probe kind, TCP, is a handshake through bash's `/dev/tcp`
 redirect: the gateway image carries no curl, and `pf-hairpin.sh` probes
@@ -1172,8 +1244,10 @@ sequences reproducible.
 the bootstrap baseline, so one run can exercise all of them at once:
 `hairpin.sh`'s second FIP (`192.0.2.12` with a `vm2` responder),
 `multi-vlan.sh`'s two VLAN provider networks (tags 101/102, routers
-pinned to `gateway-1`), and `pf-external.sh`'s `Load_Balancer` VIP
-(`192.0.2.50:80` in front of the `vm1` backend). Which of them a run puts
+pinned to `gateway-1`), `pf-external.sh`'s `Load_Balancer` VIP
+(`192.0.2.50:80` in front of the `vm1` backend), and
+`cross-chassis-fip.sh`'s second flat router `lr1` (pinned to `gateway-2`,
+FIP `192.0.2.20` with a `vm3` responder). Which of them a run puts
 up is the profile's call. The layering is idempotent, which is what makes
 it reusable as the post-fault restore path. If the start state is not
 green within 120 s the run aborts with exit code 2 — a fault injected
@@ -1194,6 +1268,7 @@ up has no responder and would be red for the whole run:
 | `fip-vlan102` | `ping 203.0.113.10` | the VLAN layers |
 | `pf-vip` | `curl http://192.0.2.50:80/` | the port-forward layer (an OVN `Load_Balancer`) |
 | `api-vip` | `curl http://192.0.2.80:8080/` | the **agent's own** DNAT (`port_forwards`), on the gateways a profile configures it on |
+| `cross-fip` | `ping 192.0.2.10` from `vm3` | the cross-chassis layer |
 
 The baseline lab's second FIP, `192.0.2.11`, is deliberately **not**
 probed: `bootstrap.sh` seeds its NAT row but nothing answers behind
@@ -1215,12 +1290,12 @@ The set is curated, not combinatorial:
 
 | `-profile` | Start topology | Agent configuration | Probes |
 | --- | --- | --- | --- |
-| `everything-on` (default) | hairpin + VLAN + port-forward | the baked lab config, unchanged | the four FIPs + `pf-vip` + `hairpin-fip` |
+| `everything-on` (default) | hairpin + VLAN + port-forward + cross-chassis | the baked lab config, unchanged | the four FIPs + `pf-vip` + `hairpin-fip` + `cross-fip` |
 | `flat-minimal` | baseline only | `cleanup_on_shutdown: true` | `fip-vm1` |
-| `flat-dnat` | hairpin + port-forward | the API VIP and the hairpin VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip`, `hairpin-fip`, `hairpin-vip` |
-| `vlan-no-dnat` | hairpin + VLAN | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip` |
+| `flat-dnat` | hairpin + port-forward + cross-chassis | the API VIP and the hairpin VIP (`port_forwards` + `port_forward_l3mdev_accept`) | `fip-vm1`, `fip-vm2`, `pf-vip`, `api-vip`, `hairpin-fip`, `hairpin-vip`, `cross-fip` |
+| `vlan-no-dnat` | hairpin + VLAN + cross-chassis | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip`, `cross-fip` |
 | `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
-| `heterogeneous` | hairpin + VLAN + port-forward | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` |
+| `heterogeneous` | hairpin + VLAN + port-forward + cross-chassis | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` + `cross-fip` |
 
 `pf-only` and `flat-minimal` carry neither same-node target: `pf-only`
 has no OVN connection, so the agent manages no FIP path at all, and
