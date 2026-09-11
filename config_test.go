@@ -1166,6 +1166,23 @@ func TestLoadConfigVethLeakTableIDInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadConfigVethLeakRulePriorityTooLow(t *testing.T) {
+	for _, priority := range []string{"0", "1"} {
+		t.Run(priority, func(t *testing.T) {
+			_, err := loadConfig(fullModeArgs(
+				"--veth-leak-rule-priority", priority,
+				"--network-cidr", "10.0.0.0/24",
+			))
+			if err == nil {
+				t.Fatal("expected error for veth-leak-rule-priority below 2")
+			}
+			if !strings.Contains(err.Error(), "veth-leak-rule-priority") {
+				t.Errorf("error = %v, want veth-leak-rule-priority validation", err)
+			}
+		})
+	}
+}
+
 func TestApplyEnvConfigVethLeak(t *testing.T) {
 	cfg := Config{VethLeakEnabled: true}
 	t.Setenv("OVN_NETWORK_VETH_LEAK_ENABLED", "false")
@@ -1534,13 +1551,14 @@ port_forwards:
 func TestPortForwardValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
-			VethNexthop:        "169.254.0.1",
-			ReconcileInterval:  60 * time.Second,
-			VethLeakEnabled:    true,
-			VethLeakTableID:    200,
-			PortForwardDev:     "loopback1",
-			PortForwardTableID: 201,
-			PortForwardCTZone:  64000,
+			VethNexthop:          "169.254.0.1",
+			ReconcileInterval:    60 * time.Second,
+			VethLeakEnabled:      true,
+			VethLeakTableID:      200,
+			VethLeakRulePriority: 2000,
+			PortForwardDev:       "loopback1",
+			PortForwardTableID:   201,
+			PortForwardCTZone:    64000,
 			PortForwards: []PortForwardVIP{
 				{
 					VIP: "198.51.100.10",
@@ -1878,13 +1896,14 @@ func TestDestAddrsHelper(t *testing.T) {
 func TestPortForwardMultiBackendValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
-			VethNexthop:        "169.254.0.1",
-			ReconcileInterval:  60 * time.Second,
-			VethLeakEnabled:    true,
-			VethLeakTableID:    200,
-			PortForwardDev:     "loopback1",
-			PortForwardTableID: 201,
-			PortForwardCTZone:  64000,
+			VethNexthop:          "169.254.0.1",
+			ReconcileInterval:    60 * time.Second,
+			VethLeakEnabled:      true,
+			VethLeakTableID:      200,
+			VethLeakRulePriority: 2000,
+			PortForwardDev:       "loopback1",
+			PortForwardTableID:   201,
+			PortForwardCTZone:    64000,
 			PortForwards: []PortForwardVIP{
 				{
 					VIP: "198.51.100.10",
@@ -2003,10 +2022,11 @@ port_forwards:
 // VethProviderIP) trips this test instead of silently changing the contract.
 func TestVethProviderIPAutoComputeWrapsAt255_255_255_255(t *testing.T) {
 	cfg := Config{
-		VethNexthop:       "255.255.255.255",
-		ReconcileInterval: 60 * time.Second,
-		VethLeakEnabled:   true,
-		VethLeakTableID:   200,
+		VethNexthop:          "255.255.255.255",
+		ReconcileInterval:    60 * time.Second,
+		VethLeakEnabled:      true,
+		VethLeakTableID:      200,
+		VethLeakRulePriority: 2000,
 		// VethProviderIP intentionally unset — triggers auto-compute.
 	}
 

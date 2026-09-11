@@ -87,6 +87,10 @@ type ruleInfo struct {
 	Priority int             `json:"priority"`
 	Src      string          `json:"src,omitempty"`
 	Srclen   int             `json:"srclen,omitempty"`
+	Dst      string          `json:"dst,omitempty"`
+	To       string          `json:"to,omitempty"`
+	Dstlen   int             `json:"dstlen,omitempty"`
+	DstLen   int             `json:"dst_len,omitempty"`
 	Table    json.RawMessage `json:"table,omitempty"`
 }
 
@@ -98,6 +102,26 @@ func (r ruleInfo) srcCIDR() string {
 		return ""
 	}
 	return r.Src + "/" + strconv.Itoa(r.Srclen)
+}
+
+// dstCIDR rebuilds the rule's destination CIDR from dst + dst_len. iproute2
+// uses "all" for an unqualified destination, just as it does for source.
+func (r ruleInfo) dstCIDR() string {
+	dst := r.Dst
+	if dst == "" {
+		dst = r.To
+	}
+	if dst == "" || dst == "all" {
+		return ""
+	}
+	if strings.Contains(dst, "/") {
+		return dst
+	}
+	prefixLen := r.Dstlen
+	if prefixLen == 0 {
+		prefixLen = r.DstLen
+	}
+	return dst + "/" + strconv.Itoa(prefixLen)
 }
 
 // readLink invokes `ip -j -d link show <name>` and decodes the first entry.
@@ -374,6 +398,80 @@ func DeleteIPRule(t *testing.T, priority int, src string) {
 	}
 }
 
+// AssertIPRuleToPriorityTable waits for a destination policy rule at priority
+// that points at tableID. This is used for the local-FIP exception placed just
+// before the veth-leak source policy rule.
+func AssertIPRuleToPriorityTable(t *testing.T, priority int, dst string, tableID int, timeout time.Duration) {
+	t.Helper()
+	if _, _, err := net.ParseCIDR(dst); err != nil {
+		t.Fatalf("AssertIPRuleToPriorityTable: invalid CIDR %q: %v", dst, err)
+	}
+	deadline := time.Now().Add(timeout)
+	var lastOut string
+	for {
+		out, err := exec.Command("ip", "-j", "rule", "show").CombinedOutput()
+		lastOut = string(out)
+		if err == nil {
+			var rules []ruleInfo
+			if err := json.Unmarshal(out, &rules); err == nil {
+				for _, r := range rules {
+					if r.Priority == priority && r.dstCIDR() == dst && tableMatches(r.Table, tableID) {
+						return
+					}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ip rule priority %d to %s table %d not present after %s (last: %q)",
+				priority, dst, tableID, timeout, strings.TrimSpace(lastOut))
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// AssertNoIPRuleToPriority waits until no matching destination policy rule
+// remains. It verifies FIP cleanup and that drift was actually injected.
+func AssertNoIPRuleToPriority(t *testing.T, priority int, dst string, timeout time.Duration) {
+	t.Helper()
+	if _, _, err := net.ParseCIDR(dst); err != nil {
+		t.Fatalf("AssertNoIPRuleToPriority: invalid CIDR %q: %v", dst, err)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := exec.Command("ip", "-j", "rule", "show").CombinedOutput()
+		if err == nil {
+			var rules []ruleInfo
+			if err := json.Unmarshal(out, &rules); err == nil {
+				present := false
+				for _, r := range rules {
+					if r.Priority == priority && r.dstCIDR() == dst {
+						present = true
+						break
+					}
+				}
+				if !present {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ip rule priority %d to %s still present after %s (out: %q)",
+				priority, dst, timeout, strings.TrimSpace(string(out)))
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// DeleteIPRuleTo removes a destination policy rule from the main table. It
+// simulates an upgraded host or an out-of-band deletion for reconciliation.
+func DeleteIPRuleTo(t *testing.T, priority int, dst string) {
+	t.Helper()
+	out, err := exec.Command("ip", "rule", "del", "priority", strconv.Itoa(priority), "to", dst, "lookup", "main").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip rule del priority %d to %s lookup main: %v (%s)", priority, dst, err, strings.TrimSpace(string(out)))
+	}
+}
+
 // hasFlag reports whether flag appears in flags. Used to fall back to UP
 // detection when iproute2 omits operstate (rare, but seen on some kernels
 // with veth devices that have no carrier).
@@ -444,24 +542,26 @@ func scrubVethLeakState(t *testing.T) {
 	t.Helper()
 
 	// Drop policy rules we might have planted at the agent's priorities.
-	// Both default and any custom priority a future test may inject get
-	// flushed; missing rules cause `ip rule del` to exit non-zero with
-	// "RTNETLINK answers: No such file or directory" — ignore.
+	// This includes both the veth-leak source rule and the local-FIP
+	// destination exception immediately before it. Missing rules cause `ip
+	// rule del` to exit non-zero with "RTNETLINK answers: No such file or
+	// directory" — ignore.
 	if out, err := exec.Command("ip", "-j", "rule", "show").CombinedOutput(); err == nil {
 		var rules []ruleInfo
 		if err := json.Unmarshal(out, &rules); err == nil {
 			for _, r := range rules {
-				if r.Priority != DefaultVethLeakRulePriority {
-					continue
+				switch {
+				case r.Priority == DefaultVethLeakRulePriority && r.srcCIDR() != "":
+					_ = exec.Command("ip", "rule", "del",
+						"priority", strconv.Itoa(r.Priority),
+						"from", r.srcCIDR(),
+					).Run()
+				case r.Priority == DefaultVethLeakRulePriority-1 && r.dstCIDR() != "":
+					_ = exec.Command("ip", "rule", "del",
+						"priority", strconv.Itoa(r.Priority),
+						"to", r.dstCIDR(), "lookup", "main",
+					).Run()
 				}
-				cidr := r.srcCIDR()
-				if cidr == "" {
-					continue
-				}
-				_ = exec.Command("ip", "rule", "del",
-					"priority", strconv.Itoa(r.Priority),
-					"from", cidr,
-				).Run()
 			}
 		}
 	}

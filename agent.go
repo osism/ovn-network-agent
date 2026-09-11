@@ -883,6 +883,14 @@ func (a *Agent) ensureRoutes(desiredIPs, frrStaticIPs []string, ipDev map[string
 				slog.Error("failed to add kernel route", "ip", ip, "dev", dev, "error", err)
 				kernelOK = false
 			}
+		} else if manageKernel && !skipKernelRoute[ip] {
+			// The /32 already exists, but its companion destination policy rule
+			// may have been absent in an older release or deleted out of band.
+			// Repair it on every reconcile without touching the healthy route.
+			if err := a.routing.EnsureKernelRouteRule(ip); err != nil {
+				slog.Error("failed to ensure kernel route ip rule", "ip", ip, "error", err)
+				kernelOK = false
+			}
 		}
 		if needsFRR {
 			addFRR = append(addFRR, ip)
