@@ -3,7 +3,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "d
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOFLAGS   := -trimpath
 
-.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-cross-chassis-fip e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report e2e-chaos-random
+.PHONY: all build build-static build-integration clean fmt vet test test-integration install docs-gen docs-gen-check models-gen models-gen-check e2e-images e2e-pull-base-images e2e-up e2e-down e2e-install-tools e2e-baseline e2e-failover e2e-failover-strict e2e-hairpin e2e-hairpin-churn e2e-cross-chassis-fip e2e-multi-vlan e2e-pf-external e2e-pf-hairpin e2e-pf-split-owner e2e-stale-chassis e2e-drain-hitless e2e-chaos e2e-chaos-report e2e-chaos-random
 
 # Containerlab E2E harness. See test/e2e/README.md for the topology and
 # acceptance criteria (issue #44).
@@ -24,6 +24,7 @@ E2E_CHAOS       := go run ./test/e2e/chaos
 E2E_CHAOS_RANDOM := test/e2e/chaos-random.sh
 E2E_GWNODE_TAG  := ovn-network-agent/gwnode:e2e
 E2E_CENTRAL_TAG := ovn-network-agent/central:e2e
+E2E_PULL_BASE_IMAGES := test/e2e/pull-base-images.sh
 
 # Pinned containerlab release for CI and local installs. The sha256
 # values are the linux_{amd64,arm64}.deb lines from the upstream
@@ -117,9 +118,17 @@ models-gen-check: models-gen
 # the target works on hosts without the docker-buildx-plugin (which is
 # only required for multi-arch publication, documented in
 # docs/contributing/e2e-tests.md).
-e2e-images:
+#
+# The base images are pulled up front with retries (test/e2e/
+# pull-base-images.sh) because `docker build` gives up on the first
+# failed registry request while resolving `FROM` — one flaky connection
+# used to take the whole lab bring-up down with it.
+e2e-images: e2e-pull-base-images
 	docker build -f test/e2e/Dockerfile.central -t $(E2E_CENTRAL_TAG) .
 	docker build -f test/e2e/Dockerfile.gwnode  -t $(E2E_GWNODE_TAG)  .
+
+e2e-pull-base-images:
+	$(E2E_PULL_BASE_IMAGES) test/e2e/Dockerfile.central test/e2e/Dockerfile.gwnode
 
 # Install the containerlab CLI when it is missing. Linux/Debian only:
 # the pinned .deb (CONTAINERLAB_VERSION above) is downloaded and its
