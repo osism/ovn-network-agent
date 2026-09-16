@@ -270,6 +270,15 @@ make e2e-up    # build images + containerlab deploy + bootstrap
 make e2e-down  # containerlab destroy
 ```
 
+Before the images are built, `make e2e-images` pre-pulls their base
+images (`test/e2e/pull-base-images.sh`, derived from the `FROM` lines
+and `ARG` defaults of the two Dockerfiles) and retries transient
+registry errors with an exponential backoff. `docker build` itself
+aborts on the first failed registry request while resolving `FROM`, so
+without the pre-pull one flaky connection took the whole bring-up down.
+`E2E_PULL_ATTEMPTS` (default 5) and `E2E_PULL_BACKOFF` (initial wait in
+seconds, default 5) tune the retry loop.
+
 Between bring-up and teardown, each scenario is its own `make` target:
 
 | Scenario | `make` target | What it asserts | Issue |
