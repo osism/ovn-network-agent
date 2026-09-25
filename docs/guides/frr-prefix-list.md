@@ -66,6 +66,20 @@ permit-all.
 The agent only manages the prefix-list contents — it does not modify your BGP
 configuration.
 
+## Rename the list on a running agent
+
+Changing `frr_prefix_list` and reloading the agent (`systemctl reload
+ovn-network-agent`, see
+[Reload the configuration](./configuration#reload-the-configuration)) empties
+the previous list at once. The new list is filled by the reconcile that follows
+the reload. Update both BGP references (the neighbor outbound filter and the
+route-map `match`) to the new name and reload the agent in one step: whichever
+happens first, the node announces nothing through the list until the other has
+happened too.
+
+Setting the key to `""` on a reload also empties the previous list; the agent
+then stops managing prefix lists.
+
 ## Where to go next
 
 - [Configuration reference](../reference/configuration) — every flag, env

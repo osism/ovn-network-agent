@@ -40,10 +40,11 @@ Weigh these current constraints before planning a deployment:
   [gatewayless provider networks](./explanation/gatewayless-networks) and issues
   [#85](https://github.com/osism/ovn-network-agent/issues/85) /
   [#70](https://github.com/osism/ovn-network-agent/issues/70).
-- **No runtime configuration reload** — configuration is read once at startup
-  and there is no SIGHUP reload, so restart the agent to apply any change,
-  including the TLS certificate files for `ssl:` OVN remotes
-  ([#91](https://github.com/osism/ovn-network-agent/issues/91)).
+- **Partial runtime reload** — a SIGHUP (`systemctl reload`) applies the log
+  level, reconcile interval, FRR prefix-list name, stale-chassis grace period,
+  port forwards, shutdown and drain settings, and the OVN client certificate.
+  Every other key, including `ovn_ssl_ca`, needs a restart. See
+  [Reload the configuration](./guides/configuration#reload-the-configuration).
 - **Port forwarding is IPv4-only with modulo hashing** — multi-backend VIPs
   distribute clients with `jhash ip saddr mod N` over the backend count. This
   is sticky per client but not a consistent hash, so adding or removing a
