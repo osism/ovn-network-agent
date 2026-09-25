@@ -1792,7 +1792,10 @@ settle window took to reach its expected state), `violation` and
 multi-node fault carries the `peer` it also disrupted, and a decision that
 touched a named object (a route, a database server, an nftables table)
 carries it in `object` — so a run mixing all classes is triageable from the
-artifacts alone.
+artifacts alone. An `inject` of a fault that stops an agent (`agent-terminate`,
+`gateway-restart`, `config-flip`, `double-failover`) carries `drain`: whether
+the target ran with the drain on, as the settle oracle resolved it. It is
+absent when that could not be read.
 `summary.json` aggregates the run: inputs, tick and decision counts,
 actions by name, how many baseline sweeps ran and how many of them
 evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
@@ -1820,8 +1823,8 @@ dumped into `<out>/lab-state`.
 GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
 copy-pasteable replay line, the slowest recoveries against their
 budgets, per-probe loss totals, every loss window attributed to the
-fault whose inject→converged span it overlapped, the settle results,
-and the decisions the guardrails skipped:
+fault whose inject→converged span it overlapped, the planned restarts,
+the settle results, and the decisions the guardrails skipped:
 
 ```sh
 # A run directory (or its summary.json) written with -out:
@@ -1833,12 +1836,21 @@ make e2e-chaos-report CHAOS_RUN=/tmp/chaos-a
 make e2e-chaos-report CHAOS_RUN=https://github.com/osism/ovn-network-agent/actions/runs/<id>
 ```
 
+The **Planned restarts** section lists every `agent-terminate`,
+`gateway-restart` and `config-flip` with how it landed (`restart`,
+`reload`, or `rejected`), whether the target drained, and the longest loss
+window that overlapped it. Its summary line reads only the drained
+restarts off the workload host (`gateway-3`): restarting the workload host
+takes every workload down with it, drained or not, so those restarts can
+never be hitless. That line is where a drained restart is expected to stay
+under a second.
+
 The report's spine is `summary.json`; the `journal.jsonl` next to it
-adds what the record alone cannot say — the loss-window attribution and
-the skip reasons. Without a journal the report still renders, falling
-back to the record's 10-second loss buckets. Rendering exits `0` even
-for a run that recorded a failure: the report's exit code says whether
-the report could be produced, not what the run found.
+adds what the record alone cannot say — the loss-window attribution, the
+planned restarts and the skip reasons. Without a journal the report still
+renders, falling back to the record's 10-second loss buckets. Rendering
+exits `0` even for a run that recorded a failure: the report's exit code
+says whether the report could be produced, not what the run found.
 
 **In CI.** The runner has its own workflow,
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),

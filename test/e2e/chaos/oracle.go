@@ -110,13 +110,15 @@ func (o *oracle) drainEnvOf(ctx context.Context, gw string) (string, error) {
 
 // observeInject records, before a disruptive action injects, whether the
 // target could legitimately end at priority 0 — i.e. its drain is effectively
-// enabled. Only the actions that take a chassis down carry that meaning; the
-// rest leave the drain classification untouched.
-func (o *oracle) observeInject(ctx context.Context, action, target string) error {
+// enabled — and returns that drain, so the inject event can journal it. Only
+// the actions that take a chassis down carry that meaning; the rest leave the
+// drain classification untouched and return nil, as does a drain question
+// that could not be asked.
+func (o *oracle) observeInject(ctx context.Context, action, target string) (*bool, error) {
 	switch action {
 	case "agent-terminate", "gateway-restart", "config-flip", "double-failover":
 	default:
-		return nil
+		return nil, nil
 	}
 
 	drain, err := o.effectiveDrain(ctx, target)
@@ -127,7 +129,7 @@ func (o *oracle) observeInject(ctx context.Context, action, target string) error
 		// drain-while-disabled violation — the same "could not ask" split
 		// agentAlive and checkError make.
 		o.drainedLegit[target] = true
-		return err
+		return nil, err
 	}
 	o.drainedLegit[target] = drain
 
@@ -138,7 +140,7 @@ func (o *oracle) observeInject(ctx context.Context, action, target string) error
 	if action == "double-failover" {
 		o.drainedLegit[nextGateway(target)] = false
 	}
-	return nil
+	return &drain, nil
 }
 
 // effectiveDrain resolves the drain the target actually runs with. When the

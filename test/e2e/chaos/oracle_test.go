@@ -266,8 +266,12 @@ func TestDrainResidueIsAViolationOnlyWithoutADrainEnabledTermination(t *testing.
 	// After a drain-enabled termination of gateway-2 (marker present, so the
 	// config's drain wins), the same row is tolerated and the settle passes.
 	fx.marker["gateway-2"] = true
-	if err := o.observeInject(ctx, "agent-terminate", "gateway-2"); err != nil {
+	drain, err := o.observeInject(ctx, "agent-terminate", "gateway-2")
+	if err != nil {
 		t.Fatalf("observeInject: %v", err)
+	}
+	if drain == nil || !*drain {
+		t.Fatalf("observeInject returned drain %v for a drain-enabled termination, want true", drain)
 	}
 	v2, convergedMS := o.verify(ctx)
 	if len(v2) != 0 {
@@ -402,9 +406,12 @@ func TestObserveInjectToleratesAnUnanswerableDrainQuestion(t *testing.T) {
 	// A fresh priority-0 row appears for gateway-2 — drain residue on its face.
 	fx.extraGC = append(fx.extraGC, gcExtra{uuid: "gc-new", name: "lr0-public-extra", chassis: "gateway-2"})
 
-	err := o.observeInject(ctx, "agent-terminate", "gateway-2")
+	drain, err := o.observeInject(ctx, "agent-terminate", "gateway-2")
 	if err == nil {
 		t.Fatal("observeInject swallowed the unanswerable drain question instead of surfacing it")
+	}
+	if drain != nil {
+		t.Fatalf("observeInject answered drain %v to a question it could not ask", *drain)
 	}
 	v, convergedMS := o.verify(ctx)
 	if hasViolation(v, violationDrainDisabled, "gateway-2") {
@@ -433,8 +440,8 @@ func TestDrainToleranceExpiresWithTheSettleWindowThatConsumesIt(t *testing.T) {
 	// A drain-enabled termination of gateway-2, and the priority-0 row it
 	// legitimately leaves behind.
 	fx.marker["gateway-2"] = true
-	if err := o.observeInject(ctx, "agent-terminate", "gateway-2"); err != nil {
-		t.Fatalf("observeInject: %v", err)
+	if drain, err := o.observeInject(ctx, "agent-terminate", "gateway-2"); err != nil || drain == nil || !*drain {
+		t.Fatalf("observeInject = %v, %v; want drain true", drain, err)
 	}
 	fx.extraGC = append(fx.extraGC, gcExtra{uuid: "gc-new", name: "lr0-public-extra", chassis: "gateway-2"})
 

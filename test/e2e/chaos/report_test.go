@@ -392,3 +392,96 @@ func TestRunReportReportsAnEmptyActionsRun(t *testing.T) {
 		t.Fatalf("error = %v, want one saying the run held no record", err)
 	}
 }
+
+// plannedRestartEvents is a journal with one of each planned-restart shape
+// the report has to tell apart. The record around it ends at 19:03:30.
+func plannedRestartEvents() []event {
+	on, off, no, yes := boolPtr(true), boolPtr(false), boolPtr(false), boolPtr(true)
+	return []event{
+		// tick 1: a drained restart of gateway-1, with a short blip.
+		{TS: "2026-07-16T19:00:10Z", Event: evInject, Tick: 1, Action: "gateway-restart", Target: "gateway-1", Drain: on},
+		{TS: "2026-07-16T19:00:12Z", Event: evProbeTransition, Probe: "fip-vm2", Up: boolPtr(false)},
+		{TS: "2026-07-16T19:00:12.400Z", Event: evProbeTransition, Probe: "fip-vm2", Up: boolPtr(true)},
+		{TS: "2026-07-16T19:00:30Z", Event: evConverged, Tick: 1, Action: "gateway-restart", Target: "gateway-1"},
+		// tick 2: a reloading flip on gateway-2, lossless.
+		{TS: "2026-07-16T19:00:40Z", Event: evInject, Tick: 2, Action: "config-flip", Target: "gateway-2", Drain: on},
+		{TS: "2026-07-16T19:00:41Z", Event: evConfigFlip, Target: "gateway-2", Flip: "cadence-toggle", Mode: flipModeReload, Rejected: no},
+		{TS: "2026-07-16T19:00:45Z", Event: evConverged, Tick: 2, Action: "config-flip", Target: "gateway-2"},
+		// tick 3: a flip the agent refused.
+		{TS: "2026-07-16T19:00:50Z", Event: evInject, Tick: 3, Action: "config-flip", Target: "gateway-1", Drain: off},
+		{TS: "2026-07-16T19:00:51Z", Event: evConfigFlip, Target: "gateway-1", Flip: "cidr-toggle", Mode: flipModeRestart, Rejected: yes},
+		{TS: "2026-07-16T19:00:55Z", Event: evConverged, Tick: 3, Action: "config-flip", Target: "gateway-1"},
+		// tick 4: a flip journaled before flips could reload — no mode.
+		{TS: "2026-07-16T19:01:00Z", Event: evInject, Tick: 4, Action: "config-flip", Target: "gateway-2"},
+		{TS: "2026-07-16T19:01:01Z", Event: evConfigFlip, Target: "gateway-2", Flip: "drain-toggle", Rejected: no},
+		{TS: "2026-07-16T19:01:20Z", Event: evConverged, Tick: 4, Action: "config-flip", Target: "gateway-2"},
+		// tick 5: a drained terminate of the workload host: every workload down.
+		{TS: "2026-07-16T19:01:30Z", Event: evInject, Tick: 5, Action: "agent-terminate", Target: workloadHost, Drain: on},
+		{TS: "2026-07-16T19:01:32Z", Event: evProbeTransition, Probe: "fip-vm1", Up: boolPtr(false)},
+		{TS: "2026-07-16T19:01:43Z", Event: evProbeTransition, Probe: "fip-vm1", Up: boolPtr(true)},
+		{TS: "2026-07-16T19:02:00Z", Event: evConverged, Tick: 5, Action: "agent-terminate", Target: workloadHost},
+		// tick 6: an undrained restart that never converged, dark to the end.
+		{TS: "2026-07-16T19:02:10Z", Event: evInject, Tick: 6, Action: "gateway-restart", Target: "gateway-2", Drain: off},
+		{TS: "2026-07-16T19:02:12Z", Event: evProbeTransition, Probe: "fip-vm2", Up: boolPtr(false)},
+	}
+}
+
+func TestRenderReportSplitsPlannedRestartsByDrain(t *testing.T) {
+	t.Parallel()
+	out := renderToString(t, reportRecord(t), plannedRestartEvents())
+
+	for _, want := range []string{
+		"### Planned restarts",
+		"Drained restarts off the workload host: 1 · longest loss window 400 ms (fip-vm2)",
+		"| 1 | gateway-restart | gateway-1 | restart | on | 400 ms (fip-vm2) |",
+		"| 2 | config-flip | gateway-2 | reload | — | none |",
+		"| 3 | config-flip | gateway-1 | rejected | — | none |",
+		"| 4 | config-flip | gateway-2 | restart | — | none |",
+		"| 5 | agent-terminate | " + workloadHost + " (workload host) | restart | on | 11.0 s (fip-vm1) |",
+		"| 6 | gateway-restart | gateway-2 | restart | off | until run end (fip-vm2) |",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the Planned restarts section lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// The summary reads only drained restarts off the workload host; a run with
+// none says so rather than reporting a hitless run it never measured.
+func TestRenderReportSaysWhenNoDrainedRestartWasMeasured(t *testing.T) {
+	t.Parallel()
+	events := []event{
+		{TS: "2026-07-16T19:00:10Z", Event: evInject, Tick: 1, Action: "gateway-restart", Target: workloadHost, Drain: boolPtr(true)},
+		{TS: "2026-07-16T19:00:20Z", Event: evConverged, Tick: 1, Action: "gateway-restart", Target: workloadHost},
+		{TS: "2026-07-16T19:00:30Z", Event: evInject, Tick: 2, Action: "agent-terminate", Target: "gateway-1", Drain: boolPtr(false)},
+		{TS: "2026-07-16T19:00:40Z", Event: evConverged, Tick: 2, Action: "agent-terminate", Target: "gateway-1"},
+		// A flip that failed before it was journaled: no config-flip event
+		// follows its inject, so nothing says how — or whether — it landed.
+		{TS: "2026-07-16T19:00:50Z", Event: evInject, Tick: 3, Action: "config-flip", Target: "gateway-2", Drain: boolPtr(true)},
+		{TS: "2026-07-16T19:01:00Z", Event: evInject, Tick: 4, Action: "controller-restart", Target: "gateway-1"},
+	}
+
+	out := renderToString(t, reportRecord(t), events)
+
+	if !strings.Contains(out, "No drained restart off the workload host in this run.") {
+		t.Fatalf("a run without a drained restart off the workload host did not say so:\n%s", out)
+	}
+	if !strings.Contains(out, "| 3 | config-flip | gateway-2 | — | — | none |") {
+		t.Fatalf("a flip that never journaled how it landed was not shown as unknown:\n%s", out)
+	}
+}
+
+// Without a planned restart in the journal — or without a journal at all —
+// there is nothing to split, and the section stays out of the report.
+func TestRenderReportLeavesOutPlannedRestartsItNeverSaw(t *testing.T) {
+	t.Parallel()
+	withoutRestarts := []event{
+		{TS: "2026-07-16T19:00:30Z", Event: evInject, Tick: 1, Action: "frr-restart", Target: "gateway-2"},
+		{TS: "2026-07-16T19:00:40Z", Event: evConverged, Tick: 1, Action: "frr-restart", Target: "gateway-2"},
+	}
+	for name, events := range map[string][]event{"no planned restart": withoutRestarts, "no journal": nil} {
+		if out := renderToString(t, reportRecord(t), events); strings.Contains(out, "Planned restarts") {
+			t.Fatalf("%s: the report rendered a Planned restarts section:\n%s", name, out)
+		}
+	}
+}

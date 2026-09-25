@@ -507,22 +507,29 @@ func (e *engine) execute(ctx context.Context, d decision) {
 		e.setNodeState(n, nodeDisrupted)
 	}
 
-	injectedAt := e.now()
-	e.jrnl.emit(event{Event: evInject, Tick: d.tick, Action: d.action.name, Target: d.target, Peer: d.peer})
-	e.lastActionOffset = e.jrnl.count()
-
 	// Ask the oracle to record what this fault means for the drain
-	// classification before it lands. An error means the question could not
-	// be asked (docker under load, the container gone mid-inject); the oracle
-	// tolerates the residue rather than fabricating a violation, and here it
-	// is journaled — never fatal, mirroring checkError's "could not ask"
-	// philosophy.
+	// classification before it lands. The drain it resolved rides on the
+	// inject event, so a report can tell a drained restart from one that
+	// was not. An error means the question could not be asked (docker under
+	// load, the container gone mid-inject); the oracle tolerates the residue
+	// rather than fabricating a violation, the inject event carries no drain,
+	// and the error is journaled — never fatal, mirroring checkError's
+	// "could not ask" philosophy.
+	var drain *bool
 	if e.oracle != nil {
-		if err := e.oracle.observeInject(ctx, d.action.name, d.target); err != nil {
+		var err error
+		if drain, err = e.oracle.observeInject(ctx, d.action.name, d.target); err != nil {
 			e.jrnl.emit(event{Event: evCheckError, Tick: d.tick, Target: d.target,
 				Detail: "oracle drain classification: " + err.Error()})
 		}
 	}
+
+	injectedAt := e.now()
+	e.jrnl.emit(event{
+		Event: evInject, Tick: d.tick, Action: d.action.name,
+		Target: d.target, Peer: d.peer, Drain: drain,
+	})
+	e.lastActionOffset = e.jrnl.count()
 
 	if err := d.action.inject(ctx, e.lab, d.target, d.flip); err != nil {
 		e.undo(ctx, d, err)

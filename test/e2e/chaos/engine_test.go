@@ -1346,3 +1346,91 @@ func TestSettleViolationsCarryTheLastActionsJournalOffset(t *testing.T) {
 			got.JournalOffset, injectLine)
 	}
 }
+
+// injectDrains runs a short engine over agent-terminate faults, answering
+// through respond, and returns the drain every inject event carried: "on",
+// "off", or "" for an event without one. withOracle wires the config-aware
+// oracle over fx the way the runner does.
+func injectDrains(t *testing.T, fx *oracleLab, respond func([]string) (string, error), withOracle bool) []string {
+	t.Helper()
+	clock := newFakeClock()
+	lab := newTestLab(&fakeCommander{respond: respond}, clock)
+	var buf bytes.Buffer
+	rec := &runRecord{
+		Inputs: runInputs{
+			Seed: 42, DurationMS: (5 * time.Minute).Milliseconds(),
+			TickMinMS: (10 * time.Second).Milliseconds(), TickMaxMS: (30 * time.Second).Milliseconds(),
+			Lab: "ovn-e2e",
+		},
+		ActionsByName: map[string]int{},
+	}
+	e := newEngine(lab, defaultTestProfile(t), noopActions("agent-terminate"), greenProbes{},
+		newJournal(&buf, clock.now), rec)
+	e.wait, e.now = clock.wait, clock.now
+	if withOracle {
+		orc := newOracle(lab, oracleApplier(fullModeDocs(t)))
+		if err := orc.prime(context.Background()); err != nil {
+			t.Fatalf("prime the oracle: %v", err)
+		}
+		e.oracle = orc
+	}
+	e.run(context.Background())
+
+	var drains []string
+	for _, ev := range eventsIn(t, buf.String()) {
+		if ev.Event != evInject {
+			continue
+		}
+		switch {
+		case ev.Drain == nil:
+			drains = append(drains, "")
+		case *ev.Drain:
+			drains = append(drains, "on")
+		default:
+			drains = append(drains, "off")
+		}
+	}
+	if len(drains) == 0 {
+		t.Fatal("the run injected nothing")
+	}
+	return drains
+}
+
+// The inject event carries the drain the target ran with, so a report can
+// tell a drained restart from one that was not — and carries none when the
+// question could not be asked or nobody was there to ask it.
+func TestInjectEventCarriesTheEffectiveDrain(t *testing.T) {
+	drainOn := newOracleLab(t)
+	drainOn.drainEnv = "true" // no marker: the deploy-time env decides
+	failing := newOracleLab(t)
+	tests := []struct {
+		name       string
+		fx         *oracleLab
+		respond    func([]string) (string, error)
+		withOracle bool
+		want       string
+	}{
+		{"drain on", drainOn, drainOn.respond, true, "on"},
+		{"drain off", newOracleLab(t), nil, true, "off"},
+		{"the drain question fails", failing, func(argv []string) (string, error) {
+			if strings.Contains(strings.Join(argv, " "), "test -f "+profileMarkerPath) {
+				return "", errBoom
+			}
+			return failing.respond(argv)
+		}, true, ""},
+		{"no oracle", nil, healthyLabResponses, false, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			respond := tc.respond
+			if respond == nil {
+				respond = tc.fx.respond
+			}
+			for i, got := range injectDrains(t, tc.fx, respond, tc.withOracle) {
+				if got != tc.want {
+					t.Fatalf("inject %d carried drain %q, want %q", i, got, tc.want)
+				}
+			}
+		})
+	}
+}
