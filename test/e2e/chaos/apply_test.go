@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -391,4 +392,220 @@ func lastEventOf(t *testing.T, journal, name string) event {
 		t.Fatalf("no %s event was journaled: %s", name, journal)
 	}
 	return found
+}
+
+// reloadingLab answers like a lab whose agent reloads on SIGHUP: every
+// `kill -HUP 1` moves the reload counter named by verdict — "success",
+// "error", or "" for an agent that never gets to it — and the loopback
+// metrics scrape reports both counters.
+func reloadingLab(live, verdict string) func(argv []string) (string, error) {
+	hups := 0
+	return func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(line, "kill -HUP 1"):
+			hups++
+			return "", nil
+		case strings.Contains(line, "/dev/tcp/127.0.0.1/9273"):
+			ok, failed := 0, 0
+			switch verdict {
+			case "success":
+				ok = hups
+			case "error":
+				failed = hups
+			}
+			return fmt.Sprintf("ovn_network_agent_config_reload_total{outcome=\"error\"} %d\n"+
+				"ovn_network_agent_config_reload_total{outcome=\"success\"} %d\n", failed, ok), nil
+		}
+		return labWithConfig(live)(argv)
+	}
+}
+
+// flipOnto applies the default profile and returns the applier ready for a
+// flip, with the journal in buf and the commands issued so far counted.
+func flipOnto(t *testing.T, cmd *fakeCommander) (*applier, *bytes.Buffer, int) {
+	t.Helper()
+	a := newTestApplier(t, cmd, defaultProfileName)
+	var buf bytes.Buffer
+	a.jrnl = newJournal(&buf, newFakeClock().now)
+	if err := a.applyProfile(context.Background()); err != nil {
+		t.Fatalf("applyProfile: %v", err)
+	}
+	return a, &buf, len(cmd.lines())
+}
+
+// A flip the running agent applies in place goes on with a SIGHUP, not a
+// restart: validate, read the reload counters, swap, SIGHUP, and take the
+// counter that moved as the agent's verdict. The marker stays as it was —
+// no container start means the environment the agent started with stands.
+func TestFlipReloadsWhatTheAgentReloadsInPlace(t *testing.T) {
+	cmd := &fakeCommander{respond: reloadingLab(string(baseConfig(t)), "success")}
+	a, buf, before := flipOnto(t, cmd)
+
+	if err := a.flip(context.Background(), "gateway-2", flipIndex(t, "cadence-toggle")); err != nil {
+		t.Fatalf("flip: %v", err)
+	}
+
+	flipped := cmd.lines()[before:]
+	last := -1
+	for _, step := range []string{
+		"--check-config", "/dev/tcp/127.0.0.1/9273", "mv " + agentConfigNextPath,
+		"docker exec clab-ovn-e2e-gateway-2 kill -HUP 1", "/dev/tcp/127.0.0.1/9273",
+	} {
+		at := -1
+		for i, line := range flipped {
+			if i > last && strings.Contains(line, step) {
+				at = i
+				break
+			}
+		}
+		if at < 0 {
+			t.Fatalf("the reload never issued %q, or issued it out of order: %v", step, flipped)
+		}
+		last = at
+	}
+	for _, line := range flipped {
+		if strings.Contains(line, profileMarkerPath) || strings.Contains(line, restartCmd) ||
+			strings.Contains(line, "docker start") {
+			t.Fatalf("a reloading flip touched the marker or restarted the node: %q", line)
+		}
+	}
+	if got := a.current["gateway-2"]["reconcile_interval"]; got != slowCadence {
+		t.Fatalf("the tracker did not follow the reload: reconcile_interval = %v", got)
+	}
+	if a.restartedByFlip("gateway-2") {
+		t.Fatal("a reload was recorded as a restart — the restore would re-wire a live gateway")
+	}
+	ev := lastEventOf(t, buf.String(), evConfigFlip)
+	if ev.Mode != flipModeReload || ev.Rejected == nil || *ev.Rejected {
+		t.Fatalf("journaled %+v, want an applied reload", ev)
+	}
+}
+
+// The agent validates the *merged* configuration a reload produces, so it
+// can refuse one the file-level check passed. It then keeps running what
+// it ran; the previous file goes back so the next restart does not pick up
+// what the agent refused, and the flip is journaled as rejected.
+func TestFlipReloadRefusedByTheAgentPutsThePreviousFileBack(t *testing.T) {
+	cmd := &fakeCommander{respond: reloadingLab(string(baseConfig(t)), "error")}
+	a, buf, before := flipOnto(t, cmd)
+
+	if err := a.flip(context.Background(), "gateway-2", flipIndex(t, "cadence-toggle")); err != nil {
+		t.Fatalf("a refused reload failed the run: %v", err)
+	}
+
+	hup := -1
+	restored := -1
+	for i, line := range cmd.lines()[before:] {
+		switch {
+		case strings.Contains(line, "kill -HUP 1"):
+			hup = i
+		case strings.Contains(line, "> "+agentConfigPath) && strings.Contains(line, "reconcile_interval: "+fastCadence):
+			restored = i
+		}
+	}
+	if hup < 0 || restored < hup {
+		t.Fatalf("the previous config was not written back after the refused reload: %v", cmd.lines()[before:])
+	}
+	if got := a.current["gateway-2"]["reconcile_interval"]; got != fastCadence {
+		t.Fatalf("the tracker kept a config the agent refused: reconcile_interval = %v", got)
+	}
+	ev := lastEventOf(t, buf.String(), evConfigFlip)
+	if ev.Mode != flipModeReload || ev.Rejected == nil || !*ev.Rejected || ev.Detail == "" {
+		t.Fatalf("journaled %+v, want the reload recorded as rejected, with a reason", ev)
+	}
+}
+
+// An agent that never reports a verdict on the SIGHUP is a failed action,
+// not a silent success: the file and the running agent may now disagree.
+func TestFlipReloadTimesOutWhenTheAgentNeverAnswers(t *testing.T) {
+	cmd := &fakeCommander{respond: reloadingLab(string(baseConfig(t)), "")}
+	a, _, _ := flipOnto(t, cmd)
+
+	err := a.flip(context.Background(), "gateway-2", flipIndex(t, "cadence-toggle"))
+
+	if err == nil || !strings.Contains(err.Error(), "gateway-2") ||
+		!strings.Contains(err.Error(), "did not report a configuration reload") {
+		t.Fatalf("flip returned %v, want the reload timeout naming the gateway", err)
+	}
+}
+
+// Without the counters' starting values no verdict can be read, so the
+// flip stops before anything live is touched.
+func TestFlipReloadNeedsItsBaselineCounters(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "/dev/tcp/127.0.0.1/9273") {
+			return "", errBoom
+		}
+		return labWithConfig(string(baseConfig(t)))(argv)
+	}}
+	a, _, before := flipOnto(t, cmd)
+
+	err := a.flip(context.Background(), "gateway-2", flipIndex(t, "cadence-toggle"))
+
+	if err == nil || !strings.Contains(err.Error(), "read the reload counters on gateway-2") {
+		t.Fatalf("flip returned %v, want the failed counter read", err)
+	}
+	for _, line := range cmd.lines()[before:] {
+		if strings.Contains(line, "mv "+agentConfigNextPath) {
+			t.Fatalf("the config was swapped although no verdict could be read: %q", line)
+		}
+	}
+}
+
+// The flips a running agent cannot apply in place keep the restart path:
+// marker, swap, planned restart — and the restore has a node to put back.
+func TestFlipsThatNeedARestartStillRestart(t *testing.T) {
+	for _, name := range []string{"drain-toggle", "cidr-toggle"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := &fakeCommander{respond: reloadingLab(string(baseConfig(t)), "success")}
+			a, buf, before := flipOnto(t, cmd)
+
+			if err := a.flip(context.Background(), "gateway-1", flipIndex(t, name)); err != nil {
+				t.Fatalf("flip: %v", err)
+			}
+
+			flipped := strings.Join(cmd.lines()[before:], "\n")
+			for _, step := range []string{profileMarkerPath, "mv " + agentConfigNextPath, restartCmd, "docker start"} {
+				if !strings.Contains(flipped, step) {
+					t.Fatalf("%s never issued %q: %s", name, step, flipped)
+				}
+			}
+			if strings.Contains(flipped, "kill -HUP 1") {
+				t.Fatalf("%s sent a SIGHUP the agent cannot apply", name)
+			}
+			if !a.restartedByFlip("gateway-1") {
+				t.Fatalf("%s restarted the node but did not record it", name)
+			}
+			if ev := lastEventOf(t, buf.String(), evConfigFlip); ev.Mode != flipModeRestart {
+				t.Fatalf("journaled %+v, want mode %q", ev, flipModeRestart)
+			}
+		})
+	}
+}
+
+// The reload counters are read off the metrics scrape; a scrape without
+// them — an agent that never reloaded, or an empty answer — reads as zero.
+func TestParseMetricsReadsTheReloadCounters(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		ok, failed int
+	}{
+		{"empty body", "", 0, 0},
+		{"no reload series", "ovn_network_agent_inactive_routes 0\n", 0, 0},
+		{"both series", "# TYPE ovn_network_agent_config_reload_total counter\n" +
+			"ovn_network_agent_config_reload_total{outcome=\"error\"} 1\n" +
+			"ovn_network_agent_config_reload_total{outcome=\"success\"} 3\n", 3, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := parseMetrics(tc.body)
+			if m.configReloadSuccess != tc.ok || m.configReloadError != tc.failed {
+				t.Fatalf("reload counters = %d/%d, want %d/%d",
+					m.configReloadSuccess, m.configReloadError, tc.ok, tc.failed)
+			}
+		})
+	}
 }

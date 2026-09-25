@@ -212,6 +212,15 @@ func (l *lab) terminateAgent(ctx context.Context, gw string) error {
 	return nil
 }
 
+// reloadAgent sends SIGHUP through PID 1 — tini forwards it to the agent,
+// which reloads its configuration file in place (reload.go).
+func (l *lab) reloadAgent(ctx context.Context, gw string) error {
+	if _, err := l.exec(ctx, gw, "kill", "-HUP", "1"); err != nil {
+		return fmt.Errorf("reload agent on %s: %w", gw, err)
+	}
+	return nil
+}
+
 func (l *lab) startGateway(ctx context.Context, gw string) error {
 	if _, err := l.docker(ctx, "start", l.node(gw)); err != nil {
 		return fmt.Errorf("start %s: %w", gw, err)

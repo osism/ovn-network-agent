@@ -481,3 +481,44 @@ func TestAnApplierWithoutAProfileSkipsEveryFlip(t *testing.T) {
 		}
 	}
 }
+
+// The config-flip restore puts back only a node the flip restarted. After
+// a reload or a rejected flip the gateway never went down, and re-wiring it
+// would take its underlay link and BGP session down for nothing.
+func TestConfigFlipRestoresOnlyANodeTheFlipRestarted(t *testing.T) {
+	tests := []struct {
+		name        string
+		flip        string
+		verdict     string
+		wantRestore bool
+	}{
+		{name: "a reload", flip: "cadence-toggle", verdict: "success"},
+		{name: "a refused reload", flip: "cadence-toggle", verdict: "error"},
+		{name: "a restart", flip: "drain-toggle", verdict: "success", wantRestore: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &fakeCommander{respond: reloadingLab(string(baseConfig(t)), tc.verdict)}
+			a, _, _ := flipOnto(t, cmd)
+			act := actionFromRegistry(t,
+				allActions(a.profile, a.lab, a, newChurner(a.lab)), "config-flip")
+
+			if err := act.inject(context.Background(), a.lab, "gateway-1", flipIndex(t, tc.flip)); err != nil {
+				t.Fatalf("inject: %v", err)
+			}
+			before := len(cmd.lines())
+			if err := act.restore(context.Background(), a.lab, "gateway-1"); err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+
+			restored := cmd.lines()[before:]
+			rewired := strings.Contains(strings.Join(restored, "\n"), "containerlab tools veth create")
+			if rewired != tc.wantRestore {
+				t.Fatalf("after %s the restore re-wired = %v, want %v: %v", tc.name, rewired, tc.wantRestore, restored)
+			}
+			if !tc.wantRestore && len(restored) != 0 {
+				t.Fatalf("after %s the restore touched a live gateway: %v", tc.name, restored)
+			}
+		})
+	}
+}

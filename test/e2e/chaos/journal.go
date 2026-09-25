@@ -63,6 +63,7 @@ type event struct {
 	From        string           `json:"from,omitempty"`
 	To          string           `json:"to,omitempty"`
 	Rejected    *bool            `json:"rejected,omitempty"`
+	Mode        string           `json:"mode,omitempty"`
 	Probe       string           `json:"probe,omitempty"`
 	Up          *bool            `json:"up,omitempty"`
 	State       string           `json:"state,omitempty"`

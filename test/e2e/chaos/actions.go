@@ -95,11 +95,12 @@ func starterActions(p *profile) []*action {
 // seed still replays the sequence it recorded.
 //
 // config-flip is the operational fault the other four cannot express: a
-// gateway is reconfigured and restarted onto the new configuration while
-// the lab is under load, the way a rollout, a tuning change or an
-// emergency flag flip actually reaches production. Its restart is the
-// fault and its own undo, so like gateway-restart it holds nothing and
-// pays the full container-lifecycle recovery budget.
+// gateway is reconfigured while the lab is under load — reloaded onto the
+// new configuration when the agent applies it in place, restarted onto it
+// when it does not — the way a rollout, a tuning change or an emergency
+// flag flip actually reaches production. The change is the fault and its
+// own undo, so like gateway-restart it holds nothing and keeps the full
+// container-lifecycle recovery budget for the flips that restart.
 func allActions(p *profile, l *lab, ap *applier, ch *churner) []*action {
 	actions := append(starterActions(p), &action{
 		name:           "config-flip",
@@ -112,7 +113,13 @@ func allActions(p *profile, l *lab, ap *applier, ch *churner) []*action {
 		inject: func(ctx context.Context, _ *lab, gw string, flip int) error {
 			return ap.flip(ctx, gw, flip)
 		},
+		// Only a flip that restarted the node has anything to restore: a
+		// reload or a rejected flip leaves it running, and re-wiring a live
+		// gateway would take its underlay link and BGP session down.
 		restore: func(ctx context.Context, l *lab, gw string) error {
+			if !ap.restartedByFlip(gw) {
+				return nil
+			}
 			return restoreNode(ctx, l, p, gw)
 		},
 	})
