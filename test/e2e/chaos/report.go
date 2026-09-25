@@ -238,6 +238,7 @@ func renderReport(w *mdWriter, rec *runRecord, events []event, source string) {
 	renderRecoveries(w, rec)
 	renderProbes(w, rec)
 	renderLoss(w, rec, events, start, end)
+	renderPlannedRestarts(w, events, end)
 	renderSettles(w, rec)
 	renderSkipped(w, events)
 	renderInputs(w, rec)
@@ -394,6 +395,172 @@ func renderLoss(w *mdWriter, rec *runRecord, events []event, start, end time.Tim
 			offsetMS(r.offsetMS), offsetMS(r.offsetMS+10_000), cell(r.probe), r.lost, r.sent)
 	}
 	w.printf("\n")
+}
+
+// renderPlannedRestarts answers "was a planned restart hitless": one row per
+// agent-terminate, gateway-restart and config-flip, with how the change
+// landed, whether the target drained, and the longest loss window that
+// overlapped it. The summary line reads only the drained restarts off the
+// workload host: restarting the workload host takes every workload down with
+// it, drained or not, so no drain can make that one hitless.
+func renderPlannedRestarts(w *mdWriter, events []event, end time.Time) {
+	rows := plannedRestarts(events, end)
+	if len(rows) == 0 {
+		return
+	}
+	drained := 0
+	var worst *plannedRestart
+	for i := range rows {
+		r := &rows[i]
+		if !r.drained() || r.target == workloadHost {
+			continue
+		}
+		drained++
+		if r.longest.probe != "" && (worst == nil || r.longestMS > worst.longestMS) {
+			worst = r
+		}
+	}
+
+	w.printf("### Planned restarts\n\n")
+	switch {
+	case drained == 0:
+		w.printf("No drained restart off the workload host in this run.\n\n")
+	case worst == nil:
+		w.printf("Drained restarts off the workload host: %d · longest loss window none\n\n", drained)
+	default:
+		w.printf("Drained restarts off the workload host: %d · longest loss window %s\n\n",
+			drained, worst.lossCell())
+	}
+	w.printf("| tick | action | target | mode | drain | longest loss window |\n")
+	w.printf("| --- | --- | --- | --- | --- | --- |\n")
+	for _, r := range rows {
+		target := r.target
+		if target == workloadHost {
+			target += " (workload host)"
+		}
+		w.printf("| %d | %s | %s | %s | %s | %s |\n",
+			r.tick, cell(r.action), cell(target), orDashS(r.mode), r.drainCell(), cell(r.lossCell()))
+	}
+	w.printf("\n")
+}
+
+// plannedRestartActions are the faults that stand for a restart an operator
+// makes on purpose: a maintenance stop, a restart, a rollout.
+var plannedRestartActions = map[string]bool{
+	"agent-terminate": true, "gateway-restart": true, "config-flip": true,
+}
+
+// plannedRestart is one planned-restart fault and what the journal says
+// about it.
+type plannedRestart struct {
+	tick           int
+	action, target string
+	// mode is how the change landed: restart, reload, rejected, or empty
+	// for a config-flip that failed before it was journaled.
+	mode        string
+	drain       *bool
+	inject, end time.Time
+	// longest is the longest loss window overlapping inject→end; a zero
+	// probe means none did.
+	longest   lossSpan
+	longestMS int64
+}
+
+// drained reports whether the row is a restart that ran with the drain on.
+func (r plannedRestart) drained() bool {
+	return r.mode == flipModeRestart && r.drain != nil && *r.drain
+}
+
+func (r plannedRestart) drainCell() string {
+	switch {
+	case r.drain == nil || r.mode != flipModeRestart:
+		return "—"
+	case *r.drain:
+		return "on"
+	default:
+		return "off"
+	}
+}
+
+func (r plannedRestart) lossCell() string {
+	switch {
+	case r.longest.probe == "":
+		return "none"
+	case r.longest.end.IsZero():
+		return "until run end (" + r.longest.probe + ")"
+	default:
+		return fmt.Sprintf("%s (%s)", fmtMS(r.longestMS), r.longest.probe)
+	}
+}
+
+// plannedRestarts pairs every planned-restart inject with its converged
+// event, the config-flip event that says how a flip landed — the first one
+// for the same target before the next inject — and the loss windows that
+// overlapped it. A tick that never converged runs to the end of the run.
+func plannedRestarts(events []event, runEnd time.Time) []plannedRestart {
+	var rows []plannedRestart
+	byTick := map[int]int{}
+	pendingFlip := -1
+	for _, ev := range events {
+		ts, ok := parseTS(ev.TS)
+		if !ok {
+			continue
+		}
+		switch ev.Event {
+		case evInject:
+			pendingFlip = -1
+			if !plannedRestartActions[ev.Action] {
+				continue
+			}
+			row := plannedRestart{tick: ev.Tick, action: ev.Action, target: ev.Target, drain: ev.Drain, inject: ts}
+			if ev.Action == "config-flip" {
+				pendingFlip = len(rows)
+			} else {
+				row.mode = flipModeRestart
+			}
+			byTick[ev.Tick] = len(rows)
+			rows = append(rows, row)
+		case evConfigFlip:
+			if pendingFlip < 0 || rows[pendingFlip].target != ev.Target {
+				continue
+			}
+			switch {
+			case ev.Rejected != nil && *ev.Rejected:
+				rows[pendingFlip].mode = "rejected"
+			case ev.Mode == "":
+				// Journaled before flips could reload: every one restarted.
+				rows[pendingFlip].mode = flipModeRestart
+			default:
+				rows[pendingFlip].mode = ev.Mode
+			}
+			pendingFlip = -1
+		case evConverged:
+			if i, seen := byTick[ev.Tick]; seen {
+				rows[i].end = ts
+			}
+		}
+	}
+
+	spans := lossSpans(events)
+	for i := range rows {
+		r := &rows[i]
+		if r.end.IsZero() {
+			r.end = runEnd
+		}
+		for _, s := range spans {
+			spanEnd := s.end
+			if spanEnd.IsZero() {
+				spanEnd = runEnd
+			}
+			if !s.start.Before(r.end) || !spanEnd.After(r.inject) {
+				continue
+			}
+			if ms := spanEnd.Sub(s.start).Milliseconds(); r.longest.probe == "" || ms > r.longestMS {
+				r.longest, r.longestMS = s, ms
+			}
+		}
+	}
+	return rows
 }
 
 func renderSettles(w *mdWriter, rec *runRecord) {
