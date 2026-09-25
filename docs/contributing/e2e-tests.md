@@ -284,7 +284,7 @@ Between bring-up and teardown, each scenario is its own `make` target:
 | Scenario | `make` target | What it asserts | Issue |
 | --- | --- | --- | --- |
 | [Baseline](#baseline) | `e2e-baseline` | An external client reaches a FIP once the agent reconciles. | [#45](https://github.com/osism/ovn-network-agent/issues/45) |
-| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of six agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, no gateway port is claimed twice, and the lab converges to its config-aware expected state in settle windows. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177), [#179](https://github.com/osism/ovn-network-agent/issues/179) |
+| [Chaos runner](#chaos-runner) | `e2e-chaos` | Under a seeded, randomized fault sequence — in any of seven agent [configuration profiles](#configuration-profiles) — the agents stay alive, reachability recovers within budget, no gateway port is claimed twice, and the lab converges to its config-aware expected state in settle windows. | [#176](https://github.com/osism/ovn-network-agent/issues/176), [#177](https://github.com/osism/ovn-network-agent/issues/177), [#179](https://github.com/osism/ovn-network-agent/issues/179) |
 | [Cross-chassis FIP-to-FIP](#cross-chassis-fip-to-fip) | `e2e-cross-chassis-fip` | A FIP behind a router on one gateway reaches a FIP behind a router on another gateway through both kernels' veth paths. | [#265](https://github.com/osism/ovn-network-agent/issues/265) |
 | [Drain-hitless](#drain-hitless) | `e2e-drain-hitless` | A graceful `SIGTERM` drain loses fewer packets than a hard `docker kill` of the same chassis. | [#113](https://github.com/osism/ovn-network-agent/issues/113) |
 | [Failover](#failover) | `e2e-failover` | `cr-lr0-public` re-elects to a surviving chassis after the master is lost. | [#105](https://github.com/osism/ovn-network-agent/issues/105) |
@@ -1305,10 +1305,23 @@ The set is curated, not combinatorial:
 | `vlan-no-dnat` | hairpin + VLAN + cross-chassis | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip`, `cross-fip` |
 | `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
 | `heterogeneous` | hairpin + VLAN + port-forward + cross-chassis | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` + `cross-fip` |
+| `drain-everywhere` | hairpin + VLAN + cross-chassis | `drain_on_shutdown: true` on every gateway | `fip-vm1`, `fip-vm2`, `hairpin-fip` |
 
 `pf-only` and `flat-minimal` carry neither same-node target: `pf-only`
 has no OVN connection, so the agent manages no FIP path at all, and
 `flat-minimal` puts up no hairpin layer.
+
+`drain-everywhere` runs the drain on every gateway, as production does by
+default, and is the profile whose planned restarts the report's Planned
+restarts section is about. It probes only the paths a drain can keep up:
+the three that ride `lr0`, whose port has a `Gateway_Chassis` on every
+gateway. The VLAN and cross-chassis layers stay up without their probes.
+Their routers have a single gateway chassis each (`gateway-1` and
+`gateway-2`), so a restart of that chassis darkens their FIPs whatever the
+drain does, while the drain itself has to skip their ports rather than
+wait them out. The port-forward layer stays off, because the runner
+re-points `pf-vip`'s route only after a restore, so a drain that moves the
+master would leave it dark regardless of the agent.
 
 The **API VIP** (`192.0.2.80:8080`) is the agent's own DNAT path, as
 opposed to `pf-vip`, which is an OVN `Load_Balancer`. Its backend is a
@@ -1832,7 +1845,7 @@ make e2e-chaos-report CHAOS_RUN=/tmp/chaos-a
 
 # An Actions run URL — fetches the artifacts with `gh run download`
 # (so `gh` must be installed and authenticated) and renders every
-# chaos record the run uploaded, e.g. all six nightly profiles:
+# chaos record the run uploaded, e.g. all seven nightly profiles:
 make e2e-chaos-report CHAOS_RUN=https://github.com/osism/ovn-network-agent/actions/runs/<id>
 ```
 
@@ -1854,7 +1867,7 @@ says whether the report could be produced, not what the run found.
 
 **In CI.** The runner has its own workflow,
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
-on three triggers. Nightly it fans out as a matrix over all six curated
+on three triggers. Nightly it fans out as a matrix over all seven curated
 profiles, one job per profile at the default 10-minute window, with the
 seed set to the run id so each night is a different — and, because the
 runner records it, replayable — fault sequence. `workflow_dispatch`

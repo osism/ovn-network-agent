@@ -60,6 +60,14 @@ so a fix merged in the evening first shows in the next morning's run.
   holds are harness-side sweep noise, not agent regressions.
 - Actions whose median worst downtime is 0 with occasional small `after`
   loss windows (route drops, churn, pauses) are healthy.
+- Planned restarts (`agent-terminate`, `gateway-restart`, `config-flip`)
+  are read from the `drain-everywhere` profile's run report, whose
+  Planned restarts section splits them by drain and by how a flip landed
+  (reload or restart). `analyze.py`'s per-action rows pool drained and
+  undrained events. A restart of `gateway-3`, the workload host, darkens
+  every probe regardless of the drain, and the VLAN FIPs and `cross-fip`
+  go dark on a restart of their router's only chassis (`gateway-1`,
+  `gateway-2`).
 
 ## 4. Known-good baseline (2026-07-30, runs 30288259170..30518214683)
 

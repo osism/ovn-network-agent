@@ -15,11 +15,12 @@ import (
 // seed together determine a run, so the profile is part of the
 // reproducibility contract and is journaled alongside the seed.
 //
-// The set below is curated rather than combinatorial: six configurations
+// The set below is curated rather than combinatorial: seven configurations
 // that each change what the agent actually has to do — no VLAN provider
 // networks, DNAT on an API VIP, no OVN connection at all, gateways
-// running different configurations mid-rollout — instead of every product
-// of the agent's behaviour-changing options.
+// running different configurations mid-rollout, every gateway draining on
+// shutdown — instead of every product of the agent's behaviour-changing
+// options.
 
 const (
 	// defaultProfileName keeps today's chaos run: every topology layer
@@ -309,6 +310,31 @@ func profiles() []*profile {
 				},
 			},
 			probes: append(append([]probeTarget{}, defaultProbes...), probeAPIVIP, probeHairpinVIP),
+		},
+		{
+			// The drain on every gateway, as production runs it
+			// (drain_on_shutdown defaults to true): the profile that
+			// shows whether a planned restart is hitless. It probes only
+			// paths a drain can keep up — the three that ride lr0, whose
+			// port has a Gateway_Chassis on every gateway.
+			//
+			// The VLAN and cross-chassis layers stay up but unprobed:
+			// their routers have one gateway chassis each (gateway-1,
+			// gateway-2), so every drained restart of those gateways
+			// meets a port with no standby, which the drain must skip
+			// rather than wait out — and a restart of that one chassis
+			// darkens their FIPs whatever the drain does. The
+			// port-forward layer stays off: the harness re-points
+			// pf-vip's upstream route only after a restore
+			// (followMaster), so a drain that moves the master leaves it
+			// dark however well the agent behaves.
+			name:         "drain-everywhere",
+			description:  "every gateway drains on shutdown; probes only paths with a standby chassis",
+			hairpin:      true,
+			vlans:        true,
+			crossChassis: true,
+			gateways:     everyGateway(gwConfig{drainOnShutdown: true}),
+			probes:       []probeTarget{probeVM1, probeVM2, probeHairpinFIP},
 		},
 	}
 }

@@ -43,7 +43,7 @@ func render(t *testing.T, c gwConfig, mgmtIP string) map[string]any {
 func TestProfileRegistryNamesTheCuratedSet(t *testing.T) {
 	want := []string{
 		"everything-on", "flat-minimal", "flat-dnat",
-		"vlan-no-dnat", "pf-only", "heterogeneous",
+		"vlan-no-dnat", "pf-only", "heterogeneous", "drain-everywhere",
 	}
 
 	var got []string
@@ -242,11 +242,13 @@ func TestHairpinVIPNeverAppearsWithoutItsBackend(t *testing.T) {
 func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
 	wantFIP := map[string]bool{
 		"everything-on": true, "flat-dnat": true,
-		"vlan-no-dnat": true, "heterogeneous": true,
+		"vlan-no-dnat": true, "heterogeneous": true, "drain-everywhere": true,
 	}
 	wantVIP := map[string]bool{"flat-dnat": true, "heterogeneous": true}
 	// The cross-chassis probe rides every profile that puts the hairpin
-	// layer up: both need OVN and a second router beside lr0 (#265).
+	// layer up: both need OVN and a second router beside lr0 (#265) —
+	// except drain-everywhere, whose restarts of gateway-2 would darken it
+	// by construction: lr1 has no standby.
 	wantCross := map[string]bool{
 		"everything-on": true, "flat-dnat": true,
 		"vlan-no-dnat": true, "heterogeneous": true,
@@ -331,6 +333,33 @@ func TestHeterogeneousProfileRendersOneConfigPerGateway(t *testing.T) {
 
 	if got := strings.Join(p.apiVIPGateways(), ","); got != "gateway-1,gateway-2" {
 		t.Fatalf("apiVIPGateways = %v, want exactly the gateways whose configs carry the VIP", got)
+	}
+}
+
+// drain-everywhere puts the drain on every gateway and measures only the
+// paths a drain can keep up: the three that ride lr0, whose port has a
+// standby on every gateway. A probe behind a router with no standby, or
+// behind the harness-plumbed pf-vip route, would read the lab's topology
+// as the agent's loss.
+func TestDrainEverywhereDrainsEveryGatewayAndProbesOnlyStandbyPaths(t *testing.T) {
+	p, err := profileByName("drain-everywhere")
+	if err != nil {
+		t.Fatalf("profileByName: %v", err)
+	}
+	for _, gw := range gatewayNames() {
+		if doc := render(t, p.gwConfig(gw), "172.20.20.4"); doc["drain_on_shutdown"] != true {
+			t.Fatalf("%s = %v, want drain_on_shutdown: true", gw, doc)
+		}
+	}
+	var got []string
+	for _, target := range p.probes {
+		got = append(got, target.name)
+	}
+	if want := "fip-vm1,fip-vm2,hairpin-fip"; strings.Join(got, ",") != want {
+		t.Fatalf("drain-everywhere probes %v, want %s", got, want)
+	}
+	if !p.vlans || !p.crossChassis || p.ovnLB {
+		t.Fatalf("drain-everywhere layers = %+v, want the VLAN and cross-chassis layers up and the port-forward layer off", p)
 	}
 }
 
