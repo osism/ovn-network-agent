@@ -325,8 +325,10 @@ func TestScenario_DrainOnShutdown(t *testing.T) {
 	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
 		Name:        "drain",
 		LRPNetworks: []string{"198.51.100.11/24"},
+		// The drain only touches a port that has a standby to fail over to.
 		GatewayChassis: []testenv.GatewayChassisEntry{
 			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+			{ChassisName: "drain-peer", Priority: 1},
 		},
 	})
 

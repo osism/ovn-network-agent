@@ -80,13 +80,17 @@ releases early, just slower). If you need faster drains during the
 upgrade window, temporarily lower `drain_timeout` or set
 `drain_settle_delay: 0`.
 
+## Routers without a standby
+
+A router port whose only `Gateway_Chassis` entry is this chassis cannot fail
+over: OVN has nowhere to move it. The drain leaves such a port alone. It does
+not lower its priority and does not wait for it to migrate, and logs
+`drain: skipping gateway chassis with no standby` for each one. Non-HA routers,
+and every router of a single-chassis deployment, therefore never delay the
+shutdown; their traffic stops when the node goes down, drained or not.
+
 ## When to disable drain
 
-- **Single-chassis deployments** — if there is no standby chassis, lowering
-  the priority has no effect and the timeout just delays shutdown.
-- **Non-HA routers** — routers without multiple `Gateway_Chassis` entries
-  cannot fail over; drain is a no-op (the agent detects this and skips
-  immediately).
 - **Environments where Neutron manages priorities** — if an external system
   actively manages `Gateway_Chassis` priorities and would conflict with the
   agent's changes.
