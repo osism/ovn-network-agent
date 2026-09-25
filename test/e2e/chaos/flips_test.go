@@ -19,7 +19,7 @@ func TestFlipWhitelistOrderIsStable(t *testing.T) {
 		if i >= len(want) || f.name != want[i] {
 			t.Fatalf("flip %d = %q, want %q", i, f.name, want)
 		}
-		if f.applicable == nil || f.apply == nil {
+		if f.applicable == nil || f.apply == nil || f.reloadable == nil {
 			t.Fatalf("flip %s is not fully declared", f.name)
 		}
 		if flipName(i) != want[i] {
@@ -116,6 +116,54 @@ func TestInapplicableFlips(t *testing.T) {
 			t.Parallel()
 			if flipNamed(t, tc.flip).applicable(flipContext(t, tc.profile, tc.gw)) {
 				t.Fatalf("%s was applicable even though %s", tc.flip, tc.reason)
+			}
+		})
+	}
+}
+
+// A flip reloads exactly when the running agent applies it on SIGHUP
+// (reloadableKeys in reload.go). A flip classified wrong either restarts a
+// gateway for nothing, or sends a SIGHUP whose change the agent keeps at
+// its running value — the file and the running agent would then disagree.
+func TestFlipReloadClassification(t *testing.T) {
+	withOnlyTheFlipVIP := func(t *testing.T) flipCtx {
+		c := flipContext(t, defaultProfileName, "gateway-1")
+		flipNamed(t, "pf-rule-toggle").apply(c) // no port_forwards → only the flip VIP
+		return c
+	}
+	withTheFlipVIPBesideTheAPIVIP := func(t *testing.T) flipCtx {
+		c := flipContext(t, "flat-dnat", "gateway-1")
+		flipNamed(t, "pf-rule-toggle").apply(c)
+		return c
+	}
+	tests := []struct {
+		name string
+		flip string
+		ctx  func(*testing.T) flipCtx
+		want bool
+	}{
+		{"drain-toggle restarts, the env override lives in the running agent", "drain-toggle",
+			func(t *testing.T) flipCtx { return flipContext(t, "flat-dnat", "gateway-1") }, false},
+		{"masquerade-toggle reloads, the API VIP keeps port_forwards non-empty", "masquerade-toggle",
+			func(t *testing.T) flipCtx { return flipContext(t, "flat-dnat", "gateway-1") }, true},
+		{"cidr-toggle restarts, network_cidr is read at startup", "cidr-toggle",
+			func(t *testing.T) flipCtx { return flipContext(t, "flat-dnat", "gateway-1") }, false},
+		{"cadence-toggle reloads", "cadence-toggle",
+			func(t *testing.T) flipCtx { return flipContext(t, defaultProfileName, "gateway-1") }, true},
+		{"pf-rule-toggle restarts when it turns port forwarding on", "pf-rule-toggle",
+			func(t *testing.T) flipCtx { return flipContext(t, defaultProfileName, "gateway-1") }, false},
+		{"pf-rule-toggle restarts when it turns port forwarding off", "pf-rule-toggle",
+			withOnlyTheFlipVIP, false},
+		{"pf-rule-toggle reloads beside the API VIP", "pf-rule-toggle",
+			func(t *testing.T) flipCtx { return flipContext(t, "flat-dnat", "gateway-1") }, true},
+		{"pf-rule-toggle reloads removing its VIP beside the API VIP", "pf-rule-toggle",
+			withTheFlipVIPBesideTheAPIVIP, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := flipNamed(t, tc.flip).reloadable(tc.ctx(t)); got != tc.want {
+				t.Fatalf("%s reloadable = %v, want %v", tc.flip, got, tc.want)
 			}
 		})
 	}

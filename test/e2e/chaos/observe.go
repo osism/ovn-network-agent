@@ -407,6 +407,12 @@ type gatewayMetrics struct {
 	// answers — unlike the counters above, where zero is the healthy value.
 	vrfDefaultGauge        int
 	vrfDefaultGaugeScraped bool
+
+	// configReloadSuccess and configReloadError are the agent's SIGHUP
+	// reload counters. A reloading config-flip reads them either side of
+	// its SIGHUP: the one that moved is the agent's verdict on the reload.
+	configReloadSuccess int
+	configReloadError   int
 }
 
 // observeGateway gathers every data plane the oracle verifies on one gateway.
@@ -706,9 +712,24 @@ func parseMetrics(body string) gatewayMetrics {
 		case name == "ovn_network_agent_vrf_default_route_present":
 			m.vrfDefaultGauge = value
 			m.vrfDefaultGaugeScraped = true
+		case name == `ovn_network_agent_config_reload_total{outcome="success"}`:
+			m.configReloadSuccess = value
+		case name == `ovn_network_agent_config_reload_total{outcome="error"}`:
+			m.configReloadError = value
 		}
 	}
 	return m
+}
+
+// reloadCounters reads the agent's SIGHUP reload counters off its loopback
+// metrics endpoint. A scrape without the series reads as zero for both.
+func (l *lab) reloadCounters(ctx context.Context, gw string) (ok, failed int, err error) {
+	out, err := l.exec(ctx, gw, "bash", "-c", metricsScrapeScript)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read the reload counters on %s: %w", gw, err)
+	}
+	m := parseMetrics(out)
+	return m.configReloadSuccess, m.configReloadError, nil
 }
 
 func parseMetricValue(s string) int {

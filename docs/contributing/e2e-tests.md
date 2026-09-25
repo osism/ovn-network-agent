@@ -1404,7 +1404,7 @@ part of the replay contract: a new action is appended, never inserted.
 | `gateway-kill` | gateway | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
 | `agent-terminate` | gateway | 2 | 10–30 s | 180 s | `kill -TERM 1` — tini forwards to the agent ([drain-hitless](#drain-hitless)) |
 | `gateway-restart` | gateway | 2 | — | 180 s | a planned restart: `kill -TERM 1` with the restart policy pinned, up to 120 s for the agent to exit, then `docker start` |
-| `config-flip` | gateway | 2 | — | 180 s | rewrite one gateway's config and restart it onto it — see below |
+| `config-flip` | gateway | 2 | — | 180 s | rewrite one gateway's config and reload or restart it onto it — see below |
 | `nb-pause` | central | 2 | 5–90 s | 90 s | SIGSTOP/SIGCONT the NB `ovsdb-server` |
 | `sb-pause` | central | 2 | 5–90 s | 120 s | SIGSTOP/SIGCONT the SB `ovsdb-server` |
 | `northd-pause` | central | 1 | 10–60 s | 60 s | SIGSTOP/SIGCONT `ovn-northd` |
@@ -1519,16 +1519,31 @@ either way — the drain only changes how much the run loses.
 **The `config-flip` action.** Rollouts, tuning changes and emergency flag
 flips happen on live gateways, under load, one node at a time. The action
 draws one of the whitelisted toggles below, applies it to the target's
-current config, validates the result with `--check-config`, swaps it in
-and restarts the node onto it — the same path the profile apply uses.
+current config, validates the result with `--check-config` and swaps it
+in. It then puts the node onto it the way a rollout would: with a
+`SIGHUP` when the running agent reloads the change in place (see
+[Reload the configuration](../guides/configuration#reload-the-configuration)),
+with a restart when it does not.
 
-| Flip | What it toggles | Applicable when |
-| --- | --- | --- |
-| `drain-toggle` | `drain_on_shutdown` | always |
-| `masquerade-toggle` | `hairpin_masquerade` on the API VIP | the gateway's config carries the API VIP |
-| `cidr-toggle` | `network_cidr` between the profile's value and the manual filter (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) | the profile did not already configure that filter |
-| `cadence-toggle` | `reconcile_interval` between `5s` and `15s` | always |
-| `pf-rule-toggle` | adds/removes an unprobed port-forward VIP (`192.0.2.99:8081`) | always |
+| Flip | What it toggles | Applicable when | Lands by |
+| --- | --- | --- | --- |
+| `drain-toggle` | `drain_on_shutdown` | always | restart |
+| `masquerade-toggle` | `hairpin_masquerade` on the API VIP | the gateway's config carries the API VIP | reload |
+| `cidr-toggle` | `network_cidr` between the profile's value and the manual filter (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) | the profile did not already configure that filter | restart |
+| `cadence-toggle` | `reconcile_interval` between `5s` and `15s` | always | reload |
+| `pf-rule-toggle` | adds/removes an unprobed port-forward VIP (`192.0.2.99:8081`) | always | reload beside another VIP, restart when it turns port forwarding on or off |
+
+A reloading flip reads the agent's
+`ovn_network_agent_config_reload_total` counters, swaps the file, sends
+`kill -HUP 1` (tini forwards it to the agent) and waits up to 30 s for one
+of the counters to move. `success` is an applied flip. `error` means the
+agent refused the merged configuration: the previous file goes back and
+the flip is journaled as rejected. Neither is a failed action. It does not
+touch the profile marker and does not re-wire the node, since the gateway
+never went down. `drain-toggle` restarts although `drain_on_shutdown` is
+reloadable: the deploy-time `OVN_NETWORK_DRAIN_ON_SHUTDOWN` stays in the
+running agent's environment unless the entrypoint dropped it when the
+container last started, and a reload re-reads that same environment.
 
 Each is a *toggle*: applied twice it puts the gateway back on the config
 the profile gave it, so a long run cannot drift away from the
@@ -1767,7 +1782,8 @@ was restarted onto the profile from one that was already on it),
 `state-applied`, one `decision` per tick (with the drawn values — the
 flip among them — and either `executed` or a `skip_reason`), `inject` /
 `restore` / `converged`, `config-flip` (the flip, the values it moved
-between, and `rejected` when the agent refused it), `ovn-churn` (each
+between, `mode` — `reload` or `restart` — and `rejected` when the agent
+refused it), `ovn-churn` (each
 executed churn, with the `object` it touched and the `from`/`to` values it
 moved between), `node-state`, `probe-transition`, `vip-repoint`,
 `settle-start` / `settle-result` (the latter with the `converged_ms` the

@@ -9,8 +9,10 @@ import (
 // A configuration change is a fault like any other: rollouts, tuning and
 // emergency flag flips happen on live gateways, under load, one node at a
 // time. The config-flip action draws one of the toggles below, rewrites
-// the target's configuration with it, and restarts the node onto it —
-// through the same validate-then-swap path the profile apply uses.
+// the target's configuration with it, and puts the node onto it through
+// the same validate-then-swap path the profile apply uses — with a SIGHUP
+// when the running agent reloads the change in place, with a restart when
+// it does not.
 //
 // The whitelist is append-only, exactly like the action registry: the
 // engine draws a flip *by index* from the seeded stream, so inserting one
@@ -50,6 +52,11 @@ type flip struct {
 	// apply toggles the option in place, reporting the values it moved
 	// between.
 	apply func(c flipCtx) (from, to string)
+
+	// reloadable reports whether a running agent applies the flip on
+	// SIGHUP (reloadableKeys in reload.go) rather than needing a restart.
+	// It is evaluated on the configuration before apply mutates it.
+	reloadable func(c flipCtx) bool
 }
 
 func flips() []flip {
@@ -58,11 +65,19 @@ func flips() []flip {
 			// What the agent does with a SIGTERM: exit, or hand its
 			// chassis over first. The flip's own restart is the SIGTERM,
 			// so the very next one exercises whichever path it just set.
+			//
+			// It always restarts, although drain_on_shutdown is
+			// reloadable: the deploy-time OVN_NETWORK_DRAIN_ON_SHUTDOWN
+			// stays in the running agent's environment unless the
+			// entrypoint dropped it at the container's last start, and a
+			// reload re-reads that same environment — on such a gateway
+			// the file's value would never apply.
 			name:       "drain-toggle",
 			applicable: alwaysApplicable,
 			apply: func(c flipCtx) (string, string) {
 				return toggleBool(c.doc, "drain_on_shutdown")
 			},
+			reloadable: neverReloadable,
 		},
 		{
 			// The agent's hairpin SNAT. Traffic from the provider
@@ -75,6 +90,8 @@ func flips() []flip {
 			apply: func(c flipCtx) (string, string) {
 				return toggleBool(apiVIPIn(c.doc), "hairpin_masquerade")
 			},
+			// The API VIP stays, so port_forwards stays non-empty.
+			reloadable: alwaysReloadable,
 		},
 		{
 			// OVN-discovered networks versus a manual filter — the
@@ -102,6 +119,8 @@ func flips() []flip {
 				c.doc["network_cidr"] = anySlice(explicitCIDRs)
 				return cidrLabel(from), cidrLabel(explicitCIDRs)
 			},
+			// network_cidr is read only at startup.
+			reloadable: neverReloadable,
 		},
 		{
 			// How often the agent re-reconciles — the tuning knob an
@@ -118,6 +137,7 @@ func flips() []flip {
 				c.doc["reconcile_interval"] = to
 				return from, to
 			},
+			reloadable: alwaysReloadable,
 		},
 		{
 			// A port-forward rule added and removed under load. It carries
@@ -143,6 +163,17 @@ func flips() []flip {
 				c.doc["port_forwards"] = append(vips, flipVIPBlock(c.mgmtIP))
 				return "absent", flipVIPAddr
 			},
+			// A reload applies a changed port_forwards list, but not one
+			// that turns port forwarding on or off: the flip reloads only
+			// when another VIP keeps the list non-empty either way.
+			reloadable: func(c flipCtx) bool {
+				for _, vip := range vipsOf(c.doc) {
+					if vipAddrOf(vip) != flipVIPAddr {
+						return true
+					}
+				}
+				return false
+			},
 		},
 	}
 }
@@ -152,6 +183,10 @@ func flips() []flip {
 func flipName(idx int) string { return flips()[idx].name }
 
 func alwaysApplicable(flipCtx) bool { return true }
+
+func alwaysReloadable(flipCtx) bool { return true }
+
+func neverReloadable(flipCtx) bool { return false }
 
 // toggleBool inverts a boolean key, treating an absent key as false —
 // which is what the agent's own config layering does with it.

@@ -8,10 +8,18 @@ import (
 
 // profileApplyTimeout is how long a reconfigured gateway gets to come
 // back before the run is abandoned. It matches the recovery budget of the
-// actions that recycle a container: the mechanic is the same `docker
-// restart`, and the node has to be all the way back before the roll moves
-// on to the next one.
+// actions that recycle a container: the mechanic is the same planned
+// restart (restartGateway), and the node has to be all the way back before
+// the roll moves on to the next one.
 const profileApplyTimeout = 180 * time.Second
+
+// reloadTimeout is how long a reloading config-flip waits for the agent to
+// report its verdict on the SIGHUP. A reload runs between two reconcile
+// cycles, so the wait is at most one cycle plus the reload itself.
+const reloadTimeout = 30 * time.Second
+
+// reloadPollInterval is how often that wait re-reads the reload counters.
+const reloadPollInterval = time.Second
 
 // applier owns the agent configuration of every gateway for the length of
 // a run.
@@ -19,14 +27,13 @@ const profileApplyTimeout = 180 * time.Second
 // Applying a profile to a running lab needs no image rebuild and no
 // redeploy: the config file is the only thing that changes, and the
 // gwnode entrypoint execs the agent, so restarting the container is the
-// reload.
-// What makes that safe is the order — render every gateway's config and
-// hand each one to the agent's own --check-config *before* a single live
-// file is touched, then roll the gateways one at a time so the lab keeps
-// forwarding while it is reconfigured.
+// reload. What makes that safe is the order — render every gateway's
+// config and hand each one to the agent's own --check-config *before* a
+// single live file is touched, then roll the gateways one at a time so the
+// lab keeps forwarding while it is reconfigured.
 //
 // The same path serves the config-flip action mid-run: toggle a
-// whitelisted option, validate, swap, restart.
+// whitelisted option, validate, swap, then SIGHUP the agent or restart it.
 type applier struct {
 	lab     *lab
 	profile *profile
@@ -52,16 +59,23 @@ type applier struct {
 	// configured, not back to what the image ships.
 	baseline map[string]map[string]any
 	current  map[string]map[string]any
+
+	// flipRestarted records whether the last flip on each gateway restarted
+	// it. Only a restarted node needs the config-flip restore: re-wiring a
+	// gateway that never went down would take its underlay link and BGP
+	// session down for nothing.
+	flipRestarted map[string]bool
 }
 
 func newApplier(l *lab, p *profile, base []byte) *applier {
 	return &applier{
-		lab:      l,
-		profile:  p,
-		base:     base,
-		mgmtIP:   map[string]string{},
-		baseline: map[string]map[string]any{},
-		current:  map[string]map[string]any{},
+		lab:           l,
+		profile:       p,
+		base:          base,
+		mgmtIP:        map[string]string{},
+		baseline:      map[string]map[string]any{},
+		current:       map[string]map[string]any{},
+		flipRestarted: map[string]bool{},
 	}
 }
 
@@ -214,8 +228,9 @@ func (a *applier) applicable(_ context.Context, gw string, idx int) bool {
 
 // flip rewrites one gateway's configuration mid-run: toggle a whitelisted
 // option, validate the result the way applyProfile does, and only then
-// swap the file and restart the node onto it — a rolling reconfiguration
-// under fault load.
+// swap the file and put the node onto it — with a SIGHUP when the running
+// agent reloads the change in place, with a restart when it does not. A
+// rolling reconfiguration under fault load, the way a rollout applies it.
 //
 // A configuration the agent rejects is journaled and dropped, and the
 // tracker goes back to what the gateway is still running. That is not a
@@ -223,6 +238,7 @@ func (a *applier) applicable(_ context.Context, gw string, idx int) bool {
 // rollout, and the whitelist is deliberately free to draw a combination
 // the agent must refuse rather than accept.
 func (a *applier) flip(ctx context.Context, gw string, idx int) error {
+	a.flipRestarted[gw] = false
 	f := flips()[idx]
 	c, ok := a.flipCtx(gw)
 	if !ok {
@@ -233,10 +249,20 @@ func (a *applier) flip(ctx context.Context, gw string, idx int) error {
 	if err != nil {
 		return err
 	}
+	mode := flipModeRestart
+	if f.reloadable(c) {
+		mode = flipModeReload
+	}
 	from, to := f.apply(c)
 	raw, err := marshalConfig(c.doc)
 	if err != nil {
 		return err
+	}
+	journal := func(rejected bool, detail string) {
+		a.jrnl.emit(event{
+			Event: evConfigFlip, Target: gw, Flip: f.name, From: from, To: to,
+			Mode: mode, Rejected: boolPtr(rejected), Detail: detail,
+		})
 	}
 
 	valid, detail, err := a.stage(ctx, gw, raw)
@@ -244,16 +270,15 @@ func (a *applier) flip(ctx context.Context, gw string, idx int) error {
 		return err
 	}
 	if !valid {
-		reverted, err := parseConfig(before)
-		if err != nil {
+		if err := a.revert(gw, before); err != nil {
 			return err
 		}
-		a.current[gw] = reverted
-		a.jrnl.emit(event{
-			Event: evConfigFlip, Target: gw, Flip: f.name, From: from, To: to,
-			Rejected: boolPtr(true), Detail: detail,
-		})
+		journal(true, detail)
 		return nil
+	}
+
+	if mode == flipModeReload {
+		return a.reloadOnto(ctx, gw, before, journal)
 	}
 
 	// The marker goes down before the restart: from here on the file is
@@ -265,12 +290,80 @@ func (a *applier) flip(ctx context.Context, gw string, idx int) error {
 	if err := a.lab.moveFile(ctx, gw, agentConfigNextPath, agentConfigPath); err != nil {
 		return err
 	}
-	a.jrnl.emit(event{
-		Event: evConfigFlip, Target: gw, Flip: f.name, From: from, To: to,
-		Rejected: boolPtr(false),
-	})
+	journal(false, "")
+	a.flipRestarted[gw] = true
 	return a.lab.restartGateway(ctx, gw)
 }
+
+// The two ways a flip puts a gateway onto its new configuration, as the
+// config-flip event journals them.
+const (
+	flipModeReload  = "reload"
+	flipModeRestart = "restart"
+)
+
+// reloadOnto puts a staged, validated configuration live on a running agent:
+// swap the file, SIGHUP the agent, and wait for its reload counters to give
+// the verdict. The marker is left alone — a reload does not restart the
+// container, so the environment the agent started with still stands.
+//
+// An agent that refuses the reload (the merged configuration it validates
+// can be invalid where the file alone was not) keeps running what it was
+// running; the previous file goes back so the next restart does not pick up
+// a configuration the agent refused, and the flip is journaled as rejected.
+func (a *applier) reloadOnto(ctx context.Context, gw string, before []byte, journal func(bool, string)) error {
+	okBefore, failedBefore, err := a.lab.reloadCounters(ctx, gw)
+	if err != nil {
+		return err
+	}
+	if err := a.lab.moveFile(ctx, gw, agentConfigNextPath, agentConfigPath); err != nil {
+		return err
+	}
+	if err := a.lab.reloadAgent(ctx, gw); err != nil {
+		return err
+	}
+
+	deadline := a.lab.now().Add(reloadTimeout)
+	for a.lab.now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		a.lab.sleep(reloadPollInterval)
+		ok, failed, err := a.lab.reloadCounters(ctx, gw)
+		switch {
+		case err != nil:
+			// A scrape that could not run is no verdict; keep polling.
+		case ok > okBefore:
+			journal(false, "")
+			return nil
+		case failed > failedBefore:
+			if err := a.lab.writeFile(ctx, gw, agentConfigPath, string(before)); err != nil {
+				return err
+			}
+			if err := a.revert(gw, before); err != nil {
+				return err
+			}
+			journal(true, "the agent rejected the reload")
+			return nil
+		}
+	}
+	return fmt.Errorf("%s did not report a configuration reload within %s after SIGHUP", gw, reloadTimeout)
+}
+
+// revert points the tracker back at the configuration the gateway is still
+// running.
+func (a *applier) revert(gw string, before []byte) error {
+	reverted, err := parseConfig(before)
+	if err != nil {
+		return err
+	}
+	a.current[gw] = reverted
+	return nil
+}
+
+// restartedByFlip reports whether the last flip on gw restarted it — the
+// only case in which the config-flip restore has a node to put back.
+func (a *applier) restartedByFlip(gw string) bool { return a.flipRestarted[gw] }
 
 func (a *applier) flipCtx(gw string) (flipCtx, bool) {
 	doc, ok := a.current[gw]
