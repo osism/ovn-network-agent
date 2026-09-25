@@ -2742,6 +2742,32 @@ func TestValidateConfigDerivesOVNTLS(t *testing.T) {
 	})
 }
 
+// TestValidateSettingsSkipsTLS pins the split a reload relies on:
+// validateSettings never reads the PEM files, so re-validating a merged
+// reload config cannot fail on (or re-warn about) TLS material, while
+// validateConfig still reads them.
+func TestValidateSettingsSkipsTLS(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.pem")
+	cfg := Config{
+		VethNexthop:       "169.254.0.1",
+		VRFName:           "vrf-provider",
+		ReconcileInterval: 60 * time.Second,
+		OVNSSLCert:        missing,
+		OVNSSLKey:         missing,
+	}
+
+	settingsCfg := cfg
+	if err := validateSettings(&settingsCfg); err != nil {
+		t.Fatalf("validateSettings() error = %v, want nil (it must not read the PEM files)", err)
+	}
+
+	fullCfg := cfg
+	err := validateConfig(&fullCfg)
+	if err == nil || !strings.Contains(err.Error(), "stat ovn-ssl-key") {
+		t.Fatalf("validateConfig() error = %v, want one containing %q", err, "stat ovn-ssl-key")
+	}
+}
+
 func TestValidateConfigRejectsMixedSSLRemotes(t *testing.T) {
 	tests := []struct {
 		name     string

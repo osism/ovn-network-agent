@@ -727,32 +727,20 @@ func remoteUsesSSL(flagName, remote string) (bool, error) {
 	return ssl > 0, nil
 }
 
+// validateConfig validates cfg and derives its computed fields. The TLS
+// checks run last because they read the PEM files; validateSettings covers
+// everything else and is what a reload re-runs on its merged config.
 func validateConfig(cfg *Config) error {
-	if net.ParseIP(cfg.VethNexthop) == nil {
-		return fmt.Errorf("invalid veth-nexthop IP: %q", cfg.VethNexthop)
+	if err := validateSettings(cfg); err != nil {
+		return err
 	}
-	if cfg.VRFName != "" && !isValidIdentifier(cfg.VRFName) {
-		return fmt.Errorf("invalid vrf-name: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.VRFName)
-	}
-	if cfg.RouteTableID < 0 || cfg.RouteTableID > 252 {
-		return fmt.Errorf("invalid route-table-id: %d (must be 0-252)", cfg.RouteTableID)
-	}
-	if len(cfg.NetworkCIDRs) > 0 {
-		cfg.NetworkFilters = make([]*net.IPNet, 0, len(cfg.NetworkCIDRs))
-		for _, cidrStr := range cfg.NetworkCIDRs {
-			_, cidr, err := net.ParseCIDR(cidrStr)
-			if err != nil {
-				return fmt.Errorf("invalid network-cidr %q: %w", cidrStr, err)
-			}
-			cfg.NetworkFilters = append(cfg.NetworkFilters, cidr)
-		}
-	}
+	return validateTLS(cfg)
+}
 
-	// FRR prefix-list validation
-	if cfg.FRRPrefixList != "" && !isValidIdentifier(cfg.FRRPrefixList) {
-		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
-	}
-
+// validateTLS rejects an OVN remote list that mixes ssl: with plaintext
+// endpoints and derives cfg.OVNTLS from the ovn-ssl-* path options, reading
+// the PEM files.
+func validateTLS(cfg *Config) error {
 	// TLS for ssl: OVN remotes. Reject a remote list that mixes ssl: with
 	// plaintext endpoints (a failover must not silently downgrade), then
 	// derive the *tls.Config from the ovn-ssl-* path options.
@@ -790,6 +778,38 @@ func validateConfig(cfg *Config) error {
 	if sbSSL != nbSSL {
 		slog.Warn("OVN remotes use mixed schemes: one database is dialed over TLS and the other in cleartext",
 			"ovn_sb_remote_tls", sbSSL, "ovn_nb_remote_tls", nbSSL)
+	}
+	return nil
+}
+
+// validateSettings validates every option except the TLS material and derives
+// the computed fields that do not need the filesystem (NetworkFilters,
+// VethProviderIP, PortForwardEnabled). It never reads a file, so a reload can
+// re-run it on the merged configuration without touching the PEMs again.
+func validateSettings(cfg *Config) error {
+	if net.ParseIP(cfg.VethNexthop) == nil {
+		return fmt.Errorf("invalid veth-nexthop IP: %q", cfg.VethNexthop)
+	}
+	if cfg.VRFName != "" && !isValidIdentifier(cfg.VRFName) {
+		return fmt.Errorf("invalid vrf-name: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.VRFName)
+	}
+	if cfg.RouteTableID < 0 || cfg.RouteTableID > 252 {
+		return fmt.Errorf("invalid route-table-id: %d (must be 0-252)", cfg.RouteTableID)
+	}
+	if len(cfg.NetworkCIDRs) > 0 {
+		cfg.NetworkFilters = make([]*net.IPNet, 0, len(cfg.NetworkCIDRs))
+		for _, cidrStr := range cfg.NetworkCIDRs {
+			_, cidr, err := net.ParseCIDR(cidrStr)
+			if err != nil {
+				return fmt.Errorf("invalid network-cidr %q: %w", cidrStr, err)
+			}
+			cfg.NetworkFilters = append(cfg.NetworkFilters, cidr)
+		}
+	}
+
+	// FRR prefix-list validation
+	if cfg.FRRPrefixList != "" && !isValidIdentifier(cfg.FRRPrefixList) {
+		return fmt.Errorf("invalid frr-prefix-list: %q (only alphanumeric, hyphen, underscore, dot allowed)", cfg.FRRPrefixList)
 	}
 
 	// ReconcileInterval feeds time.NewTicker, which panics on a
