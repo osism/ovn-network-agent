@@ -6,7 +6,8 @@ import (
 )
 
 // agentExitTimeout is how long a SIGTERM'ed agent gets to take its
-// container down before agent-terminate gives up on the graceful path.
+// container down before agent-terminate, or a planned restart
+// (restartGateway), gives up on the graceful path.
 //
 // It is generous because a profile (or a drain-toggle flip) can put a
 // gateway on drain_on_shutdown, and a draining agent holds its SIGTERM
@@ -25,7 +26,7 @@ const agentExitTimeout = 120 * time.Second
 //	controller-restart — failover.sh's clean chassis-loss simulation
 //	gateway-kill       — stale-chassis.sh's SIGKILL
 //	agent-terminate    — drain-hitless.sh's SIGTERM to PID 1
-//	gateway-restart    — pf-hairpin.sh's `docker restart`
+//	gateway-restart    — agent-terminate's SIGTERM without the hold (restartGateway)
 //
 // The recovery budgets differ because the faults differ: stopping
 // ovn-controller costs a re-election, while any container lifecycle
@@ -77,7 +78,7 @@ func starterActions(p *profile) []*action {
 		{
 			name:   "gateway-restart",
 			weight: 2,
-			// No hold: `docker restart` is the fault and its own undo.
+			// No hold: the restart is the fault and its own undo.
 			holdMin:        0,
 			holdMax:        0,
 			recoveryBudget: 180 * time.Second,

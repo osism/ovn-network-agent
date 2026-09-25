@@ -1403,7 +1403,7 @@ part of the replay contract: a new action is appended, never inserted.
 | `controller-restart` | gateway | 3 | 10–30 s | 90 s | `ovn-ctl stop_controller` / `start_controller` ([failover](#failover)) |
 | `gateway-kill` | gateway | 1 | 15–45 s | 180 s | `docker kill -s KILL`, then `docker start` ([stale chassis](#stale-chassis)) |
 | `agent-terminate` | gateway | 2 | 10–30 s | 180 s | `kill -TERM 1` — tini forwards to the agent ([drain-hitless](#drain-hitless)) |
-| `gateway-restart` | gateway | 2 | — | 180 s | `docker restart` ([pf-hairpin](#port-forward-hairpin-masquerade)) |
+| `gateway-restart` | gateway | 2 | — | 180 s | a planned restart: `kill -TERM 1` with the restart policy pinned, up to 120 s for the agent to exit, then `docker start` |
 | `config-flip` | gateway | 2 | — | 180 s | rewrite one gateway's config and restart it onto it — see below |
 | `nb-pause` | central | 2 | 5–90 s | 90 s | SIGSTOP/SIGCONT the NB `ovsdb-server` |
 | `sb-pause` | central | 2 | 5–90 s | 120 s | SIGSTOP/SIGCONT the SB `ovsdb-server` |
@@ -1542,10 +1542,15 @@ answer a rejected rollout gives an operator, and the whitelist is
 deliberately free to draw a combination the agent must refuse. Disable
 the action entirely with `-weights config-flip=0`.
 
-A flip on a gateway with `drain_on_shutdown` on can have its drain
-truncated: `docker restart`'s 10 s stop-grace SIGKILLs an agent that is
-still draining. That is legitimate chaos — the run only asserts that the
-node recovers — but it is worth knowing when reading a journal.
+Every restart the runner makes on purpose — `gateway-restart`, a
+restarting `config-flip`, the profile apply — gives the agent the stop
+budget production gives it: the systemd unit's `TimeoutStopSec=120`. The
+runner pins the restart policy, sends `kill -TERM 1`, waits up to 120 s for
+the container to go down, starts it and puts the policy back. It does not
+use `docker restart`, whose 10 s grace would SIGKILL an agent that is still
+draining; a draining agent holds its exit until the takeover chassis can
+forward, so a planned restart of a gateway with `drain_on_shutdown` on
+hands its routers over before it goes down.
 
 **Guardrails** keep a run meaningful, and every action declares the node
 states it may target through its *scope* — gateway, central, upstream, or

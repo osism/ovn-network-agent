@@ -575,13 +575,14 @@ func (e *engine) restoreNode(ctx context.Context, d decision, node string) error
 //
 // An inject is not atomic: injectGatewayKill and injectAgentTerminate
 // both pin the docker restart policy to "no" before the step that can
-// fail, so bailing out on the error would hand the lab a gateway docker
-// will never revive — with its containerlab veth to `upstream` gone for
-// good — and only `make e2e-down && make e2e-up` gets it back. The
-// restore is the one path that puts the policy back (and re-wires the
-// underlay), so it runs even here: on the same detached, bounded context
-// the held-fault restore uses, since the inject may well have failed
-// because the run was cancelled underneath it.
+// fail (restartGateway pins it too, but puts it back itself), so bailing
+// out on the error would hand the lab a gateway docker will never revive —
+// with its containerlab veth to `upstream` gone for good — and only
+// `make e2e-down && make e2e-up` gets it back. The restore is the one path
+// that puts the policy back (and re-wires the underlay), so it runs even
+// here: on the same detached, bounded context the held-fault restore uses,
+// since the inject may well have failed because the run was cancelled
+// underneath it.
 func (e *engine) undo(ctx context.Context, d decision, injectErr error) {
 	for _, n := range e.nodesFor(d) {
 		detail := "undo after a failed inject"

@@ -21,10 +21,11 @@ func newTestApplier(t *testing.T, cmd commander, name string) *applier {
 	return a
 }
 
-// restartCmd is the container-qualified form of the restart, because the
-// baked config's own comments mention `docker restart` — a bare substring
-// match would find them in the argv that *writes* the config.
-const restartCmd = "docker restart clab-"
+// restartCmd is the step that identifies a restart: restartGateway's
+// SIGTERM to PID 1, issued once per restart and never by anything the
+// applier writes (the baked config's own comments mention `docker
+// restart`, so that would not do).
+const restartCmd = "kill -TERM 1"
 
 // labWithConfig answers `cat <live config>` with what the gateway is
 // running, and everything else the way a healthy lab does.
@@ -155,11 +156,11 @@ func TestApplyProfileRollsTheGatewaysOneAtATime(t *testing.T) {
 		t.Fatalf("applyProfile: %v", err)
 	}
 
-	firstRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-1")
+	firstRestart := cmd.indexOf("docker exec clab-ovn-e2e-gateway-1 " + restartCmd)
 	firstBack := cmd.indexOf("find Chassis name=gateway-1")
-	secondRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-2")
+	secondRestart := cmd.indexOf("docker exec clab-ovn-e2e-gateway-2 " + restartCmd)
 	secondBack := cmd.indexOf("find Chassis name=gateway-2")
-	thirdRestart := cmd.indexOf("docker restart clab-ovn-e2e-gateway-3")
+	thirdRestart := cmd.indexOf("docker exec clab-ovn-e2e-gateway-3 " + restartCmd)
 	if firstRestart < 0 || firstBack < 0 || secondRestart < 0 || secondBack < 0 || thirdRestart < 0 {
 		t.Fatalf("the roll did not restart and gate all three overlaid gateways: %v", cmd.lines())
 	}
@@ -290,7 +291,8 @@ func TestFlipValidatesThenSwapsThenRestarts(t *testing.T) {
 		"--check-config",
 		"printf '%s' 'everything-on' > " + profileMarkerPath, // the file now owns the drain
 		"mv " + agentConfigNextPath,
-		"docker restart clab-ovn-e2e-gateway-2",
+		"docker exec clab-ovn-e2e-gateway-2 " + restartCmd,
+		"docker start clab-ovn-e2e-gateway-2",
 	}
 	flipped := cmd.lines()[before:]
 	last := -1

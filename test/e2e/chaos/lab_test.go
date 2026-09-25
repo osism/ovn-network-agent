@@ -218,6 +218,56 @@ func TestLabPrimitivesWrapFailuresWithContext(t *testing.T) {
 	}
 }
 
+// A planned restart that breaks half-way must still hand the restart policy
+// back to docker, and must not start a container whose stop it could not
+// confirm: that one is still running, or nobody knows.
+func TestRestartGatewayRestoresThePolicyOnEveryFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		fail      string // the argv substring that fails
+		running   bool   // the container never goes down
+		wantStart bool
+		want      string
+	}{
+		{name: "the SIGTERM cannot be sent", fail: "kill -TERM 1", want: "terminate agent on gateway-3"},
+		{name: "the container never goes down", running: true, want: "still running"},
+		{name: "the container does not start", fail: "docker start", wantStart: true, want: "start gateway-3"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+				line := strings.Join(argv, " ")
+				switch {
+				case tc.fail != "" && strings.Contains(line, tc.fail):
+					return "", errBoom
+				case tc.running && strings.Contains(line, "{{.State.Running}}"):
+					return "true\n", nil
+				}
+				return healthyLabResponses(argv)
+			}}
+
+			err := newTestLab(cmd, newFakeClock()).restartGateway(ctxT(), "gateway-3")
+
+			if err == nil {
+				t.Fatal("a restart that broke half-way was reported as success")
+			}
+			if !strings.Contains(err.Error(), "restart gateway-3") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not say %q", err, tc.want)
+			}
+			if tc.fail != "" && !errors.Is(err, errBoom) {
+				t.Fatalf("error %q dropped the cause from the chain", err)
+			}
+			if got := cmd.called("docker start"); got != tc.wantStart {
+				t.Fatalf("docker start issued = %v, want %v: %v", got, tc.wantStart, cmd.lines())
+			}
+			if !cmd.called("docker update --restart=always clab-ovn-e2e-gateway-3") {
+				t.Fatalf("the restart policy was left pinned to no: %v", cmd.lines())
+			}
+		})
+	}
+}
+
 // A daemon that never comes back must fail the re-wire, not let it push
 // config at a container that cannot accept it.
 func TestWaitReadyGivesUpOnADaemonThatNeverComesBack(t *testing.T) {
