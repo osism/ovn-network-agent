@@ -65,6 +65,11 @@ type RouteManager struct {
 	// which networks, without touching netlink.
 	refreshVethNexthopHook func(networks []*net.IPNet) error
 
+	// withdrawVIPsHook, when non-nil, replaces WithdrawVIPAddresses in a
+	// reload. Tests set this to observe which VIPs a reload withdraws without
+	// touching netlink.
+	withdrawVIPsHook func(vips []string) error
+
 	// wrapperStdinOK caches whether the configured OVS wrapper forwards
 	// stdin into the wrapped command, and ofctlBundleOK whether this
 	// ovs-ofctl speaks OpenFlow 1.4 bundles. Both are nil until probed and
@@ -151,6 +156,15 @@ func (rm *RouteManager) listKernelRoutes() ([]kernelRouteEntry, error) {
 		return rm.listKernelRoutesHook()
 	}
 	return rm.ListKernelRoutes()
+}
+
+// withdrawVIPs dispatches to the platform WithdrawVIPAddresses, or to the test
+// hook when one is set.
+func (rm *RouteManager) withdrawVIPs(vips []string) error {
+	if rm.withdrawVIPsHook != nil {
+		return rm.withdrawVIPsHook(vips)
+	}
+	return rm.WithdrawVIPAddresses(vips)
 }
 
 // refreshVethNexthop dispatches to the platform RefreshVethNexthop, or to the

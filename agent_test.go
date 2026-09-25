@@ -1635,7 +1635,7 @@ func TestNewAgentInitializesMissingChassis(t *testing.T) {
 		VethNexthop: "169.254.0.1",
 		VRFName:     "vrf-provider",
 	}
-	a, err := NewAgent(cfg)
+	a, err := NewAgent(cfg, nil)
 	if err != nil {
 		t.Fatalf("NewAgent() error: %v", err)
 	}
@@ -2377,7 +2377,7 @@ func portForwardOnlyConfig() Config {
 // construct an OVN client in port-forward-only mode — the agent runs as a
 // standalone VIP service with no OVN connection.
 func TestNewAgentPortForwardOnlyHasNoOVNClient(t *testing.T) {
-	a, err := NewAgent(portForwardOnlyConfig())
+	a, err := NewAgent(portForwardOnlyConfig(), nil)
 	if err != nil {
 		t.Fatalf("NewAgent() error: %v", err)
 	}
@@ -2427,7 +2427,7 @@ func TestAgentRunPortForwardOnly(t *testing.T) {
 	cfg := portForwardOnlyConfig()
 	cfg.VethLeakEnabled = true
 
-	a, err := NewAgent(cfg)
+	a, err := NewAgent(cfg, nil)
 	if err != nil {
 		t.Fatalf("NewAgent() error: %v", err)
 	}

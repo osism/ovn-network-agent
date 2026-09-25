@@ -93,6 +93,10 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// SIGHUP gets its own channel: a reload request queued in sigCh's
+	// one-slot buffer would make signal.Notify drop a following SIGTERM.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
 
 	if cfg.MetricsListen != "" {
 		m := initMetricsForConfig(cfg)
@@ -102,11 +106,20 @@ func main() {
 		}
 	}
 
-	agent, err := NewAgent(cfg)
+	// A reload re-runs the full loader with the original args, so the
+	// file < env < flag precedence holds on reload exactly as at startup.
+	agent, err := NewAgent(cfg, func() (Config, error) { return loadConfig(os.Args[1:]) })
 	if err != nil {
 		slog.Error("failed to create agent", "error", err)
 		os.Exit(1)
 	}
+
+	go func() {
+		for range hupCh {
+			slog.Info("received SIGHUP, reloading configuration")
+			agent.RequestReload()
+		}
+	}()
 
 	go func() {
 		sig := <-sigCh
@@ -130,21 +143,30 @@ func initMetricsForConfig(cfg Config) *metricsRegistry {
 	return initMetrics(!cfg.PortForwardOnly)
 }
 
-func setupLogging(level string) {
-	var lvl slog.Level
+// logLevel is the level of the process-wide handler setupLogging installs. It
+// is a LevelVar so a SIGHUP reload can change log_level on the running agent.
+var logLevel slog.LevelVar
+
+// parseLogLevel maps a log_level value to its slog level. Unknown values fall
+// back to info, as they always have: log_level is not validated.
+func parseLogLevel(level string) slog.Level {
 	switch strings.ToLower(level) {
 	case "debug":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug
 	case "warn", "warning":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn
 	case "error":
-		lvl = slog.LevelError
+		return slog.LevelError
 	default:
-		lvl = slog.LevelInfo
+		return slog.LevelInfo
 	}
+}
+
+func setupLogging(level string) {
+	logLevel.Set(parseLogLevel(level))
 
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: lvl,
+		Level: &logLevel,
 	})
 	slog.SetDefault(slog.New(handler))
 }

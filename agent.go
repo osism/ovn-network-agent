@@ -24,6 +24,15 @@ type Agent struct {
 	// Channel to trigger reconciliation
 	reconcileCh chan struct{}
 
+	// reloadCh carries SIGHUP reload requests into Run's loop, so a reload
+	// is applied between reconcile cycles and never mid-cycle. Capacity 1:
+	// requests coalesce like reconcileCh's.
+	reloadCh chan struct{}
+
+	// reloadConfig re-reads the configuration for a reload; main passes
+	// loadConfig over the original args. Nil means reload is unavailable.
+	reloadConfig func() (Config, error)
+
 	// effectiveFilters holds the network filters in effect for the current
 	// reconciliation cycle — either from manual config or auto-discovered
 	// from OVN Logical_Router_Port.Networks.
@@ -78,11 +87,16 @@ const (
 // than crash a unit that systemd would only restart in a tight loop anyway.
 const ovnConnectRetryInterval = 5 * time.Second
 
-func NewAgent(cfg Config) (*Agent, error) {
+// NewAgent builds the agent for cfg. reloadConfig is what a SIGHUP reload
+// re-reads the configuration with; nil makes every reload fail with
+// errReloadUnavailable.
+func NewAgent(cfg Config, reloadConfig func() (Config, error)) (*Agent, error) {
 	a := &Agent{
 		cfg:                cfg,
 		routing:            NewRouteManager(cfg),
 		reconcileCh:        make(chan struct{}, 1),
+		reloadCh:           make(chan struct{}, 1),
+		reloadConfig:       reloadConfig,
 		missingChassis:     make(map[string]time.Time),
 		staleCleanupJitter: time.Duration(rand.Int63n(int64(maxStaleCleanupJitter))),
 	}
@@ -251,6 +265,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				slog.Info("shutting down, keeping routes in place")
 			}
 			return nil
+
+		case <-a.reloadCh:
+			if a.handleReload() {
+				ticker.Reset(a.cfg.ReconcileInterval)
+			}
 
 		case <-a.reconcileCh:
 			slog.Debug("event-triggered reconciliation")
