@@ -144,7 +144,7 @@ green-main contract needs:
 The chaos runner (`e2e-chaos.yml`) also runs nightly, on its own
 `17 3 * * *` cron — off the hour and staggered clear of the Monday
 05:00–06:00 UTC burst so the two schedules never contend for runners.
-Each night fans out as a `fail-fast: false` matrix over all six curated
+Each night fans out as a `fail-fast: false` matrix over all seven curated
 chaos profiles, one job per profile at 10 minutes, so a fault that only
 shows up under a particular gateway configuration still gets exercised.
 The seed is the run id, so successive nights explore different fault
@@ -169,7 +169,7 @@ gave for free:
 - **One chaos job per machine.** The lab name `ovn-e2e` is fixed in the
   topology, so two concurrent chaos jobs on one host collide at
   `containerlab deploy`. The pool is sized one runner process per
-  machine; the nightly's six-profile fan-out relies on that. A job that
+  machine; the nightly's seven-profile fan-out relies on that. A job that
   dies outside its own teardown still leaves a lab behind, which the
   workflow's pre-run `make e2e-down || true` sweep clears before
   deploying.

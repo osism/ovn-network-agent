@@ -3,7 +3,7 @@
 # profile, on demand, from a checkout.
 #
 # Why this exists: the chaos runner's exploration budget is the nightly
-# matrix — six profiles, seeded from the run id, once a day. Touching the
+# matrix — seven profiles, seeded from the run id, once a day. Touching the
 # failover, drain or chassis-cleanup paths means wanting that exploration
 # *now*, and the only ad-hoc path is the Actions tab, where a human picks
 # the seed and the profile by hand. Picking either by hand is the problem:

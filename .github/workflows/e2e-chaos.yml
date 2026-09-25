@@ -75,6 +75,7 @@ on:
           - vlan-no-dnat
           - pf-only
           - heterogeneous
+          - drain-everywhere
   # Nightly, off the hour, staggered clear of the Monday 05:00–06:00 UTC
   # weekly-cron burst (govulncheck/test/codeql/scorecard).
   schedule:
@@ -131,7 +132,7 @@ jobs:
           schedule)
             # Nightly: sweep every curated profile, seed = the run id so
             # each night is a different (recorded, replayable) sequence.
-            profiles='["everything-on","flat-minimal","flat-dnat","vlan-no-dnat","pf-only","heterogeneous"]'
+            profiles='["everything-on","flat-minimal","flat-dnat","vlan-no-dnat","pf-only","heterogeneous","drain-everywhere"]'
             runner="self-hosted"
             seed="${GITHUB_RUN_ID}"
             duration="10m"
