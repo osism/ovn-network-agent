@@ -77,6 +77,9 @@ type metricsRegistry struct {
 	hairpinFlowsInstalled prometheus.Gauge
 	ovsFlowApplyErrors    *prometheus.CounterVec
 
+	// Configuration reloads (SIGHUP)
+	configReloadTotal *prometheus.CounterVec
+
 	// Readiness signals backing the /readyz endpoint
 	readiness readinessState
 }
@@ -245,6 +248,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Name:      "ovs_flow_apply_errors_total",
 			Help:      "Total failed OVS flow mutations, labelled by flow plane (hairpin, mactweak).",
 		}, []string{"plane"}),
+
+		configReloadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "config_reload_total",
+			Help:      "Total configuration reloads triggered by SIGHUP, labelled by outcome (success, error). success means the file loaded and validated; restart-only changes it contained are logged and skipped.",
+		}, []string{"outcome"}),
 	}
 
 	reg.MustRegister(
@@ -271,6 +280,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.hairpinFlowsDesired,
 		m.hairpinFlowsInstalled,
 		m.ovsFlowApplyErrors,
+		m.configReloadTotal,
 	)
 
 	// Initialise label series so they appear in /metrics with a zero value
@@ -292,6 +302,8 @@ func newMetricsRegistry() *metricsRegistry {
 	m.ovnConnectionState.WithLabelValues("sb").Set(0)
 	m.ovsFlowApplyErrors.WithLabelValues("hairpin").Add(0)
 	m.ovsFlowApplyErrors.WithLabelValues("mactweak").Add(0)
+	m.configReloadTotal.WithLabelValues("success").Add(0)
+	m.configReloadTotal.WithLabelValues("error").Add(0)
 
 	return m
 }
@@ -544,6 +556,15 @@ func recordOVSFlowApplyError(plane string) {
 		return
 	}
 	metrics.ovsFlowApplyErrors.WithLabelValues(plane).Inc()
+}
+
+// recordConfigReload counts one SIGHUP reload by outcome ("success" or
+// "error").
+func recordConfigReload(outcome string) {
+	if metrics == nil {
+		return
+	}
+	metrics.configReloadTotal.WithLabelValues(outcome).Inc()
 }
 
 // setLastReconcileStatus records the outcome of the most recent reconcile

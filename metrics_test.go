@@ -90,6 +90,7 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setHairpinFlowPlane(3, 2)
 	recordOVSFlowApplyError("hairpin")
 	setLastReconcileStatus(true)
+	recordConfigReload("success")
 }
 
 func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
@@ -120,6 +121,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_hairpin_flows_desired",
 		"ovn_network_agent_hairpin_flows_installed",
 		"ovn_network_agent_ovs_flow_apply_errors_total",
+		"ovn_network_agent_config_reload_total",
 	}
 	gotNames := make(map[string]bool, len(got))
 	for _, mf := range got {
@@ -735,5 +737,29 @@ func TestStartMetricsServerErrorsOnInvalidAddr(t *testing.T) {
 	defer cancel()
 	if err := startMetricsServer(ctx, "127.0.0.1:not-a-port", newMetricsRegistry()); err == nil {
 		t.Fatal("expected error for invalid addr, got nil")
+	}
+}
+
+// TestConfigReloadCounter pins both outcome series of config_reload_total: they
+// exist at 0 from the first scrape and count one reload each.
+func TestConfigReloadCounter(t *testing.T) {
+	const name = "ovn_network_agent_config_reload_total"
+	m := withTestMetrics(t)
+
+	for _, outcome := range []string{"success", "error"} {
+		if got := counterValue(t, m, name, "outcome", outcome); got != 0 {
+			t.Errorf("%s{outcome=%q} = %v on a fresh registry, want 0", name, outcome, got)
+		}
+	}
+
+	recordConfigReload("success")
+	recordConfigReload("error")
+	recordConfigReload("error")
+
+	if got := counterValue(t, m, name, "outcome", "success"); got != 1 {
+		t.Errorf("%s{outcome=\"success\"} = %v, want 1", name, got)
+	}
+	if got := counterValue(t, m, name, "outcome", "error"); got != 2 {
+		t.Errorf("%s{outcome=\"error\"} = %v, want 2", name, got)
 	}
 }

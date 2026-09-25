@@ -303,6 +303,15 @@ func NewOVNClient(cfg Config, onChange func()) *OVNClient {
 	}
 }
 
+// setDrainSettleDelay applies a reloaded drain_settle_delay. It writes only
+// that one field, and only from Run's goroutine: the field is read solely by
+// the drain path on the same goroutine (awaitTakeoverReady, holdSettleMargin),
+// never by the refresh loop, so this is race-free where replacing all of o.cfg
+// would not be.
+func (o *OVNClient) setDrainSettleDelay(d time.Duration) {
+	o.cfg.DrainSettleDelay = d
+}
+
 func (o *OVNClient) Connect(ctx context.Context) error {
 	hostname, err := getHostname()
 	if err != nil {

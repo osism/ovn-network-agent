@@ -237,6 +237,20 @@ type configOption struct {
 	applyEnv func(cfg *Config, v string) error
 	// applyYAML decodes this option's config-file node into cfg.
 	applyYAML func(cfg *Config, n *yaml.Node) error
+
+	// value returns the option's current value in cfg, and copyValue copies
+	// it from src into dst. A SIGHUP reload uses them to diff the running
+	// configuration against the reloaded one and to merge the reloadable
+	// keys, without a second per-option declaration.
+	value     func(cfg *Config) any
+	copyValue func(dst, src *Config)
+}
+
+// withAccessors sets o's value and copyValue from the option's field accessor.
+func withAccessors[T any](o configOption, field func(*Config) *T) configOption {
+	o.value = func(cfg *Config) any { return *field(cfg) }
+	o.copyValue = func(dst, src *Config) { *field(dst) = *field(src) }
+	return o
 }
 
 // envVarName derives an option's environment variable from its flag name:
@@ -284,7 +298,7 @@ func stringOpt(flagName, def, usage string, field func(*Config) *string) configO
 		}
 		return nil
 	}
-	return o
+	return withAccessors(o, field)
 }
 
 // boolOpt declares a boolean option. The flag is a real bool flag, so the bare
@@ -312,7 +326,7 @@ func boolOpt(flagName string, def bool, usage string, field func(*Config) *bool)
 		*field(cfg) = b
 		return nil
 	}
-	return o
+	return withAccessors(o, field)
 }
 
 // intOpt declares an integer option.
@@ -338,7 +352,7 @@ func intOpt(flagName string, def int, usage string, field func(*Config) *int) co
 		*field(cfg) = i
 		return nil
 	}
-	return o
+	return withAccessors(o, field)
 }
 
 // durationOpt declares a time.Duration option. The flag is registered as a
@@ -380,7 +394,7 @@ func durationOpt(flagName string, def time.Duration, usage string, field func(*C
 		*field(cfg) = d
 		return nil
 	}
-	return o
+	return withAccessors(o, field)
 }
 
 // stringSliceOpt declares a list option. The flag and environment forms are
@@ -402,14 +416,14 @@ func stringSliceOpt(flagName, usage string, field func(*Config) *[]string) confi
 		}
 		return nil
 	}
-	return o
+	return withAccessors(o, field)
 }
 
 // portForwardsOpt declares the port_forwards list, which has no flag or
 // environment form: it is a nested structure that only the config file can
 // express.
 func portForwardsOpt(key, usage string, field func(*Config) *[]PortForwardVIP) configOption {
-	return configOption{
+	return withAccessors(configOption{
 		Key:   key,
 		Usage: usage,
 		applyYAML: func(cfg *Config, n *yaml.Node) error {
@@ -422,7 +436,7 @@ func portForwardsOpt(key, usage string, field func(*Config) *[]PortForwardVIP) c
 			}
 			return nil
 		},
-	}
+	}, field)
 }
 
 // configOptions is the single declaration of every configuration option. Order

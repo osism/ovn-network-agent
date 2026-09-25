@@ -36,6 +36,9 @@ StartLimitBurst=10
 [Service]
 Type=simple
 ExecStart=/usr/bin/ovn-network-agent --config /etc/ovn-network-agent/config.yaml
+# `systemctl reload` re-reads the config file and applies the reloadable keys
+# without draining; the rest need a restart (see docs/guides/configuration.md).
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 

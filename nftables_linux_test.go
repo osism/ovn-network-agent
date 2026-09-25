@@ -176,3 +176,14 @@ func atoiOrFail(t *testing.T, s string) int {
 	}
 	return n
 }
+
+// TestWithdrawVIPAddressesMissingDevice covers the upstream error of a reload's
+// VIP withdrawal: a port_forward_dev that does not exist is reported, naming
+// the device. netlink.LinkByName needs no privileges for the lookup.
+func TestWithdrawVIPAddressesMissingDevice(t *testing.T) {
+	rm := &RouteManager{cfg: Config{PortForwardDev: "nosuchdev0"}}
+	err := rm.WithdrawVIPAddresses([]string{"198.51.100.31"})
+	if err == nil || !strings.Contains(err.Error(), "find device nosuchdev0") {
+		t.Fatalf("WithdrawVIPAddresses() error = %v, want one containing %q", err, "find device nosuchdev0")
+	}
+}

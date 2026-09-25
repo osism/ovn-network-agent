@@ -353,6 +353,46 @@ func (rm *RouteManager) reconcilePortForwardVIPs(announceVIPs bool) error {
 	return nil
 }
 
+// WithdrawVIPAddresses removes the /32 of each given VIP from port_forward_dev.
+// A reload calls it for managed VIPs the new configuration drops or no longer
+// manages: reconcilePortForwardVIPs only walks the current list, so without
+// this the address, and the connected route that announces it, would outlive
+// the VIP. An address that is already gone counts as done; any other failure
+// is kept, the remaining VIPs are still tried, and the first error is returned.
+func (rm *RouteManager) WithdrawVIPAddresses(vips []string) error {
+	if len(vips) == 0 {
+		return nil
+	}
+	if rm.cfg.DryRun {
+		for _, v := range vips {
+			slog.Info("[dry-run] would remove VIP address", "vip", v, "dev", rm.cfg.PortForwardDev)
+		}
+		return nil
+	}
+
+	link, err := netlink.LinkByName(rm.cfg.PortForwardDev)
+	if err != nil {
+		return fmt.Errorf("find device %s: %w", rm.cfg.PortForwardDev, err)
+	}
+	var firstErr error
+	for _, v := range vips {
+		addr := &netlink.Addr{
+			IPNet: &net.IPNet{IP: net.ParseIP(v), Mask: net.CIDRMask(32, 32)},
+		}
+		if err := netlink.AddrDel(link, addr); err != nil {
+			if isNoSuchAddr(err) {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("remove VIP %s: %w", v, err)
+			}
+			continue
+		}
+		slog.Info("VIP address removed", "vip", v, "dev", rm.cfg.PortForwardDev)
+	}
+	return firstErr
+}
+
 // applyNftRuleset atomically replaces the nftables table with the current config.
 // The delete + create is submitted as a single nft -f input to avoid a window
 // where no rules exist.

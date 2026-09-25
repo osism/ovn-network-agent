@@ -40,3 +40,16 @@ func (rm *RouteManager) TeardownPortForward() error {
 	}
 	return fmt.Errorf("port forwarding is only supported on Linux")
 }
+
+func (rm *RouteManager) WithdrawVIPAddresses(vips []string) error {
+	if len(vips) == 0 {
+		return nil
+	}
+	if rm.cfg.DryRun {
+		for _, v := range vips {
+			slog.Info("[dry-run] would remove VIP address", "vip", v, "dev", rm.cfg.PortForwardDev)
+		}
+		return nil
+	}
+	return fmt.Errorf("port forwarding is only supported on Linux")
+}
