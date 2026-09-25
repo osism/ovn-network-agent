@@ -6,6 +6,12 @@
 # Usage:
 #   ovn-network-agent --config /etc/ovn-network-agent/config.yaml
 #
+# Reload:
+#   systemctl reload ovn-network-agent (sends SIGHUP) applies the reloadable
+#   keys without a restart; every other changed key keeps its running value
+#   and is logged as needing a restart. See docs/guides/configuration.md,
+#   "Reload the configuration".
+#
 # Operating mode is derived from configuration presence:
 #   - both OVN remotes set            -> full mode (synchronise FIP routes,
 #                                        gateway routing, port forwarding)
@@ -38,8 +44,9 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # ovn_ssl_cert: "/etc/ovn-network-agent/cert.pem"
 # ovn_ssl_key: "/etc/ovn-network-agent/key.pem"
 # The private key must not be group- or world-accessible (chmod 0600) — the
-# agent refuses to start otherwise.
-# The files are read once at startup — rotation requires a restart.
+# agent refuses to start (or rejects the reload) otherwise.
+# The cert/key pair is re-read on every reload (SIGHUP); the CA file is read
+# only at startup, so rotating it requires a restart.
 
 # Provider bridge device for kernel routes (default: br-ex)
 # bridge_dev: "br-ex"

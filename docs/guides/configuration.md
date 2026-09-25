@@ -162,9 +162,12 @@ completed one — the cleartext database still carries the chassis and
 `Port_Binding` data the agent turns into routes, FRR announcements, and NAT
 rules.
 
-The certificate files are read once at startup; there is no runtime reload
-([#91](https://github.com/osism/ovn-network-agent/issues/91)). Restart the
-agent after rotating them. An already-expired `ovn_ssl_cert` is loaded with a
+The client certificate and key are re-read on every
+[reload](#reload-the-configuration): rotate `ovn_ssl_cert` and `ovn_ssl_key`
+in place, run `systemctl reload ovn-network-agent`, and the next TLS handshake
+presents the new pair. Established sessions keep their certificate until they
+reconnect. The CA file is read only at startup, so restart the agent after
+rotating `ovn_ssl_ca`. An already-expired `ovn_ssl_cert` is loaded with a
 warning rather than rejected — an established session survives its own expiry,
 so the failure surfaces only at the next reconnect.
 
@@ -197,6 +200,58 @@ you cannot move to `ssl:` yet, reduce the exposure:
 - **nftables**: `nft` binary must be in `PATH` (required for port forwarding /
   DNAT).
 - **Permissions**: root or `CAP_NET_ADMIN` for netlink route manipulation.
+
+## Reload the configuration
+
+Send `SIGHUP` to apply a changed config file without restarting the agent:
+
+```bash
+sudo systemctl reload ovn-network-agent
+# or, without systemd
+sudo kill -HUP "$(pidof ovn-network-agent)"
+```
+
+A reload does not drain the node or fail its gateways over. The agent
+re-reads the configuration with the same layering as at startup and applies it
+between two reconcile cycles, so no cycle runs with half of the new settings. A `SIGHUP` that arrives while the agent is still starting up (for
+example while it waits for OVN) is applied once the main loop runs. When the
+reload changed a setting, a reconcile follows right away.
+
+These keys take effect on a reload:
+
+| Key | Effect of a reload |
+|---|---|
+| `log_level` | The new level applies from the next log line. |
+| `reconcile_interval` | The periodic reconcile restarts on the new interval. |
+| `frr_prefix_list` | The agent empties the previous list, then fills the new one. See [renaming the list](./frr-prefix-list#rename-the-list-on-a-running-agent). |
+| `stale_chassis_grace_period` | Applies to the next stale-chassis check. `0` disables the cleanup and forgets the chassis tracked as missing. |
+| `port_forwards` | VIPs and rules are added, changed, or removed on the next reconcile. The address of a managed VIP that the file drops, or no longer manages, is removed from `port_forward_dev` at once. |
+| `cleanup_on_shutdown`, `drain_on_shutdown`, `drain_timeout`, `drain_settle_delay` | Apply to the next shutdown. |
+| `ovn_ssl_cert`, `ovn_ssl_key` | Re-read on every reload, even at unchanged paths, and presented from the next TLS handshake. Open OVN sessions keep their certificate until they reconnect. |
+
+Every other key is read only at startup. When the file changes one, the reload
+keeps the running value and logs `configuration change needs a restart,
+keeping the running value` with the key and the reason. The same holds for:
+
+- turning port forwarding on or off, that is, going from no `port_forwards` to
+  some or back;
+- adding or removing the OVN client certificate;
+- a changed `ovn_ssl_ca`, even at the same path.
+
+Environment variables and CLI flags keep overriding the config file on a
+reload. The agent reads its environment and command line only at startup, so
+editing the file cannot change a key they set, and a change to
+`/etc/default/ovn-network-agent` needs a restart.
+
+A reload whose file does not parse or validate changes nothing: the agent keeps
+its previous configuration and logs `configuration reload failed, keeping the
+running configuration` with the error. Run [`--check-config`](#validate-a-configuration)
+before the reload to catch that first.
+
+Each reload logs one `configuration reloaded` line with the `applied` and
+`restart_required` keys and increments
+[`ovn_network_agent_config_reload_total`](../reference/metrics) with
+`outcome="success"` or `outcome="error"`.
 
 ## Validate a configuration
 
