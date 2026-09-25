@@ -350,17 +350,35 @@ func (p *AgentProc) LogTail(n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// writeTempConfig serialises cfg to a temp YAML file in t.TempDir(). It uses
-// yaml.v3 with explicit handling for fields whose semantics differ between
-// "unset" and "empty string". In particular, frr_prefix_list always emits a
-// quoted value (the agent treats an absent key as "use the default
-// ANNOUNCED-NETWORKS prefix list", but tests usually want to disable it
-// outright by passing an empty string).
+// Reload rewrites the agent's config file with cfg and sends SIGHUP, the
+// way an operator edits the file and runs `systemctl reload`. The agent
+// applies the reload asynchronously on its main loop; scenarios assert on its
+// log line, metrics, or host state with a timeout.
+func (p *AgentProc) Reload(cfg AgentConfig) {
+	p.t.Helper()
+	writeConfigFile(p.t, p.configF, cfg)
+	if err := p.cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		p.t.Fatalf("signal SIGHUP: %v", err)
+	}
+}
+
+// writeTempConfig serialises cfg to a temp YAML file in t.TempDir() and
+// returns its path.
 func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agent.yaml")
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	writeConfigFile(t, path, cfg)
+	return path
+}
 
+// writeConfigFile serialises cfg as YAML to path. It uses yaml.v3 with
+// explicit handling for fields whose semantics differ between "unset" and
+// "empty string". In particular, frr_prefix_list always emits a quoted value
+// (the agent treats an absent key as "use the default ANNOUNCED-NETWORKS
+// prefix list", but tests usually want to disable it outright by passing an
+// empty string).
+func writeConfigFile(t *testing.T, path string, cfg AgentConfig) {
+	t.Helper()
 	doc := map[string]any{}
 	put := func(k, v string) {
 		if v != "" {
@@ -427,7 +445,6 @@ func writeTempConfig(t *testing.T, cfg AgentConfig) string {
 	if err := os.WriteFile(path, out, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	return path
 }
 
 // mergeEnv returns base with each "KEY=value" entry from overrides spliced
