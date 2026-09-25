@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -2490,40 +2491,39 @@ func TestOVNTLSConfig(t *testing.T) {
 	}
 
 	tests := []struct {
-		name             string
-		ca, cert, key    string
-		wantNil          bool     // expect (nil, nil)
-		wantErr          []string // substrings the error must contain; empty = expect success
-		wantRootCAs      bool
-		wantCertificates int
+		name           string
+		ca, cert, key  string
+		wantNil        bool     // expect (nil, nil, nil)
+		wantErr        []string // substrings the error must contain; empty = expect success
+		wantRootCAs    bool
+		wantClientCert bool
 	}{
 		{
 			name:    "all empty",
 			wantNil: true,
 		},
 		{
-			name:             "ca only",
-			ca:               certPath,
-			wantRootCAs:      true,
-			wantCertificates: 0,
+			name:        "ca only",
+			ca:          certPath,
+			wantRootCAs: true,
 		},
 		{
-			name:             "ca cert key",
-			ca:               certPath,
-			cert:             certPath,
-			key:              keyPath,
-			wantRootCAs:      true,
-			wantCertificates: 1,
+			name:           "ca cert key",
+			ca:             certPath,
+			cert:           certPath,
+			key:            keyPath,
+			wantRootCAs:    true,
+			wantClientCert: true,
 		},
 		{
 			// Mutual TLS against servers whose certificates chain to the
 			// system trust store: legal, and the only quadrant where
 			// RootCAs must stay nil while a client certificate is loaded.
-			name:             "cert key without ca",
-			cert:             certPath,
-			key:              keyPath,
-			wantRootCAs:      false,
-			wantCertificates: 1,
+			name:           "cert key without ca",
+			cert:           certPath,
+			key:            keyPath,
+			wantRootCAs:    false,
+			wantClientCert: true,
 		},
 		{
 			name:    "cert without key",
@@ -2567,7 +2567,7 @@ func TestOVNTLSConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tc, err := ovnTLSConfig(tt.ca, tt.cert, tt.key)
+			tc, holder, err := ovnTLSConfig(tt.ca, tt.cert, tt.key)
 			if len(tt.wantErr) > 0 {
 				if err == nil {
 					t.Fatalf("ovnTLSConfig() error = nil, want error")
@@ -2583,8 +2583,8 @@ func TestOVNTLSConfig(t *testing.T) {
 				t.Fatalf("ovnTLSConfig() error = %v, want nil", err)
 			}
 			if tt.wantNil {
-				if tc != nil {
-					t.Fatalf("ovnTLSConfig() = %+v, want nil", tc)
+				if tc != nil || holder != nil {
+					t.Fatalf("ovnTLSConfig() = %+v, %+v, want nil, nil", tc, holder)
 				}
 				return
 			}
@@ -2597,10 +2597,90 @@ func TestOVNTLSConfig(t *testing.T) {
 			if (tc.RootCAs != nil) != tt.wantRootCAs {
 				t.Errorf("RootCAs set = %v, want %v", tc.RootCAs != nil, tt.wantRootCAs)
 			}
-			if len(tc.Certificates) != tt.wantCertificates {
-				t.Errorf("Certificates = %d, want %d", len(tc.Certificates), tt.wantCertificates)
+			// The client certificate is served through the holder so a
+			// reload can swap it. crypto/tls ignores Certificates once
+			// GetClientCertificate is set, so the slice must stay empty.
+			if len(tc.Certificates) != 0 {
+				t.Errorf("Certificates = %d, want 0 (served via GetClientCertificate)", len(tc.Certificates))
+			}
+			if (holder != nil) != tt.wantClientCert {
+				t.Errorf("client cert holder set = %v, want %v", holder != nil, tt.wantClientCert)
+			}
+			if (tc.GetClientCertificate != nil) != tt.wantClientCert {
+				t.Errorf("GetClientCertificate set = %v, want %v", tc.GetClientCertificate != nil, tt.wantClientCert)
+			}
+			if holder != nil && holder.load() == nil {
+				t.Error("client cert holder is empty, want the loaded pair")
 			}
 		})
+	}
+}
+
+// handshakeClientCert runs one TLS handshake between a server that demands a
+// client certificate and client, over an in-memory pipe, and returns the DER
+// of the certificate the server received.
+func handshakeClientCert(t *testing.T, serverCert tls.Certificate, client *tls.Config) []byte {
+	t.Helper()
+	sc, cc := net.Pipe()
+	defer func() { _ = sc.Close() }()
+	defer func() { _ = cc.Close() }()
+
+	srv := tls.Server(sc, &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAnyClientCert,
+		// net.Pipe is unbuffered: a post-handshake session ticket would
+		// block the server on a client that has stopped reading.
+		SessionTicketsDisabled: true,
+	})
+	cli := tls.Client(cc, client)
+
+	errc := make(chan error, 1)
+	go func() { errc <- cli.Handshake() }()
+	if err := srv.Handshake(); err != nil {
+		t.Fatalf("server handshake: %v", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	peers := srv.ConnectionState().PeerCertificates
+	if len(peers) == 0 {
+		t.Fatal("server received no client certificate")
+	}
+	return peers[0].Raw
+}
+
+// TestClientCertHolderRotatesHandshakeCert proves the reload seam end to end:
+// the same *tls.Config that ovnTLSConfig built (libovsdb redials with exactly
+// one) presents a different client certificate on the next handshake once a
+// new pair is stored in its holder.
+func TestClientCertHolderRotatesHandshakeCert(t *testing.T) {
+	certA, keyA := writeTestTLSFiles(t)
+	certB, keyB := writeTestTLSFiles(t)
+	pairA, err := tls.LoadX509KeyPair(certA, keyA)
+	if err != nil {
+		t.Fatalf("load pair A: %v", err)
+	}
+	pairB, err := tls.LoadX509KeyPair(certB, keyB)
+	if err != nil {
+		t.Fatalf("load pair B: %v", err)
+	}
+
+	tc, holder, err := ovnTLSConfig("", certA, keyA)
+	if err != nil {
+		t.Fatalf("ovnTLSConfig() error = %v", err)
+	}
+	// The test certificates carry no SANs; server verification is not what
+	// this test is about.
+	tc.InsecureSkipVerify = true
+
+	if got := handshakeClientCert(t, pairA, tc); !bytes.Equal(got, pairA.Certificate[0]) {
+		t.Fatal("first handshake did not present certificate A")
+	}
+
+	holder.store(&pairB)
+
+	if got := handshakeClientCert(t, pairA, tc); !bytes.Equal(got, pairB.Certificate[0]) {
+		t.Fatal("handshake after store(B) did not present certificate B")
 	}
 }
 
@@ -2615,12 +2695,12 @@ func TestOVNTLSConfigWarnsOnExpiredCert(t *testing.T) {
 		buf := captureSlog(t)
 		certPath, keyPath := writeTestTLSFilesNotAfter(t, time.Now().Add(-time.Hour))
 
-		tc, err := ovnTLSConfig("", certPath, keyPath)
+		_, holder, err := ovnTLSConfig("", certPath, keyPath)
 		if err != nil {
 			t.Fatalf("ovnTLSConfig() error = %v, want nil", err)
 		}
-		if len(tc.Certificates) != 1 {
-			t.Errorf("Certificates = %d, want 1 (an expired cert must warn, not be dropped)", len(tc.Certificates))
+		if holder == nil || holder.load() == nil {
+			t.Error("client cert holder is empty, want the expired pair (an expired cert must warn, not be dropped)")
 		}
 		if !strings.Contains(buf.String(), warning) {
 			t.Errorf("warnings %q do not contain %q", buf.String(), warning)
@@ -2631,7 +2711,7 @@ func TestOVNTLSConfigWarnsOnExpiredCert(t *testing.T) {
 		buf := captureSlog(t)
 		certPath, keyPath := writeTestTLSFiles(t)
 
-		if _, err := ovnTLSConfig("", certPath, keyPath); err != nil {
+		if _, _, err := ovnTLSConfig("", certPath, keyPath); err != nil {
 			t.Fatalf("ovnTLSConfig() error = %v, want nil", err)
 		}
 		if strings.Contains(buf.String(), warning) {

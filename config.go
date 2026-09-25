@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -118,8 +119,9 @@ type Config struct {
 	OVNNBRemote string
 
 	// OVNSSLCA, OVNSSLCert and OVNSSLKey are PEM file paths used to dial
-	// ssl: OVN remotes. They are read once at startup; rotating the files
-	// requires a restart.
+	// ssl: OVN remotes. The cert/key pair is re-read on every SIGHUP reload
+	// and presented from the next handshake on; the CA is read only at
+	// startup, so rotating it requires a restart.
 	OVNSSLCA   string
 	OVNSSLCert string
 	OVNSSLKey  string
@@ -127,6 +129,12 @@ type Config struct {
 	// OVNTLS is derived by validateConfig from the three ovn-ssl-* path
 	// options; nil when none of them are set.
 	OVNTLS *tls.Config
+
+	// OVNClientCert holds the client certificate OVNTLS presents, derived by
+	// validateConfig; nil when no ovn-ssl-cert is configured. Every copy of a
+	// Config shares the pointer, so a reload that stores a renewed pair here
+	// reaches the tls.Config libovsdb redials with.
+	OVNClientCert *clientCertHolder
 
 	BridgeDev         string
 	VRFName           string
@@ -628,21 +636,53 @@ func validateMode(cfg *Config) error {
 	return nil
 }
 
+// clientCertHolder serves the OVN client certificate to TLS handshakes and
+// lets a reload swap in a renewed pair. libovsdb redials every reconnect with
+// the same *tls.Config, so the certificate cannot live in its Certificates
+// slice (mutating that would race with a handshake); GetClientCertificate
+// reads it from here instead.
+type clientCertHolder struct {
+	cert atomic.Pointer[tls.Certificate]
+}
+
+// load returns the certificate the next handshake presents.
+func (h *clientCertHolder) load() *tls.Certificate {
+	return h.cert.Load()
+}
+
+// store replaces the certificate for every later handshake. Established
+// sessions keep the one they handshook with.
+func (h *clientCertHolder) store(c *tls.Certificate) {
+	h.cert.Store(c)
+}
+
+// getClientCertificate is the tls.Config.GetClientCertificate callback. It
+// makes the same choice crypto/tls makes over Config.Certificates: present the
+// certificate when the server's request supports it, otherwise send none.
+func (h *clientCertHolder) getClientCertificate(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	c := h.load()
+	if c == nil || cri.SupportsCertificate(c) != nil {
+		return new(tls.Certificate), nil
+	}
+	return c, nil
+}
+
 // ovnTLSConfig builds the *tls.Config used to dial ssl: OVN remotes from the
-// ovn-ssl-ca/-cert/-key path options. It returns (nil, nil) when none are set,
-// so a plain tcp: deployment carries no TLS material. The CA, when given,
+// ovn-ssl-ca/-cert/-key path options. It returns (nil, nil, nil) when none are
+// set, so a plain tcp: deployment carries no TLS material. The CA, when given,
 // becomes RootCAs so server certificates verify against the operator's private
 // CA instead of the system trust store; the cert/key pair (which must be set
-// together) becomes the client certificate for mutual TLS; the key file is
-// rejected unless its mode keeps it off-limits to group and other. Reading the
-// files here means a bad path fails the config load — and --check-config —
-// rather than the first dial.
-func ovnTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
+// together) becomes the client certificate for mutual TLS, served through the
+// returned holder; the key file is rejected unless its mode keeps it
+// off-limits to group and other. Reading the files here means a bad path fails
+// the config load — and --check-config, and a SIGHUP reload — rather than the
+// first dial.
+func ovnTLSConfig(caPath, certPath, keyPath string) (*tls.Config, *clientCertHolder, error) {
 	if caPath == "" && certPath == "" && keyPath == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if (certPath == "") != (keyPath == "") {
-		return nil, fmt.Errorf("ovn-ssl-cert and ovn-ssl-key must be set together")
+		return nil, nil, fmt.Errorf("ovn-ssl-cert and ovn-ssl-key must be set together")
 	}
 
 	tc := &tls.Config{MinVersion: tls.VersionTLS12}
@@ -650,15 +690,16 @@ func ovnTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
 	if caPath != "" {
 		pem, err := os.ReadFile(caPath)
 		if err != nil {
-			return nil, fmt.Errorf("read ovn-ssl-ca %q: %w", caPath, err)
+			return nil, nil, fmt.Errorf("read ovn-ssl-ca %q: %w", caPath, err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("ovn-ssl-ca %q: no PEM certificates found", caPath)
+			return nil, nil, fmt.Errorf("ovn-ssl-ca %q: no PEM certificates found", caPath)
 		}
 		tc.RootCAs = pool
 	}
 
+	var holder *clientCertHolder
 	if certPath != "" {
 		// The private key is what lets anything speak for this agent
 		// against the write-capable NB database, so refuse to load one
@@ -667,14 +708,14 @@ func ovnTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
 		// the gateway node a working client identity, silently.
 		fi, err := os.Stat(keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("stat ovn-ssl-key %q: %w", keyPath, err)
+			return nil, nil, fmt.Errorf("stat ovn-ssl-key %q: %w", keyPath, err)
 		}
 		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-			return nil, fmt.Errorf("ovn-ssl-key %q has mode %04o: the private key must not be group- or world-accessible (chmod 0600)", keyPath, perm)
+			return nil, nil, fmt.Errorf("ovn-ssl-key %q has mode %04o: the private key must not be group- or world-accessible (chmod 0600)", keyPath, perm)
 		}
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load ovn-ssl-cert %q / ovn-ssl-key %q: %w", certPath, keyPath, err)
+			return nil, nil, fmt.Errorf("load ovn-ssl-cert %q / ovn-ssl-key %q: %w", certPath, keyPath, err)
 		}
 		// LoadX509KeyPair checks that the key matches the certificate but
 		// never looks at the validity period, so an expired leaf loads
@@ -683,13 +724,15 @@ func ovnTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
 		// refuses to start mid-renewal is worse than one that reconnects
 		// as soon as the new PEMs land.
 		if leaf := cert.Leaf; leaf != nil && time.Now().After(leaf.NotAfter) {
-			slog.Warn("ovn-ssl-cert has expired: OVN TLS handshakes will be rejected until it is renewed and the agent restarted",
+			slog.Warn("ovn-ssl-cert has expired: OVN TLS handshakes will be rejected until it is renewed and the agent reloaded (SIGHUP) or restarted",
 				"path", certPath, "not_after", leaf.NotAfter)
 		}
-		tc.Certificates = []tls.Certificate{cert}
+		holder = &clientCertHolder{}
+		holder.store(&cert)
+		tc.GetClientCertificate = holder.getClientCertificate
 	}
 
-	return tc, nil
+	return tc, holder, nil
 }
 
 // remoteUsesSSL reports whether an OVN remote list dials over TLS. Every
@@ -752,7 +795,7 @@ func validateTLS(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	cfg.OVNTLS, err = ovnTLSConfig(cfg.OVNSSLCA, cfg.OVNSSLCert, cfg.OVNSSLKey)
+	cfg.OVNTLS, cfg.OVNClientCert, err = ovnTLSConfig(cfg.OVNSSLCA, cfg.OVNSSLCert, cfg.OVNSSLKey)
 	if err != nil {
 		return err
 	}
