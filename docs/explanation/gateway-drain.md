@@ -27,7 +27,9 @@ agent:
 1. **Lowers its `Gateway_Chassis` priority to 0** in the OVN Northbound
    database for all locally-active router ports. Since standby chassis have
    priority >= 1, `ovn-northd` immediately begins migrating chassisredirect
-   ports to standby chassis.
+   ports to standby chassis. A port whose only `Gateway_Chassis` entry is this
+   chassis has no standby to migrate to, so the drain leaves it out of this
+   step and of the two waits below.
 2. **Waits for the chassisredirect ports to move away** from this chassis.
    The SB monitor is still connected during the drain, so the wait is
    event-driven: each chassisredirect `Port_Binding` change wakes it

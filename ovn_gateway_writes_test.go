@@ -1581,7 +1581,7 @@ func TestAwaitTakeoverReady_ReturnsOnMarker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	c.awaitTakeoverReady(ctx, "host-a")
+	c.awaitTakeoverReady(ctx, "host-a", nil)
 	elapsed := time.Since(start)
 	if elapsed < c.cfg.DrainSettleDelay {
 		t.Errorf("returned after %v, want at least the %v safety margin", elapsed, c.cfg.DrainSettleDelay)
@@ -1609,7 +1609,7 @@ func TestAwaitTakeoverReady_TimeoutFallbackWhenMarkerNeverAppears(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	c.awaitTakeoverReady(ctx, "host-a")
+	c.awaitTakeoverReady(ctx, "host-a", nil)
 	elapsed := time.Since(start)
 	if elapsed < 250*time.Millisecond {
 		t.Errorf("returned after %v, expected it to wait for the ~300ms deadline", elapsed)
@@ -1634,7 +1634,7 @@ func TestAwaitTakeoverReady_DisabledWhenSettleZero(t *testing.T) {
 	})
 
 	start := time.Now()
-	c.awaitTakeoverReady(context.Background(), "host-a")
+	c.awaitTakeoverReady(context.Background(), "host-a", nil)
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Errorf("settle delay 0 must disable the handshake, but it blocked %v", elapsed)
 	}
@@ -1660,7 +1660,7 @@ func TestAwaitTakeoverReady_NoManagedRouteHoldsMarginOnly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	c.awaitTakeoverReady(ctx, "host-a")
+	c.awaitTakeoverReady(ctx, "host-a", nil)
 	elapsed := time.Since(start)
 	if elapsed < c.cfg.DrainSettleDelay {
 		t.Errorf("returned after %v, want at least the %v margin", elapsed, c.cfg.DrainSettleDelay)
@@ -1725,6 +1725,245 @@ func TestDrainGateways_SettleDelaySkippedWhenNothingToDrain(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("drain held for %v with nothing to drain; settle delay must not apply", elapsed)
+	}
+}
+
+// localRoutersWithSoleCandidate is the frozen pre-drain state the sole-candidate
+// tests drain from: lr-ha's port has a standby on host-b, lr-solo's port has
+// only this chassis's Gateway_Chassis row, so OVN has nowhere to move it.
+func localRoutersWithSoleCandidate() []LocalRouterInfo {
+	return []LocalRouterInfo{
+		{RouterUUID: "lr-ha", LRPName: "lrp-ha", CRPort: "cr-lrp-ha", GatewayChassisUUIDs: []string{"g-ha-a", "g-ha-b"}},
+		{RouterUUID: "lr-solo", LRPName: "lrp-solo", CRPort: "cr-lrp-solo", GatewayChassisUUIDs: []string{"g-solo-a"}},
+	}
+}
+
+// loweredRows returns the Gateway_Chassis rows the drain's write transactions
+// set to priority 0, by UUID.
+func loweredRows(t *testing.T, nb *fakeOVSDBClient) []string {
+	t.Helper()
+	var lowered []string
+	for i := range nb.writeTransacts() {
+		for _, op := range findOps(t, nb.writeTransacts(), i, ovsdb.OperationUpdate, "Gateway_Chassis") {
+			if got, ok := op.Row["priority"].(int); !ok || got != 0 {
+				t.Errorf("drain op should set priority=0, got %#v", op.Row["priority"])
+			}
+			lowered = append(lowered, op.UUID)
+		}
+	}
+	return lowered
+}
+
+// TestDrainGateways_SkipsGatewayPortsWithoutAStandby is the regression for a
+// drain that ran out drain_timeout on a router whose port has no standby: its
+// only Gateway_Chassis row is this chassis's, so lowering it moved nothing, the
+// local chassisredirect binding never went away, and the migration wait held
+// the shutdown until the deadline. Only the HA router's row is lowered now, and
+// the drain returns as soon as that router has migrated.
+func TestDrainGateways_SkipsGatewayPortsWithoutAStandby(t *testing.T) {
+	buf := captureSlog(t)
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{LocalRouters: localRoutersWithSoleCandidate()})
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g-ha-a", Name: "lrp-ha_host-a", ChassisName: "host-a", Priority: 30},
+		&NBGatewayChassis{UUID: "g-ha-b", Name: "lrp-ha_host-b", ChassisName: "host-b", Priority: 20},
+		&NBGatewayChassis{UUID: "g-solo-a", Name: "lrp-solo_host-a", ChassisName: "host-a", Priority: 30},
+	)
+	// lr-ha has migrated to host-b; lr-solo's port stays bound here.
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-solo", LogicalPort: "cr-lrp-solo", Type: "chassisredirect", Chassis: strPtr("ch-a"),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	drained, err := c.DrainGateways(ctx, "host-a")
+	if err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — the HA router's row was lowered")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("drain blocked %v; a port with no standby must not hold it until the deadline", elapsed)
+	}
+	if got := loweredRows(t, nb); len(got) != 1 || got[0] != "g-ha-a" {
+		t.Errorf("lowered rows = %v, want only the HA router's g-ha-a", got)
+	}
+	if !strings.Contains(buf.String(), "drain: skipping gateway chassis with no standby") ||
+		!strings.Contains(buf.String(), "lrp-solo_host-a") {
+		t.Errorf("expected the skip of lrp-solo_host-a to be logged, got:\n%s", buf.String())
+	}
+}
+
+// TestDrainGateways_NothingToDrainWhenEveryPortIsASoleCandidate covers a
+// chassis whose every gateway port lacks a standby: nothing is lowered, the
+// drain reports a no-op, and no settle margin is held.
+func TestDrainGateways_NothingToDrainWhenEveryPortIsASoleCandidate(t *testing.T) {
+	buf := captureSlog(t)
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 30 * time.Second
+	c.state.Replace(OVNState{LocalRouters: localRoutersWithSoleCandidate()[1:]})
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g-solo-a", Name: "lrp-solo_host-a", ChassisName: "host-a", Priority: 30},
+	)
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-solo", LogicalPort: "cr-lrp-solo", Type: "chassisredirect", Chassis: strPtr("ch-a"),
+	})
+
+	start := time.Now()
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if drained {
+		t.Errorf("drained = true, want false — every local port lacks a standby")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("drain held for %v; with nothing lowered no margin applies", elapsed)
+	}
+	if got := nb.writeTransacts(); len(got) != 0 {
+		t.Errorf("expected no write transacts, got %+v", got)
+	}
+	if !strings.Contains(buf.String(), "skipped_sole_candidates=1") {
+		t.Errorf("expected the no-op log to count the skipped row, got:\n%s", buf.String())
+	}
+}
+
+// TestDrainGateways_LowersRowsNoSoleCandidateNames pins what the skip must not
+// reach: a router with no Gateway_Chassis references (an HA_Chassis_Group
+// port) is not a sole candidate, and a local row no local router references
+// (a standby row for a router active elsewhere) is lowered as before.
+func TestDrainGateways_LowersRowsNoSoleCandidateNames(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{
+		{RouterUUID: "lr-hcg", LRPName: "lrp-hcg", CRPort: "cr-lrp-hcg", GatewayChassisUUIDs: nil},
+	}})
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g-standby-a", Name: "lrp-other_host-a", ChassisName: "host-a", Priority: 10},
+	)
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — the standby row was lowered")
+	}
+	if got := loweredRows(t, nb); len(got) != 1 || got[0] != "g-standby-a" {
+		t.Errorf("lowered rows = %v, want the standby row g-standby-a", got)
+	}
+}
+
+// TestDrainGateways_FallbackSkipsSoleCandidates covers the #115 path: rows the
+// server select recovers for a cache that missed them are filtered the same
+// way the cache's own rows are.
+func TestDrainGateways_FallbackSkipsSoleCandidates(t *testing.T) {
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{LocalRouters: localRoutersWithSoleCandidate()})
+	// The cache holds only the peer's row; the server has both local rows.
+	nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g-ha-b", Name: "lrp-ha_host-b", ChassisName: "host-b", Priority: 20},
+	)
+	nb.setSelectRows("Gateway_Chassis",
+		ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: "g-ha-a"}, "name": "lrp-ha_host-a", "chassis_name": "host-a", "priority": float64(30)},
+		ovsdb.Row{"_uuid": ovsdb.UUID{GoUUID: "g-solo-a"}, "name": "lrp-solo_host-a", "chassis_name": "host-a", "priority": float64(30)},
+	)
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+
+	drained, err := c.DrainGateways(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — the recovered HA row was lowered")
+	}
+	if got := loweredRows(t, nb); len(got) != 1 || got[0] != "g-ha-a" {
+		t.Errorf("lowered rows = %v, want only the recovered HA row g-ha-a", got)
+	}
+}
+
+// TestAwaitTakeoverReady_IgnoresSoleCandidateRoutes pins the handshake half of
+// the skip: no takeover chassis will ever stamp the default route of a router
+// with no standby, so waiting for it would run to the deadline. With the HA
+// router's route stamped by its takeover chassis, the wait returns after the
+// margin.
+func TestAwaitTakeoverReady_IgnoresSoleCandidateRoutes(t *testing.T) {
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 50 * time.Millisecond
+	c.state.Replace(OVNState{LocalRouters: localRoutersWithSoleCandidate()})
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-ha", StaticRoutes: []string{"sr-ha"}},
+		&NBLogicalRouter{UUID: "lr-solo", StaticRoutes: []string{"sr-solo"}},
+	)
+	nb.setRows("Logical_Router_Static_Route",
+		&NBLogicalRouterStaticRoute{
+			UUID: "sr-ha", IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-b"},
+		},
+		&NBLogicalRouterStaticRoute{
+			UUID: "sr-solo", IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-a"},
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	c.awaitTakeoverReady(ctx, "host-a", map[string]bool{"lrp-solo": true})
+	elapsed := time.Since(start)
+	if elapsed < c.cfg.DrainSettleDelay {
+		t.Errorf("returned after %v, want at least the %v safety margin", elapsed, c.cfg.DrainSettleDelay)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("blocked %v; the sole candidate's route must not hold the handshake", elapsed)
+	}
+}
+
+// TestCountLocalCRPorts_SkipsOnlyTheNamedPorts: a skipped port is not
+// counted, every other local chassisredirect binding still is — including one
+// whose name follows no convention — and a failed SB read is still an error.
+func TestCountLocalCRPorts_SkipsOnlyTheNamedPorts(t *testing.T) {
+	c, _, sb := newOVNClientWithFakes(t, "host-a")
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	sb.setRows("Port_Binding",
+		&SBPortBinding{UUID: "pb-solo", LogicalPort: "cr-lrp-solo", Type: "chassisredirect", Chassis: strPtr("ch-a")},
+		&SBPortBinding{UUID: "pb-odd", LogicalPort: "odd-name", Type: "chassisredirect", Chassis: strPtr("ch-a")},
+	)
+
+	got, err := c.countLocalCRPorts(context.Background(), "host-a", map[string]bool{"cr-lrp-solo": true})
+	if err != nil {
+		t.Fatalf("countLocalCRPorts: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("counted %d local ports, want 1 — only cr-lrp-solo is skipped", got)
+	}
+
+	sb.listErr = errors.New("connection refused")
+	if _, err := c.countLocalCRPorts(context.Background(), "host-a", nil); err == nil ||
+		!strings.Contains(err.Error(), "list port bindings") {
+		t.Errorf("a failed SB read returned %v, want the wrapped list port bindings error", err)
+	}
+}
+
+// TestSoleCandidatePorts keys each port without a standby three ways and
+// leaves every other router out.
+func TestSoleCandidatePorts(t *testing.T) {
+	gc, cr, lrp := soleCandidatePorts(append(localRoutersWithSoleCandidate(),
+		LocalRouterInfo{RouterUUID: "lr-hcg", LRPName: "lrp-hcg", CRPort: "cr-lrp-hcg"},
+	))
+	if !reflect.DeepEqual(gc, map[string]bool{"g-solo-a": true}) ||
+		!reflect.DeepEqual(cr, map[string]bool{"cr-lrp-solo": true}) ||
+		!reflect.DeepEqual(lrp, map[string]bool{"lrp-solo": true}) {
+		t.Errorf("sole candidates = %v / %v / %v, want only lr-solo's port", gc, cr, lrp)
+	}
+
+	gc, cr, lrp = soleCandidatePorts(nil)
+	if len(gc) != 0 || len(cr) != 0 || len(lrp) != 0 {
+		t.Errorf("no local routers produced sole candidates: %v / %v / %v", gc, cr, lrp)
 	}
 }
 

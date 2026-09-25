@@ -810,6 +810,11 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 // cache shows no row at all for the local chassis, fall back to a direct
 // OVSDB select so the drain does not silently no-op.
 //
+// A router port whose only Gateway_Chassis row is this chassis's has no
+// standby: lowering its priority moves nothing, and waiting for it to migrate
+// would hold the shutdown for the whole drain_timeout. Such ports are left out
+// of every step (see soleCandidatePorts).
+//
 // It reports whether any Gateway_Chassis priorities were actually lowered, so
 // the caller can distinguish a real drain from a no-op.
 func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) (drained bool, err error) {
@@ -841,6 +846,12 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 		}
 	}
 
+	// The frozen pre-drain state names the ports that cannot migrate: it
+	// carries each local router's Gateway_Chassis references from the guarded
+	// refresh, so this needs no NB read of its own.
+	soleGC, soleCRPorts, soleLRPs := soleCandidatePorts(o.GetState().LocalRouters)
+	toDrain, skipped := withoutSoleCandidates(toDrain, soleGC)
+
 	if len(toDrain) == 0 {
 		// Surface what was actually read so a "no entries" log does not end
 		// the triage trail. Useful when an empty match is caused by a
@@ -850,6 +861,7 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 			"local_chassis_name", localChassisName,
 			"cache_count", len(gwChassisList),
 			"cache_entries", summarizeGatewayChassis(gwChassisList),
+			"skipped_sole_candidates", skipped,
 		}
 		if !hasLocalRow {
 			// The cache dump cannot hold the local row — its absence is what
@@ -895,13 +907,13 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 	defer ticker.Stop()
 
 	for {
-		remaining, err := o.countLocalCRPorts(ctx, localChassisName)
+		remaining, err := o.countLocalCRPorts(ctx, localChassisName, soleCRPorts)
 		if err != nil {
 			return true, fmt.Errorf("drain: failed to query port bindings: %w", err)
 		}
 		if remaining == 0 {
 			slog.Info("drain: complete, all gateways migrated away")
-			o.awaitTakeoverReady(ctx, localChassisName)
+			o.awaitTakeoverReady(ctx, localChassisName, soleLRPs)
 			return true, nil
 		}
 		slog.Info("drain: waiting for gateway migration", "remaining_gateways", remaining)
@@ -931,17 +943,30 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 // Routers whose default route is not agent-managed are excluded from the wait
 // set: no marker can ever appear for them, so if none of the local routers has
 // a managed default route the behaviour degrades to the plain margin hold. The
-// whole wait is bounded by ctx (drain_timeout): a takeover that never signals
-// falls back cleanly at the deadline and proceeds with cleanup.
-func (o *OVNClient) awaitTakeoverReady(ctx context.Context, localChassisName string) {
+// routers named in skipLRPs are excluded too: their port has no standby, so no
+// takeover chassis will ever stamp them. The whole wait is bounded by ctx
+// (drain_timeout): a takeover that never signals falls back cleanly at the
+// deadline and proceeds with cleanup.
+func (o *OVNClient) awaitTakeoverReady(ctx context.Context, localChassisName string, skipLRPs map[string]bool) {
 	if o.cfg.DrainSettleDelay <= 0 {
 		return // handshake disabled
+	}
+
+	localRouters := o.GetState().LocalRouters
+	if len(skipLRPs) > 0 {
+		kept := make([]LocalRouterInfo, 0, len(localRouters))
+		for _, lr := range localRouters {
+			if !skipLRPs[lr.LRPName] {
+				kept = append(kept, lr)
+			}
+		}
+		localRouters = kept
 	}
 
 	// Resolve the wait set once from the frozen pre-drain router snapshot: the
 	// managed default routes this chassis owned. The read goes through the
 	// cache-consistency guard so a stale NB cache cannot stall the handshake.
-	waitRoutes, err := o.localManagedDefaultRoutes(ctx, o.GetState().LocalRouters)
+	waitRoutes, err := o.localManagedDefaultRoutes(ctx, localRouters)
 	if err != nil {
 		slog.Warn("drain: could not resolve managed default routes, holding the safety margin only", "error", err)
 		o.holdSettleMargin(ctx)
@@ -1199,6 +1224,49 @@ func filterDrainCandidates(gwChassisList []NBGatewayChassis, localChassisName st
 	return toDrain, hasLocalRow
 }
 
+// soleCandidatePorts returns the gateway ports among localRouters that have no
+// standby: their Logical_Router_Port references exactly one Gateway_Chassis
+// row, this chassis's own. OVN has nowhere to move such a port, so the drain
+// must neither lower its priority (it moves nothing) nor wait for it to
+// migrate (that waits out drain_timeout). The answer is keyed once per drain
+// step that has to leave them alone: the Gateway_Chassis row UUID, the
+// chassisredirect logical port, and the LRP name. A router with no
+// Gateway_Chassis references at all (an HA_Chassis_Group port) is not a sole
+// candidate: the drain never touched those rows, and still does not.
+func soleCandidatePorts(localRouters []LocalRouterInfo) (gcUUIDs, crPorts, lrpNames map[string]bool) {
+	gcUUIDs = make(map[string]bool)
+	crPorts = make(map[string]bool)
+	lrpNames = make(map[string]bool)
+	for _, lr := range localRouters {
+		if len(lr.GatewayChassisUUIDs) != 1 {
+			continue
+		}
+		gcUUIDs[lr.GatewayChassisUUIDs[0]] = true
+		if lr.CRPort != "" {
+			crPorts[lr.CRPort] = true
+		}
+		if lr.LRPName != "" {
+			lrpNames[lr.LRPName] = true
+		}
+	}
+	return gcUUIDs, crPorts, lrpNames
+}
+
+// withoutSoleCandidates drops the rows in soleGC from toDrain, logging each,
+// and reports how many it dropped.
+func withoutSoleCandidates(toDrain []NBGatewayChassis, soleGC map[string]bool) ([]NBGatewayChassis, int) {
+	kept := make([]NBGatewayChassis, 0, len(toDrain))
+	for _, gwc := range toDrain {
+		if soleGC[gwc.UUID] {
+			slog.Info("drain: skipping gateway chassis with no standby",
+				"name", gwc.Name, "chassis", gwc.ChassisName)
+			continue
+		}
+		kept = append(kept, gwc)
+	}
+	return kept, len(toDrain) - len(kept)
+}
+
 // selectLocalGatewayChassis performs a direct OVSDB select on Gateway_Chassis
 // for entries with chassis_name == localChassisName, bypassing the libovsdb
 // monitor cache. Used as the fallback path when the cache appears to have
@@ -1258,8 +1326,10 @@ func rowToGatewayChassis(row ovsdb.Row) NBGatewayChassis {
 }
 
 // countLocalCRPorts returns the number of chassisredirect ports currently
-// bound to the given chassis hostname in the SB Port_Binding table.
-func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName string) (int, error) {
+// bound to the given chassis hostname in the SB Port_Binding table, leaving out
+// the logical ports in skipCRPorts: ports with no standby, which stay bound here
+// however long the drain waits.
+func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName string, skipCRPorts map[string]bool) (int, error) {
 	// countLocalCRPorts drives the drain poll loop: a stale SB cache here makes
 	// the drain converge on the wrong answer (hang until timeout, or finish
 	// early while ports are still bound). Read through the consistency guard
@@ -1288,6 +1358,9 @@ func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName stri
 			continue
 		}
 		if o.cfg.GatewayPort != "" && pb.LogicalPort != o.cfg.GatewayPort {
+			continue
+		}
+		if skipCRPorts[pb.LogicalPort] {
 			continue
 		}
 		hostname := chassisHostname[*pb.Chassis]

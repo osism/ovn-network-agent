@@ -30,8 +30,10 @@ func TestScenario_DrainTimeout(t *testing.T) {
 	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
 		Name:        "draintmo",
 		LRPNetworks: []string{"198.51.100.11/24"},
+		// The drain only touches a port that has a standby to fail over to.
 		GatewayChassis: []testenv.GatewayChassisEntry{
 			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+			{ChassisName: "drain-timeout-peer", Priority: 1},
 		},
 	})
 	_ = router
@@ -105,6 +107,54 @@ func TestScenario_DrainWithoutLocalRouters(t *testing.T) {
 	}
 }
 
+// TestScenario_DrainSkipsSoleCandidateRouter (#236):
+//
+// A router whose only Gateway_Chassis is the local chassis has no standby:
+// lowering its priority would move nothing, and waiting for its chassisredirect
+// port to migrate would hold the shutdown for the whole drain_timeout. The
+// drain must leave it alone — its priority unchanged, no migration wait — so
+// Stop returns well under the 30s drain_timeout.
+func TestScenario_DrainSkipsSoleCandidateRouter(t *testing.T) {
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "drainsolo",
+		LRPNetworks: []string{"198.51.100.11/24"},
+		GatewayChassis: []testenv.GatewayChassisEntry{
+			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+		},
+	})
+
+	cfg := testenv.Defaults()
+	on := true
+	cfg.DrainOnShutdown = &on
+	cfg.DrainTimeout = "30s" // a Stop well under this proves the skip, not the deadline
+	cfg.ReconcileInterval = "2s"
+	a := readyAgent(t, cfg)
+
+	testenv.AssertKernelRoute(t, "198.51.100.11", 15*time.Second)
+
+	if err := a.Stop(10 * time.Second); err != nil {
+		t.Fatalf("agent stop: %v (a sole-candidate router must not hold the drain)", err)
+	}
+
+	logs := a.LogTail(100000)
+	if !strings.Contains(logs, "drain: skipping gateway chassis with no standby") {
+		t.Errorf("expected the sole-candidate skip log line; last logs:\n%s", a.LogTail(40))
+	}
+	if strings.Contains(logs, "drain: timeout exceeded") {
+		t.Errorf("the drain waited out its timeout on a port with no standby; last logs:\n%s", a.LogTail(40))
+	}
+
+	gcName := "lrp-" + router.Name + "_" + testenv.LocalHostname(t)
+	for _, gc := range testenv.MustList[testenv.NBGatewayChassis](t, ctx, nb) {
+		if gc.Name == gcName && gc.Priority != 5 {
+			t.Errorf("sole-candidate Gateway_Chassis priority = %d, want it left at 5", gc.Priority)
+		}
+	}
+}
+
 // TestScenario_DrainKeepsRoutesWhenCleanupDisabled (#59 scenario 3):
 //
 // drain_on_shutdown=true with cleanup_on_shutdown=false must drain (NB
@@ -123,8 +173,10 @@ func TestScenario_DrainKeepsRoutesWhenCleanupDisabled(t *testing.T) {
 	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
 		Name:        "drainkeep",
 		LRPNetworks: []string{"198.51.100.11/24"},
+		// The drain only touches a port that has a standby to fail over to.
 		GatewayChassis: []testenv.GatewayChassisEntry{
 			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+			{ChassisName: "drainkeep-peer", Priority: 1},
 		},
 	})
 
@@ -245,8 +297,10 @@ func TestScenario_DrainSettleTimeoutFallback(t *testing.T) {
 	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
 		Name:        "drainfallback",
 		LRPNetworks: []string{"198.51.100.11/24"},
+		// The drain only touches a port that has a standby to fail over to.
 		GatewayChassis: []testenv.GatewayChassisEntry{
 			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+			{ChassisName: "drainfallback-peer", Priority: 1},
 		},
 	})
 
@@ -317,8 +371,10 @@ func TestScenario_DrainStuckNBWrite(t *testing.T) {
 	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
 		Name:        "drainstuck",
 		LRPNetworks: []string{"198.51.100.11/24"},
+		// The drain only touches a port that has a standby to fail over to.
 		GatewayChassis: []testenv.GatewayChassisEntry{
 			{ChassisName: testenv.LocalHostname(t), Priority: 5},
+			{ChassisName: "drainstuck-peer", Priority: 1},
 		},
 	})
 	_ = router
