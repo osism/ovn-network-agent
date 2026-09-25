@@ -212,10 +212,11 @@ func TestStartAndRestoreGatewayRestoresThePolicyWhenTheStartFails(t *testing.T) 
 	}
 }
 
-// gateway-restart is the odd one out twice over: `docker restart` is not
-// a kill, so the restart policy must stay untouched, and the action has
-// no hold — inject and restore run back to back, so the restore re-wires
-// a container docker is still bringing up.
+// gateway-restart is a planned restart: agent-terminate's SIGTERM, with the
+// restart policy pinned so docker does not revive the node on its own and
+// put back once the container is started again — never `docker restart`,
+// whose 10 s grace SIGKILLs a draining agent. It has no hold, so inject and
+// restore run back to back and the restore re-wires the returned node.
 func TestGatewayRestartRecyclesTheContainerAndRestoresTheNode(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
@@ -228,12 +229,22 @@ func TestGatewayRestartRecyclesTheContainerAndRestoresTheNode(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 
-	if !cmd.called("docker restart clab-ovn-e2e-gateway-3") {
-		t.Fatalf("the container was not recycled: %v", cmd.lines())
+	last := -1
+	for _, step := range []string{
+		"docker update --restart=no clab-ovn-e2e-gateway-3",
+		"docker exec clab-ovn-e2e-gateway-3 kill -TERM 1",
+		"docker inspect -f {{.State.Running}} clab-ovn-e2e-gateway-3",
+		"docker start clab-ovn-e2e-gateway-3",
+		"docker update --restart=always clab-ovn-e2e-gateway-3",
+	} {
+		at := cmd.indexOf(step)
+		if at <= last {
+			t.Fatalf("the restart never issued %q, or issued it out of order: %v", step, cmd.lines())
+		}
+		last = at
 	}
-	if cmd.called("--restart=no") {
-		t.Fatalf("`docker restart` is not a kill — the restart policy must stay as containerlab set it: %v",
-			cmd.lines())
+	if cmd.called("docker restart") {
+		t.Fatalf("`docker restart` SIGKILLs a draining agent after 10 s: %v", cmd.lines())
 	}
 	rewire := cmd.indexOf("containerlab tools veth create")
 	responder := cmd.indexOf("external_ids:iface-id=ls0-vm1")

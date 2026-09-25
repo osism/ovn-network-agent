@@ -219,8 +219,35 @@ func (l *lab) startGateway(ctx context.Context, gw string) error {
 	return nil
 }
 
+// restartGateway is a planned restart: the agent gets the SIGTERM a rollout
+// gives it and the whole agentExitTimeout to act on it — a draining agent
+// holds its exit until the takeover chassis can forward — before the
+// container comes back. That is the budget the systemd unit gives a drain in
+// production (TimeoutStopSec=120). It is not `docker restart`: that SIGKILLs
+// after a 10 s grace, and a longer grace would outlast the cmdTimeout of the
+// CLI call carrying it. So it is agent-terminate's sequence without the hold:
+// pin the restart policy so docker does not revive the node on its own,
+// signal PID 1, wait for the container to go down, start it again.
+//
+// The policy goes back to "always" whatever happened after it was pinned —
+// leaving it at "no" hands the lab a gateway docker will never bring back.
+// A terminate or wait that failed leaves the container unstarted: it is still
+// running, or its state is unknown.
 func (l *lab) restartGateway(ctx context.Context, gw string) error {
-	if _, err := l.docker(ctx, "restart", l.node(gw)); err != nil {
+	if err := l.setRestartPolicy(ctx, gw, "no"); err != nil {
+		return fmt.Errorf("restart %s: %w", gw, err)
+	}
+	err := l.terminateAgent(ctx, gw)
+	if err == nil {
+		err = l.waitContainerExit(ctx, gw, agentExitTimeout)
+	}
+	if err == nil {
+		err = l.startGateway(ctx, gw)
+	}
+	if policyErr := l.setRestartPolicy(ctx, gw, "always"); err == nil {
+		err = policyErr
+	}
+	if err != nil {
 		return fmt.Errorf("restart %s: %w", gw, err)
 	}
 	return nil

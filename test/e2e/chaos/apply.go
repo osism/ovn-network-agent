@@ -18,7 +18,8 @@ const profileApplyTimeout = 180 * time.Second
 //
 // Applying a profile to a running lab needs no image rebuild and no
 // redeploy: the config file is the only thing that changes, and the
-// gwnode entrypoint execs the agent, so `docker restart` is the reload.
+// gwnode entrypoint execs the agent, so restarting the container is the
+// reload.
 // What makes that safe is the order — render every gateway's config and
 // hand each one to the agent's own --check-config *before* a single live
 // file is touched, then roll the gateways one at a time so the lab keeps
