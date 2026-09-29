@@ -42,14 +42,22 @@ so a fix merged in the evening first shows in the next morning's run.
 
 ## 3. Read the numbers — semantics that matter
 
-- Per recovery event, `from_inject_ms` (per probe) is downtime measured
-  from fault injection; `from_restore_ms` is the part after the fault was
-  lifted. The hold (`hold_ms` on the `decision` journal event, 0–45 s
-  by action) is the fault window itself.
-- **Downtime ≈ hold + ~1–3 s, per probe** means that traffic class never
-  failed over and waited for the node to come back. That is the smell to
-  chase: with three gateways, loss should end at failover (a few
-  seconds), not at restore.
+- Per recovery event, `down_ms` (per probe) is the summed length of the
+  probe's red windows between the inject and the convergence, and
+  `down_windows` is their count. The hold (`hold_ms` on the `decision`
+  journal event, 0–45 s by action) is the fault window itself.
+- `from_restore_ms` is the part of `down_ms` after the restore anchor.
+  The anchor is when the restore command returned, which is later than
+  the `restore` journal line by the restore's own duration. Records
+  written before `down_ms` existed carry the older restore-to-last-recovery
+  span in `from_restore_ms`; `analyze.py` leaves those out of `residual`
+  and says how many it left out.
+- `from_inject_ms` is the older span from the inject to the probe's last
+  recovery. It stays in the record for old readers and is in no table:
+  it reads a 1.2 s failover followed by a 90 ms blink at restore as 41 s.
+- A probe that stayed dark for the hold shows `down_ms ≈ hold_ms` with
+  `down_windows` 1. A failover shows a short window plus, often, a second
+  short window at restore.
 - **`from_restore_ms` (residual)** is the tail the recovery path owns —
   the agent's reaction plus BGP re-establishment after the node returns.
 - Probe classes: `fip-vm*` = FIPs on the flat (Geneve-backed) provider
@@ -69,19 +77,41 @@ so a fix merged in the evening first shows in the next morning's run.
   go dark on a restart of their router's only chassis (`gateway-1`,
   `gateway-2`).
 
-## 4. Known-good baseline (2026-07-30, runs 30288259170..30518214683)
+## 4. Known-good baseline (2026-09-26..29, runs 36230357161, 36308907967, 36405972578, 36551938602 and the dispatch runs 36596597161, 36608325274, 36608338899, 36608352426, 36608365961, 36608379365, 36608391793; 35 records)
 
-- Overall probe loss 5.13 % pooled; best night 0.4–1.9 % per profile.
-- Fast and fine: all pause/churn/drop actions converge in ~100–300 ms
-  with no downtime.
-- Standing offenders (each ends ~1–3 s after restore, i.e. no failover):
-  `gateway-kill`/`double-failover` up to 42 s on VLAN+PF probes,
-  `controller-restart` ~15 s, `agent-terminate` ~19 s,
-  `upstream-bgp-restart` ~15–19 s on every probe,
-  `config-flip`/`gateway-restart` 6–14 s.
-- A consistent ~2.4–3.2 s residual follows nearly every restore.
+In `down_ms` terms, computed from those records' journals with the
+window sum `downtime_from_journal` implements. `median worst probe` and
+`max worst probe` are taken over each event's worst probe; `total` sums
+every probe's `down_ms` over all events.
 
-Regressions are deviations from this shape, not from zero.
+| action | events | with downtime | median worst probe | max worst probe | total | windows |
+| --- | --- | --- | --- | --- | --- | --- |
+| double-failover | 18 | 16 | 37.5 s | 41.2 s | 2765.1 s | 82 |
+| gateway-kill | 29 | 21 | 35.2 s | 46.4 s | 1358.6 s | 84 |
+| agent-terminate | 24 | 17 | 18.6 s | 28.9 s | 1114.5 s | 71 |
+| upstream-bgp-restart | 23 | 23 | 12.4 s | 19.1 s | 1017.7 s | 78 |
+| controller-restart | 19 | 10 | 0.1 s | 19.4 s | 277.1 s | 33 |
+| gateway-restart | 26 | 18 | 7.6 s | 9.1 s | 267.2 s | 64 |
+| frr-restart | 28 | 11 | 0.0 s | 5.7 s | 140.6 s | 30 |
+| config-flip | 25 | 8 | 0.0 s | 9.1 s | 116.9 s | 38 |
+| frr-route-drop | 16 | 2 | 0.0 s | 11.6 s | 16.9 s | 2 |
+
+Every other action (northd-pause, mgmt-loss, mgmt-delay, nb-pause,
+chassis-delete, lb-vip-churn, fip-churn, kernel-route-drop,
+ovs-flow-drop, priority-flip, nft-flush, sb-pause) had no downtime in
+those runs. Total 7074 s, against 8563 s by `from_inject_ms`.
+
+Most of the top four rows is loss the lab causes by design, tracked in
+#236 (a fault on the workload host `gateway-3` darkens every probe; the
+VLAN routers on `gateway-1` and lr1 on `gateway-2` have no standby
+chassis; `pf-vip`'s upstream route is re-pointed only after the
+restore), so the ranking is not an agent ranking. A SIGKILLed lr0 owner
+fails over in about 1.2 to 3 s on the flat FIPs (nightly 36551938602,
+`everything-on`, tick 8: `fip-vm1` 1.3 s in 2 windows) while `pf-vip`
+and the VLAN FIPs stay dark for the hold.
+
+Regressions are deviations from this table on the flat-FIP probes and
+on the `frr-restart` and `upstream-bgp-restart` rows.
 
 ## 5. Derive measures and file issues
 
