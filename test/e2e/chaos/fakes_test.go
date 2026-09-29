@@ -183,6 +183,9 @@ func (greenProbes) redTargets() []string { return nil }
 func (greenProbes) recoverySince(time.Time) map[string]int64 {
 	return map[string]int64{"fip-vm1": 0}
 }
+func (greenProbes) downtimeSince(time.Time) (map[string]int64, map[string]int) {
+	return map[string]int64{"fip-vm1": 0}, map[string]int{"fip-vm1": 0}
+}
 
 // redProbes is a probeSource whose data path never comes back: the node
 // is up, but nothing behind it answers.
@@ -192,6 +195,23 @@ func (redProbes) allGreen() bool       { return false }
 func (redProbes) redTargets() []string { return []string{"fip-vm1"} }
 func (redProbes) recoverySince(time.Time) map[string]int64 {
 	return map[string]int64{"fip-vm1": 0}
+}
+func (redProbes) downtimeSince(time.Time) (map[string]int64, map[string]int) {
+	return map[string]int64{"fip-vm1": 0}, map[string]int{"fip-vm1": 0}
+}
+
+// windowProbes is a probeSource that answers downtimeSince with its
+// anchor in Unix milliseconds, so a test can tell which anchor fed which
+// field.
+type windowProbes struct{}
+
+func (windowProbes) allGreen() bool       { return true }
+func (windowProbes) redTargets() []string { return nil }
+func (windowProbes) recoverySince(time.Time) map[string]int64 {
+	return map[string]int64{"fip-vm1": 40_090}
+}
+func (windowProbes) downtimeSince(anchor time.Time) (map[string]int64, map[string]int) {
+	return map[string]int64{"fip-vm1": anchor.UnixMilli()}, map[string]int{"fip-vm1": 2}
 }
 
 // testProfile resolves a profile the tests drive the runner with. Most of

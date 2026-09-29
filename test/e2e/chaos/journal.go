@@ -70,6 +70,8 @@ type event struct {
 	State       string           `json:"state,omitempty"`
 	CROwner     string           `json:"cr_owner,omitempty"`
 	RecoveryMS  map[string]int64 `json:"recovery_ms,omitempty"`
+	DownMS      map[string]int64 `json:"down_ms,omitempty"`
+	DownWindows map[string]int   `json:"down_windows,omitempty"`
 	Kind        string           `json:"kind,omitempty"`
 	Detail      string           `json:"detail,omitempty"`
 	Result      string           `json:"result,omitempty"`
@@ -174,11 +176,15 @@ type probeSummary struct {
 	Buckets     []lossBucket `json:"buckets"`
 }
 
-// recoveryRecord is how long each probe target took to come back after
-// one action. Measured from two anchors: the fault injection and the
-// restore. Resources pinned to the node under fault are legitimately
-// dark while it is held down, so the restore anchor is the one the
-// recovery budget is enforced against.
+// recoveryRecord is what each probe target lost during one action.
+// `down_ms` is the summed length of its red windows between the inject
+// and the convergence, `down_windows` how many there were;
+// `from_restore_ms` is the part of `down_ms` after the restore, the
+// anchor the recovery budget is enforced against, because resources
+// pinned to the node under fault are legitimately dark while it is held
+// down. `from_inject_ms` is the older inject-to-last-recovery span; it
+// overstates a failover followed by a blink at restore and stays only so
+// old and new records read alike.
 type recoveryRecord struct {
 	Tick          int              `json:"tick"`
 	Action        string           `json:"action"`
@@ -186,6 +192,8 @@ type recoveryRecord struct {
 	Peer          string           `json:"peer,omitempty"`
 	BudgetMS      int64            `json:"budget_ms"`
 	ConvergedMS   int64            `json:"converged_ms"`
+	DownMS        map[string]int64 `json:"down_ms"`
+	DownWindows   map[string]int   `json:"down_windows"`
 	FromInjectMS  map[string]int64 `json:"from_inject_ms"`
 	FromRestoreMS map[string]int64 `json:"from_restore_ms"`
 	CROwnerAfter  string           `json:"cr_owner_after"`
