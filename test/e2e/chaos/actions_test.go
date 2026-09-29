@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func actionNamed(t *testing.T, name string) *action {
@@ -119,6 +121,300 @@ func TestRewireSkipsTheVethWhenTheInterfaceSurvived(t *testing.T) {
 
 	if cmd.called("containerlab tools veth create") {
 		t.Fatalf("re-created a veth that was still present: %v", cmd.lines())
+	}
+}
+
+// errCollision is what containerlab 0.77.0 reports when `veth create` cannot
+// rename the new pair's upstream end because the previous incarnation's end
+// still holds the name, folded into the error the way execCommander folds
+// stderr.
+var errCollision = errors.New("containerlab tools veth create ...: exit status 1: " +
+	"ERROR Failed to deploy veth endpoint: failed to rename link: file exists")
+
+// upstreamEndTornDownAfter answers the upstream `ip link show eth2` probe as
+// present for its first n calls and as gone after, the way the kernel's
+// asynchronous teardown of the previous incarnation's veth looks from
+// upstream. Everything else is answered by healthyLabResponses.
+func upstreamEndTornDownAfter(n int) func(argv []string) (string, error) {
+	probes := 0
+	return func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "clab-ovn-e2e-upstream ip link show eth2") {
+			probes++
+			if probes <= n {
+				return "", nil
+			}
+		}
+		return healthyLabResponses(argv)
+	}
+}
+
+// A restore reaches `veth create` seconds after the old container exited,
+// while the kernel may still be tearing down the old pair's upstream end.
+// Creating then collides on the name, so the rewire waits for the end to go.
+func TestRewireWaitsForTheStaleUpstreamEndBeforeRecreatingTheVeth(t *testing.T) {
+	cmd := &fakeCommander{respond: upstreamEndTornDownAfter(3)}
+	clock := newFakeClock()
+	l := newTestLab(cmd, clock)
+	var notes []string
+	l.note = func(detail string) { notes = append(notes, detail) }
+
+	started := clock.now()
+	if err := l.rewireUnderlay(context.Background(), "gateway-2"); err != nil {
+		t.Fatalf("rewireUnderlay: %v", err)
+	}
+
+	if got := cmd.count("containerlab tools veth create"); got != 1 {
+		t.Fatalf("veth create ran %d times, want once: %v", got, cmd.lines())
+	}
+	fourthProbe, probes := -1, 0
+	for i, line := range cmd.lines() {
+		if strings.Contains(line, "clab-ovn-e2e-upstream ip link show eth2") {
+			if probes++; probes == 4 {
+				fourthProbe = i
+			}
+		}
+	}
+	if create := cmd.indexOf("containerlab tools veth create"); fourthProbe < 0 || create < fourthProbe {
+		t.Fatalf("veth create ran before upstream:eth2 was seen gone: %v", cmd.lines())
+	}
+	if cmd.called("ip link del") {
+		t.Fatalf("deleted an upstream end the kernel tore down within the budget: %v", cmd.lines())
+	}
+	if waited := clock.now().Sub(started); waited != 3*vethRecreatePollInterval {
+		t.Fatalf("the rewire waited %s, want %s", waited, 3*vethRecreatePollInterval)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "upstream:eth2 seen stale: true") ||
+		!strings.Contains(notes[0], "deleted: false") {
+		t.Fatalf("notes = %q, want one saying upstream:eth2 was seen stale and not deleted", notes)
+	}
+}
+
+// Every command a real restore issues takes time. A re-creation whose first
+// create succeeds on a free name had nothing to work around, however long its
+// probe and the create itself took, and must not be noted as if it had.
+func TestRewireNotesNothingWhenTheFirstCreateSucceeds(t *testing.T) {
+	clock := newFakeClock()
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		clock.sleep(500 * time.Millisecond)
+		return healthyLabResponses(argv)
+	}}
+	l := newTestLab(cmd, clock)
+	var notes []string
+	l.note = func(detail string) { notes = append(notes, detail) }
+
+	if err := l.rewireUnderlay(context.Background(), "gateway-2"); err != nil {
+		t.Fatalf("rewireUnderlay: %v", err)
+	}
+
+	if !cmd.called("containerlab tools veth create") {
+		t.Fatalf("the veth was not re-created: %v", cmd.lines())
+	}
+	if len(notes) != 0 {
+		t.Fatalf("a re-creation that succeeded at the first try was noted: %q", notes)
+	}
+}
+
+// An upstream end that outlives the budget can only be the dead peer of a
+// netns that no longer exists: the gateway's own eth1 is already gone. It is
+// deleted rather than failing the restore.
+func TestRewireDeletesTheStaleUpstreamEndWhenItOutlivesTheBudget(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "clab-ovn-e2e-upstream ip link show eth2") {
+			return "", nil
+		}
+		return healthyLabResponses(argv)
+	}}
+	clock := newFakeClock()
+	l := newTestLab(cmd, clock)
+	var notes []string
+	l.note = func(detail string) { notes = append(notes, detail) }
+
+	started := clock.now()
+	if err := l.rewireUnderlay(context.Background(), "gateway-2"); err != nil {
+		t.Fatalf("rewireUnderlay: %v", err)
+	}
+
+	del := cmd.indexOf("docker exec clab-ovn-e2e-upstream ip link del eth2")
+	create := cmd.indexOf("containerlab tools veth create")
+	if del < 0 || del > create {
+		t.Fatalf("the stale upstream end was not deleted before the veth create: %v", cmd.lines())
+	}
+	if got := cmd.count("containerlab tools veth create"); got != 1 {
+		t.Fatalf("veth create ran %d times, want once: %v", got, cmd.lines())
+	}
+	if waited := clock.now().Sub(started); waited < vethRecreateTimeout {
+		t.Fatalf("the stale end was deleted after %s, before the %s budget ran out",
+			waited, vethRecreateTimeout)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "deleted: true") {
+		t.Fatalf("notes = %q, want one saying deleted: true", notes)
+	}
+}
+
+// When the rename of the upstream end collides, containerlab 0.77.0 leaves
+// the new pair behind with its gateway end already named eth1. The rewire
+// removes it before trying again, or the retry would collide on the gateway.
+func TestRewireRetriesVethCreateOnAFileExistsCollision(t *testing.T) {
+	creates := 0
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "containerlab tools veth create") {
+			if creates++; creates == 1 {
+				return "", errCollision
+			}
+			return "", nil
+		}
+		return healthyLabResponses(argv)
+	}}
+	l := newTestLab(cmd, newFakeClock())
+	var notes []string
+	l.note = func(detail string) { notes = append(notes, detail) }
+
+	if err := l.rewireUnderlay(context.Background(), "gateway-2"); err != nil {
+		t.Fatalf("rewireUnderlay: %v", err)
+	}
+
+	if got := cmd.count("containerlab tools veth create"); got != 2 {
+		t.Fatalf("veth create ran %d times, want the attempt and one retry: %v", got, cmd.lines())
+	}
+	var createAt []int
+	for i, line := range cmd.lines() {
+		if strings.Contains(line, "containerlab tools veth create") {
+			createAt = append(createAt, i)
+		}
+	}
+	del := cmd.indexOf("docker exec clab-ovn-e2e-gateway-2 ip link del eth1")
+	if del <= createAt[0] || del >= createAt[1] {
+		t.Fatalf("the half-created gateway end was not deleted between the two creates: %v", cmd.lines())
+	}
+	// The upstream end read as gone, so the note must not claim a wait for it.
+	if len(notes) != 1 || !strings.Contains(notes[0], "seen stale: false") ||
+		!strings.Contains(notes[0], "collided 1 time(s)") {
+		t.Fatalf("notes = %q, want one saying the end was not seen stale and the create collided once", notes)
+	}
+}
+
+// A collision that never clears must still end within the budget, and the
+// error has to say which end was in the way.
+func TestRewireFailsNamingTheUpstreamEndWhenVethCreateKeepsColliding(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "containerlab tools veth create") {
+			return "", errCollision
+		}
+		return healthyLabResponses(argv)
+	}}
+	clock := newFakeClock()
+	l := newTestLab(cmd, clock)
+	var notes []string
+	l.note = func(detail string) { notes = append(notes, detail) }
+
+	started := clock.now()
+	err := l.rewireUnderlay(context.Background(), "gateway-2")
+
+	if err == nil {
+		t.Fatal("a veth create that kept colliding was reported as a successful rewire")
+	}
+	if !errors.Is(err, errCollision) {
+		t.Fatalf("error %q does not wrap the last create error", err)
+	}
+	for _, want := range []string{"re-create underlay veth for gateway-2", "upstream:eth2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+	if waited := clock.now().Sub(started); waited < vethRecreateTimeout {
+		t.Fatalf("the rewire gave up after %s, before the %s budget ran out", waited, vethRecreateTimeout)
+	} else if waited > vethRecreateTimeout+vethRecreatePollInterval {
+		t.Fatalf("the rewire kept retrying for %s, past the %s budget", waited, vethRecreateTimeout)
+	}
+	if got := cmd.count("containerlab tools veth create"); got < 2 {
+		t.Fatalf("veth create ran %d times, want it retried: %v", got, cmd.lines())
+	}
+	if len(notes) != 0 {
+		t.Fatalf("a failed re-creation was noted as healed: %q", notes)
+	}
+}
+
+// The restore's bounded context can expire while the rewire waits; the
+// rewire must then stop at once instead of creating a veth nobody waits for.
+func TestRewireGivesUpWhenTheContextExpiresWhileItWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	// The context expires on the second look at the upstream end, while the
+	// end is still there and the rewire is waiting for it.
+	tornDown := upstreamEndTornDownAfter(10)
+	probes := 0
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "clab-ovn-e2e-upstream ip link show eth2") {
+			if probes++; probes == 2 {
+				cancel()
+			}
+		}
+		return tornDown(argv)
+	}}
+	clock := newFakeClock()
+	l := newTestLab(cmd, clock)
+
+	started := clock.now()
+	err := l.rewireUnderlay(ctx, "gateway-2")
+
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("rewireUnderlay = %v, want the context's own error", err)
+	}
+	if waited := clock.now().Sub(started); waited >= vethRecreateTimeout {
+		t.Fatalf("the rewire waited out its %s budget on a context that had expired", vethRecreateTimeout)
+	}
+	if cmd.called("containerlab tools veth create") || cmd.called("ip link del") {
+		t.Fatalf("acted on the veth after the context expired: %v", cmd.lines())
+	}
+}
+
+// Outside the engine nobody listens for notes, and a re-creation that had
+// something to report must not trip over the missing listener.
+func TestRewireNoteIsOptional(t *testing.T) {
+	cmd := &fakeCommander{respond: upstreamEndTornDownAfter(3)}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := l.rewireUnderlay(context.Background(), "gateway-2"); err != nil {
+		t.Fatalf("rewireUnderlay: %v", err)
+	}
+	if got := cmd.count("containerlab tools veth create"); got != 1 {
+		t.Fatalf("veth create ran %d times, want once: %v", got, cmd.lines())
+	}
+}
+
+func TestRewireRejectsAnUnknownGateway(t *testing.T) {
+	cmd := &fakeCommander{}
+	l := newTestLab(cmd, newFakeClock())
+
+	err := l.rewireUnderlay(context.Background(), "gateway-9")
+
+	if err == nil || err.Error() != "no underlay link known for gateway-9" {
+		t.Fatalf("rewireUnderlay = %v, want no underlay link known for gateway-9", err)
+	}
+	if len(cmd.lines()) != 0 {
+		t.Fatalf("issued commands for a gateway with no underlay link: %v", cmd.lines())
+	}
+}
+
+// Only a name collision is worth a retry. Any other failure, including an
+// exec that could not run at all, is returned as it is.
+func TestIsVethCollision(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"containerlab rename collision", errCollision, true},
+		{"iproute2 spelling", errors.New("exit status 2: RTNETLINK answers: File exists"), true},
+		{"a failure that is not a collision", errBoom, false},
+		{"a non-zero exit without the message", errExit(t, 1), false},
+		{"no error", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isVethCollision(tc.err); got != tc.want {
+				t.Fatalf("isVethCollision(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

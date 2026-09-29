@@ -1759,6 +1759,15 @@ underlay `/30` and the BGP session `bootstrap.sh` seeds, and — on
 `gateway-3` — rebuilds the netns responders and the port-forward backend
 its destroyed network namespace took with it. This needs the same
 privileges `containerlab deploy` already does.
+
+The kernel tears the previous incarnation's veth down asynchronously when
+its network namespace goes, and with OVS datapaths in that namespace this
+takes seconds. A `veth create` that lands inside that window finds
+`upstream:ethN` still taken and fails with
+`failed to rename link: file exists`. So the runner waits up to 30 s for
+the upstream end to disappear and deletes it if it outlives that budget.
+A create that still collides is retried after the runner deletes the
+half-created gateway end that containerlab 0.77.0 leaves behind.
 :::
 
 ::: details Why the runner re-points the port-forward VIP

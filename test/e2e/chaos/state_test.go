@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -195,6 +196,18 @@ func TestRestoreNodeReportsAFailedRewire(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "re-create underlay veth") {
 		t.Fatalf("error %q does not name the step that failed", err)
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("error %q does not wrap the create's own error", err)
+	}
+	// Only a name collision is retried: any other failure is attempted once
+	// and deletes nothing.
+	if got := cmd.count("containerlab tools veth create"); got != 1 {
+		t.Fatalf("veth create ran %d times after a failure that is not a collision, want once: %v",
+			got, cmd.lines())
+	}
+	if cmd.called("ip link del") {
+		t.Fatalf("deleted a link after a failure that is not a collision: %v", cmd.lines())
 	}
 }
 

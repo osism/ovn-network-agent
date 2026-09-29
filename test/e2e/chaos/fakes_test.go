@@ -92,12 +92,13 @@ func (f *fakeCommander) count(substr string) int {
 
 // healthyLabResponses answers every query the runner makes about a lab
 // that is behaving: daemons up, chassis registered, cr-lr0-public bound.
-// The one thing it models as gone is eth1 (the `ip link show eth1` probe) —
-// a container lifecycle event destroys the containerlab veth, which is the
-// whole reason the restore path exists. The restore's own verification reads
-// eth1 back with a *different* probe (`ip -o -4 addr show eth1`) after the
-// rewire has re-created it, so the two answers stand for two points in the
-// restore rather than contradicting each other. The container's identity
+// The one thing it models as gone is the containerlab veth: a container
+// lifecycle event takes both ends of it with it, so every `ip link show eth1`/
+// `eth2`/`eth3` probe, on a gateway or on upstream, answers "gone" — which is
+// the whole reason the restore path exists. The restore's own verification
+// reads eth1 back with a *different* probe (`ip -o -4 addr show eth1`) after
+// the rewire has re-created it, so the two answers stand for two points in
+// the restore rather than contradicting each other. The container's identity
 // (.State.StartedAt) is stable, so no reincarnation is detected unless a test
 // varies it deliberately (#217).
 func healthyLabResponses(argv []string) (string, error) {
@@ -109,8 +110,8 @@ func healthyLabResponses(argv []string) (string, error) {
 		return "false\n", nil // a killed container stays down until started
 	case strings.Contains(line, "{{.State.StartedAt}}"):
 		return "2026-07-20T12:00:00.000000000Z\n", nil
-	case strings.Contains(line, "ip link show eth1"):
-		return "Device \"eth1\" does not exist.", errBoom
+	case strings.Contains(line, "ip link show eth"):
+		return "Device does not exist.", errBoom
 	case strings.Contains(line, "ip -o -4 addr show eth1"):
 		// The rewire re-created eth1 and gave it the underlay address; the
 		// verification reads it back on the incarnation the rewire ran against.
