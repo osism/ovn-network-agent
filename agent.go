@@ -39,9 +39,13 @@ type Agent struct {
 	effectiveFilters []*net.IPNet
 
 	// consecutiveReAdds tracks how many reconcile cycles in a row the
-	// post-change verification had to re-add missing routes. A sustained
-	// non-zero value indicates persistent route instability (e.g. FRR
-	// misconfiguration) and triggers escalated logging.
+	// post-change verification had to re-add missing routes. verifyRoutes
+	// increments it on a cycle with re-adds and resets it on a verified
+	// clean cycle; reconcile resets it on a cycle that added or removed no
+	// FRR static and so ran no verification. A sustained non-zero value
+	// indicates persistent route instability (e.g. FRR misconfiguration)
+	// and triggers escalated logging. Written through setReAddStreak, which
+	// publishes it as ovn_network_agent_consecutive_readds.
 	consecutiveReAdds int
 
 	// lastNexthopRepair is when the agent last flapped veth-provider's address
@@ -541,9 +545,16 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 
 	// Post-change route verification: re-add any desired route that
 	// disappeared during the mutation. Runs after the announce and only
-	// when routes actually changed, matching the pre-#131 trigger.
+	// when routes actually changed, matching the pre-#131 trigger. A cycle
+	// that added or removed no FRR static runs no verification, so it ends
+	// the consecutive re-add streak here; without this the gauge froze at
+	// the last change-driven value (#275). Kernel routes ensureRoutes
+	// re-added on such a cycle, including every route it replaced after
+	// failing to list them, do not count toward the streak and end it too.
 	if routeSync.changed {
 		a.verifyRoutes(desiredIPs, frrStaticIPs, ipDev, skipKernelRoute)
+	} else {
+		a.setReAddStreak(0)
 	}
 
 	// Surface FRR-static routes that are configured but not actually advertised
@@ -1111,8 +1122,13 @@ const nexthopRepairCooldown = time.Minute
 // verified — ownership is no longer inferred from CIDR membership.
 //
 // Returns the number of routes that had to be re-added (0 means all routes
-// were present). The agent tracks consecutive non-zero results and escalates
-// logging to help operators detect persistent route instability. IPs in
+// were present). The agent tracks consecutive non-zero results in
+// consecutiveReAdds and escalates logging to help operators detect
+// persistent route instability; reconcile resets that streak on every
+// cycle that added or removed no FRR static and so did not call
+// verifyRoutes, even when ensureRoutes re-added kernel routes on it. A
+// listing failure below returns 0 without touching the streak: it neither
+// confirms nor clears instability. IPs in
 // skipKernelRoute are not re-added at the kernel level: their VLAN segment did
 // not resolve this cycle, so their existing route must be left untouched
 // rather than recreated on the bridge fallback.
@@ -1176,7 +1192,7 @@ func (a *Agent) verifyRoutes(desiredIPs, frrStaticIPs []string, ipDev map[string
 	totalReAdds := len(reAddFRR) + reAddKernel
 	recordRouteReAdds(len(reAddFRR), reAddKernel)
 	if totalReAdds > 0 {
-		a.consecutiveReAdds++
+		a.setReAddStreak(a.consecutiveReAdds + 1)
 		if a.consecutiveReAdds >= consecutiveReAddThreshold {
 			slog.Error("persistent route instability detected: routes required re-adding for multiple consecutive cycles",
 				"consecutive_cycles", a.consecutiveReAdds,
@@ -1185,11 +1201,18 @@ func (a *Agent) verifyRoutes(desiredIPs, frrStaticIPs []string, ipDev map[string
 			a.repairUnresolvableNexthop()
 		}
 	} else {
-		a.consecutiveReAdds = 0
+		a.setReAddStreak(0)
 	}
-	setConsecutiveReAdds(a.consecutiveReAdds)
 
 	return totalReAdds
+}
+
+// setReAddStreak sets the consecutive re-add streak and publishes it as
+// ovn_network_agent_consecutive_readds, so the counter and the gauge never
+// disagree.
+func (a *Agent) setReAddStreak(n int) {
+	a.consecutiveReAdds = n
+	setConsecutiveReAdds(n)
 }
 
 // repairUnresolvableNexthop diagnoses the one cause of persistent route

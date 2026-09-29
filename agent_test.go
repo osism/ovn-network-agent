@@ -174,6 +174,114 @@ func TestVerifyRoutesConsecutiveReAddCounter(t *testing.T) {
 	}
 }
 
+// TestReconcileUnchangedCycleResetsConsecutiveReAdds is the regression test
+// for #275. Change-driven cycles that each re-add the FIP build a streak, then
+// a cycle that finds every route present changes nothing and runs no
+// verification. That clean cycle must end the streak: before the fix counter
+// and gauge still read 2 after it, frozen until the next cycle that changed a
+// route.
+//
+// It is not a dry run, because a dry-run ListFRRRoutes always reports every
+// static missing, so no dry-run cycle can be unchanged.
+func TestReconcileUnchangedCycleResetsConsecutiveReAdds(t *testing.T) {
+	const fip = "198.51.100.50"
+	m := withTestMetrics(t)
+	a, rec, _ := newLiveFIPReconcile(t, fip)
+
+	// Cycles 1 and 2: the FRR listing is unregistered and answers an empty
+	// body, so ensureRoutes adds the static and verifyRoutes, re-reading the
+	// same empty document, re-adds it once. The streak must build across
+	// change-driven cycles rather than restart on each of them.
+	for want := 1; want <= 2; want++ {
+		a.reconcile(context.Background(), "test")
+		if a.consecutiveReAdds != want {
+			t.Fatalf("after change-driven cycle %d: consecutiveReAdds = %d, want %d", want, a.consecutiveReAdds, want)
+		}
+		if got := gaugeValue(t, m, "ovn_network_agent_consecutive_readds"); got != float64(want) {
+			t.Fatalf("after change-driven cycle %d: gauge = %v, want %d", want, got, want)
+		}
+	}
+
+	// Cycle 3: FRR now lists the static, so nothing is added or removed and
+	// reconcile skips verifyRoutes.
+	rec.on(
+		[]string{"vtysh", "-c", "show ip route vrf vrf-provider static json"},
+		frrStaticRoutesJSON("169.254.0.1", fip),
+		nil,
+	)
+	n := len(rec.calls)
+	a.reconcile(context.Background(), "test")
+	// Vacuity guard: an FRR add or delete would run verifyRoutes, whose own
+	// clean-cycle path also ends the streak, so the reset under test would go
+	// unexercised.
+	for _, c := range rec.calls[n:] {
+		if strings.Contains(strings.Join(c, " "), "ip route "+fip+"/32") {
+			t.Fatalf("the unchanged cycle mutated FRR (%q); it no longer exercises the unchanged-cycle reset", c)
+		}
+	}
+	if a.consecutiveReAdds != 0 {
+		t.Errorf("after the unchanged cycle: consecutiveReAdds = %d, want 0", a.consecutiveReAdds)
+	}
+	if got := gaugeValue(t, m, "ovn_network_agent_consecutive_readds"); got != 0 {
+		t.Errorf("after the unchanged cycle: gauge = %v, want 0", got)
+	}
+}
+
+// TestReconcileStandbyCycleResetsConsecutiveReAdds covers the empty-input
+// edge: with no desired IPs and no local routers reconcile takes the
+// removeAllRoutes path, routeSync keeps its zero value, and no verification
+// runs. A streak left over from earlier cycles must still end there.
+func TestReconcileStandbyCycleResetsConsecutiveReAdds(t *testing.T) {
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
+	c, _, _ := newOVNClientWithFakes(t, "host-a")
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	m := withTestMetrics(t)
+	a.setReAddStreak(2)
+
+	a.reconcile(context.Background(), "test")
+	if a.consecutiveReAdds != 0 {
+		t.Errorf("consecutiveReAdds = %d, want 0", a.consecutiveReAdds)
+	}
+	if got := gaugeValue(t, m, "ovn_network_agent_consecutive_readds"); got != 0 {
+		t.Errorf("gauge = %v, want 0", got)
+	}
+}
+
+// TestVerifyRoutesListErrorLeavesConsecutiveReAddsUntouched covers the
+// upstream-error edge: a verification that cannot read FRR neither confirms
+// nor clears instability, so the streak carries over unchanged to the next
+// cycle that can verify.
+func TestVerifyRoutesListErrorLeavesConsecutiveReAddsUntouched(t *testing.T) {
+	rec := newVtyshRecorder()
+	rec.on(
+		strings.Fields("vtysh -c show ip route vrf vrf-provider static json"),
+		"",
+		errors.New("test: zebra is not running"),
+	)
+	// PortForwardOnly keeps verifyRoutes off the kernel plane.
+	rm := &RouteManager{cfg: Config{VRFName: "vrf-provider", VethNexthop: "169.254.0.1", PortForwardOnly: true}}
+	rm.execVtyshHook = rec.hook()
+	a := &Agent{cfg: rm.cfg, routing: rm}
+	m := withTestMetrics(t)
+	a.setReAddStreak(2)
+
+	if n := a.verifyRoutes([]string{"192.0.2.1"}, []string{"192.0.2.1"}, nil, nil); n != 0 {
+		t.Errorf("verifyRoutes = %d, want 0", n)
+	}
+	if a.consecutiveReAdds != 2 {
+		t.Errorf("consecutiveReAdds = %d, want 2", a.consecutiveReAdds)
+	}
+	if got := gaugeValue(t, m, "ovn_network_agent_consecutive_readds"); got != 2 {
+		t.Errorf("gauge = %v, want 2", got)
+	}
+}
+
 // unresolvableNexthopAgent builds an agent in the #214 failure state: the FIP
 // statics are configured in FRR but none entered the RIB, so every cycle sees
 // them missing and re-adds them. connected controls what zebra reports as
@@ -825,53 +933,10 @@ func TestReconcileWithdrawsPreUpgradeVIPStaticAndAddsNoVIPStatic(t *testing.T) {
 // affects the announce outcome under test.
 func TestReconcileMixedFamilyAnnouncesV4AndWritesMarker(t *testing.T) {
 	const (
-		v4FIP  = "198.51.100.50"
-		v6FIP  = "2001:db8::50"
-		bridge = "ovnagent-nonexistent-br"
-		lrpMAC = "fa:16:3e:aa:aa:aa"
+		v4FIP = "198.51.100.50"
+		v6FIP = "2001:db8::50"
 	)
-	rec := newVtyshRecorder()
-	rm := &RouteManager{
-		cfg: Config{
-			BridgeDev:   bridge,
-			VRFName:     "vrf-provider",
-			VethNexthop: "169.254.0.1",
-		},
-		execVtyshHook: rec.hook(),
-		execOVSHook: func(*exec.Cmd) ([]byte, error) {
-			return nil, errors.New("test: no ovs available")
-		},
-		// The v4 FIP's /32 already exists on the bridge, so ensureRoutes sees
-		// no missing kernel route and never calls the Linux-only AddKernelRoute.
-		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
-			return []kernelRouteEntry{{IP: v4FIP, Dev: bridge}}, nil
-		},
-	}
-
-	c, nb, _ := newOVNClientWithFakes(t, "host-a")
-	c.state.Replace(OVNState{
-		LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
-		HasLocalRouters:  true,
-		NATIPToRouterMAC: map[string]string{v4FIP: lrpMAC, v6FIP: lrpMAC},
-	})
-	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
-	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
-		UUID:     "sr1",
-		IPPrefix: "0.0.0.0/0",
-		ExternalIDs: map[string]string{
-			"ovn-network-agent":         "managed",
-			"ovn-network-agent-chassis": "host-b",
-			takeoverReadyMarkerKey:      "host-b",
-		},
-	})
-
-	a := &Agent{
-		cfg:            Config{},
-		ovn:            c,
-		routing:        rm,
-		reconcileCh:    make(chan struct{}, 1),
-		missingChassis: make(map[string]time.Time),
-	}
+	a, rec, nb := newLiveFIPReconcile(t, v4FIP, v6FIP)
 	a.reconcile(context.Background(), "test")
 
 	var joined string
@@ -937,58 +1002,15 @@ func TestReconcileSkipsMarkerWithoutLocalRouters(t *testing.T) {
 // state.HasLocalRouters` — makes this test fail: the marker would be written
 // despite the failed announce.
 func TestReconcileFailedAnnounceWithholdsMarker(t *testing.T) {
-	const (
-		fip    = "198.51.100.50"
-		bridge = "ovnagent-nonexistent-br"
-		lrpMAC = "fa:16:3e:aa:aa:aa"
-	)
-	rec := newVtyshRecorder()
+	const fip = "198.51.100.50"
+	// The FIP's kernel route is pre-seeded, so the announce fails purely on
+	// the FRR add.
+	a, rec, nb := newLiveFIPReconcile(t, fip)
 	// Arm the FRR batch-add for the FIP to fail. AddFRRRoutes joins the batch
 	// errors and returns non-nil, so ensureRoutes sets announced = false.
 	rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
 		"-c", "ip route " + fip + "/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
 		"", errors.New("test: vtysh add failed"))
-	rm := &RouteManager{
-		cfg: Config{
-			BridgeDev:   bridge,
-			VRFName:     "vrf-provider",
-			VethNexthop: "169.254.0.1",
-		},
-		execVtyshHook: rec.hook(),
-		execOVSHook: func(*exec.Cmd) ([]byte, error) {
-			return nil, errors.New("test: no ovs available")
-		},
-		// Pre-seed the FIP /32 on the bridge so ensureRoutes never calls the
-		// Linux-only AddKernelRoute — the announce fails purely on the FRR add.
-		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
-			return []kernelRouteEntry{{IP: fip, Dev: bridge}}, nil
-		},
-	}
-
-	c, nb, _ := newOVNClientWithFakes(t, "host-a")
-	c.state.Replace(OVNState{
-		LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
-		HasLocalRouters:  true,
-		NATIPToRouterMAC: map[string]string{fip: lrpMAC},
-	})
-	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
-	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
-		UUID:     "sr1",
-		IPPrefix: "0.0.0.0/0",
-		ExternalIDs: map[string]string{
-			"ovn-network-agent":         "managed",
-			"ovn-network-agent-chassis": "host-b",
-			takeoverReadyMarkerKey:      "host-b",
-		},
-	})
-
-	a := &Agent{
-		cfg:            Config{},
-		ovn:            c,
-		routing:        rm,
-		reconcileCh:    make(chan struct{}, 1),
-		missingChassis: make(map[string]time.Time),
-	}
 	a.reconcile(context.Background(), "test")
 
 	// Vacuity guard: the failing announce path must actually have been driven —
@@ -1057,54 +1079,11 @@ func TestReconcileRecordsReadinessOutcome(t *testing.T) {
 	// The FRR batch add errors, so ensureRoutes reports not-ready.
 	t.Run("failed announce is not ready", func(t *testing.T) {
 		m := withTestMetrics(t)
-		const (
-			fip    = "198.51.100.50"
-			bridge = "ovnagent-nonexistent-br"
-			lrpMAC = "fa:16:3e:aa:aa:aa"
-		)
-		rec := newVtyshRecorder()
+		const fip = "198.51.100.50"
+		a, rec, _ := newLiveFIPReconcile(t, fip)
 		rec.on([]string{"vtysh", "-c", "conf t", "-c", "vrf vrf-provider",
 			"-c", "ip route " + fip + "/32 169.254.0.1", "-c", "exit-vrf", "-c", "end"},
 			"", errors.New("test: vtysh add failed"))
-		rm := &RouteManager{
-			cfg: Config{
-				BridgeDev:   bridge,
-				VRFName:     "vrf-provider",
-				VethNexthop: "169.254.0.1",
-			},
-			execVtyshHook: rec.hook(),
-			execOVSHook: func(*exec.Cmd) ([]byte, error) {
-				return nil, errors.New("test: no ovs available")
-			},
-			listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
-				return []kernelRouteEntry{{IP: fip, Dev: bridge}}, nil
-			},
-		}
-
-		c, nb, _ := newOVNClientWithFakes(t, "host-a")
-		c.state.Replace(OVNState{
-			LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
-			HasLocalRouters:  true,
-			NATIPToRouterMAC: map[string]string{fip: lrpMAC},
-		})
-		nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
-		nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
-			UUID:     "sr1",
-			IPPrefix: "0.0.0.0/0",
-			ExternalIDs: map[string]string{
-				"ovn-network-agent":         "managed",
-				"ovn-network-agent-chassis": "host-b",
-				takeoverReadyMarkerKey:      "host-b",
-			},
-		})
-
-		a := &Agent{
-			cfg:            Config{},
-			ovn:            c,
-			routing:        rm,
-			reconcileCh:    make(chan struct{}, 1),
-			missingChassis: make(map[string]time.Time),
-		}
 		a.reconcile(context.Background(), "test")
 
 		if !m.readiness.reconcileRan.Load() {
@@ -1138,6 +1117,67 @@ func TestReconcileRecordsReadinessOutcome(t *testing.T) {
 			t.Error("lastReconcileOK false for a healthy standby cycle")
 		}
 	})
+}
+
+// newLiveFIPReconcile builds an Agent on host-a that owns router r1 with fip
+// and extraNATIPs NATed on it, for reconcile tests that are not a dry run:
+// vtysh goes through the returned recorder, which answers every unregistered
+// command with an empty body. fip's /32 is pre-seeded on the bridge so
+// ensureRoutes never calls the Linux-only AddKernelRoute; extraNATIPs get no
+// kernel route. The OVS hook errors so segment discovery bails cleanly
+// (hairpin reconcile becomes a no-op). NB holds a managed default route whose
+// takeover marker names host-b, so a test can detect host-a stamping it.
+func newLiveFIPReconcile(t *testing.T, fip string, extraNATIPs ...string) (*Agent, *vtyshRecorder, *fakeOVSDBClient) {
+	t.Helper()
+	const (
+		bridge = "ovnagent-nonexistent-br"
+		lrpMAC = "fa:16:3e:aa:aa:aa"
+	)
+	rec := newVtyshRecorder()
+	rm := &RouteManager{
+		cfg: Config{
+			BridgeDev:   bridge,
+			VRFName:     "vrf-provider",
+			VethNexthop: "169.254.0.1",
+		},
+		execVtyshHook: rec.hook(),
+		execOVSHook: func(*exec.Cmd) ([]byte, error) {
+			return nil, errors.New("test: no ovs available")
+		},
+		listKernelRoutesHook: func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: fip, Dev: bridge}}, nil
+		},
+	}
+
+	natIPs := map[string]string{fip: lrpMAC}
+	for _, ip := range extraNATIPs {
+		natIPs[ip] = lrpMAC
+	}
+	c, nb, _ := newOVNClientWithFakes(t, "host-a")
+	c.state.Replace(OVNState{
+		LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
+		HasLocalRouters:  true,
+		NATIPToRouterMAC: natIPs,
+	})
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", Name: "r1", StaticRoutes: []string{"sr1"}})
+	nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:     "sr1",
+		IPPrefix: "0.0.0.0/0",
+		ExternalIDs: map[string]string{
+			"ovn-network-agent":         "managed",
+			"ovn-network-agent-chassis": "host-b",
+			takeoverReadyMarkerKey:      "host-b",
+		},
+	})
+
+	a := &Agent{
+		cfg:            Config{},
+		ovn:            c,
+		routing:        rm,
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+	return a, rec, nb
 }
 
 // hasMarkerUpdate reports whether any recorded write updates a
