@@ -570,10 +570,20 @@ func (e *engine) execute(ctx context.Context, d decision) {
 }
 
 // restoreNode runs one node's restore on its own detached, bounded
-// context.
+// context. While it runs, the lab's notes become `restore` events with a
+// detail, so a restore that had to work around something (a veth
+// re-creation that waited for the previous incarnation's end) says so in
+// the journal. Restores run inline on the engine goroutine and no prober
+// reads lab.note, so the field needs no lock. undo restores through here
+// too, so its notes are journaled as well, ahead of the `restore` event
+// that reports the undo.
 func (e *engine) restoreNode(ctx context.Context, d decision, node string) error {
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreTimeout)
 	defer cancel()
+	e.lab.note = func(detail string) {
+		e.jrnl.emit(event{Event: evRestore, Tick: d.tick, Action: d.action.name, Target: node, Detail: detail})
+	}
+	defer func() { e.lab.note = nil }()
 	return d.action.restore(restoreCtx, e.lab, node)
 }
 
