@@ -11,6 +11,8 @@
 #   <out>/frr/<gateway>-running-config.txt  — FRR `show running-config`
 #   <out>/frr/<gateway>-bgp-summary.txt     — `show bgp summary`
 #   <out>/frr/upstream-*.txt                — upstream FRR daemon + BGP state
+#   <out>/kernel/<gateway>-*.txt            — ip addr/route/rule + nft ruleset per gateway
+#   <out>/kernel/upstream-ip-{addr,link}.txt — upstream link + address state
 #   <out>/ovn-controller/<gateway>.log      — gateway ovn-controller log (chassis-registration daemon)
 #   <out>/agent/<gateway>.log               — `docker logs` of the gateway (agent runs in foreground)
 #
@@ -141,13 +143,17 @@ collect_frr() {
 }
 
 collect_kernel() {
-    log "kernel routing / link state from each gateway"
+    log "kernel routing / link state from each gateway and upstream"
     for gw in "${GATEWAYS[@]}"; do
         capture "${OUT_DIR}/kernel/${gw}-ip-addr.txt"      exec_in "${gw}" ip addr
         capture "${OUT_DIR}/kernel/${gw}-ip-route.txt"     exec_in "${gw}" ip route show table all
         capture "${OUT_DIR}/kernel/${gw}-ip-rule.txt"      exec_in "${gw}" ip rule show
         capture "${OUT_DIR}/kernel/${gw}-nft-ruleset.txt"  exec_in "${gw}" nft list ruleset
     done
+    # -d prints each veth's kind and peer ifindex, which tell a live pair
+    # from the stale end of a gateway's previous incarnation.
+    capture "${OUT_DIR}/kernel/upstream-ip-addr.txt" exec_in "${UPSTREAM}" ip -d addr
+    capture "${OUT_DIR}/kernel/upstream-ip-link.txt" exec_in "${UPSTREAM}" ip -d link
 }
 
 # Agent logs are part of the gateway containers' stdout (the entrypoint
