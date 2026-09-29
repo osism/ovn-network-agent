@@ -233,3 +233,85 @@ func TestProberStopsWithItsContext(t *testing.T) {
 		}
 	}
 }
+
+// A failover followed by a blink at restore is two short red windows, not
+// one outage spanning from the inject to the last recovery: downtimeSince
+// sums the windows after the anchor while recoverySince keeps dating the
+// last red-to-green edge.
+func TestDowntimeSinceSumsTheWindowsAfterTheAnchor(t *testing.T) {
+	clock := newFakeClock()
+	targets := []probeTarget{
+		{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"},
+		{name: "fip-vm2", kind: probePing, addr: "192.0.2.12"},
+	}
+	p := newProber(nil, targets, newJournal(&bytes.Buffer{}, clock.now), clock.now)
+	downtime := func(anchor time.Time, probe string, wantMS int64, wantWindows int) {
+		t.Helper()
+		ms, windows := p.downtimeSince(anchor)
+		if ms[probe] != wantMS || windows[probe] != wantWindows {
+			t.Fatalf("downtimeSince(t+%s)[%s] = %d ms in %d windows, want %d ms in %d",
+				anchor.Sub(p.startedAt), probe, ms[probe], windows[probe], wantMS, wantWindows)
+		}
+	}
+
+	anchor := clock.now()
+	p.record("fip-vm1", true) // t+0: already green, no edge
+	clock.sleep(2 * time.Second)
+	p.record("fip-vm1", false) // t+2: the failover starts
+	clock.sleep(500 * time.Millisecond)
+	p.record("fip-vm1", false) // t+2.5: still red, no new window
+	clock.sleep(700 * time.Millisecond)
+	p.record("fip-vm1", true) // t+3.2: failed over
+	clock.sleep(36_800 * time.Millisecond)
+	p.record("fip-vm1", false) // t+40: the blink at restore
+	clock.sleep(90 * time.Millisecond)
+	p.record("fip-vm1", true) // t+40.09
+
+	downtime(anchor, "fip-vm1", 1290, 2)
+	if got := p.summary()["fip-vm1"].Transitions; got != 4 {
+		t.Fatalf("transitions = %d, want 4: a repeated sample is not an edge", got)
+	}
+	if got := p.recoverySince(anchor)["fip-vm1"]; got != 40_090 {
+		t.Fatalf("recoverySince = %d ms, want 40090", got)
+	}
+	// An anchor inside a window counts only the part after it, and the
+	// window once.
+	downtime(anchor.Add(2500*time.Millisecond), "fip-vm1", 790, 2)
+	downtime(anchor.Add(10*time.Second), "fip-vm1", 90, 1)
+
+	// A window still open counts up to the prober's now.
+	clock.sleep(9910 * time.Millisecond)
+	p.record("fip-vm1", false) // t+50
+	clock.sleep(2 * time.Second)
+	downtime(anchor.Add(51*time.Second), "fip-vm1", 1000, 1)
+
+	// A target that never went red is reported, with nothing lost.
+	ms, windows := p.downtimeSince(anchor)
+	if got, ok := ms["fip-vm2"]; !ok || got != 0 {
+		t.Fatalf("fip-vm2 down_ms = %d (present %t), want a 0 entry", got, ok)
+	}
+	if got, ok := windows["fip-vm2"]; !ok || got != 0 {
+		t.Fatalf("fip-vm2 down_windows = %d (present %t), want a 0 entry", got, ok)
+	}
+
+	// A window that ended exactly at the anchor is not after it.
+	p.record("fip-vm1", true) // t+52
+	downtime(clock.now(), "fip-vm1", 0, 0)
+
+	// A target without state is skipped, as recoverySince skips it.
+	delete(p.state, "fip-vm2")
+	ms, windows = p.downtimeSince(anchor)
+	if len(ms) != 1 || len(windows) != 1 {
+		t.Fatalf("downtimeSince without fip-vm2's state = %v, %v, want only fip-vm1", ms, windows)
+	}
+	if _, ok := ms["fip-vm1"]; !ok {
+		t.Fatalf("downtimeSince dropped fip-vm1: %v", ms)
+	}
+
+	// No targets at all: two empty maps a JSON reader sees as {}.
+	empty := newProber(nil, nil, newJournal(&bytes.Buffer{}, clock.now), clock.now)
+	ms, windows = empty.downtimeSince(anchor)
+	if ms == nil || windows == nil || len(ms) != 0 || len(windows) != 0 {
+		t.Fatalf("downtimeSince on no targets = %#v, %#v, want two empty, non-nil maps", ms, windows)
+	}
+}
