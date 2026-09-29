@@ -248,6 +248,11 @@ func TestSummaryAggregatesLossBucketsAndRecoveries(t *testing.T) {
 	if !p.allGreen() {
 		t.Fatal("the target is up again but allGreen reports red")
 	}
+	// The same history, summed: one 10s window after the anchor.
+	if ms, windows := p.downtimeSince(anchor); ms["pf-vip"] != 10_000 || windows["pf-vip"] != 1 {
+		t.Fatalf("downtime since the anchor = %dms in %d windows, want 10000 in 1",
+			ms["pf-vip"], windows["pf-vip"])
+	}
 }
 
 func TestProberReportsRedTargets(t *testing.T) {

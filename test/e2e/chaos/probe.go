@@ -54,6 +54,12 @@ func probeOnce(ctx context.Context, l *lab, t probeTarget) error {
 	}
 }
 
+// lossWindow is one contiguous red span of a target. end stays zero
+// while the target is still down.
+type lossWindow struct {
+	start, end time.Time
+}
+
 // targetState is one probe's live status and history.
 type targetState struct {
 	up          bool
@@ -61,9 +67,12 @@ type targetState struct {
 	lost        int
 	transitions int
 	// lastUpAt is when the target most recently went from red to green.
-	// The engine dates recovery from it.
+	// It dates the legacy from_inject_ms; windows is what down_ms sums.
 	lastUpAt time.Time
-	buckets  map[int64]*lossBucket
+	// windows is every red span since the run started, in order; the
+	// engine sums the ones after an anchor.
+	windows []lossWindow
+	buckets map[int64]*lossBucket
 }
 
 // prober measures every probe target continuously — one goroutine per
@@ -164,8 +173,14 @@ func (p *prober) record(name string, up bool) {
 	if changed {
 		st.up = up
 		st.transitions++
+		// The edges alternate: changed is only true when the state flips,
+		// and every target starts green, so on an up edge the last window
+		// is the open one.
 		if up {
 			st.lastUpAt = now
+			st.windows[len(st.windows)-1].end = now
+		} else {
+			st.windows = append(st.windows, lossWindow{start: now})
 		}
 	}
 	p.mu.Unlock()
@@ -219,6 +234,42 @@ func (p *prober) recoverySince(anchor time.Time) map[string]int64 {
 		out[t.name] = 0
 	}
 	return out
+}
+
+// downtimeSince reports, per target, how long it was red after `anchor`
+// and in how many separate windows. A window that was already open at
+// the anchor counts from the anchor; a window still open now counts to
+// now. A target with no red span after the anchor reports 0 and 0.
+func (p *prober) downtimeSince(anchor time.Time) (ms map[string]int64, windows map[string]int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	ms = make(map[string]int64, len(p.targets))
+	windows = make(map[string]int, len(p.targets))
+	for _, t := range p.targets {
+		st := p.state[t.name]
+		if st == nil {
+			continue
+		}
+		ms[t.name] = 0
+		windows[t.name] = 0
+		for _, w := range st.windows {
+			end := w.end
+			if end.IsZero() {
+				end = now
+			}
+			if !end.After(anchor) {
+				continue
+			}
+			start := w.start
+			if start.Before(anchor) {
+				start = anchor
+			}
+			ms[t.name] += end.Sub(start).Milliseconds()
+			windows[t.name]++
+		}
+	}
+	return ms, windows
 }
 
 // summary renders the per-target run-record section, buckets ordered by
