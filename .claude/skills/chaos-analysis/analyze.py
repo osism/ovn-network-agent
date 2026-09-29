@@ -22,6 +22,9 @@ from datetime import datetime
 from pathlib import Path
 
 RECORD_SCHEMA = "chaos-run-record/v1"
+# Mirrors probeInterval in test/e2e/chaos/probe.go: a record and its
+# journal may disagree by up to one probe period.
+PROBE_INTERVAL_MS = 1000
 
 
 def parse_ts(s):
@@ -64,22 +67,25 @@ def load_record(path):
     return rec, events
 
 
-def loss_windows(events, run_end):
-    """Pair probe-transition events into down windows, attributed to the
-    fault whose inject→converged span they overlap (the report renderer's
-    duringFaults logic, reduced to the primary attribution)."""
-    faults, by_tick = [], {}
+def fault_spans(events, run_end):
+    """The inject→converged span of every injected fault, keyed by tick in
+    journal order. A fault that never converged spans to the run end."""
+    spans = {}
     for ev in events:
         if ev.get("event") == "inject":
-            by_tick[ev["tick"]] = len(faults)
-            faults.append({"tick": ev["tick"], "action": ev["action"], "target": ev.get("target", ""),
-                           "inject": parse_ts(ev["ts"]), "end": None})
-        elif ev.get("event") == "converged" and ev.get("tick") in by_tick:
-            faults[by_tick[ev["tick"]]]["end"] = parse_ts(ev["ts"])
-    for f in faults:
-        if f["end"] is None:
-            f["end"] = run_end
+            spans[ev["tick"]] = {"action": ev["action"], "target": ev.get("target", ""),
+                                 "inject": parse_ts(ev["ts"]), "end": None}
+        elif ev.get("event") == "converged" and ev.get("tick") in spans:
+            spans[ev["tick"]]["end"] = parse_ts(ev["ts"])
+    for span in spans.values():
+        if span["end"] is None:
+            span["end"] = run_end
+    return spans
 
+
+def probe_windows(events, run_end):
+    """Pair probe-transition events into down windows. A window still open
+    at the end of the journal ends at the run end."""
     open_at, windows = {}, []
     for ev in events:
         if ev.get("event") != "probe-transition":
@@ -91,7 +97,15 @@ def loss_windows(events, run_end):
             windows.append({"probe": ev["probe"], "start": open_at.pop(ev["probe"]), "end": ts})
     for probe, start in open_at.items():
         windows.append({"probe": probe, "start": start, "end": run_end})
+    return windows
 
+
+def loss_windows(events, run_end):
+    """Pair probe-transition events into down windows, attributed to the
+    fault whose inject→converged span they overlap (the report renderer's
+    duringFaults logic, reduced to the primary attribution)."""
+    faults = list(fault_spans(events, run_end).values())
+    windows = probe_windows(events, run_end)
     for w in windows:
         w["ms"] = (w["end"] - w["start"]).total_seconds() * 1000
         hits = [f for f in faults if w["start"] < f["end"] and w["end"] > f["inject"]]
@@ -102,6 +116,20 @@ def loss_windows(events, run_end):
             w["action"] = before[-1]["action"] if before else "(none)"
             w["attribution"] = "after"
     return windows
+
+
+def downtime_from_journal(span, windows):
+    """down_ms and down_windows for one recovery, as the runner computes
+    them: the probe windows overlapping (span.inject, span.end], clipped
+    at the inject, summed per probe and counted per probe."""
+    down, count = {}, {}
+    for w in windows:
+        if w["end"] <= span["inject"] or w["start"] >= span["end"]:
+            continue
+        ms = (min(w["end"], span["end"]) - max(w["start"], span["inject"])).total_seconds() * 1000
+        down[w["probe"]] = down.get(w["probe"], 0) + ms
+        count[w["probe"]] = count.get(w["probe"], 0) + 1
+    return down, count
 
 
 def analyze(roots):
@@ -125,8 +153,13 @@ def analyze(roots):
             "violations": len(rec.get("violations", [])),
             "sent": sum(p["sent"] for p in rec["probes"].values()),
             "lost": sum(p["lost"] for p in rec["probes"].values()),
+            "downtime_derived": 0,
+            "downtime_missing": 0,
+            "residual_legacy": 0,
         }
         runs.append(run)
+        spans = fault_spans(events, end)
+        journal_windows = loss_windows(events, end)
 
         for name, p in rec["probes"].items():
             agg = per_probe.setdefault(name, {"sent": 0, "lost": 0, "transitions": 0, "target": p["target"]})
@@ -135,24 +168,51 @@ def analyze(roots):
             agg["transitions"] += p["transitions"]
 
         for r in rec.get("recoveries", []):
+            down, down_windows = r.get("down_ms"), r.get("down_windows")
+            legacy = down is None
+            span = spans.get(r["tick"])
+            if legacy:
+                # A record written before down_ms existed: the journal
+                # holds the same windows the runner would have summed.
+                if span is not None:
+                    down, down_windows = downtime_from_journal(span, journal_windows)
+                    run["downtime_derived"] += 1
+                else:
+                    down, down_windows = {}, {}
+                    run["downtime_missing"] += 1
+            elif span is not None:
+                derived, _ = downtime_from_journal(span, journal_windows)
+                for probe in sorted(down.keys() | derived.keys()):
+                    a, b = down.get(probe, 0), derived.get(probe, 0)
+                    if abs(a - b) > PROBE_INTERVAL_MS:
+                        print(f"{path}: tick {r['tick']} down_ms disagrees with the journal: "
+                              f"{probe} record {a} ms, journal {b:.0f} ms", file=sys.stderr)
+
             agg = per_action.setdefault(r["action"], {
                 "events": 0, "converged_ms": [], "budget_ms": r["budget_ms"],
-                "worst_downtime_ms": [], "downtime_events": 0,
-                "downtime_sum_s": 0.0, "residual_sum_s": 0.0, "worst": None})
+                "worst_downtime_ms": [], "downtime_events": 0, "windows": 0,
+                "downtime_sum_s": 0.0, "residual_sum_s": 0.0, "residual_events": 0, "worst": None})
             agg["events"] += 1
             agg["converged_ms"].append(r["converged_ms"])
-            worst = max(r.get("from_inject_ms", {}).values(), default=0)
+            worst = max(down.values(), default=0)
             agg["worst_downtime_ms"].append(worst)
             if worst > 0:
                 agg["downtime_events"] += 1
-            agg["downtime_sum_s"] += sum(r.get("from_inject_ms", {}).values()) / 1000
-            agg["residual_sum_s"] += sum(r.get("from_restore_ms", {}).values()) / 1000
+            agg["windows"] += sum(down_windows.values())
+            agg["downtime_sum_s"] += sum(down.values()) / 1000
+            if legacy:
+                # Before down_ms, from_restore_ms was the restore→last-recovery
+                # span, not a window sum; it would overstate the residual.
+                run["residual_legacy"] += 1
+            else:
+                agg["residual_sum_s"] += sum(r.get("from_restore_ms", {}).values()) / 1000
+                agg["residual_events"] += 1
             if agg["worst"] is None or worst > agg["worst"]["worst_ms"]:
                 agg["worst"] = {"worst_ms": worst, "run": label, "tick": r["tick"],
                                 "target": r.get("target", ""), "converged_ms": r["converged_ms"],
-                                "probes": {k: v for k, v in r.get("from_inject_ms", {}).items() if v > 0}}
+                                "probes": {k: v for k, v in down.items() if v > 0}}
 
-        for w in loss_windows(events, end):
+        for w in journal_windows:
             key = (w["action"], w["attribution"])
             agg = windows_by_action.setdefault(key, {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
             agg["count"] += 1
@@ -174,6 +234,16 @@ def render_md(runs, per_action, per_probe, windows_by_action, top):
     out.append(f"Overall probe loss: **{total_lost}/{total_sent}** "
                f"(**{100 * total_lost / max(total_sent, 1):.2f}%**) · "
                f"results: {', '.join(sorted({r['result'] for r in runs}))}\n")
+    derived = sum(r["downtime_derived"] for r in runs)
+    missing = sum(r["downtime_missing"] for r in runs)
+    if derived or missing:
+        out.append(f"`down_ms` derived from the journal for {derived} recovery events of records "
+                   f"written before the field existed; {missing} events had neither and count as "
+                   f"no downtime.\n")
+    legacy = sum(r["residual_legacy"] for r in runs)
+    if legacy:
+        out.append(f"`residual` leaves out {legacy} recovery events whose `from_restore_ms` "
+                   f"predates `down_ms` and is a restore→last-recovery span.\n")
 
     out.append("## Runs\n")
     out.append("| record | profile | seed | result | loss | check errors | violations |")
@@ -184,16 +254,23 @@ def render_md(runs, per_action, per_probe, windows_by_action, top):
                    f"| {r['check_errors']} | {r['violations']} |")
     out.append("")
 
-    out.append("## Downtime by fault action — worst probe, from inject\n")
-    out.append("Sorted by total probe-downtime seconds across all runs. `residual` is downtime "
-               "*after* the fault was restored — the part the agent's reaction time owns.\n")
-    out.append("| action | events | with downtime | median worst | max worst | total probe-down | residual | median converged | budget |")
-    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    out.append("## Downtime by fault action — summed loss windows per event (`down_ms`)\n")
+    out.append("Sorted by total probe-down seconds across all runs. `down_ms` sums every probe's "
+               "red windows between the inject and the convergence; `residual` is the part of it "
+               "after the restore.\n")
+    out.append("| action | events | with downtime | windows | median worst | max worst | total probe-down | residual | median converged | budget |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, a in sorted(per_action.items(), key=lambda kv: -kv[1]["downtime_sum_s"]):
-        out.append(f"| {name} | {a['events']} | {a['downtime_events']} "
+        if a["residual_events"] == 0:
+            residual = "n/a"
+        elif a["residual_events"] < a["events"]:
+            residual = f"{a['residual_sum_s']:.1f} s ({a['residual_events']}/{a['events']})"
+        else:
+            residual = f"{a['residual_sum_s']:.1f} s"
+        out.append(f"| {name} | {a['events']} | {a['downtime_events']} | {a['windows']} "
                    f"| {fmt_ms(statistics.median(a['worst_downtime_ms']))} "
                    f"| {fmt_ms(max(a['worst_downtime_ms']))} "
-                   f"| {a['downtime_sum_s']:.1f} s | {a['residual_sum_s']:.1f} s "
+                   f"| {a['downtime_sum_s']:.1f} s | {residual} "
                    f"| {fmt_ms(statistics.median(a['converged_ms']))} | {fmt_ms(a['budget_ms'])} |")
     out.append("")
 
