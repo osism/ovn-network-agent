@@ -121,6 +121,12 @@ const (
 	// Readiness budget for the daemons a restarted gateway brings back
 	// up (OVS, then FRR) before rewireUnderlay may talk to them.
 	daemonReadyTimeout = 60 * time.Second
+
+	// vethRecreateTimeout bounds, together, the wait for the previous
+	// incarnation's upstream veth end to be torn down and the `veth create`
+	// retries that follow it.
+	vethRecreateTimeout      = 30 * time.Second
+	vethRecreatePollInterval = time.Second
 )
 
 // lab drives one deployed containerlab lab. Poll loops take their clock
@@ -130,6 +136,9 @@ type lab struct {
 	cmd   commander
 	sleep func(time.Duration)
 	now   func() time.Time
+	// note records a restore-time observation worth journaling; nil means
+	// nobody is listening.
+	note func(detail string)
 }
 
 func newLab(name string, cmd commander) *lab {
@@ -631,9 +640,7 @@ func (l *lab) rewireUnderlay(ctx context.Context, gw string) error {
 		return fmt.Errorf("no underlay link known for %s", gw)
 	}
 	if _, err := l.exec(ctx, gw, "ip", "link", "show", "eth1"); err != nil {
-		if _, err := l.cmd.run(ctx, "containerlab", "tools", "veth", "create",
-			"-a", l.node(gw)+":eth1",
-			"-b", l.node(upstreamNode)+":"+link.upstreamIface); err != nil {
+		if err := l.recreateUnderlayVeth(ctx, gw, link); err != nil {
 			return fmt.Errorf("re-create underlay veth for %s: %w", gw, err)
 		}
 	}
@@ -666,6 +673,88 @@ func (l *lab) rewireUnderlay(ctx context.Context, gw string) error {
 		return err
 	}
 	return l.verifyUnderlay(ctx, gw, link)
+}
+
+// recreateUnderlayVeth runs `containerlab tools veth create` for the
+// gateway's underlay link once the previous incarnation's veth is out of the
+// way. The kernel tears that pair down asynchronously when the old netns
+// goes, and with OVS datapaths in the netns this takes seconds: a create that
+// lands inside that window finds upstream:ethN still taken and fails with
+// `failed to rename link: file exists`. So the upstream end is polled until it
+// is gone, and deleted if it outlives vethRecreateTimeout (the gateway's own
+// eth1 is already proven absent, so it can only be the dead peer of a netns
+// that no longer exists). A create that still collides is retried within the
+// same budget. A re-creation that saw the stale end or collided is reported
+// through note; one whose first create found the name free reports nothing,
+// however long its commands took.
+func (l *lab) recreateUnderlayVeth(ctx context.Context, gw string, link underlayLink) error {
+	started := l.now()
+	deadline := started.Add(vethRecreateTimeout)
+	sawStale, deleted := false, false
+	collisions := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if l.upstreamLinkPresent(ctx, link.upstreamIface) {
+			sawStale = true
+			if l.now().Before(deadline) {
+				l.sleep(vethRecreatePollInterval)
+				continue
+			}
+			// The error is discarded on purpose: "Cannot find device" means the
+			// kernel got there first, and any other failure resurfaces as the
+			// create's collision below, which is retried or returned.
+			_, _ = l.exec(ctx, upstreamNode, "ip", "link", "del", link.upstreamIface)
+			deleted = true
+		}
+		_, err := l.cmd.run(ctx, "containerlab", "tools", "veth", "create",
+			"-a", l.node(gw)+":eth1",
+			"-b", l.node(upstreamNode)+":"+link.upstreamIface)
+		if err == nil {
+			if (sawStale || collisions > 0) && l.note != nil {
+				l.note(fmt.Sprintf("re-created the underlay veth for %s after %s (upstream:%s seen stale: %t, "+
+					"stale end deleted: %t, veth create collided %d time(s))",
+					gw, l.now().Sub(started).Round(time.Second), link.upstreamIface, sawStale, deleted, collisions))
+			}
+			return nil
+		}
+		if !isVethCollision(err) {
+			return err
+		}
+		// containerlab 0.77.0 cleans up a half-created pair only when the first
+		// end fails. When the rename of the upstream end collides, the gateway
+		// end is left behind as eth1 and a retry would collide on it instead.
+		// Deleting one veth end deletes its peer; the error is discarded because
+		// "Cannot find device" means containerlab cleaned up itself, and any
+		// other failure resurfaces as the next create's collision.
+		_, _ = l.exec(ctx, gw, "ip", "link", "del", "eth1")
+		collisions++
+		if !l.now().Before(deadline) {
+			return fmt.Errorf("upstream:%s still taken after %s (veth create collided %d time(s), "+
+				"stale end deleted: %t): %w",
+				link.upstreamIface, l.now().Sub(started).Round(time.Second), collisions, deleted, err)
+		}
+		l.sleep(vethRecreatePollInterval)
+	}
+}
+
+// upstreamLinkPresent reports whether iface still exists on upstream. Any
+// error reads as "gone", the convention the gateway-side `ip link show eth1`
+// probe in rewireUnderlay uses too: a docker hiccup misread as "gone" costs
+// one collided `veth create`, which recreateUnderlayVeth retries.
+func (l *lab) upstreamLinkPresent(ctx context.Context, iface string) bool {
+	_, err := l.exec(ctx, upstreamNode, "ip", "link", "show", iface)
+	return err == nil
+}
+
+// isVethCollision reports whether a `containerlab tools veth create` failed
+// because an interface of the requested name already exists, as in
+// `ERROR Failed to deploy veth endpoint: failed to rename link: file exists`.
+// execCommander.run folds the command's stderr into the error, which is where
+// containerlab prints that message.
+func isVethCollision(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "file exists")
 }
 
 // verifyUnderlay asserts the rewire's own outcome before the restore declares
