@@ -1767,7 +1767,12 @@ takes seconds. A `veth create` that lands inside that window finds
 `failed to rename link: file exists`. So the runner waits up to 30 s for
 the upstream end to disappear and deletes it if it outlives that budget.
 A create that still collides is retried after the runner deletes the
-half-created gateway end that containerlab 0.77.0 leaves behind.
+half-created gateway end that containerlab 0.77.0 leaves behind. A
+held-fault restore or an undo that had to do any of this journals an extra
+`restore` event for its node whose `detail` says so: after the node's plain
+`restore` event, or, on an undo, ahead of the `restore` event that reports
+the undo. A `config-flip` that restarts a gateway re-creates the veth the
+same way but journals none of this.
 :::
 
 ::: details Why the runner re-points the port-forward VIP
@@ -1803,9 +1808,12 @@ one `profile-apply` per gateway (with `executed` telling a gateway that
 was restarted onto the profile from one that was already on it),
 `state-applied`, one `decision` per tick (with the drawn values — the
 flip among them — and either `executed` or a `skip_reason`), `inject` /
-`restore` / `converged`, `config-flip` (the flip, the values it moved
-between, `mode` — `reload` or `restart` — and `rejected` when the agent
-refused it), `ovn-churn` (each
+`restore` / `converged` (a `restore` may carry a `detail` on a veth
+re-creation that ran into the previous incarnation's teardown: how long it
+took, whether the old upstream end was seen and deleted, and how often the
+create collided), `config-flip` (the flip, the values
+it moved between, `mode` — `reload` or `restart` — and `rejected` when the
+agent refused it), `ovn-churn` (each
 executed churn, with the `object` it touched and the `from`/`to` values it
 moved between), `node-state`, `probe-transition`, `vip-repoint`,
 `settle-start` / `settle-result` (the latter with the `converged_ms` the

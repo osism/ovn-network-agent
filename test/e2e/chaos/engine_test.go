@@ -759,6 +759,176 @@ func TestAFailedAgentTerminateHandsTheRestartPolicyBack(t *testing.T) {
 	}
 }
 
+// upstreamEndTornDownLate answers every upstream `ip link show ethN` probe
+// as present for its first two calls after each veth create (and before the
+// first), and as gone otherwise: every restore's re-creation finds the
+// previous incarnation's end still there and has to wait for it.
+func upstreamEndTornDownLate() func(argv []string) (string, error) {
+	probes := 0
+	return func(argv []string) (string, error) {
+		line := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(line, "containerlab tools veth create"):
+			probes = 0
+			return "", nil
+		case strings.Contains(line, "clab-ovn-e2e-upstream ip link show eth"):
+			if probes++; probes <= 2 {
+				return "", nil
+			}
+		}
+		return healthyLabResponses(argv)
+	}
+}
+
+// A restore whose veth re-creation had to wait for the previous
+// incarnation's upstream end says so in the journal, right after the plain
+// `restore` event the engine emits before it. A clean restore journals
+// exactly what it always did, and a failed one leaves its trace in the
+// action-failed violation, not in a note. The lab's note hook never
+// outlives the restore that set it.
+func TestARestoreThatWaitedForTheStaleVethIsJournaled(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		respond     func(argv []string) (string, error)
+		wantNotes   bool
+		wantFailure string
+	}{
+		{
+			name:      "the upstream end is torn down late",
+			respond:   upstreamEndTornDownLate(),
+			wantNotes: true,
+		},
+		{
+			name:    "the upstream end is already gone",
+			respond: healthyLabResponses,
+		},
+		{
+			name: "the rewire fails",
+			respond: func(argv []string) (string, error) {
+				if strings.Contains(strings.Join(argv, " "), "containerlab tools veth create") {
+					return "", errBoom
+				}
+				return healthyLabResponses(argv)
+			},
+			wantFailure: "re-create underlay veth",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := newFakeClock()
+			// Every command takes time, as a real docker exec does, so a clean
+			// restore cannot pass for one that waited.
+			cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+				clock.sleep(500 * time.Millisecond)
+				return tc.respond(argv)
+			}}
+			rec := &runRecord{
+				Inputs: runInputs{
+					Seed:       42,
+					DurationMS: (5 * time.Minute).Milliseconds(),
+					TickMinMS:  (10 * time.Second).Milliseconds(),
+					TickMaxMS:  (10 * time.Second).Milliseconds(),
+				},
+				ActionsByName: map[string]int{},
+			}
+			var buf bytes.Buffer
+			e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), []*action{actionNamed(t, "gateway-restart")},
+				greenProbes{}, newJournal(&buf, clock.now), rec)
+			e.wait, e.now = clock.wait, clock.now
+
+			e.run(context.Background())
+
+			if e.lab.note != nil {
+				t.Fatal("the lab's note hook outlived the restore that set it")
+			}
+			if tc.wantFailure == "" && len(rec.Violations) != 0 {
+				t.Fatalf("violations = %+v, want none", rec.Violations)
+			}
+			if tc.wantFailure != "" && (len(rec.Violations) == 0 ||
+				rec.Violations[0].Kind != violationActionFailed ||
+				!strings.Contains(rec.Violations[0].Detail, tc.wantFailure)) {
+				t.Fatalf("violations = %+v, want a %s naming %q", rec.Violations, violationActionFailed, tc.wantFailure)
+			}
+
+			events := eventsIn(t, buf.String())
+			noted, prev := 0, -1
+			for i, ev := range events {
+				if ev.Event != evRestore {
+					continue
+				}
+				if ev.Detail != "" {
+					if !tc.wantNotes {
+						t.Fatalf("restore event carries a detail: %+v", ev)
+					}
+					if want := "upstream:" + mustLink(t, ev.Target).upstreamIface; !strings.Contains(ev.Detail, want) {
+						t.Fatalf("restore detail %q does not name %s", ev.Detail, want)
+					}
+					if prev < 0 || events[prev].Tick != ev.Tick || events[prev].Target != ev.Target ||
+						events[prev].Detail != "" {
+						t.Fatalf("restore note %+v does not follow the plain restore event of its node", ev)
+					}
+					noted++
+				}
+				prev = i
+			}
+			if tc.wantNotes && noted == 0 {
+				t.Fatalf("no restore journaled the wait for the stale upstream end: %q", buf.String())
+			}
+		})
+	}
+}
+
+// undo restores through the same path, so a re-creation it had to wait for
+// is journaled too. There is no plain `restore` event ahead of an undo: the
+// note comes first, and the `restore` event reporting the undo follows it.
+func TestAnUndoThatWaitedForTheStaleVethIsJournaled(t *testing.T) {
+	clock := newFakeClock()
+	// The container never follows the agent down, so the inject fails and
+	// the undo re-creates the veth while the upstream end is still there.
+	late := upstreamEndTornDownLate()
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "{{.State.Running}}") {
+			return "true\n", nil
+		}
+		return late(argv)
+	}}
+	rec := &runRecord{
+		Inputs: runInputs{
+			Seed:       42,
+			DurationMS: (5 * time.Minute).Milliseconds(),
+			TickMinMS:  (10 * time.Second).Milliseconds(),
+			TickMaxMS:  (10 * time.Second).Milliseconds(),
+		},
+		ActionsByName: map[string]int{},
+	}
+	var buf bytes.Buffer
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), []*action{actionNamed(t, "agent-terminate")},
+		greenProbes{}, newJournal(&buf, clock.now), rec)
+	e.wait, e.now = clock.wait, clock.now
+
+	e.run(context.Background())
+
+	if e.lab.note != nil {
+		t.Fatal("the lab's note hook outlived the undo that set it")
+	}
+	var restores []event
+	for _, ev := range eventsIn(t, buf.String()) {
+		if ev.Event == evRestore {
+			restores = append(restores, ev)
+		}
+	}
+	if len(restores) != 2 {
+		t.Fatalf("restore events = %+v, want the note and the undo", restores)
+	}
+	note, undo := restores[0], restores[1]
+	if want := "upstream:" + mustLink(t, note.Target).upstreamIface; !strings.Contains(note.Detail, want) {
+		t.Fatalf("first restore event %+v is not the note naming %s", note, want)
+	}
+	if !strings.HasPrefix(undo.Detail, "undo after a failed inject") ||
+		undo.Tick != note.Tick || undo.Target != note.Target {
+		t.Fatalf("restore event %+v after the note is not the undo of its node", undo)
+	}
+}
+
 // The tick loop idles out its interval on the real clock. Waited out with
 // a bare time.Sleep, a Ctrl-C would only be observed once the current
 // interval (up to -tick-max) had run its course.
