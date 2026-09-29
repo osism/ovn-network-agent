@@ -40,8 +40,12 @@ func reportRecord(t *testing.T) *runRecord {
 		},
 		Recoveries: []recoveryRecord{
 			{Tick: 1, Action: "mgmt-delay", Target: "gateway-1", BudgetMS: 90_000, ConvergedMS: 150,
+				DownMS:        map[string]int64{"fip-vm1": 0, "pf-vip": 0},
+				DownWindows:   map[string]int{"fip-vm1": 0, "pf-vip": 0},
 				FromRestoreMS: map[string]int64{"fip-vm1": 0, "pf-vip": 0}},
 			{Tick: 2, Action: "frr-restart", Target: "gateway-2", BudgetMS: 120_000, ConvergedMS: 5_200,
+				DownMS:        map[string]int64{"fip-vm1": 5_100, "pf-vip": 0},
+				DownWindows:   map[string]int{"fip-vm1": 2, "pf-vip": 0},
 				FromRestoreMS: map[string]int64{"fip-vm1": 3_800, "pf-vip": 0}},
 		},
 		Settles: []settleRecord{{Tick: 2, ConvergedMS: 1_600, Passed: true}},
@@ -75,7 +79,8 @@ func TestRenderReportCoversTheRecord(t *testing.T) {
 		"wall clock 3m30s",
 		"`frr-restart` ×1, `mgmt-delay` ×1",
 		`CHAOS_FLAGS="-seed 7 -profile pf-only -duration 3m0s -tick-min 10s -tick-max 30s -settle-every 3m0s -settle-timeout 2m0s"`,
-		"| 2 | frr-restart | gateway-2 | 5.2 s | 2m0s | fip-vm1 3.8 s |",
+		"| 2 | frr-restart | gateway-2 | 5.2 s | 2m0s | fip-vm1 5.1 s | fip-vm1 3.8 s |",
+		"| 1 | mgmt-delay | gateway-1 | 150 ms | 1m30s | none | none |",
 		"| fip-vm1 | 192.0.2.10 | 180 | 4 | 2.2% | 2 |",
 		"| 2 | 1.6 s | pass | 0 |",
 		`"weights"`,
@@ -92,6 +97,33 @@ func TestRenderReportCoversTheRecord(t *testing.T) {
 	// Slowest first: the 5.2 s recovery outranks the 150 ms one.
 	if strings.Index(out, "frr-restart | gateway-2") > strings.Index(out, "mgmt-delay | gateway-1") {
 		t.Fatalf("recoveries are not sorted slowest-first:\n%s", out)
+	}
+}
+
+// A record written before down_ms existed unmarshals with nil maps: its
+// probe loss renders as a dash, since nothing was measured, and the loss
+// after the restore still renders.
+func TestRenderRecoveriesDashesAnOldRecordsLoss(t *testing.T) {
+	t.Parallel()
+	rec := reportRecord(t)
+	for i := range rec.Recoveries {
+		rec.Recoveries[i].DownMS = nil
+		rec.Recoveries[i].DownWindows = nil
+	}
+	dir := writeRunDir(t, rec, nil)
+	var buf bytes.Buffer
+
+	if err := runReport(dir, &buf, &fakeCommander{}); err != nil {
+		t.Fatalf("runReport: %v", err)
+	}
+
+	for _, want := range []string{
+		"| 2 | frr-restart | gateway-2 | 5.2 s | 2m0s | — | fip-vm1 3.8 s |",
+		"| 1 | mgmt-delay | gateway-1 | 150 ms | 1m30s | — | none |",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("report is missing %q:\n%s", want, buf.String())
+		}
 	}
 }
 
