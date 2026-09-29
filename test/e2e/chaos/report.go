@@ -303,23 +303,31 @@ func renderRecoveries(w *mdWriter, rec *runRecord) {
 		rows = rows[:slowestRecoveries]
 	}
 	w.printf("%s\n\n", title)
-	w.printf("| tick | action | target | converged | budget | probe loss after restore |\n")
-	w.printf("| --- | --- | --- | --- | --- | --- |\n")
+	w.printf("| tick | action | target | converged | budget | probe loss | probe loss after restore |\n")
+	w.printf("| --- | --- | --- | --- | --- | --- | --- |\n")
 	for _, r := range rows {
-		w.printf("| %d | %s | %s | %s | %s | %s |\n",
+		w.printf("| %d | %s | %s | %s | %s | %s | %s |\n",
 			r.Tick, cell(r.Action), cell(r.Target),
-			fmtMS(r.ConvergedMS), fmtMS(r.BudgetMS), probeLoss(r.FromRestoreMS))
+			fmtMS(r.ConvergedMS), fmtMS(r.BudgetMS), recoveryLoss(r), probeLoss(r.FromRestoreMS))
 	}
 	w.printf("\n")
 }
 
-// probeLoss names the probes an action actually hurt, measured from the
-// restore — the anchor the recovery budget is enforced against, because
-// resources pinned to the node under fault are legitimately dark while
-// it is held down.
-func probeLoss(fromRestore map[string]int64) string {
-	names := make([]string, 0, len(fromRestore))
-	for name, ms := range fromRestore {
+// recoveryLoss renders the summed loss since the inject. A record
+// written before down_ms existed carries a nil map and renders as a
+// dash, not as "none": nothing was measured, rather than nothing lost.
+func recoveryLoss(r recoveryRecord) string {
+	if r.DownMS == nil {
+		return "—"
+	}
+	return probeLoss(r.DownMS)
+}
+
+// probeLoss names the probes with a non-zero value in the map, sorted by
+// name, each with its value, or "none" when there is no such probe.
+func probeLoss(lossMS map[string]int64) string {
+	names := make([]string, 0, len(lossMS))
+	for name, ms := range lossMS {
 		if ms > 0 {
 			names = append(names, name)
 		}
@@ -330,7 +338,7 @@ func probeLoss(fromRestore map[string]int64) string {
 	sort.Strings(names)
 	parts := make([]string, 0, len(names))
 	for _, name := range names {
-		parts = append(parts, fmt.Sprintf("%s %s", name, fmtMS(fromRestore[name])))
+		parts = append(parts, fmt.Sprintf("%s %s", name, fmtMS(lossMS[name])))
 	}
 	return strings.Join(parts, ", ")
 }
