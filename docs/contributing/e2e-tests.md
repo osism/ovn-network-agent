@@ -1811,7 +1811,9 @@ flip among them — and either `executed` or a `skip_reason`), `inject` /
 `restore` / `converged` (a `restore` may carry a `detail` on a veth
 re-creation that ran into the previous incarnation's teardown: how long it
 took, whether the old upstream end was seen and deleted, and how often the
-create collided), `config-flip` (the flip, the values
+create collided; a `converged` carries `down_ms` and `down_windows` per
+probe beside `recovery_ms`, the part of `down_ms` after the restore and
+the same value as the recovery's `from_restore_ms`), `config-flip` (the flip, the values
 it moved between, `mode` — `reload` or `restart` — and `rejected` when the
 agent refused it), `ovn-churn` (each
 executed churn, with the `object` it touched and the `from`/`to` values it
@@ -1829,7 +1831,10 @@ absent when that could not be read.
 `summary.json` aggregates the run: inputs, tick and decision counts,
 actions by name, how many baseline sweeps ran and how many of them
 evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
-loss buckets, the per-action recovery durations, a `settles` section (one
+loss buckets, per-recovery downtime (`down_ms` and `down_windows` per
+probe: the summed red windows between inject and convergence and their
+count; `from_restore_ms`, the part after the restore; and the legacy
+`from_inject_ms` span), a `settles` section (one
 entry per settle window: its tick, `converged_ms`, whether it passed, and
 how many violations it raised), and every violation — each now stamped
 with the `journal_offset` of the last executed action, so it points back
@@ -1852,9 +1857,10 @@ dumped into `<out>/lab-state`.
 **Reading a run back.** `-report` renders a recorded run as
 GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
 copy-pasteable replay line, the slowest recoveries against their
-budgets, per-probe loss totals, every loss window attributed to the
-fault whose inject→converged span it overlapped, the planned restarts,
-the settle results, and the decisions the guardrails skipped:
+budgets, each with its summed probe loss, per-probe loss totals, every
+loss window attributed to the fault whose inject→converged span it
+overlapped, the planned restarts, the settle results, and the decisions
+the guardrails skipped:
 
 ```sh
 # A run directory (or its summary.json) written with -out:
