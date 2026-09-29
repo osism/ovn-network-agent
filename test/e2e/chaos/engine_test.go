@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1007,6 +1009,110 @@ func TestRecoveryBudgetExpiryIsAViolation(t *testing.T) {
 	if state := e.nodeState(rec.Violations[0].Target); state != nodeUnconverged {
 		t.Fatalf("node %s left in state %q, want %q", rec.Violations[0].Target, state, nodeUnconverged)
 	}
+}
+
+// A converged action records the summed loss since the inject and since
+// the restore, keeps the legacy inject-to-last-recovery span, and puts the
+// same loss on the converged journal line.
+func TestConvergeRecordsSummedDowntime(t *testing.T) {
+	t.Run("a probe source that lost time", func(t *testing.T) {
+		journal, rec := runEngine(t, 42, 35*time.Second, noopActions("gateway-kill"),
+			func(e *engine) { e.probes = windowProbes{} })
+
+		if rec.Decisions.Executed == 0 {
+			t.Fatal("the run executed no action, so nothing converged")
+		}
+		if len(rec.Recoveries) != rec.Decisions.Executed {
+			t.Fatalf("%d recovery records for %d executed actions", len(rec.Recoveries), rec.Decisions.Executed)
+		}
+		// windowProbes answers with its anchor, so each measure must equal
+		// the time of the journal line it is anchored at; the noop restore
+		// returns at once, so the restore anchor is the restore line's time.
+		events := eventsIn(t, journal)
+		injected, restored := map[int]int64{}, map[int]int64{}
+		for _, ev := range events {
+			ts, err := time.Parse(time.RFC3339Nano, ev.TS)
+			if err != nil {
+				t.Fatalf("journal ts %q: %v", ev.TS, err)
+			}
+			switch ev.Event {
+			case evInject:
+				injected[ev.Tick] = ts.UnixMilli()
+			case evRestore:
+				restored[ev.Tick] = ts.UnixMilli()
+			}
+		}
+		for _, r := range rec.Recoveries {
+			if r.DownMS["fip-vm1"] != injected[r.Tick] || r.DownWindows["fip-vm1"] != 2 {
+				t.Fatalf("tick %d down_ms/down_windows = %v/%v, want the loss since the inject (%d) in 2 windows",
+					r.Tick, r.DownMS, r.DownWindows, injected[r.Tick])
+			}
+			if r.FromRestoreMS["fip-vm1"] != restored[r.Tick] {
+				t.Fatalf("tick %d from_restore_ms = %v, want the loss since the restore (%d)",
+					r.Tick, r.FromRestoreMS, restored[r.Tick])
+			}
+			if r.FromInjectMS["fip-vm1"] != 40_090 {
+				t.Fatalf("tick %d from_inject_ms = %v, want recoverySince's span (40090)", r.Tick, r.FromInjectMS)
+			}
+		}
+		first := rec.Recoveries[0]
+		raw, err := json.Marshal(first)
+		if err != nil {
+			t.Fatalf("marshal a recovery: %v", err)
+		}
+		for _, key := range []string{
+			fmt.Sprintf(`"down_ms":{"fip-vm1":%d}`, injected[first.Tick]), `"down_windows":{"fip-vm1":2}`,
+			`"from_inject_ms":{"fip-vm1":40090}`, fmt.Sprintf(`"from_restore_ms":{"fip-vm1":%d}`, restored[first.Tick]),
+		} {
+			if !strings.Contains(string(raw), key) {
+				t.Fatalf("the summary.json recovery lacks %s: %s", key, raw)
+			}
+		}
+		converged := 0
+		for _, ev := range events {
+			if ev.Event != evConverged {
+				continue
+			}
+			converged++
+			if ev.DownMS["fip-vm1"] != injected[ev.Tick] || ev.DownWindows["fip-vm1"] != 2 {
+				t.Fatalf("converged event down_ms/down_windows = %v/%v, want the loss since the inject (%d) in 2 windows",
+					ev.DownMS, ev.DownWindows, injected[ev.Tick])
+			}
+			if ev.RecoveryMS["fip-vm1"] != restored[ev.Tick] {
+				t.Fatalf("converged event recovery_ms = %v, want the loss since the restore (%d), as in from_restore_ms",
+					ev.RecoveryMS, restored[ev.Tick])
+			}
+		}
+		if converged != rec.Decisions.Executed {
+			t.Fatalf("%d converged events for %d executed actions", converged, rec.Decisions.Executed)
+		}
+	})
+
+	t.Run("a probe source that lost nothing", func(t *testing.T) {
+		journal, rec := runEngine(t, 42, 35*time.Second, noopActions("gateway-kill"), nil)
+
+		if rec.Decisions.Executed == 0 {
+			t.Fatal("the run executed no action, so nothing converged")
+		}
+		// omitempty drops a nil map, not one holding a zero entry: a
+		// reader sees every probe on every converged line.
+		converged := 0
+		for _, ev := range eventsIn(t, journal) {
+			if ev.Event != evConverged {
+				continue
+			}
+			converged++
+			ms, msOK := ev.DownMS["fip-vm1"]
+			windows, windowsOK := ev.DownWindows["fip-vm1"]
+			if !msOK || !windowsOK || ms != 0 || windows != 0 {
+				t.Fatalf("converged event down_ms/down_windows = %v/%v, want a 0 entry for fip-vm1",
+					ev.DownMS, ev.DownWindows)
+			}
+		}
+		if converged == 0 {
+			t.Fatal("the journal carries no converged event")
+		}
+	})
 }
 
 func TestParseWeights(t *testing.T) {

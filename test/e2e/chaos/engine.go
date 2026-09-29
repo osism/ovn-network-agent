@@ -123,6 +123,7 @@ type probeSource interface {
 	allGreen() bool
 	redTargets() []string
 	recoverySince(anchor time.Time) map[string]int64
+	downtimeSince(anchor time.Time) (map[string]int64, map[string]int)
 }
 
 // engine drives one chaos run. Every decision it makes is drawn from
@@ -651,6 +652,11 @@ func (e *engine) park(gw string) {
 // VIP routes following the current master, and every probe target green.
 // Budget expiry is the reachability-recovery violation the run asserts
 // against.
+//
+// A converged action records three measures per probe: down_ms is the
+// summed loss between the inject and the convergence, from_restore_ms the
+// part of it after the restore, and from_inject_ms the legacy span from
+// the inject to the last recovery.
 func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time) {
 	nodes := e.nodesFor(d)
 	deadline := restoredAt.Add(d.action.recoveryBudget)
@@ -662,7 +668,8 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			for _, n := range nodes {
 				e.setNodeState(n, nodeHealthy)
 			}
-			fromRestore := e.probes.recoverySince(restoredAt)
+			downMS, downWindows := e.probes.downtimeSince(injectedAt)
+			fromRestore, _ := e.probes.downtimeSince(restoredAt)
 			e.rec.Recoveries = append(e.rec.Recoveries, recoveryRecord{
 				Tick:          d.tick,
 				Action:        d.action.name,
@@ -670,6 +677,8 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 				Peer:          d.peer,
 				BudgetMS:      d.action.recoveryBudget.Milliseconds(),
 				ConvergedMS:   e.now().Sub(restoredAt).Milliseconds(),
+				DownMS:        downMS,
+				DownWindows:   downWindows,
 				FromInjectMS:  e.probes.recoverySince(injectedAt),
 				FromRestoreMS: fromRestore,
 				CROwnerAfter:  e.vipOwner,
@@ -677,6 +686,7 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			e.jrnl.emit(event{
 				Event: evConverged, Tick: d.tick, Action: d.action.name,
 				Target: d.target, Peer: d.peer, CROwner: e.vipOwner, RecoveryMS: fromRestore,
+				DownMS: downMS, DownWindows: downWindows,
 			})
 			return
 		}
