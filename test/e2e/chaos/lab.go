@@ -98,9 +98,18 @@ const (
 	centralNode  = "central"
 	upstreamNode = "upstream"
 	clientNode   = "client-1"
-	workloadHost = "gateway-3"
 	crPort       = "cr-lr0-public"
 	lrPublicPort = "lr0-public"
+
+	// workloadHost is the chassis every probed workload lives on: a gwnode
+	// container in the compute role (OVS + ovn-controller, no agent), which
+	// is in no Gateway_Chassis list and absent from underlayLinks, so no
+	// action ever draws it.
+	workloadHost = "compute-1"
+	// bootstrapWorkloadHost is where bootstrap.sh's ensure_workload_netns
+	// puts vm1 for the scenario tests (WORKLOAD_HOST). The start state
+	// evicts it from there before it re-creates it on workloadHost.
+	bootstrapWorkloadHost = "gateway-3"
 
 	// The agent as the gwnode image ships it: the binary, the config file
 	// the entrypoint execs it with, and the two paths the chaos runner

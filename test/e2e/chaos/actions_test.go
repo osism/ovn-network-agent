@@ -518,10 +518,10 @@ func TestGatewayRestartRecyclesTheContainerAndRestoresTheNode(t *testing.T) {
 	l := newTestLab(cmd, newFakeClock())
 	act := actionNamed(t, "gateway-restart")
 
-	if err := act.inject(context.Background(), l, workloadHost, 0); err != nil {
+	if err := act.inject(context.Background(), l, "gateway-3", 0); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
-	if err := act.restore(context.Background(), l, workloadHost); err != nil {
+	if err := act.restore(context.Background(), l, "gateway-3"); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 
@@ -542,46 +542,32 @@ func TestGatewayRestartRecyclesTheContainerAndRestoresTheNode(t *testing.T) {
 	if cmd.called("docker restart") {
 		t.Fatalf("`docker restart` SIGKILLs a draining agent after 10 s: %v", cmd.lines())
 	}
-	rewire := cmd.indexOf("containerlab tools veth create")
-	responder := cmd.indexOf("external_ids:iface-id=ls0-vm1")
-	if rewire < 0 || responder < 0 {
-		t.Fatalf("restore did not re-wire the underlay and rebuild the responders: %v", cmd.lines())
+	if !cmd.called("containerlab tools veth create") {
+		t.Fatalf("restore did not re-wire the underlay: %v", cmd.lines())
 	}
-	if rewire > responder {
-		t.Fatalf("the responders were rebuilt before the underlay came back: %v", cmd.lines())
+	if cmd.called("external_ids:iface-id=") {
+		t.Fatalf("restoring a gateway rebuilt a responder, but no workload lives on a gateway: %v", cmd.lines())
 	}
 }
 
-// A container lifecycle event on the workload host destroys its network
-// namespace: every responder behind a FIP and the port-forward backend
-// have to be re-created. No other gateway carries node-local workloads.
-func TestReprovisionRebuildsTheWorkloadHostOnly(t *testing.T) {
-	cmd := &fakeCommander{respond: healthyLabResponses}
-	l := newTestLab(cmd, newFakeClock())
+// The workloads live on the compute chassis, which no action targets, so a
+// container lifecycle event on a gateway takes none of them down. Under a
+// profile without the API VIP there is nothing node-local to rebuild on
+// any gateway, gateway-3 included: bootstrap.sh puts vm1 there, but the
+// start state evicts it.
+func TestReprovisionNeverRebuildsWorkloads(t *testing.T) {
+	for _, gw := range gatewayNames() {
+		t.Run(gw, func(t *testing.T) {
+			cmd := &fakeCommander{respond: healthyLabResponses}
 
-	if err := reprovisionNode(context.Background(), l, defaultTestProfile(t), workloadHost); err != nil {
-		t.Fatalf("reprovision %s: %v", workloadHost, err)
-	}
-
-	for _, want := range []string{
-		"external_ids:iface-id=ls0-vm1",
-		"external_ids:iface-id=ls0-vm2",
-		"external_ids:iface-id=vm101",
-		"external_ids:iface-id=vm102",
-		"/usr/local/bin/pf-backend -addr :8080 -log /tmp/pf-backend.log",
-	} {
-		if !cmd.called(want) {
-			t.Fatalf("reprovision did not restore %q: %v", want, cmd.lines())
-		}
-	}
-
-	peer := &fakeCommander{respond: healthyLabResponses}
-	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()),
-		defaultTestProfile(t), "gateway-2"); err != nil {
-		t.Fatalf("reprovision gateway-2: %v", err)
-	}
-	if len(peer.lines()) != 0 {
-		t.Fatalf("reprovision touched a gateway with no node-local workloads: %v", peer.lines())
+			if err := reprovisionNode(context.Background(), newTestLab(cmd, newFakeClock()),
+				defaultTestProfile(t), gw); err != nil {
+				t.Fatalf("reprovision %s: %v", gw, err)
+			}
+			if len(cmd.lines()) != 0 {
+				t.Fatalf("reprovision of %s issued commands, but it hosts nothing node-local: %v", gw, cmd.lines())
+			}
+		})
 	}
 }
 
@@ -596,7 +582,7 @@ func TestStartPFBackendReplacesAnyRunningInstance(t *testing.T) {
 	}
 
 	kill := cmd.indexOf("pkill -f " + pfBackendLog)
-	start := cmd.indexOf("exec -d clab-ovn-e2e-gateway-3")
+	start := cmd.indexOf("exec -d clab-ovn-e2e-compute-1 ip netns exec vm1 /usr/local/bin/pf-backend -addr :8080 -log /tmp/pf-backend.log")
 	listen := cmd.indexOf("sport = :8080")
 	if kill < 0 || start < 0 || listen < 0 {
 		t.Fatalf("backend was not reset, started and waited for: %v", cmd.lines())

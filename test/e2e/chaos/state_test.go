@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -92,22 +96,25 @@ func TestPortForwardLayerFailsWhenTheGatewayPortIsUnbound(t *testing.T) {
 }
 
 // restoreNode is the whole reason a killed node can be returned to
-// service: the underlay first, then the node-local workloads.
-func TestRestoreNodeRewiresBeforeReprovisioning(t *testing.T) {
+// service: it brings the underlay back. It rebuilds no responder and
+// restarts no port-forward backend, not even on gateway-3, where
+// bootstrap.sh puts vm1 for the scenarios: the start state moves every
+// workload to the compute chassis.
+func TestRestoreNodeRewiresTheUnderlayWithoutRebuildingWorkloads(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
 
-	if err := restoreNode(context.Background(), l, defaultTestProfile(t), workloadHost); err != nil {
+	if err := restoreNode(context.Background(), l, defaultTestProfile(t), "gateway-3"); err != nil {
 		t.Fatalf("restoreNode: %v", err)
 	}
 
-	rewire := cmd.indexOf("containerlab tools veth create")
-	responder := cmd.indexOf("external_ids:iface-id=ls0-vm1")
-	if rewire < 0 || responder < 0 {
-		t.Fatalf("restore did not rewire and reprovision: %v", cmd.lines())
+	if !cmd.called("containerlab tools veth create") {
+		t.Fatalf("restore did not rewire the underlay: %v", cmd.lines())
 	}
-	if rewire > responder {
-		t.Fatalf("the workloads were rebuilt before the underlay was back: %v", cmd.lines())
+	for _, unwanted := range []string{"external_ids:iface-id=", pfBackendLog} {
+		if cmd.called(unwanted) {
+			t.Fatalf("restoring a gateway issued %q, but no workload lives on a gateway: %v", unwanted, cmd.lines())
+		}
 	}
 }
 
@@ -211,18 +218,222 @@ func TestRestoreNodeReportsAFailedRewire(t *testing.T) {
 	}
 }
 
-// Every responder the probe set depends on must be in the table that
-// reprovisionNode rebuilds — a FIP whose responder is not restored would
-// stay red after its host is recycled and fail the next recovery gate.
-func TestEveryProbedFIPHasARestoredResponder(t *testing.T) {
+// Every responder the probe set depends on must be in the table the start
+// state creates on the workload host — a FIP without its responder would
+// keep the start state from ever going green.
+func TestEveryProbedFIPHasAResponderInTheStartState(t *testing.T) {
 	lsps := map[string]bool{}
 	for _, n := range responders(defaultTestProfile(t)) {
 		lsps[n.lsp] = true
 	}
 	for _, want := range []string{"ls0-vm1", "ls0-vm2", "vm101", "vm102", "ls1-vm3"} {
 		if !lsps[want] {
-			t.Fatalf("responder for %s is not rebuilt after its host is recycled", want)
+			t.Fatalf("responder for %s is not created by the start state", want)
 		}
+	}
+}
+
+// bootstrap.sh leaves vm1 on gateway-3 for the scenario tests. The start
+// state has to take its OVS port away there before it binds the same
+// iface-id on the compute chassis: two interfaces carrying one iface-id on
+// two chassis contend for a single Port_Binding.
+func TestApplyStartStateEvictsTheBootstrapWorkloadBeforeRehomingIt(t *testing.T) {
+	cmd := &fakeCommander{respond: healthyLabResponses}
+	l := newTestLab(cmd, newFakeClock())
+	p := defaultTestProfile(t)
+
+	if err := applyStartState(context.Background(), l, p); err != nil {
+		t.Fatalf("applyStartState: %v", err)
+	}
+
+	evict := cmd.indexOf("docker exec clab-ovn-e2e-gateway-3 sh -euc ovs-vsctl --if-exists del-port br-int vm1-host")
+	rehome := -1
+	for i, line := range cmd.lines() {
+		if strings.Contains(line, "docker exec clab-ovn-e2e-compute-1") &&
+			strings.Contains(line, "external_ids:iface-id=ls0-vm1") {
+			rehome = i
+			break
+		}
+	}
+	if evict < 0 || rehome < 0 {
+		t.Fatalf("vm1 was not evicted from gateway-3 and re-created on compute-1: %v", cmd.lines())
+	}
+	if evict > rehome {
+		t.Fatalf("vm1 was bound on compute-1 while its port on gateway-3 still existed: %v", cmd.lines())
+	}
+	// Every responder the profile creates is evicted, not only vm1: an
+	// interrupted scenario may have left any of them on gateway-3.
+	for _, n := range responders(p) {
+		if !cmd.called("clab-ovn-e2e-gateway-3 sh -euc ovs-vsctl --if-exists del-port br-int " + n.hostVeth()) {
+			t.Fatalf("responder %s was not evicted from gateway-3: %v", n.name, cmd.lines())
+		}
+	}
+	for _, line := range cmd.lines() {
+		if strings.Contains(line, "clab-ovn-e2e-gateway-3") && strings.Contains(line, "external_ids:iface-id=") {
+			t.Fatalf("the start state bound a workload port on gateway-3: %q", line)
+		}
+	}
+}
+
+// The eviction only frees the Port_Binding if it deletes the port
+// bootstrap.sh created, on the node it created it on. Against any other
+// name or node `ovs-vsctl --if-exists del-port` succeeds as a no-op, and
+// vm1 ends up bound on two chassis while every test above stays green.
+func TestBootstrapWorkloadPlacementMatchesTheEviction(t *testing.T) {
+	raw, err := os.ReadFile("../bootstrap.sh")
+	if err != nil {
+		t.Fatalf("read bootstrap.sh: %v", err)
+	}
+	defaultOf := func(name string) string {
+		t.Helper()
+		m := regexp.MustCompile(`(?m)^` + name + `="\$\{` + name + `:-([^}]+)\}"`).FindSubmatch(raw)
+		if m == nil {
+			t.Fatalf("bootstrap.sh declares no default for %s — the parse shape has drifted", name)
+		}
+		return string(m[1])
+	}
+
+	if got := defaultOf("WORKLOAD_HOST"); got != bootstrapWorkloadHost {
+		t.Fatalf("bootstrap.sh puts vm1 on %s, but the start state evicts it from %s", got, bootstrapWorkloadHost)
+	}
+	vm1 := responders(defaultTestProfile(t))[0]
+	if got, want := defaultOf("WORKLOAD_HOST_VETH"), vm1.hostVeth(); got != want {
+		t.Fatalf("bootstrap.sh names vm1's OVS port %s, but the eviction deletes %s", got, want)
+	}
+}
+
+// The eviction runs on every start, and from the second run on a lab
+// gateway-3 holds nothing: the veth and the netns are gone, and so is the
+// OVS port. That has to succeed, or no second run could start. A failing
+// ovs-vsctl is another matter: the port would keep contending for the
+// Port_Binding, so the eviction must fail. The script runs in a real sh
+// against stubs, so this is the shell's own `-e` verdict on the guards.
+func TestEvictBootstrapWorkloadsToleratesOnlyAMissingVethOrNetns(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ovsExit int
+		wantErr bool
+	}{
+		{name: "gateway-3 holds no responder", ovsExit: 0},
+		{name: "the OVS port cannot be deleted", ovsExit: 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubs := t.TempDir()
+			for name, body := range map[string]string{
+				// --if-exists turns a port that is already gone into exit 0.
+				"ovs-vsctl": fmt.Sprintf("exit %d", tc.ovsExit),
+				// There is no veth and no netns to delete.
+				"ip": `echo "Cannot find device" >&2; exit 1`,
+			} {
+				if err := os.WriteFile(filepath.Join(stubs, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+					t.Fatalf("write the %s stub: %v", name, err)
+				}
+			}
+			cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+				script := exec.Command("sh", "-euc", argv[len(argv)-1])
+				script.Env = []string{"PATH=" + stubs}
+				out, err := script.CombinedOutput()
+				return string(out), err
+			}}
+
+			err := evictBootstrapWorkloads(context.Background(), newTestLab(cmd, newFakeClock()), defaultTestProfile(t))
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("an OVS port that could not be deleted was reported as evicted: %v", cmd.lines())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("evicting from a gateway that holds no responder failed: %v", err)
+			}
+			if got, want := cmd.count("del-port br-int"), len(responders(defaultTestProfile(t))); got != want {
+				t.Fatalf("evicted %d responders, want every one of the profile's %d: %v", got, want, cmd.lines())
+			}
+		})
+	}
+}
+
+// A failed eviction stops the start state before any responder is created
+// on the compute chassis, and says which responder it could not move.
+func TestEvictBootstrapWorkloadsReportsAFailedEviction(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "del-port br-int vm1-host") {
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+	l := newTestLab(cmd, newFakeClock())
+
+	err := applyStartState(context.Background(), l, defaultTestProfile(t))
+
+	if err == nil {
+		t.Fatal("a start state whose eviction failed was accepted")
+	}
+	if !strings.Contains(err.Error(), "evict responder vm1 from gateway-3") {
+		t.Fatalf("error %q does not name the responder and the host", err)
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("error %q does not wrap the eviction's own error", err)
+	}
+	for _, line := range cmd.lines() {
+		if strings.Contains(line, "clab-ovn-e2e-compute-1") && strings.Contains(line, "ip netns add") {
+			t.Fatalf("a responder was created on compute-1 after the eviction failed: %q", line)
+		}
+	}
+}
+
+// A compute chassis whose br-int never shows up cannot host a responder.
+// The start state gives up after the daemon-ready budget, before it has
+// evicted anything from gateway-3: the scenario placement stays intact.
+func TestApplyStartStateFailsWhenTheComputeChassisIsNotReady(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "clab-ovn-e2e-compute-1 sh -euc ovs-vsctl br-exists br-int") {
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+	clock := newFakeClock()
+	start := clock.now()
+
+	err := applyStartState(context.Background(), newTestLab(cmd, clock), defaultTestProfile(t))
+
+	if err == nil {
+		t.Fatal("a start state on a compute chassis without br-int was accepted")
+	}
+	if !strings.Contains(err.Error(), "wait for br-int on compute-1") {
+		t.Fatalf("error %q does not name the chassis that was not ready", err)
+	}
+	if waited := clock.now().Sub(start); waited < daemonReadyTimeout {
+		t.Fatalf("gave up after %s, before the %s daemon-ready budget", waited, daemonReadyTimeout)
+	}
+	for _, unwanted := range []string{"del-port", "external_ids:iface-id="} {
+		if cmd.called(unwanted) {
+			t.Fatalf("issued %q although the compute chassis was not ready: %v", unwanted, cmd.lines())
+		}
+	}
+}
+
+// A responder that cannot be created names itself and the host it was
+// meant for, which is the compute chassis, not a gateway.
+func TestEnsureRespondersNamesTheWorkloadHostOnFailure(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "external_ids:iface-id=ls0-vm1") {
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+
+	err := ensureResponders(context.Background(), newTestLab(cmd, newFakeClock()), defaultTestProfile(t))
+
+	if err == nil {
+		t.Fatal("a responder that could not be created was reported as provisioned")
+	}
+	if !strings.Contains(err.Error(), "provision responder vm1 on compute-1") {
+		t.Fatalf("error %q does not name the responder and the workload host", err)
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("error %q does not wrap the provisioning's own error", err)
 	}
 }
 
@@ -230,9 +441,9 @@ func TestEveryProbedFIPHasARestoredResponder(t *testing.T) {
 // merely that it is listed. A container restart destroys the namespace but
 // leaves a dead anchor under /run/netns, which keeps `ip netns list`
 // answering yes; provisioning then skips the re-create and fails moving the
-// veth in ("Peer netns reference is invalid", EINVAL). That is deterministic
-// after every gateway restart — a profile apply or a lifecycle-fault
-// restore — so the listing guard must not come back.
+// veth in ("Peer netns reference is invalid", EINVAL). A run on a lab whose
+// workload host restarted since the previous run hits that every time, so
+// the listing guard must not come back.
 func TestResponderGuardSurvivesADeadNamespaceAnchor(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
@@ -278,13 +489,18 @@ func TestApplyStartStateOnlyLayersTheProfilesOwnScenarios(t *testing.T) {
 		"external_ids:iface-id=ls0-vm2",
 		"external_ids:iface-id=ls1-vm3",
 		"/usr/local/bin/pf-backend",
+		// No responder but vm1 is evicted or created.
+		"vm2", "vm101", "vm102", "vm3",
 	} {
 		if cmd.called(unwanted) {
 			t.Fatalf("flat-minimal layered %q, which none of its probes measure: %v", unwanted, cmd.lines())
 		}
 	}
-	// The bootstrap responder behind the one FIP it does probe is still
-	// ensured — it is the restore path too.
+	// The bootstrap responder behind the one FIP it does probe still moves
+	// from gateway-3 to the workload host.
+	if !cmd.called("clab-ovn-e2e-gateway-3 sh -euc ovs-vsctl --if-exists del-port br-int vm1-host") {
+		t.Fatalf("the bootstrap workload was not evicted from gateway-3: %v", cmd.lines())
+	}
 	if !cmd.called("external_ids:iface-id=ls0-vm1") {
 		t.Fatalf("the workload behind the probed FIP was not ensured: %v", cmd.lines())
 	}
@@ -292,9 +508,8 @@ func TestApplyStartStateOnlyLayersTheProfilesOwnScenarios(t *testing.T) {
 
 // The API VIP's backend runs in the gateway's default namespace, and only
 // on the gateways whose configuration carries the VIP. It is the same
-// binary as the Load_Balancer VIP's backend, so the two kill patterns must
-// not overlap: resetting one on gateway-3 would otherwise take the other
-// one down with it.
+// binary as the Load_Balancer VIP's backend, so each kill pattern keys on
+// its own log path, never on the binary both share.
 func TestStartStateStartsTheAPIBackendOnlyOnItsGateways(t *testing.T) {
 	cmd := &fakeCommander{respond: healthyLabResponses}
 	l := newTestLab(cmd, newFakeClock())
@@ -335,12 +550,12 @@ func TestReprovisionRestartsTheAPIBackendOnItsGateways(t *testing.T) {
 		t.Fatalf("the API backend was not restarted after the lifecycle event: %v", cmd.lines())
 	}
 
-	// A gateway with neither node-local workloads nor an API VIP has
-	// nothing to reprovision — under this profile every gateway carries
-	// something, so the empty case needs one without any DNAT at all.
+	// A gateway without the API VIP has nothing to reprovision: no
+	// workload lives on a gateway. gateway-3 is the one bootstrap.sh puts
+	// vm1 on, under a profile that also runs the Load_Balancer backend.
 	peer := &fakeCommander{respond: healthyLabResponses}
-	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()), testProfile(t, "vlan-no-dnat"), "gateway-1"); err != nil {
-		t.Fatalf("reprovision gateway-1: %v", err)
+	if err := reprovisionNode(context.Background(), newTestLab(peer, newFakeClock()), p, "gateway-3"); err != nil {
+		t.Fatalf("reprovision gateway-3: %v", err)
 	}
 	if len(peer.lines()) != 0 {
 		t.Fatalf("reprovision touched a gateway that carries nothing: %v", peer.lines())

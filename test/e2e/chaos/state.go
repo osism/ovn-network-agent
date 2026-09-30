@@ -28,14 +28,17 @@ import (
 // Load_Balancer VIP, and one that measures the agent's own DNAT path
 // brings its own backend instead.
 //
-// The bootstrap baseline itself (HA router, FIP 192.0.2.10, the vm1
-// workload) is assumed — the runner drives a lab that `make e2e-up`
-// already brought up.
+// The bootstrap baseline itself (HA router, FIP 192.0.2.10, the ls0-vm1
+// port) is assumed — the runner drives a lab that `make e2e-up` already
+// brought up. Its vm1 responder is not: bootstrap.sh puts it on
+// bootstrapWorkloadHost for the scenario tests, and the start state moves
+// it, like every other responder, to workloadHost, the one chassis no
+// fault targets.
 //
 // Everything below mirrors the command blocks in those scripts. The
 // layering is idempotent for the same reason theirs is (--may-exist,
-// `ip ... replace`, guarded `ip link add`), which is what makes it
-// reusable as the post-fault restore path.
+// `ip ... replace`, guarded `ip link add`), so a second run on the same
+// lab lands in the same state; only the backends are restarted.
 
 // startStateTimeout is how long the layered state gets to come up green
 // before the run is abandoned — a start state that never went green
@@ -47,10 +50,10 @@ const startStateTimeout = 120 * time.Second
 // would leave its VIP probe red for the whole run.
 const backendBindTimeout = 10 * time.Second
 
-// The two responders' log files. They are the same binary, and on the
-// workload host both run in the same PID namespace, so the log path is
-// what a `pkill -f` pattern keys on: `pkill -f /usr/local/bin/pf-backend`
-// would take the other one down with it.
+// The two responders' log files. They are the same binary, so the log path
+// is what a `pkill -f` pattern keys on: `pkill -f /usr/local/bin/pf-backend`
+// matches either one, and only the log path scopes a reset to its own
+// responder.
 const (
 	pfBackendLog  = "/tmp/pf-backend.log"
 	apiBackendLog = "/tmp/api-backend.log"
@@ -80,10 +83,14 @@ type netns struct {
 	gw   string
 }
 
-// responders is every netns the profile's start state needs on gateway-3
-// — the bootstrap vm1 plus the ones the layers it puts up add.
-// reprovisionNode re-creates all of them after gateway-3 has been through
-// a container lifecycle event, which destroys its network namespace.
+// hostVeth is the br-int end of the responder's veth pair, the port that
+// carries the LSP's iface-id.
+func (n netns) hostVeth() string { return n.name + "-host" }
+
+// responders is every netns the profile's start state creates on the
+// workload host — the bootstrap vm1 plus the ones the layers it puts up
+// add — after evicting each of them from bootstrapWorkloadHost. Nothing
+// rebuilds them after a fault: no fault targets the workload host.
 func responders(p *profile) []netns {
 	// bootstrap.sh:ensure_workload_netns
 	all := []netns{{"vm1", "ls0-vm1", "02:00:00:00:0a:0a", "192.168.10.10/24", "192.168.10.1"}}
@@ -111,7 +118,9 @@ func responders(p *profile) []netns {
 }
 
 // applyStartState layers the profile's scenario setups onto the baseline
-// and waits for every probe target the profile measures to answer.
+// and waits for every probe target the profile measures to answer. The
+// responders are evicted from bootstrapWorkloadHost before they are
+// created on workloadHost.
 func applyStartState(ctx context.Context, l *lab, p *profile) error {
 	if p.hairpin {
 		if err := applyHairpinLayer(ctx, l); err != nil {
@@ -129,6 +138,12 @@ func applyStartState(ctx context.Context, l *lab, p *profile) error {
 		if err := applyCrossChassisLayer(ctx, l); err != nil {
 			return err
 		}
+	}
+	if err := l.waitReady(ctx, workloadHost, "ovs-vsctl br-exists br-int"); err != nil {
+		return fmt.Errorf("wait for br-int on %s: %w", workloadHost, err)
+	}
+	if err := evictBootstrapWorkloads(ctx, l, p); err != nil {
+		return err
 	}
 	if err := ensureResponders(ctx, l, p); err != nil {
 		return err
@@ -283,8 +298,8 @@ func applyPortForwardLayer(ctx context.Context, l *lab) error {
 
 // startPFBackend (re)starts the HTTP responder behind the Load_Balancer
 // VIP in the vm1 netns and waits for it to bind — start_backend in
-// pf-external.sh. Any previous instance is killed first, so this doubles
-// as the restore path after gateway-3 has been recycled.
+// pf-external.sh. Any previous instance is killed first, so a second run
+// on the same lab replaces it.
 func startPFBackend(ctx context.Context, l *lab) error {
 	if err := resetResponder(ctx, l, workloadHost, pfBackendLog); err != nil {
 		return err
@@ -359,12 +374,37 @@ func waitListening(ctx context.Context, l *lab, node, probe string) error {
 	return fmt.Errorf("did not bind within %s", backendBindTimeout)
 }
 
-// ensureResponders (re)creates every kernel-side responder on the
-// workload host. Idempotent, and the shape is lifted verbatim from
-// ensure_workload_netns in bootstrap.sh.
+// evictBootstrapWorkloads removes every responder of the profile from
+// bootstrapWorkloadHost before ensureResponders creates it on
+// workloadHost. bootstrap.sh leaves vm1 there for the scenario tests, and
+// an interrupted scenario may have left vm2 or vm3 behind.
+//
+// The OVS port goes first and must go for good: two interfaces carrying
+// the same iface-id on two chassis contend for one Port_Binding, and the
+// port record lives in conf.db, which survives a container restart. Its
+// removal is therefore not guarded; `--if-exists` only makes a port that
+// is already gone a success. The two `|| true` guards absorb a veth or a
+// netns that is already gone, which is the normal case from the second
+// run on a lab. Either one left behind without its OVS port binds nothing.
+func evictBootstrapWorkloads(ctx context.Context, l *lab, p *profile) error {
+	for _, n := range responders(p) {
+		hostVeth := n.hostVeth()
+		script := fmt.Sprintf("ovs-vsctl --if-exists del-port br-int %s; "+
+			"ip link del %s 2>/dev/null || true; ip netns delete %s 2>/dev/null || true",
+			hostVeth, hostVeth, n.name)
+		if _, err := l.sh(ctx, bootstrapWorkloadHost, script); err != nil {
+			return fmt.Errorf("evict responder %s from %s: %w", n.name, bootstrapWorkloadHost, err)
+		}
+	}
+	return nil
+}
+
+// ensureResponders creates every kernel-side responder on the workload
+// host; on a lab a previous run already set up it changes nothing. The
+// shape is lifted verbatim from ensure_workload_netns in bootstrap.sh.
 func ensureResponders(ctx context.Context, l *lab, p *profile) error {
 	for _, n := range responders(p) {
-		hostVeth := n.name + "-host"
+		hostVeth := n.hostVeth()
 		nsVeth := n.name + "-eth0"
 		script := strings.Join([]string{
 			fmt.Sprintf("ip link show %s >/dev/null 2>&1 || ip link add %s type veth peer name %s",
@@ -403,8 +443,10 @@ func ensureResponders(ctx context.Context, l *lab, p *profile) error {
 //
 //   - the containerlab veth `gateway-N:eth1 ↔ upstream:ethN`, and with
 //     it the underlay and the BGP session (rewireUnderlay), and
-//   - on the workload host, every netns and veth behind the FIPs, plus
-//     the port-forward backend (reprovisionNode).
+//   - on a gateway whose profile carries the API VIP, the responder that
+//     VIP forwards to (reprovisionNode).
+//
+// No workload lives on a gateway, so no responder behind a FIP is lost.
 //
 // This is the path the existing scenarios avoid — they either leave the
 // container up or recycle the whole lab. A chaos run has to put the node
@@ -481,25 +523,13 @@ func restoreUnderlay(ctx context.Context, l *lab, gw string) error {
 }
 
 // reprovisionNode re-creates the node-local state a container restart
-// wiped: the workload host's netns responders and the Load_Balancer VIP's
-// backend, and — on any gateway whose profile configures the API VIP —
-// the responder that VIP forwards to. The Load_Balancer VIP's scope-link
-// route is not re-applied here: ensureVIPRouting does it during
-// convergence, wherever the master happens to be by then.
+// wiped on a gateway: the responder behind the API VIP, on any gateway
+// whose profile configures it. The workloads and the Load_Balancer VIP's
+// backend live on workloadHost, which no fault targets, so there is
+// nothing else to rebuild. The Load_Balancer VIP's scope-link route is not
+// re-applied here: ensureVIPRouting does it during convergence, wherever
+// the master happens to be by then.
 func reprovisionNode(ctx context.Context, l *lab, p *profile, gw string) error {
-	if gw == workloadHost {
-		if err := l.waitReady(ctx, gw, "ovs-vsctl br-exists br-int"); err != nil {
-			return fmt.Errorf("wait for br-int on %s: %w", gw, err)
-		}
-		if err := ensureResponders(ctx, l, p); err != nil {
-			return err
-		}
-		if p.ovnLB {
-			if err := startPFBackend(ctx, l); err != nil {
-				return err
-			}
-		}
-	}
 	if !p.gwConfig(gw).apiVIP {
 		return nil
 	}

@@ -80,12 +80,12 @@ var (
 	probeLBVIP   = probeTarget{name: "pf-vip", kind: probeHTTP, addr: vipURL}
 	probeAPIVIP  = probeTarget{name: "api-vip", kind: probeHTTP, addr: apiVIPURL}
 
-	// The two same-node vantages, both from vm1's namespace on the
-	// workload host. Every target above is measured from client-1, which
-	// reaches a FIP over the physical network — the path that keeps
-	// working when the hairpin plane is broken. These two ride the
-	// cookie-0x998 reflect path on whichever chassis holds cr-lr0-public,
-	// and go dark exactly when it has a hole.
+	// The two hairpin vantages, both from vm1's namespace on the workload
+	// host, a chassis no fault targets. Every target above is measured from
+	// client-1, which reaches a FIP over the physical network — the path
+	// that keeps working when the hairpin plane is broken. These two enter
+	// OVN over geneve and ride the cookie-0x998 reflect path on whichever
+	// chassis holds cr-lr0-public, and go dark exactly when it has a hole.
 	probeHairpinFIP = probeTarget{
 		name: "hairpin-fip", kind: probePing, addr: "192.0.2.12",
 		node: workloadHost, netns: "vm1",
