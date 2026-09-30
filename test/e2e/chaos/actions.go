@@ -32,10 +32,9 @@ const agentExitTimeout = 120 * time.Second
 // ovn-controller costs a re-election, while any container lifecycle
 // event costs a full daemon bring-up plus the underlay re-wire.
 //
-// The profile is bound into the restores because what a returning gateway
-// needs put back depends on which layers the profile put up — and, for a
-// gateway whose configuration carries the API VIP, on the responder
-// behind it.
+// The profile is bound into the restores because a returning gateway whose
+// configuration carries the API VIP needs the responder behind it put
+// back.
 func starterActions(p *profile) []*action {
 	restore := func(ctx context.Context, l *lab, gw string) error {
 		return restoreNode(ctx, l, p, gw)
@@ -159,7 +158,8 @@ func injectAgentTerminate(ctx context.Context, l *lab, gw string, _ int) error {
 
 // startAndRestoreGateway brings a killed container back: start it,
 // restore the restart policy containerlab set, then put the node back in
-// service (underlay veth, BGP, node-local workloads).
+// service (underlay veth, BGP, and the API VIP's backend where the profile
+// configures one).
 //
 // The policy is put back even when the start failed: the inject pinned it
 // to "no" so docker would not revive the node mid-fault, and leaving it

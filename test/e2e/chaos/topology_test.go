@@ -3,6 +3,8 @@ package main
 import (
 	"net/netip"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -84,5 +86,76 @@ func TestTopologyPinsManagementAddresses(t *testing.T) {
 			continue
 		}
 		owner[addr] = name
+	}
+}
+
+// TestTopologyComputeNodeIsAWorkloadOnlyChassis guards the chassis the chaos
+// runner hosts its workloads on (issue #280).
+//
+// It has to be a real OVN chassis, so it runs the gateway image, and it has
+// to run no agent, so it runs that image in the compute role. Above all it
+// must never become a fault target: a lifecycle fault on the node that
+// hosts the workloads darkens every probe for the whole hold and hides the
+// failover the run measures. The engine draws its targets from
+// gatewayNames(), which is derived from underlayLinks, so an underlay link
+// on the node, or a fourth row in that table, would put the workloads back
+// in the line of fire and change what every recorded seed replays.
+func TestTopologyComputeNodeIsAWorkloadOnlyChassis(t *testing.T) {
+	raw, err := os.ReadFile("../topology.clab.yml")
+	if err != nil {
+		t.Fatalf("read the lab topology: %v", err)
+	}
+
+	var doc struct {
+		Topology struct {
+			Nodes map[string]struct {
+				Image string            `yaml:"image"`
+				Env   map[string]string `yaml:"env"`
+			} `yaml:"nodes"`
+			Links []struct {
+				Endpoints []string `yaml:"endpoints"`
+			} `yaml:"links"`
+		} `yaml:"topology"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse the lab topology: %v", err)
+	}
+	gateway, ok := doc.Topology.Nodes["gateway-1"]
+	if !ok || gateway.Image == "" || len(doc.Topology.Links) == 0 {
+		t.Fatal("the topology declares no gateway-1 image or no links — the parse shape has drifted")
+	}
+
+	node, ok := doc.Topology.Nodes[workloadHost]
+	if !ok {
+		t.Fatalf("the topology declares no node %s to host the workloads", workloadHost)
+	}
+	if node.Image != gateway.Image {
+		t.Errorf("%s runs image %q, want the gateways' %q: it has to be an OVN chassis like them",
+			workloadHost, node.Image, gateway.Image)
+	}
+	if got := node.Env["GWNODE_ROLE"]; got != "compute" {
+		t.Errorf("%s sets GWNODE_ROLE %q, want compute: any other role runs FRR and the agent", workloadHost, got)
+	}
+	if got := node.Env["CHASSIS_NAME"]; got != workloadHost {
+		t.Errorf("%s registers as chassis %q, want %q", workloadHost, got, workloadHost)
+	}
+	for _, link := range doc.Topology.Links {
+		for _, endpoint := range link.Endpoints {
+			if strings.HasPrefix(endpoint, workloadHost+":") {
+				t.Errorf("%s has a link endpoint %q: the workload host carries no underlay", workloadHost, endpoint)
+			}
+		}
+	}
+
+	want := []string{"gateway-1", "gateway-2", "gateway-3"}
+	if got := gatewayNames(); !slices.Equal(got, want) {
+		t.Fatalf("gatewayNames() = %v, want exactly %v: the engine draws its targets from it", got, want)
+	}
+	// An unset role is the gateway role; a gateway that set one would at
+	// best repeat the default and at worst drop its agent.
+	for _, gw := range want {
+		if role, set := doc.Topology.Nodes[gw].Env["GWNODE_ROLE"]; set {
+			t.Errorf("%s sets GWNODE_ROLE %q; the gateways rely on the default", gw, role)
+		}
 	}
 }
