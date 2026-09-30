@@ -3,7 +3,9 @@
 # Bundles a single Linux container that mirrors a production gateway node:
 # Open vSwitch (userspace datapath) + ovn-controller + FRR + the
 # ovn-network-agent. The entrypoint starts the supporting daemons and then
-# execs the agent in the foreground.
+# execs the agent in the foreground. With GWNODE_ROLE=compute the same image
+# runs as a plain OVN chassis instead: OVS and ovn-controller only, no FRR
+# and no agent (see gwnode-entrypoint.sh).
 #
 # Build:
 #   docker build -f test/e2e/Dockerfile.gwnode -t ovn-network-agent/gwnode:e2e .
@@ -113,10 +115,16 @@ RUN chmod 0755 /usr/local/bin/gwnode-entrypoint.sh \
 # reported healthy the moment OVS and ovn-controller were up, while the
 # entrypoint still had FRR to bring up before it execs the agent. Everything
 # that waits for `healthy` believed it (issue #205).
+#
+# A compute-role container never runs the agent, so it is exempt from that
+# clause. Docker does not substitute variables in HEALTHCHECK, so
+# ${GWNODE_ROLE} reaches the probing shell verbatim and is read from the
+# container's own environment.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
     CMD ovs-vsctl show >/dev/null 2>&1 \
         && pgrep -x ovn-controller >/dev/null \
-        && pgrep -f '^/usr/local/bin/ovn-network-agent' >/dev/null
+        && { [ "${GWNODE_ROLE:-gateway}" = compute ] \
+             || pgrep -f '^/usr/local/bin/ovn-network-agent' >/dev/null; }
 
 # tini must be PID 1: the daemons the entrypoint starts (watchfrr, zebra,
 # bgpd, staticd, ovsdb-server, ...) daemonize and reparent to PID 1, and the
