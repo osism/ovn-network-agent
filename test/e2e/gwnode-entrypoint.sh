@@ -8,6 +8,11 @@
 # container's lifecycle stays tied to the agent process — and the
 # daemons that daemonize out of this script get reaped when they exit
 # instead of lingering as zombies under the non-reaping agent.
+#
+# GWNODE_ROLE=compute turns the same image into a plain OVN chassis: the
+# script stops after ovn-controller (no VRF, no FRR, no agent) and holds
+# the container open. The chaos runner hosts its workloads on such a node,
+# compute-1 in topology.clab.yml, so no gateway fault takes them down.
 
 set -Eeuo pipefail
 
@@ -40,6 +45,9 @@ BRIDGE_DEV="${BRIDGE_DEV:-br-ex}"
 BRIDGE_MAPPING="${BRIDGE_MAPPING:-physnet1:${BRIDGE_DEV}}"
 VRF_NAME="${VRF_NAME:-vrf-provider}"
 VRF_TABLE_ID="${VRF_TABLE_ID:-100}"
+# gateway (the default) runs the whole stack below; compute stops after
+# ovn-controller. main() rejects any other value before a daemon starts.
+GWNODE_ROLE="${GWNODE_ROLE:-gateway}"
 
 # ---------------------------------------------------------------------------
 # Why no daemon start script's exit status may be fatal here
@@ -499,10 +507,24 @@ yield_config_to_chaos_profile() {
 }
 
 main() {
+    case "${GWNODE_ROLE}" in
+        gateway | compute) ;;
+        *)
+            log "FATAL: unknown GWNODE_ROLE '${GWNODE_ROLE}' (want gateway or compute)"
+            exit 1
+            ;;
+    esac
+
     start_ovs
     resolve_sb_remote
     configure_ovs
     start_ovn_controller
+
+    if [ "${GWNODE_ROLE}" = compute ]; then
+        log "compute role: no VRF, no FRR, no agent; holding the container open"
+        exec sleep infinity
+    fi
+
     setup_vrf
     setup_loopback
     start_frr
