@@ -27,9 +27,10 @@ test/e2e/
   Dockerfile.gwnode         — Ubuntu 24.04 + OVS + ovn-controller + FRR + agent
   Dockerfile.central        — ovn-northd + NB/SB ovsdb-server
   gwnode-entrypoint.sh      — starts OVS / ovn-controller / FRR, then execs the agent
+                              (GWNODE_ROLE=compute: stops after ovn-controller, no agent)
   gwnode-config.yaml        — default agent config baked into the gwnode image
   central-entrypoint.sh     — starts ovn-northd + ovsdb-server, exposes 6641/6642
-  topology.clab.yml         — containerlab topology (central + 3 gateways + upstream + 2 clients)
+  topology.clab.yml         — containerlab topology (central + 3 gateways + 1 compute + upstream + 2 clients)
   bootstrap.sh              — idempotent OVN NB seed (1 LS, 1 LR with 2 FIPs, HA across 3 chassis)
   scenarios/
     baseline.sh             — baseline reachability scenario (issue #45)
@@ -122,10 +123,11 @@ containers, which is what containerlab requires.
 +------+------+    +------+------+    +------+------+
        |                  |                  |
        +-------- mgmt net (containerlab) ----+
-                          |
-                     +----+----+
-                     | central |
-                     +---------+
+                          |                  |
+                     +----+----+    +--------+---------+
+                     | central |    |    compute-1     |
+                     +---------+    | (gwnode compute) |
+                                    +------------------+
 ```
 
 - The **management** network is the default containerlab bridge;
@@ -138,6 +140,11 @@ containers, which is what containerlab requires.
 - The two **clients** sit behind the upstream router
   (`upstream:eth4` and `upstream:eth5`) and are used as reachability
   probes for scenario-level tests.
+- **`compute-1`** is a fourth OVN chassis, built from the gwnode image
+  with `GWNODE_ROLE=compute`. It runs OVS and `ovn-controller` only:
+  it has no underlay link, no FRR, no agent and no `Gateway_Chassis`
+  row, so no router port ever lands on it. The scenarios do not use it;
+  the [chaos runner](#chaos-runner) hosts its workloads there.
 
 ## Bootstrap state
 
@@ -146,11 +153,12 @@ waits for OVN NB to become reachable from the host, then provisions
 the lab in three layers, described below.
 
 Bring-up gates on three readiness waits: OVN NB reachability, SB
-chassis registration for every gateway, and the upstream `bgpd`. The
-`bgpd` start — the one daemon bootstrap starts itself — is retried up
-to `BGPD_START_ATTEMPTS` (default `3`) times, each attempt waiting
-`BGPD_WAIT_SECS` (default `30` s) for the daemon to register, so a
-one-off startup hiccup heals itself instead of failing the job.
+chassis registration for every gateway and for `compute-1`, and the
+upstream `bgpd`. The `bgpd` start — the one daemon bootstrap starts
+itself — is retried up to `BGPD_START_ATTEMPTS` (default `3`) times, each
+attempt waiting `BGPD_WAIT_SECS` (default `30` s) for the daemon to
+register, so a one-off startup hiccup heals itself instead of failing the
+job.
 
 The upstream next-hop `Static_MAC_Binding` is written the same way, for
 a different reason: the gateway agents maintain that same row and have
@@ -257,7 +265,9 @@ diagnostics and retries.
   responder — see issue
   [#105](https://github.com/osism/ovn-network-agent/issues/105). As a
   side effect, the baseline exercises cross-chassis geneve
-  (master `gateway-1` ↔ workload host `gateway-3`).
+  (master `gateway-1` ↔ workload host `gateway-3`). The chaos runner
+  moves vm1 to `compute-1` at the start of a run (see its start state
+  under [Chaos runner](#chaos-runner)).
 
 ## Running locally
 
@@ -1171,7 +1181,7 @@ the physical network and keeps working while the hairpin plane is broken,
 so a run without an internal vantage records no loss for exactly the
 traffic class the hairpin flows exist for.
 
-Three targets use it, all from workload namespaces on `gateway-3`:
+Three targets use it, all from workload namespaces on `compute-1`:
 
 | Target | Kind | Address | What it rides |
 | --- | --- | --- | --- |
@@ -1181,11 +1191,9 @@ Three targets use it, all from workload namespaces on `gateway-3`:
 
 The third probe kind, TCP, is a handshake through bash's `/dev/tcp`
 redirect: the gateway image carries no curl, and `pf-hairpin.sh` probes
-its VIP the same way. A `docker exec` that cannot run — the node is down,
-the netns went with it mid-fault — records as loss, which is correct: the
-path is down. After a `gateway-3` recycle the restore re-provisions the
-responder namespaces (`ensureResponders`), so the vantage comes back with
-the node and the existing recovery gate applies unchanged.
+its VIP the same way. A `docker exec` that cannot run records as loss. No
+fault targets `compute-1`, so the vantage itself stays up through every
+fault, and a dark internal probe means the path it measures is down.
 
 The journal records probes by name, so both targets appear in
 `journal.jsonl` and in the run record's per-target loss buckets, and
@@ -1257,11 +1265,29 @@ pinned to `gateway-1`), `pf-external.sh`'s `Load_Balancer` VIP
 (`192.0.2.50:80` in front of the `vm1` backend), and
 `cross-chassis-fip.sh`'s second flat router `lr1` (pinned to `gateway-2`,
 FIP `192.0.2.20` with a `vm3` responder). Which of them a run puts
-up is the profile's call. The layering is idempotent, which is what makes
-it reusable as the post-fault restore path. If the start state is not
-green within 120 s the run aborts with exit code 2 — a fault injected
-into a lab that was not green to begin with would report false violations
-for the rest of the run.
+up is the profile's call. The layering is idempotent, so a second run on
+the same lab lands in the same state (the backends are restarted). If the
+start state is not green within 120 s the run aborts with exit code 2 — a
+fault injected into a lab that was not green to begin with would report
+false violations for the rest of the run.
+
+Every responder, the port-forward backend and the internal probe vantages
+live on `compute-1`, a chassis that no fault targets. A container lifecycle
+fault on the node that hosts the workloads darkens every probe for the
+whole hold, whatever the agent does, and hides the failover the run is
+there to measure: in the 2026-09-26..29 runs, 52 % of all loss was this
+class. `bootstrap.sh` still puts `vm1` on `gateway-3` for the scenarios.
+So the start state waits for `br-int` on `compute-1`, evicts every
+responder the profile uses from `gateway-3` (the OVS port first, then the
+veth and the netns) and re-creates it on `compute-1`. The chaos lab
+therefore never measures a workload on the chassis that owns
+`cr-lr0-public`: `hairpin-fip`, `hairpin-vip` and `cross-fip` always enter
+OVN over geneve from `compute-1`.
+
+::: warning Recycle the lab before a scenario
+A lab that ran a chaos session has no `vm1` on `gateway-3` any more. Run
+`make e2e-down && make e2e-up` before you run a scenario on it.
+:::
 
 **Probes.** A goroutine per target samples reachability from `client-1`
 once a second for the whole run, so loss *during* a fault hold is
@@ -1621,9 +1647,8 @@ green, no later action could converge either — the rest of the duration
 would produce nothing but violations derived from the first one.
 Budgets are measured from the *restore*, not from the injection:
 resources pinned to the node under fault (the VLAN routers and the VIP on
-`gateway-1`, every responder on `gateway-3`) are legitimately dark while
-it is held down. The probe-loss buckets still record what happened
-mid-hold.
+`gateway-1`) are legitimately dark while it is held down. The probe-loss
+buckets still record what happened mid-hold.
 
 **Baseline checks** sweep every 10 s, independently of what the engine is
 doing: every node the run considers healthy must be running an agent, and
@@ -1755,10 +1780,9 @@ why [stale-chassis](#stale-chassis) and [drain-hitless](#drain-hitless)
 tell you to recycle the whole lab. A chaos runner cannot recycle: the
 guardrails only re-target a node that has *returned*. So `restoreNode`
 re-creates the link with `containerlab tools veth create`, re-applies the
-underlay `/30` and the BGP session `bootstrap.sh` seeds, and — on
-`gateway-3` — rebuilds the netns responders and the port-forward backend
-its destroyed network namespace took with it. This needs the same
-privileges `containerlab deploy` already does.
+underlay `/30` and the BGP session `bootstrap.sh` seeds, and, on a gateway
+whose profile carries the API VIP, restarts the API backend. This needs
+the same privileges `containerlab deploy` already does.
 
 The kernel tears the previous incarnation's veth down asynchronously when
 its network namespace goes, and with OVS datapaths in that namespace this
@@ -1875,11 +1899,8 @@ make e2e-chaos-report CHAOS_RUN=https://github.com/osism/ovn-network-agent/actio
 The **Planned restarts** section lists every `agent-terminate`,
 `gateway-restart` and `config-flip` with how it landed (`restart`,
 `reload`, or `rejected`), whether the target drained, and the longest loss
-window that overlapped it. Its summary line reads only the drained
-restarts off the workload host (`gateway-3`): restarting the workload host
-takes every workload down with it, drained or not, so those restarts can
-never be hitless. That line is where a drained restart is expected to stay
-under a second.
+window that overlapped it. Its summary line reads every drained restart.
+That line is where a drained restart is expected to stay under a second.
 
 The report's spine is `summary.json`; the `journal.jsonl` next to it
 adds what the record alone cannot say — the loss-window attribution, the
@@ -2115,9 +2136,9 @@ writes:
 <artifact>/
   inspect/containerlab.txt         — output of `containerlab inspect`
   docker/<node>.log                — `docker logs` per lab container
-  ovs/<gateway>/show.txt           — OVS bridges and interfaces
-  ovs/<gateway>/br-int-flows.txt   — OpenFlow dump for br-int
-  ovs/<gateway>/br-ex-flows.txt    — OpenFlow dump for br-ex
+  ovs/<chassis>/show.txt           — OVS bridges and interfaces (every gateway and compute-1)
+  ovs/<chassis>/br-int-flows.txt   — OpenFlow dump for br-int
+  ovs/<chassis>/br-ex-flows.txt    — OpenFlow dump for br-ex
   ovn/nb-show.txt                  — `ovn-nbctl show` on central
   ovn/sb-show.txt                  — `ovn-sbctl show` on central
   ovn/nb-<table>.txt               — full NB row dumps (NAT, Gateway_Chassis, …)
@@ -2132,7 +2153,7 @@ writes:
   frr/upstream-frr-log.txt         — upstream `/var/log/frr/*` tail
   kernel/<gateway>-ip-route.txt    — `ip route show table all`
   agent/<gateway>.log              — copy of the gateway container's stdout
-  ovn-controller/<gateway>.log     — gateway `ovn-controller` log (chassis-registration daemon)
+  ovn-controller/<chassis>.log     — `ovn-controller` log per gateway and compute-1 (chassis-registration daemon)
   failover-strict/failover-strict.pcap — client-1 ICMP capture across the re-election (failover-strict only)
   hairpin/hairpin-flows-before.txt — `cookie=0x998` flows on master:br-ex before adding FIP_B (hairpin only)
   hairpin/hairpin-flows-after.txt  — `cookie=0x998` flows on master:br-ex after adding FIP_B (hairpin only)
