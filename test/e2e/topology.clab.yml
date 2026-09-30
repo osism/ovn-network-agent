@@ -2,6 +2,7 @@
 #
 #   central                    — ovn-northd + NB/SB ovsdb-server
 #   gateway-{1,2,3}            — OVS userspace + ovn-controller + FRR + agent
+#   compute-1                  — OVS userspace + ovn-controller only (chaos workload host)
 #   upstream                   — FRR BGP peer for the gateways
 #   client-{1,2}               — reachability probes attached to upstream
 #
@@ -118,6 +119,23 @@ topology:
       env:
         CHASSIS_NAME: gateway-3
       # See gateway-1.
+      stages:
+        create:
+          wait-for:
+            - node: central
+              stage: create
+
+    compute-1:
+      kind: linux
+      image: ovn-network-agent/gwnode:e2e
+      # Pinned like the gateways: this address is the chassis' geneve encap IP.
+      mgmt-ipv4: 172.30.0.21
+      env:
+        CHASSIS_NAME: compute-1
+        # OVS + ovn-controller only: no VRF, no FRR, no agent (see
+        # GWNODE_ROLE in gwnode-entrypoint.sh). The chaos runner hosts its
+        # workloads here so no fault ever takes them down (issue #280).
+        GWNODE_ROLE: compute
       stages:
         create:
           wait-for:
