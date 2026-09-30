@@ -447,11 +447,11 @@ func plannedRestartEvents() []event {
 		{TS: "2026-07-16T19:01:00Z", Event: evInject, Tick: 4, Action: "config-flip", Target: "gateway-2"},
 		{TS: "2026-07-16T19:01:01Z", Event: evConfigFlip, Target: "gateway-2", Flip: "drain-toggle", Rejected: no},
 		{TS: "2026-07-16T19:01:20Z", Event: evConverged, Tick: 4, Action: "config-flip", Target: "gateway-2"},
-		// tick 5: a drained terminate of the workload host: every workload down.
-		{TS: "2026-07-16T19:01:30Z", Event: evInject, Tick: 5, Action: "agent-terminate", Target: workloadHost, Drain: on},
+		// tick 5: a drained terminate of gateway-3 with a long loss window.
+		{TS: "2026-07-16T19:01:30Z", Event: evInject, Tick: 5, Action: "agent-terminate", Target: "gateway-3", Drain: on},
 		{TS: "2026-07-16T19:01:32Z", Event: evProbeTransition, Probe: "fip-vm1", Up: boolPtr(false)},
 		{TS: "2026-07-16T19:01:43Z", Event: evProbeTransition, Probe: "fip-vm1", Up: boolPtr(true)},
-		{TS: "2026-07-16T19:02:00Z", Event: evConverged, Tick: 5, Action: "agent-terminate", Target: workloadHost},
+		{TS: "2026-07-16T19:02:00Z", Event: evConverged, Tick: 5, Action: "agent-terminate", Target: "gateway-3"},
 		// tick 6: an undrained restart that never converged, dark to the end.
 		{TS: "2026-07-16T19:02:10Z", Event: evInject, Tick: 6, Action: "gateway-restart", Target: "gateway-2", Drain: off},
 		{TS: "2026-07-16T19:02:12Z", Event: evProbeTransition, Probe: "fip-vm2", Up: boolPtr(false)},
@@ -464,27 +464,33 @@ func TestRenderReportSplitsPlannedRestartsByDrain(t *testing.T) {
 
 	for _, want := range []string{
 		"### Planned restarts",
-		"Drained restarts off the workload host: 1 · longest loss window 400 ms (fip-vm2)",
+		"Drained restarts: 2 · longest loss window 11.0 s (fip-vm1)",
 		"| 1 | gateway-restart | gateway-1 | restart | on | 400 ms (fip-vm2) |",
 		"| 2 | config-flip | gateway-2 | reload | — | none |",
 		"| 3 | config-flip | gateway-1 | rejected | — | none |",
 		"| 4 | config-flip | gateway-2 | restart | — | none |",
-		"| 5 | agent-terminate | " + workloadHost + " (workload host) | restart | on | 11.0 s (fip-vm1) |",
+		"| 5 | agent-terminate | gateway-3 | restart | on | 11.0 s (fip-vm1) |",
 		"| 6 | gateway-restart | gateway-2 | restart | off | until run end (fip-vm2) |",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("the Planned restarts section lacks %q:\n%s", want, out)
 		}
 	}
+	// No gateway hosts the workloads, so none is set apart from the others.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "workload host") {
+			t.Fatalf("the report still sets a workload host apart: %q\n%s", line, out)
+		}
+	}
 }
 
-// The summary reads only drained restarts off the workload host; a run with
-// none says so rather than reporting a hitless run it never measured.
+// The summary reads only drained restarts; a run with none says so rather
+// than reporting a hitless run it never measured.
 func TestRenderReportSaysWhenNoDrainedRestartWasMeasured(t *testing.T) {
 	t.Parallel()
 	events := []event{
-		{TS: "2026-07-16T19:00:10Z", Event: evInject, Tick: 1, Action: "gateway-restart", Target: workloadHost, Drain: boolPtr(true)},
-		{TS: "2026-07-16T19:00:20Z", Event: evConverged, Tick: 1, Action: "gateway-restart", Target: workloadHost},
+		{TS: "2026-07-16T19:00:10Z", Event: evInject, Tick: 1, Action: "gateway-restart", Target: "gateway-3", Drain: boolPtr(false)},
+		{TS: "2026-07-16T19:00:20Z", Event: evConverged, Tick: 1, Action: "gateway-restart", Target: "gateway-3"},
 		{TS: "2026-07-16T19:00:30Z", Event: evInject, Tick: 2, Action: "agent-terminate", Target: "gateway-1", Drain: boolPtr(false)},
 		{TS: "2026-07-16T19:00:40Z", Event: evConverged, Tick: 2, Action: "agent-terminate", Target: "gateway-1"},
 		// A flip that failed before it was journaled: no config-flip event
@@ -495,8 +501,8 @@ func TestRenderReportSaysWhenNoDrainedRestartWasMeasured(t *testing.T) {
 
 	out := renderToString(t, reportRecord(t), events)
 
-	if !strings.Contains(out, "No drained restart off the workload host in this run.") {
-		t.Fatalf("a run without a drained restart off the workload host did not say so:\n%s", out)
+	if !strings.Contains(out, "No drained restart in this run.") {
+		t.Fatalf("a run without a drained restart did not say so:\n%s", out)
 	}
 	if !strings.Contains(out, "| 3 | config-flip | gateway-2 | — | — | none |") {
 		t.Fatalf("a flip that never journaled how it landed was not shown as unknown:\n%s", out)
