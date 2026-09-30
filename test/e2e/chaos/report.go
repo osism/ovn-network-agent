@@ -408,9 +408,7 @@ func renderLoss(w *mdWriter, rec *runRecord, events []event, start, end time.Tim
 // renderPlannedRestarts answers "was a planned restart hitless": one row per
 // agent-terminate, gateway-restart and config-flip, with how the change
 // landed, whether the target drained, and the longest loss window that
-// overlapped it. The summary line reads only the drained restarts off the
-// workload host: restarting the workload host takes every workload down with
-// it, drained or not, so no drain can make that one hitless.
+// overlapped it. The summary line reads every drained restart.
 func renderPlannedRestarts(w *mdWriter, events []event, end time.Time) {
 	rows := plannedRestarts(events, end)
 	if len(rows) == 0 {
@@ -420,7 +418,7 @@ func renderPlannedRestarts(w *mdWriter, events []event, end time.Time) {
 	var worst *plannedRestart
 	for i := range rows {
 		r := &rows[i]
-		if !r.drained() || r.target == workloadHost {
+		if !r.drained() {
 			continue
 		}
 		drained++
@@ -432,22 +430,18 @@ func renderPlannedRestarts(w *mdWriter, events []event, end time.Time) {
 	w.printf("### Planned restarts\n\n")
 	switch {
 	case drained == 0:
-		w.printf("No drained restart off the workload host in this run.\n\n")
+		w.printf("No drained restart in this run.\n\n")
 	case worst == nil:
-		w.printf("Drained restarts off the workload host: %d · longest loss window none\n\n", drained)
+		w.printf("Drained restarts: %d · longest loss window none\n\n", drained)
 	default:
-		w.printf("Drained restarts off the workload host: %d · longest loss window %s\n\n",
+		w.printf("Drained restarts: %d · longest loss window %s\n\n",
 			drained, worst.lossCell())
 	}
 	w.printf("| tick | action | target | mode | drain | longest loss window |\n")
 	w.printf("| --- | --- | --- | --- | --- | --- |\n")
 	for _, r := range rows {
-		target := r.target
-		if target == workloadHost {
-			target += " (workload host)"
-		}
 		w.printf("| %d | %s | %s | %s | %s | %s |\n",
-			r.tick, cell(r.action), cell(target), orDashS(r.mode), r.drainCell(), cell(r.lossCell()))
+			r.tick, cell(r.action), cell(r.target), orDashS(r.mode), r.drainCell(), cell(r.lossCell()))
 	}
 	w.printf("\n")
 }
