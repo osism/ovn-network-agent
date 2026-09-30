@@ -6,14 +6,14 @@
 #
 #   <out>/inspect/containerlab.txt          — `containerlab inspect -t <topology>`
 #   <out>/docker/<node>.log                 — `docker logs` per container
-#   <out>/ovs/<gateway>/<dump>.txt          — OVS bridge + flow dumps per gateway
+#   <out>/ovs/<chassis>/<dump>.txt          — OVS bridge + flow dumps per gateway and compute node
 #   <out>/ovn/{nb,sb}-<table>.txt           — `ovn-nbctl list`/`ovn-sbctl list` dumps
 #   <out>/frr/<gateway>-running-config.txt  — FRR `show running-config`
 #   <out>/frr/<gateway>-bgp-summary.txt     — `show bgp summary`
 #   <out>/frr/upstream-*.txt                — upstream FRR daemon + BGP state
 #   <out>/kernel/<gateway>-*.txt            — ip addr/route/rule + nft ruleset per gateway
 #   <out>/kernel/upstream-ip-{addr,link}.txt — upstream link + address state
-#   <out>/ovn-controller/<gateway>.log      — gateway ovn-controller log (chassis-registration daemon)
+#   <out>/ovn-controller/<chassis>.log      — ovn-controller log per gateway and compute node (chassis-registration daemon)
 #   <out>/agent/<gateway>.log               — `docker logs` of the gateway (agent runs in foreground)
 #
 # Best-effort: every command is allowed to fail individually so a single
@@ -34,6 +34,9 @@ if [ -z "${GATEWAYS+x}" ]; then
 fi
 if [ -z "${CLIENTS+x}" ]; then
     CLIENTS=(client-1 client-2)
+fi
+if [ -z "${COMPUTES+x}" ]; then
+    COMPUTES=(compute-1)
 fi
 CENTRAL="${CENTRAL:-central}"
 UPSTREAM="${UPSTREAM:-upstream}"
@@ -73,7 +76,7 @@ collect_inspect() {
 
 collect_docker_logs() {
     log "docker logs for every lab container"
-    local nodes=("${CENTRAL}" "${UPSTREAM}" "${GATEWAYS[@]}" "${CLIENTS[@]}")
+    local nodes=("${CENTRAL}" "${UPSTREAM}" "${GATEWAYS[@]}" "${COMPUTES[@]}" "${CLIENTS[@]}")
     for node in "${nodes[@]}"; do
         capture "${OUT_DIR}/docker/${node}.log" \
             docker logs "clab-${LAB}-${node}"
@@ -81,16 +84,16 @@ collect_docker_logs() {
 }
 
 collect_ovs() {
-    log "OVS dumps from each gateway"
-    for gw in "${GATEWAYS[@]}"; do
-        capture "${OUT_DIR}/ovs/${gw}/show.txt" \
-            exec_in "${gw}" ovs-vsctl show
-        capture "${OUT_DIR}/ovs/${gw}/br-int-flows.txt" \
-            exec_in "${gw}" ovs-ofctl --no-stats dump-flows br-int
-        capture "${OUT_DIR}/ovs/${gw}/br-ex-flows.txt" \
-            exec_in "${gw}" ovs-ofctl --no-stats dump-flows br-ex
-        capture "${OUT_DIR}/ovs/${gw}/ports.txt" \
-            exec_in "${gw}" ovs-vsctl --columns=name,type,external_ids list Interface
+    log "OVS dumps from each gateway and compute node"
+    for node in "${GATEWAYS[@]}" "${COMPUTES[@]}"; do
+        capture "${OUT_DIR}/ovs/${node}/show.txt" \
+            exec_in "${node}" ovs-vsctl show
+        capture "${OUT_DIR}/ovs/${node}/br-int-flows.txt" \
+            exec_in "${node}" ovs-ofctl --no-stats dump-flows br-int
+        capture "${OUT_DIR}/ovs/${node}/br-ex-flows.txt" \
+            exec_in "${node}" ovs-ofctl --no-stats dump-flows br-ex
+        capture "${OUT_DIR}/ovs/${node}/ports.txt" \
+            exec_in "${node}" ovs-vsctl --columns=name,type,external_ids list Interface
     done
 }
 
@@ -168,15 +171,15 @@ collect_agent_logs() {
     done
 }
 
-# The SB chassis-registration gate waits for each gateway's
-# ovn-controller to register. ovn-controller logs to a file rather than
-# the container's stdout (which the entrypoint reserves for the agent),
+# The SB chassis-registration gate waits for each gateway's and compute
+# node's ovn-controller to register. ovn-controller logs to a file rather
+# than the container's stdout (which the entrypoint reserves for the agent),
 # so `docker logs` does not carry it — pull the log file explicitly.
 collect_ovn_controller_logs() {
-    log "ovn-controller logs from each gateway"
-    for gw in "${GATEWAYS[@]}"; do
-        capture "${OUT_DIR}/ovn-controller/${gw}.log" \
-            exec_in "${gw}" cat /var/log/ovn/ovn-controller.log
+    log "ovn-controller logs from each gateway and compute node"
+    for node in "${GATEWAYS[@]}" "${COMPUTES[@]}"; do
+        capture "${OUT_DIR}/ovn-controller/${node}.log" \
+            exec_in "${node}" cat /var/log/ovn/ovn-controller.log
     done
 }
 

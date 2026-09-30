@@ -62,6 +62,11 @@
 #          `vm1` netns with 192.168.10.10/24 + default route via
 #          192.168.10.1.
 #
+# The compute chassis compute-1 is only waited for: it registers in SB
+# like the gateways, but runs no agent, gets no Gateway_Chassis row and
+# hosts nothing for the scenarios (the chaos runner puts its workloads
+# there).
+#
 # Usage:
 #   ./test/e2e/bootstrap.sh                    # against the default `ovn-e2e` lab
 #   LAB_NAME=other ./test/e2e/bootstrap.sh     # override the containerlab lab name
@@ -167,6 +172,10 @@ GATEWAYS=(
     "gateway-3 10"
 )
 
+# Chassis that register in SB but are no gateway: no agent, no underlay
+# link, no Gateway_Chassis row.
+COMPUTES=("compute-1")
+
 FIPS=(
     "192.0.2.10 192.168.10.10"
     "192.0.2.11 192.168.10.11"
@@ -234,7 +243,7 @@ wait_for_chassis() {
     done
     echo "SB chassis registration timed out; missing:${missing:-<unknown>}" >&2
     docker exec "${OVN_CENTRAL}" ovn-sbctl list Chassis >&2 || true
-    # For each still-missing gateway, dump the daemon whose registration
+    # For each still-missing chassis, dump the daemon whose registration
     # we were waiting on (ovn-controller logs to a file, not stdout) plus
     # the container's entrypoint output, which catches a container that
     # died before ovn-controller even started.
@@ -825,7 +834,7 @@ main() {
         read -r name _priority <<<"${entry}"
         chassis_names+=("${name}")
     done
-    wait_for_chassis "${chassis_names[@]}"
+    wait_for_chassis "${chassis_names[@]}" "${COMPUTES[@]}"
 
     # OVN NB topology + workload binding.
     ensure_tenant_switch
@@ -841,7 +850,7 @@ main() {
     # Before touching the wired interfaces, name any container that has
     # been auto-restarted since deploy: a restart in the wrong window is
     # the known cause of a missing eth1 below.
-    report_container_restarts "${chassis_names[@]}" "${UPSTREAM_NAME}" "${CLIENT_NAME}"
+    report_container_restarts "${chassis_names[@]}" "${COMPUTES[@]}" "${UPSTREAM_NAME}" "${CLIENT_NAME}"
 
     # The chassis gate above passes mid-entrypoint; the wiring and FRR
     # steps below need the entrypoint's later milestones (vrf-provider,
