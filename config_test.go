@@ -759,6 +759,8 @@ func TestApplyEnvConfigBooleansBothDirections(t *testing.T) {
 		// PORT_FORWARD_L3MDEV_ACCEPT was true-only: prove the disable direction.
 		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT", "false", Config{PortForwardL3mdevAccept: true}, false, func(c Config) bool { return c.PortForwardL3mdevAccept }},
 		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT", "true", Config{PortForwardL3mdevAccept: false}, true, func(c Config) bool { return c.PortForwardL3mdevAccept }},
+		{"OVN_NETWORK_ROUTE_WATCH", "false", Config{RouteWatch: true}, false, func(c Config) bool { return c.RouteWatch }},
+		{"OVN_NETWORK_ROUTE_WATCH", "true", Config{RouteWatch: false}, true, func(c Config) bool { return c.RouteWatch }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
@@ -783,6 +785,7 @@ func TestApplyEnvConfigInvalidBool(t *testing.T) {
 		{"OVN_NETWORK_DRAIN_ON_SHUTDOWN"},
 		{"OVN_NETWORK_VETH_LEAK_ENABLED"},
 		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"},
+		{"OVN_NETWORK_ROUTE_WATCH"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.env, func(t *testing.T) {
@@ -797,6 +800,55 @@ func TestApplyEnvConfigInvalidBool(t *testing.T) {
 				t.Errorf("error %q does not name %s", err, tc.env)
 			}
 		})
+	}
+}
+
+// TestLoadConfigRouteWatch pins the route watch switch through the real loader:
+// on by default, and each of the three layers can turn it off.
+func TestLoadConfigRouteWatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("route_watch: false\n"), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		args []string
+		env  string
+		want bool
+	}{
+		{name: "default", want: true},
+		{name: "flag", args: []string{"--route-watch=false"}, want: false},
+		{name: "env", env: "false", want: false},
+		{name: "yaml", args: []string{"--config", path}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("OVN_NETWORK_ROUTE_WATCH", tc.env)
+			}
+			cfg, err := loadConfig(fullModeArgs(tc.args...))
+			if err != nil {
+				t.Fatalf("loadConfig() error: %v", err)
+			}
+			if cfg.RouteWatch != tc.want {
+				t.Errorf("RouteWatch = %v, want %v", cfg.RouteWatch, tc.want)
+			}
+		})
+	}
+}
+
+// A value ParseBool rejects must fail the load and name the variable, so a
+// typo cannot silently leave the watcher in its default state.
+func TestLoadConfigRouteWatchInvalidEnv(t *testing.T) {
+	t.Setenv("OVN_NETWORK_ROUTE_WATCH", "maybe")
+
+	_, err := loadConfig(fullModeArgs())
+	if err == nil {
+		t.Fatal("loadConfig() accepted OVN_NETWORK_ROUTE_WATCH=maybe")
+	}
+	if want := `invalid OVN_NETWORK_ROUTE_WATCH "maybe"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err, want)
 	}
 }
 
