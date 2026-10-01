@@ -89,7 +89,17 @@ provider bridge).
    A `forward_veth_guard` nftables chain restricts the veth return path to
    legitimate traffic only. Requires `nft` binary and `veth_leak_enabled:
    true`.
-6. **Reconciles** periodically as a safety net (default: every 60s).
+6. **Reconciles** periodically as a safety net (default: every 60s), and at
+   once when the route watch sees a kernel route or an FRR static route the
+   agent owns deleted or replaced from outside. The watch subscribes to the
+   kernel's route notifications, so such a route is back after about a
+   second, whatever the interval is. It is on by default (`route_watch:
+   true`). With it off, or while its subscription is down, the route stays
+   missing until the next periodic reconcile. So does a route the kernel
+   removes without a notification: when an interface goes down or is
+   deleted (the provider bridge, a VLAN subinterface, `veth-provider`), the
+   kernel drops the IPv4 routes on it silently, and the watch does not see
+   them go.
 7. **Detects stale chassis** — when a node dies without graceful shutdown,
    surviving agents detect its chassis disappearing from the SB Chassis
    table and clean up its managed OVN NB entries (static routes and MAC

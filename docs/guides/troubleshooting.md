@@ -258,6 +258,18 @@ occasionally clearing a route.
 the kernel is losing routes, then follow the diagnosis for
 [`OVNNetworkAgentRouteInstability`](#alert-ovnnetworkagentrouteinstability).
 
+Compare the re-adds with `route_drift_total{kind}`. With `route_watch` on, it
+counts every route the agent owns that the kernel reported as deleted or
+replaced without the agent asking for it: `kind="kernel"` for an
+agent-installed kernel route, `kind="frr"` for an FRR static route as zebra
+installed it. A drift counter that rises with the re-adds means an installed
+route was taken away, so look for an outside writer. Re-adds while the drift
+counter stays flat mean the watch saw no deletion. Either the route never
+reached the kernel, which points at a `vtysh` race inside the agent's own
+change, or the kernel removed it without a notification, as it does with the
+IPv4 routes on an interface that went down or was deleted (the provider bridge,
+a VLAN subinterface, `veth-provider`).
+
 **Remediation.** Same as route instability: identify the competing writer. Brief
 flapping around an FRR reload or a deploy is expected; sustained flapping is
 not.
