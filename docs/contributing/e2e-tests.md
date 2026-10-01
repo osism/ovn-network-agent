@@ -1467,8 +1467,8 @@ part of the replay contract: a new action is appended, never inserted.
 | `double-failover` | gateway pair | 1 | 10–30 s | 240 s | SIGTERM one gateway, SIGKILL its ring-next peer while it drains |
 | `mgmt-loss` | gateway | 2 | 20–60 s | 90 s | `tc netem loss 30%` on the gateway→central path |
 | `mgmt-delay` | gateway | 2 | 20–60 s | 90 s | `tc netem delay 200ms 50ms` on the gateway→central path |
-| `kernel-route-drop` | gateway | 2 | — | 60 s | `ip route del 192.0.2.10/32 dev br-ex` |
-| `frr-route-drop` | gateway | 2 | — | 60 s | `no ip route 192.0.2.10/32 169.254.0.1` in `vrf-provider` |
+| `kernel-route-drop` | gateway | 2 | — | 10 s | `ip route del 192.0.2.10/32 dev br-ex` |
+| `frr-route-drop` | gateway | 2 | — | 10 s | `no ip route 192.0.2.10/32 169.254.0.1` in `vrf-provider` |
 | `nft-flush` | gateway | 2 | — | 60 s | `nft flush table ip ovn-network-agent` |
 | `ovs-flow-drop` | gateway | 2 | — | 60 s | `ovs-ofctl del-flows` the hairpin (`0x998`) and MAC-tweak (`0x999`) cookies on `br-ex` |
 | `frr-restart` | gateway | 2 | — | 120 s | `frrinit.sh` stop/clear/start, then re-assert BGP |
@@ -1512,11 +1512,20 @@ kernel route, flush the agent's nftables table, remove a hairpin or
 MAC-rewrite OVS flow, remove an FRR static route — the exact deletions
 [`scenario_drift_test.go`](https://github.com/osism/ovn-network-agent/blob/main/test/integration/scenario_drift_test.go)
 proves the agent heals on a single host, driven here against the
-multi-node lab. The deletion is the fault; the agent's next periodic
-reconcile is the undo, so the restore is a no-op and the recovery budget
-is the worst-case cadence (15 s after a `cadence-toggle` flip) plus probe
-slack. Each action skips a gateway that does not carry the object — the
-MAC-tweak flows exist only where routers are locally active, a
+multi-node lab. The deletion is the fault and the agent is the undo, so
+the restore is a no-op. The two route drops are undone by the agent's
+route watch, which reconciles as soon as the kernel reports the deletion.
+Their recovery budget is 10 s: the smallest value the 5 s convergence poll
+checks twice, and below the 15 s cadence a `cadence-toggle` flip sets, so
+a repair that waited for the periodic reconcile fails it. `nft-flush` and
+`ovs-flow-drop` are undone by the next periodic reconcile, because the
+watch covers neither nftables nor OVS flows. Their 60 s budget is that
+worst-case cadence plus probe slack.
+For a route drop the runner also reads the target's `route_drift_total`
+counters before the inject and after the convergence. It records the
+difference on the recovery and shows it in the report, and does not
+assert on it. Each action skips a gateway that does not carry the object
+— the MAC-tweak flows exist only where routers are locally active, a
 port-forward-only profile has no FIP routes — rather than record a no-op
 deletion. Removing the MAC-tweak flow darkens external probes and is
 measured; the hairpin flow's restoration is not probe-observable from
@@ -1885,7 +1894,12 @@ evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
 loss buckets, per-recovery downtime (`down_ms` and `down_windows` per
 probe: the summed red windows between inject and convergence and their
 count; `from_restore_ms`, the part after the restore; and the legacy
-`from_inject_ms` span), a `settles` section (one
+`from_inject_ms` span), for a `kernel-route-drop` or `frr-route-drop`
+recovery its `route_drift` (the `kernel` and `frr` difference of the
+target's `route_drift_total` counters between the inject and the
+convergence; absent when a scrape failed, which the journal records as a
+`check-error`, or when a counter went down because the agent restarted in
+between), a `settles` section (one
 entry per settle window: its tick, `converged_ms`, whether it passed, and
 how many violations it raised), and every violation — each now stamped
 with the `journal_offset` of the last executed action, so it points back
@@ -1908,7 +1922,8 @@ dumped into `<out>/lab-state`.
 **Reading a run back.** `-report` renders a recorded run as
 GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
 copy-pasteable replay line, the slowest recoveries against their
-budgets, each with its summed probe loss, per-probe loss totals, every
+budgets, each with its summed probe loss, the route drift the agent
+counted across each route drop, per-probe loss totals, every
 loss window attributed to the fault whose inject→converged span it
 overlapped, the VIP re-points by phase, the planned restarts, the settle
 results, and the decisions the guardrails skipped:
