@@ -246,12 +246,10 @@ func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
 	}
 	wantVIP := map[string]bool{"flat-dnat": true, "heterogeneous": true}
 	// The cross-chassis probe rides every profile that puts the hairpin
-	// layer up: both need OVN and a second router beside lr0 (#265) —
-	// except drain-everywhere, whose restarts of gateway-2 would darken it
-	// by construction: lr1 has no standby.
+	// layer up: both need OVN and a second router beside lr0 (#265).
 	wantCross := map[string]bool{
 		"everything-on": true, "flat-dnat": true,
-		"vlan-no-dnat": true, "heterogeneous": true,
+		"vlan-no-dnat": true, "heterogeneous": true, "drain-everywhere": true,
 	}
 
 	for _, p := range profiles() {
@@ -287,8 +285,9 @@ func TestSameNodeProbesAreWiredToTheRightProfiles(t *testing.T) {
 						p.name, target.name, target.node, target.netns)
 				}
 			}
-			// The cross-chassis probe must leave OVN on gateway-2, which
-			// only a workload behind lr1 does: vm3 on the workload host.
+			// The cross-chassis probe must leave OVN on the chassis holding
+			// cr-lr1-public, which only a workload behind lr1 does: vm3 on
+			// the workload host.
 			if target.name == probeCrossFIP.name {
 				if target.node != workloadHost || target.netns != "vm3" {
 					t.Errorf("%s: %s probes from %q/%q, want the workload host's vm3",
@@ -336,12 +335,12 @@ func TestHeterogeneousProfileRendersOneConfigPerGateway(t *testing.T) {
 	}
 }
 
-// drain-everywhere puts the drain on every gateway and measures only the
-// paths a drain can keep up: the three that ride lr0, whose port has a
-// standby on every gateway. A probe behind a router with no standby, or
-// behind the harness-plumbed pf-vip route, would read the lab's topology
-// as the agent's loss.
-func TestDrainEverywhereDrainsEveryGatewayAndProbesOnlyStandbyPaths(t *testing.T) {
+// drain-everywhere puts the drain on every gateway and measures every FIP
+// path: each sits behind a router with a standby chassis, so a drain can
+// keep all of them up. Only pf-vip stays out. Its upstream route is
+// plumbed by the harness, so a probe behind it would read the harness'
+// re-point as the agent's loss.
+func TestDrainEverywhereDrainsEveryGatewayAndProbesEveryFIPPath(t *testing.T) {
 	p, err := profileByName("drain-everywhere")
 	if err != nil {
 		t.Fatalf("profileByName: %v", err)
@@ -355,7 +354,7 @@ func TestDrainEverywhereDrainsEveryGatewayAndProbesOnlyStandbyPaths(t *testing.T
 	for _, target := range p.probes {
 		got = append(got, target.name)
 	}
-	if want := "fip-vm1,fip-vm2,hairpin-fip"; strings.Join(got, ",") != want {
+	if want := "fip-vm1,fip-vm2,fip-vlan101,fip-vlan102,hairpin-fip,cross-fip"; strings.Join(got, ",") != want {
 		t.Fatalf("drain-everywhere probes %v, want %s", got, want)
 	}
 	if !p.vlans || !p.crossChassis || p.ovnLB {
