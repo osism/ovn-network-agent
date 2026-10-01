@@ -94,38 +94,16 @@ func snapshotOVN(ctx context.Context, l *lab) (ovnSnapshot, error) {
 		SegmentTagByLRP: map[string]int{},
 	}
 
-	// SB Chassis: the present chassis set, and a UUID→name index for the
-	// chassisredirect binding, whose chassis column is a UUID reference.
-	chassisByUUID := map[string]string{}
-	rows, err := sbRows(ctx, l, "Chassis", "", "_uuid", "name")
+	// SB: the present chassis set and which chassis owns each cr port.
+	owners, chassis, err := crPortOwners(ctx, l)
 	if err != nil {
 		return snap, err
 	}
-	for _, r := range rows {
-		name := cellString(r["name"])
-		if name == "" {
-			continue
-		}
-		chassisByUUID[cellString(r["_uuid"])] = name
-		snap.Chassis[name] = true
-	}
-
-	// SB chassisredirect Port_Binding: which chassis owns each cr port.
-	rows, err = sbRows(ctx, l, "Port_Binding", "type=chassisredirect", "logical_port", "chassis")
-	if err != nil {
-		return snap, err
-	}
-	for _, r := range rows {
-		port := cellString(r["logical_port"])
-		if port == "" {
-			continue
-		}
-		snap.CRPortChassis[port] = chassisByUUID[cellString(r["chassis"])]
-	}
+	snap.CRPortChassis, snap.Chassis = owners, chassis
 
 	// NB NAT: external IP and type, indexed by UUID for the router join.
 	natByUUID := map[string]natRow{}
-	rows, err = nbRows(ctx, l, "NAT", "", "_uuid", "external_ip", "type")
+	rows, err := nbRows(ctx, l, "NAT", "", "_uuid", "external_ip", "type")
 	if err != nil {
 		return snap, err
 	}
@@ -204,6 +182,44 @@ func snapshotOVN(ctx context.Context, l *lab) (ovnSnapshot, error) {
 		return snap, err
 	}
 	return snap, nil
+}
+
+// crPortOwners reads SB for the present chassis set and the chassis that owns
+// each chassisredirect port. owners maps a port's logical_port to the owning
+// chassis name, "" when the port is unbound or its chassis reference names no
+// Chassis row. Both queries mirror crPortClaims in lab.go, as snapshotOVN's do.
+func crPortOwners(ctx context.Context, l *lab) (owners map[string]string, chassis map[string]bool, err error) {
+	// SB Chassis: the present chassis set, and a UUID→name index for the
+	// chassisredirect binding, whose chassis column is a UUID reference.
+	chassisByUUID := map[string]string{}
+	chassis = map[string]bool{}
+	rows, err := sbRows(ctx, l, "Chassis", "", "_uuid", "name")
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range rows {
+		name := cellString(r["name"])
+		if name == "" {
+			continue
+		}
+		chassisByUUID[cellString(r["_uuid"])] = name
+		chassis[name] = true
+	}
+
+	// SB chassisredirect Port_Binding: which chassis owns each cr port.
+	owners = map[string]string{}
+	rows, err = sbRows(ctx, l, "Port_Binding", "type=chassisredirect", "logical_port", "chassis")
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range rows {
+		port := cellString(r["logical_port"])
+		if port == "" {
+			continue
+		}
+		owners[port] = chassisByUUID[cellString(r["chassis"])]
+	}
+	return owners, chassis, nil
 }
 
 // snapshotSegments derives each LRP's provider-segment VLAN tag by joining the
@@ -794,13 +810,42 @@ func (u upstreamRoutes) announcedBy(gw string) map[string]bool {
 // gateway that announced it by mapping the path's next-hop through the
 // underlay links (gateway N announces from 100.64.N.2).
 func observeUpstream(ctx context.Context, l *lab) (upstreamRoutes, error) {
+	paths, err := upstreamPaths(ctx, l)
+	if err != nil {
+		return nil, err
+	}
+	routes := upstreamRoutes{}
+	for _, p := range paths {
+		if routes[p.prefix] == nil {
+			routes[p.prefix] = map[string]bool{}
+		}
+		routes[p.prefix][p.gateway] = true
+	}
+	return routes, nil
+}
+
+// upstreamPath is one BGP path the upstream router holds via a gateway. prefix
+// is keyed as upstreamRoutes documents (bare IP for a /32, full CIDR
+// otherwise). selected says whether the upstream forwards over the path: it is
+// the best path or one of its multipath set.
+type upstreamPath struct {
+	prefix, gateway string
+	selected        bool
+}
+
+// upstreamPaths reads the upstream router's BGP table and returns its
+// gateway-attributed paths, in prefix order. A path is attributed to a gateway
+// by its next-hops and its peer, mapped through the underlay links.
+func upstreamPaths(ctx context.Context, l *lab) ([]upstreamPath, error) {
 	out, err := l.exec(ctx, upstreamNode, "vtysh", "-c", "show bgp ipv4 unicast json")
 	if err != nil {
 		return nil, fmt.Errorf("read upstream bgp: %w", err)
 	}
 	var doc struct {
 		Routes map[string][]struct {
-			Nexthops []struct {
+			Bestpath  bool `json:"bestpath"`
+			Multipath bool `json:"multipath"`
+			Nexthops  []struct {
 				IP string `json:"ip"`
 			} `json:"nexthops"`
 			Peer *struct {
@@ -817,8 +862,8 @@ func observeUpstream(ctx context.Context, l *lab) (upstreamRoutes, error) {
 		byNexthop[addrOf(link.gatewayCIDR)] = link.gateway
 	}
 
-	routes := upstreamRoutes{}
-	for prefix, paths := range doc.Routes {
+	var paths []upstreamPath
+	for _, prefix := range sortedKeys(doc.Routes) {
 		// A /32 keeps its bare-IP key (so it matches AnnounceBound); any other
 		// prefix keeps its full CIDR string, so a gateway-attributed non-/32 —
 		// an underlay /30 a bare `redistribute connected` would leak — is
@@ -830,7 +875,7 @@ func observeUpstream(ctx context.Context, l *lab) (upstreamRoutes, error) {
 		if strings.HasSuffix(prefix, "/32") {
 			key = strings.TrimSuffix(prefix, "/32")
 		}
-		for _, p := range paths {
+		for _, p := range doc.Routes[prefix] {
 			addrs := make([]string, 0, len(p.Nexthops)+1)
 			for _, nh := range p.Nexthops {
 				addrs = append(addrs, nh.IP)
@@ -840,15 +885,38 @@ func observeUpstream(ctx context.Context, l *lab) (upstreamRoutes, error) {
 			}
 			for _, addr := range addrs {
 				if gw := byNexthop[addr]; gw != "" {
-					if routes[key] == nil {
-						routes[key] = map[string]bool{}
-					}
-					routes[key][gw] = true
+					paths = append(paths, upstreamPath{
+						prefix: key, gateway: gw, selected: p.Bestpath || p.Multipath,
+					})
 				}
 			}
 		}
 	}
-	return routes, nil
+	return paths, nil
+}
+
+// upstreamSelected maps each prefix the upstream router holds via a gateway to
+// the gateways it forwards over, in sorted order. A prefix whose gateway paths
+// are all unselected maps to an empty slice.
+func upstreamSelected(ctx context.Context, l *lab) (map[string][]string, error) {
+	paths, err := upstreamPaths(ctx, l)
+	if err != nil {
+		return nil, err
+	}
+	selected := map[string]map[string]bool{}
+	for _, p := range paths {
+		if selected[p.prefix] == nil {
+			selected[p.prefix] = map[string]bool{}
+		}
+		if p.selected {
+			selected[p.prefix][p.gateway] = true
+		}
+	}
+	out := make(map[string][]string, len(selected))
+	for prefix, gws := range selected {
+		out[prefix] = sortedKeys(gws)
+	}
+	return out, nil
 }
 
 // sortedKeys returns a map's keys in sorted order, so an iteration over the

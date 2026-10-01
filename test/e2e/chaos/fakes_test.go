@@ -598,7 +598,7 @@ func (o *oracleLab) upstreamBGP() string {
 	if o.crOwner != "" {
 		nexthop := addrOf(mustLink(o.t, o.crOwner).gatewayCIDR)
 		for _, ip := range gwFIPs {
-			routes[ip+"/32"] = []map[string]any{{"nexthops": []map[string]any{{"ip": nexthop}}}}
+			routes[ip+"/32"] = []map[string]any{{"bestpath": true, "nexthops": []map[string]any{{"ip": nexthop}}}}
 		}
 	}
 	b, _ := json.Marshal(map[string]any{"routes": routes})
