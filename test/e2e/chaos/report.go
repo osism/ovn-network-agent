@@ -241,6 +241,7 @@ func renderReport(w *mdWriter, rec *runRecord, events []event, source string) {
 	renderProbes(w, rec)
 	renderLoss(w, rec, events, start, end)
 	renderVIPRepoints(w, events, start)
+	renderFaultTraces(w, events)
 	renderPlannedRestarts(w, events, end)
 	renderSettles(w, rec)
 	renderSkipped(w, events)
@@ -463,6 +464,91 @@ func renderVIPRepoints(w *mdWriter, events []event, start time.Time) {
 		w.printf("%s", row)
 	}
 	w.printf("\n")
+}
+
+// renderFaultTraces lists what the fault trace journaled for each traced
+// action, one table per tick: the chassisredirect owners and the upstream's
+// selected paths before the fault, every change after it, and the tick's
+// inject, restore and converged events between them, so a failover can be read
+// against the fault's own timeline. A baseline row is marked `before`; every
+// other row carries its time since the inject. So does the baseline of a
+// reader whose first reading succeeded only after the inject: that row is the
+// state at its time, not the one before the fault. A tick whose inject is not
+// in the journal has no such anchor and renders a dash there.
+func renderFaultTraces(w *mdWriter, events []event) {
+	type faultTrace struct {
+		inject *event
+		rows   []*event
+		traced bool
+	}
+	var ticks []int
+	byTick := map[int]*faultTrace{}
+	for i := range events {
+		ev := &events[i]
+		switch ev.Event {
+		case evInject, evCROwner, evUpstreamPath, evRestore, evConverged:
+		default:
+			continue
+		}
+		tr := byTick[ev.Tick]
+		if tr == nil {
+			tr = &faultTrace{}
+			byTick[ev.Tick] = tr
+			ticks = append(ticks, ev.Tick)
+		}
+		tr.rows = append(tr.rows, ev)
+		switch {
+		case ev.Event == evInject && tr.inject == nil:
+			tr.inject = ev
+		case ev.Event == evCROwner || ev.Event == evUpstreamPath:
+			tr.traced = true
+		}
+	}
+
+	titled := false
+	for _, tick := range ticks {
+		tr := byTick[tick]
+		if !tr.traced {
+			continue
+		}
+		if !titled {
+			w.printf("### Fault traces\n\n")
+			titled = true
+		}
+		var injectedAt time.Time
+		anchored := false
+		if tr.inject == nil {
+			w.printf("#### Tick %d\n\n", tick)
+		} else {
+			injectedAt, anchored = parseTS(tr.inject.TS)
+			peer := ""
+			if tr.inject.Peer != "" {
+				peer = ", peer " + cell(tr.inject.Peer)
+			}
+			w.printf("#### Tick %d: %s, target %s%s\n\n",
+				tick, cell(tr.inject.Action), cell(tr.inject.Target), peer)
+		}
+		w.printf("| at | event | object | from | to |\n")
+		w.printf("| --- | --- | --- | --- | --- |\n")
+		for _, ev := range tr.rows {
+			traced := ev.Event == evCROwner || ev.Event == evUpstreamPath
+			object := ev.Target
+			if traced {
+				object = ev.Object
+			}
+			at := orDashS("")
+			switch ts, ok := parseTS(ev.TS); {
+			case !anchored:
+			case traced && ev.Detail == traceBaseline && (!ok || !ts.After(injectedAt)):
+				at = "before"
+			case ok:
+				at = "+" + fmtMS(max(0, ts.Sub(injectedAt).Milliseconds()))
+			}
+			w.printf("| %s | %s | %s | %s | %s |\n",
+				at, cell(ev.Event), orDashS(object), orDashS(ev.From), orDashS(ev.To))
+		}
+		w.printf("\n")
+	}
 }
 
 // renderPlannedRestarts answers "was a planned restart hitless": one row per
