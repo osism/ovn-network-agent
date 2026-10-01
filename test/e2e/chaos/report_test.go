@@ -595,3 +595,88 @@ func TestRenderReportLeavesOutVIPRepointsItNeverSaw(t *testing.T) {
 		t.Fatalf("a re-point with an unreadable timestamp got a row:\n%s", out)
 	}
 }
+
+// The route drift table lists what the agent's route watch counted across
+// each route drop, in tick order, so a watch repair can be told from a tick
+// repair. A recovery that measured nothing gets no row.
+func TestRenderReportListsTheRouteDriftDeltas(t *testing.T) {
+	t.Parallel()
+	rec := reportRecord(t)
+	rec.Recoveries = append(rec.Recoveries,
+		recoveryRecord{Tick: 4, Action: "frr-route-drop", Target: "gateway-2", BudgetMS: 10_000, ConvergedMS: 40,
+			RouteDrift: &routeDrift{FRR: 1}},
+		recoveryRecord{Tick: 3, Action: "kernel-route-drop", Target: "gateway-1", BudgetMS: 10_000, ConvergedMS: 60,
+			RouteDrift: &routeDrift{Kernel: 2}},
+		// The tick repaired this one: the watch counted nothing.
+		recoveryRecord{Tick: 5, Action: "kernel-route-drop", Target: "gateway-3", BudgetMS: 10_000, ConvergedMS: 5_040,
+			RouteDrift: &routeDrift{}},
+	)
+
+	out := renderToString(t, rec, nil)
+
+	last := -1
+	for _, want := range []string{
+		"### Recoveries",
+		"### Route drift seen by the agent",
+		"| tick | action | target | kernel | frr |",
+		"| 3 | kernel-route-drop | gateway-1 | 2 | 0 |",
+		"| 4 | frr-route-drop | gateway-2 | 0 | 1 |",
+		"| 5 | kernel-route-drop | gateway-3 | 0 | 0 |",
+		"### Probes",
+	} {
+		at := strings.Index(out, want)
+		if at < 0 {
+			t.Fatalf("the report lacks %q:\n%s", want, out)
+		}
+		if at < last {
+			t.Fatalf("%q is out of order:\n%s", want, out)
+		}
+		last = at
+	}
+	section := out[strings.Index(out, "### Route drift seen by the agent"):strings.Index(out, "### Probes")]
+	for _, action := range []string{"mgmt-delay", "frr-restart"} {
+		if strings.Contains(section, action) {
+			t.Errorf("the route drift table lists %s, which measured no drift:\n%s", action, section)
+		}
+	}
+}
+
+// Without a recovery that measured drift there is nothing to list, and the
+// section stays out of the report. That holds for a run without route drops
+// and for a record written before route_drift existed, which unmarshals
+// without the field.
+func TestRenderReportLeavesOutRouteDriftItNeverMeasured(t *testing.T) {
+	t.Parallel()
+	const oldRecord = `{
+  "schema": "chaos-run-record/v1",
+  "result": "pass",
+  "inputs": {"seed": 7, "profile": "flat-minimal", "duration_ms": 180000},
+  "recoveries": [{
+    "tick": 1, "action": "kernel-route-drop", "target": "gateway-1",
+    "budget_ms": 60000, "converged_ms": 5040,
+    "down_ms": {"fip-vm1": 3400}, "down_windows": {"fip-vm1": 1},
+    "from_inject_ms": {"fip-vm1": 3400}, "from_restore_ms": {"fip-vm1": 3400},
+    "cr_owner_after": "gateway-1"
+  }]
+}`
+	var old runRecord
+	if err := json.Unmarshal([]byte(oldRecord), &old); err != nil {
+		t.Fatalf("unmarshal the old record: %v", err)
+	}
+	if len(old.Recoveries) != 1 || old.Recoveries[0].RouteDrift != nil {
+		t.Fatalf("the old record unmarshalled as %+v, want one recovery without route_drift", old.Recoveries)
+	}
+
+	for name, rec := range map[string]*runRecord{
+		"no route drop":                   reportRecord(t),
+		"record written before the field": &old,
+	} {
+		out := renderToString(t, rec, nil)
+		if strings.Contains(out, "Route drift seen by the agent") {
+			t.Errorf("%s: the report rendered a route drift section:\n%s", name, out)
+		}
+		if !strings.Contains(out, "### Recoveries") {
+			t.Errorf("%s: the report lost its recoveries section:\n%s", name, out)
+		}
+	}
+}
