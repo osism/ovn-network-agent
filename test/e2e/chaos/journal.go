@@ -44,6 +44,14 @@ const (
 	evRunEnd          = "run-end"
 )
 
+// VIP re-point phases: where in a run followMaster moved the routes.
+const (
+	phaseStart    = "start"
+	phaseInject   = "inject"
+	phaseHold     = "hold"
+	phaseConverge = "converge"
+)
+
 // event is one journal line. Every field is optional except ts/event, so
 // one flat struct describes the whole event vocabulary and consumers can
 // branch on `event`.
@@ -68,6 +76,7 @@ type event struct {
 	Probe       string           `json:"probe,omitempty"`
 	Up          *bool            `json:"up,omitempty"`
 	State       string           `json:"state,omitempty"`
+	Phase       string           `json:"phase,omitempty"`
 	CROwner     string           `json:"cr_owner,omitempty"`
 	RecoveryMS  map[string]int64 `json:"recovery_ms,omitempty"`
 	DownMS      map[string]int64 `json:"down_ms,omitempty"`

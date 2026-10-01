@@ -306,7 +306,7 @@ func drive(ctx context.Context, l *lab, ap *applier, actions []*action, jrnl *jo
 	e := newEngine(l, p, actions, probes, jrnl, rec)
 	e.oracle = orc
 	e.settleEvery = time.Duration(rec.Inputs.SettleEveryMS) * time.Millisecond
-	e.followMaster(ctx)
+	e.followMaster(ctx, phaseStart)
 
 	checks := &baselineChecks{lab: l, engine: e}
 	checksDone := make(chan struct{})
