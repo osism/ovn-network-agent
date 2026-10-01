@@ -1360,9 +1360,11 @@ default, and is the profile whose planned restarts the report's Planned
 restarts section is about. Every router has a standby chassis, so the
 profile probes every FIP path: the three that ride `lr0`, both VLAN FIPs
 and `cross-fip`. A drained restart is expected to be hitless on all six.
-The port-forward layer stays off, because the runner re-points `pf-vip`'s
-route only after a restore, so a drain that moves the master would leave
-it dark regardless of the agent.
+The port-forward layer stays off, because the runner follows the owner of
+`cr-lr0-public` with a one-second poll. A drain that moves the master
+still costs `pf-vip` up to one poll interval plus the re-point. That is
+loss the agent does not cause, in a profile that expects a hitless
+restart.
 
 The **API VIP** (`192.0.2.80:8080`) is the agent's own DNAT path, as
 opposed to `pf-vip`, which is an OVN `Load_Balancer`. Its backend is a
@@ -1661,12 +1663,10 @@ data path stays dark, and since convergence gates on *every* probe being
 green, no later action could converge either — the rest of the duration
 would produce nothing but violations derived from the first one.
 Budgets are measured from the *restore*, not from the injection, because
-two things are legitimately dark while a fault is held. `pf-vip`'s
-upstream route is re-pointed only after the restore. A `double-failover`
-that takes both candidates of a group down leaves that router unbound:
-target `gateway-1` (peer `gateway-2`) darkens the VLAN FIPs and target
-`gateway-2` (peer `gateway-3`) darkens `cross-fip`, each for the hold.
-The probe-loss buckets still record what happened mid-hold.
+a `double-failover` that takes both candidates of a group down leaves
+that router unbound for the hold: target `gateway-1` (peer `gateway-2`)
+darkens the VLAN FIPs and target `gateway-2` (peer `gateway-3`) darkens
+`cross-fip`. The probe-loss buckets still record what happened mid-hold.
 
 **Baseline checks** sweep every 10 s, independently of what the engine is
 doing: every node the run considers healthy must be running an agent, and
@@ -1823,7 +1823,15 @@ same way but journals none of this.
 agent does not propagate `Load_Balancer` VIPs into the underlay. A chaos
 run migrates the master, so the runner re-points both at whichever
 chassis currently owns `cr-lr0-public` — the job an external orchestrator
-does in production — and journals it as `vip-repoint`. Without it the VIP
+does in production. It does so at run start, once a second beside the
+inject and the hold of every executed action when the owner has moved,
+and on every convergence poll after the restore. A convergence poll
+re-issues both routes even for an unmoved owner, because a recycled owner
+comes back without its scope-link route. The once-a-second poll stops
+before the restore begins. Every re-point is journaled as `vip-repoint`
+with the `phase` it happened in (`start`, `inject`, `hold` or
+`converge`), and a failed one carries the error in `detail`. The report
+lists them in its VIP re-points table. Without the re-point the VIP
 probe would go permanently red on the first re-election and every later
 violation would be noise.
 :::
@@ -1859,7 +1867,8 @@ the same value as the recovery's `from_restore_ms`), `config-flip` (the flip, th
 it moved between, `mode` — `reload` or `restart` — and `rejected` when the
 agent refused it), `ovn-churn` (each
 executed churn, with the `object` it touched and the `from`/`to` values it
-moved between), `node-state`, `probe-transition`, `vip-repoint`,
+moved between), `node-state`, `probe-transition`, `vip-repoint` (with the
+`phase` it happened in: `start`, `inject`, `hold` or `converge`),
 `settle-start` / `settle-result` (the latter with the `converged_ms` the
 settle window took to reach its expected state), `violation` and
 `run-end`. A `decision`, `inject` or `converged` for a
@@ -1901,8 +1910,8 @@ GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
 copy-pasteable replay line, the slowest recoveries against their
 budgets, each with its summed probe loss, per-probe loss totals, every
 loss window attributed to the fault whose inject→converged span it
-overlapped, the planned restarts, the settle results, and the decisions
-the guardrails skipped:
+overlapped, the VIP re-points by phase, the planned restarts, the settle
+results, and the decisions the guardrails skipped:
 
 ```sh
 # A run directory (or its summary.json) written with -out:
@@ -1922,10 +1931,11 @@ That line is where a drained restart is expected to stay under a second.
 
 The report's spine is `summary.json`; the `journal.jsonl` next to it
 adds what the record alone cannot say — the loss-window attribution, the
-planned restarts and the skip reasons. Without a journal the report still
-renders, falling back to the record's 10-second loss buckets. Rendering
-exits `0` even for a run that recorded a failure: the report's exit code
-says whether the report could be produced, not what the run found.
+VIP re-points, the planned restarts and the skip reasons. Without a
+journal the report still renders, falling back to the record's 10-second
+loss buckets. Rendering exits `0` even for a run that recorded a failure:
+the report's exit code says whether the report could be produced, not
+what the run found.
 
 **In CI.** The runner has its own workflow,
 [`e2e-chaos.yml`](https://github.com/osism/ovn-network-agent/blob/main/.github/workflows/e2e-chaos.yml),
