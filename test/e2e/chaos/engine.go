@@ -121,6 +121,12 @@ type action struct {
 	// not carry. An inapplicable fault is a journaled skip, not a rewrite or
 	// a no-op deletion. It is nil on every action that always applies.
 	applicable func(ctx context.Context, target string, flip int) bool
+
+	// countsRouteDrift is set on the route-drop actions: the engine reads the
+	// target's route_drift_total counters before the inject and after the
+	// convergence and records the difference on the recovery, so a report
+	// shows whether the agent's route watch saw the deletion.
+	countsRouteDrift bool
 }
 
 // probeSource is the slice of the prober the engine consumes.
@@ -541,6 +547,21 @@ func (e *engine) execute(ctx context.Context, d decision) {
 		}
 	}
 
+	// The drift counters are read before the inject is timed, so the scrape
+	// does not count as fault time. A failed read leaves the recovery without
+	// a delta. It is journaled and never a violation, because the delta is
+	// shown in the report and not asserted on.
+	var driftBefore *routeDrift
+	if d.action.countsRouteDrift {
+		before, err := e.lab.routeDriftCounters(ctx, d.target)
+		if err != nil {
+			e.jrnl.emit(event{Event: evCheckError, Tick: d.tick, Action: d.action.name,
+				Target: d.target, Detail: err.Error()})
+		} else {
+			driftBefore = &before
+		}
+	}
+
 	injectedAt := e.now()
 	e.jrnl.emit(event{
 		Event: evInject, Tick: d.tick, Action: d.action.name,
@@ -594,7 +615,7 @@ func (e *engine) execute(ctx context.Context, d decision) {
 		e.setNodeState(n, nodeConverging)
 	}
 
-	e.converge(ctx, d, injectedAt, restoredAt)
+	e.converge(ctx, d, injectedAt, restoredAt, driftBefore)
 }
 
 // restoreNode runs one node's restore on its own detached, bounded
@@ -684,7 +705,11 @@ func (e *engine) park(gw string) {
 // summed loss between the inject and the convergence, from_restore_ms the
 // part of it after the restore, and from_inject_ms the legacy span from
 // the inject to the last recovery.
-func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time) {
+//
+// driftBefore is the target's route drift counters from before the inject,
+// nil when the action does not measure them or the read failed. With it the
+// converged action also records how far the counters moved.
+func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time, driftBefore *routeDrift) {
 	nodes := e.nodesFor(d)
 	deadline := restoredAt.Add(d.action.recoveryBudget)
 	for e.now().Before(deadline) {
@@ -697,7 +722,7 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			}
 			downMS, downWindows := e.probes.downtimeSince(injectedAt)
 			fromRestore, _ := e.probes.downtimeSince(restoredAt)
-			e.rec.Recoveries = append(e.rec.Recoveries, recoveryRecord{
+			recovery := recoveryRecord{
 				Tick:          d.tick,
 				Action:        d.action.name,
 				Target:        d.target,
@@ -709,7 +734,11 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 				FromInjectMS:  e.probes.recoverySince(injectedAt),
 				FromRestoreMS: fromRestore,
 				CROwnerAfter:  e.vipOwner,
-			})
+			}
+			// Read after the record is built, so the scrape does not
+			// lengthen converged_ms.
+			recovery.RouteDrift = e.routeDriftSince(ctx, d, driftBefore)
+			e.rec.Recoveries = append(e.rec.Recoveries, recovery)
 			e.jrnl.emit(event{
 				Event: evConverged, Tick: d.tick, Action: d.action.name,
 				Target: d.target, Peer: d.peer, CROwner: e.vipOwner, RecoveryMS: fromRestore,
@@ -726,6 +755,28 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			d.action.recoveryBudget, strings.Join(e.probes.redTargets(), ",")),
 	})
 	e.park(d.target)
+}
+
+// routeDriftSince reads the target's route drift counters again and returns
+// how far they moved since before. It returns nil when that cannot be said:
+// the action does not measure drift or its first read failed (before is nil),
+// this read failed, or a counter went down because the agent restarted in
+// between. A failed read is journaled. None of these is a violation.
+func (e *engine) routeDriftSince(ctx context.Context, d decision, before *routeDrift) *routeDrift {
+	if before == nil {
+		return nil
+	}
+	after, err := e.lab.routeDriftCounters(ctx, d.target)
+	if err != nil {
+		e.jrnl.emit(event{Event: evCheckError, Tick: d.tick, Action: d.action.name,
+			Target: d.target, Detail: err.Error()})
+		return nil
+	}
+	delta := routeDrift{Kernel: after.Kernel - before.Kernel, FRR: after.FRR - before.FRR}
+	if delta.Kernel < 0 || delta.FRR < 0 {
+		return nil
+	}
+	return &delta
 }
 
 // converged reports whether every node the decision disrupted is back in

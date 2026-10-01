@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -607,5 +608,53 @@ func TestParseMetricsReadsTheReloadCounters(t *testing.T) {
 					m.configReloadSuccess, m.configReloadError, tc.ok, tc.failed)
 			}
 		})
+	}
+}
+
+// The route drift counters are read off the same scrape. A scrape without
+// them reads as zero for both, and the series beside them keep their meaning:
+// route_readds_total is still summed over its plane labels.
+func TestParseMetricsReadsTheRouteDriftCounters(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		kernel, frr int
+		reAdds      int
+	}{
+		{"empty body", "", 0, 0, 0},
+		{"no drift series", "ovn_network_agent_route_readds_total{plane=\"kernel\"} 2\n", 0, 0, 2},
+		{"both series beside the re-adds", "# TYPE ovn_network_agent_route_drift_total counter\n" +
+			"ovn_network_agent_route_drift_total{kind=\"frr\"} 4\n" +
+			"ovn_network_agent_route_drift_total{kind=\"kernel\"} 7\n" +
+			"ovn_network_agent_route_readds_total{plane=\"frr\"} 1\n" +
+			"ovn_network_agent_route_readds_total{plane=\"kernel\"} 2\n", 7, 4, 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := parseMetrics(tc.body)
+			if m.routeDriftKernel != tc.kernel || m.routeDriftFRR != tc.frr {
+				t.Errorf("route drift counters = %d/%d, want %d/%d",
+					m.routeDriftKernel, m.routeDriftFRR, tc.kernel, tc.frr)
+			}
+			if m.routeReAddsTotal != tc.reAdds {
+				t.Errorf("routeReAddsTotal = %d, want %d", m.routeReAddsTotal, tc.reAdds)
+			}
+		})
+	}
+}
+
+// A scrape that fails names the gateway and keeps the cause, since the engine
+// journals the text as the reason a recovery carries no drift delta.
+func TestRouteDriftCountersWrapsAFailedScrape(t *testing.T) {
+	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
+	l := newTestLab(cmd, newFakeClock())
+
+	_, err := l.routeDriftCounters(context.Background(), "gateway-2")
+	if err == nil {
+		t.Fatal("routeDriftCounters succeeded on a failed scrape")
+	}
+	if !strings.HasPrefix(err.Error(), "read the route drift counters on gateway-2: ") || !errors.Is(err, errBoom) {
+		t.Fatalf("error = %q, want it to name gateway-2 and wrap the scrape error", err)
 	}
 }

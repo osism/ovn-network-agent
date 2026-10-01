@@ -413,6 +413,12 @@ type gatewayMetrics struct {
 	// its SIGHUP: the one that moved is the agent's verdict on the reload.
 	configReloadSuccess int
 	configReloadError   int
+
+	// routeDriftKernel and routeDriftFRR are the agent's route watch
+	// counters: the changes it detected on routes it owns and did not make.
+	// A route-drop action reads them either side of its fault.
+	routeDriftKernel int
+	routeDriftFRR    int
 }
 
 // observeGateway gathers every data plane the oracle verifies on one gateway.
@@ -716,6 +722,10 @@ func parseMetrics(body string) gatewayMetrics {
 			m.configReloadSuccess = value
 		case name == `ovn_network_agent_config_reload_total{outcome="error"}`:
 			m.configReloadError = value
+		case name == `ovn_network_agent_route_drift_total{kind="kernel"}`:
+			m.routeDriftKernel = value
+		case name == `ovn_network_agent_route_drift_total{kind="frr"}`:
+			m.routeDriftFRR = value
 		}
 	}
 	return m
@@ -730,6 +740,17 @@ func (l *lab) reloadCounters(ctx context.Context, gw string) (ok, failed int, er
 	}
 	m := parseMetrics(out)
 	return m.configReloadSuccess, m.configReloadError, nil
+}
+
+// routeDriftCounters reads the agent's route drift counters off its loopback
+// metrics endpoint. A scrape without the series reads as zero for both.
+func (l *lab) routeDriftCounters(ctx context.Context, gw string) (routeDrift, error) {
+	out, err := l.exec(ctx, gw, "bash", "-c", metricsScrapeScript)
+	if err != nil {
+		return routeDrift{}, fmt.Errorf("read the route drift counters on %s: %w", gw, err)
+	}
+	m := parseMetrics(out)
+	return routeDrift{Kernel: m.routeDriftKernel, FRR: m.routeDriftFRR}, nil
 }
 
 func parseMetricValue(s string) int {
