@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func driftActionNamed(t *testing.T, l *lab, name string) *action {
@@ -144,20 +145,32 @@ func TestOVSFlowDropRemovesBothCookies(t *testing.T) {
 }
 
 // The agent's route watch sees the two route drops and nothing else in the
-// drift class, so only those two read the drift counters around their fault.
+// drift class. Only those two read the drift counters around their fault, and
+// only those two are held to the watch's budget: 10 s, which the engine checks
+// twice and which a repair that waited for a 15 s tick fails. The other two
+// heal on the periodic reconcile and keep its 60 s.
 func TestRouteWatchCoversOnlyTheRouteDrops(t *testing.T) {
+	if polls := routeWatchRecoveryBudget / convergePollInterval; polls < 2 {
+		t.Fatalf("a %s budget is checked %d time(s) at a poll interval of %s, want at least 2",
+			routeWatchRecoveryBudget, polls, convergePollInterval)
+	}
+
 	l := newTestLab(&fakeCommander{}, newFakeClock())
 	tests := []struct {
 		action      string
+		budget      time.Duration
 		countsDrift bool
 	}{
-		{"kernel-route-drop", true},
-		{"frr-route-drop", true},
-		{"nft-flush", false},
-		{"ovs-flow-drop", false},
+		{"kernel-route-drop", routeWatchRecoveryBudget, true},
+		{"frr-route-drop", routeWatchRecoveryBudget, true},
+		{"nft-flush", 60 * time.Second, false},
+		{"ovs-flow-drop", 60 * time.Second, false},
 	}
 	for _, tc := range tests {
 		act := driftActionNamed(t, l, tc.action)
+		if act.recoveryBudget != tc.budget {
+			t.Errorf("%s recoveryBudget = %s, want %s", tc.action, act.recoveryBudget, tc.budget)
+		}
 		if act.countsRouteDrift != tc.countsDrift {
 			t.Errorf("%s countsRouteDrift = %v, want %v", tc.action, act.countsRouteDrift, tc.countsDrift)
 		}
