@@ -1187,7 +1187,7 @@ Three targets use it, all from workload namespaces on `compute-1`:
 | --- | --- | --- | --- |
 | `hairpin-fip` | ping | `192.0.2.12` | from `vm1`: the `cookie=0x998` reflect path on whichever chassis holds `cr-lr0-public` |
 | `hairpin-vip` | TCP | `198.18.0.50:8080` | from `vm1`: OVN egress SNAT → `br-ex` → the chassis kernel's nftables DNAT → the API VIP's own backend, and the reply steered back into OVN |
-| `cross-fip` | ping | `192.0.2.10` | from `vm3`: OVN egress on the chassis holding `cr-lr1-public` (`gateway-2`), its kernel veth path into `vrf-provider`, BGP to the chassis holding `cr-lr0-public`, and that kernel's `iif veth-default` ingress into `br-ex` (issue #265) |
+| `cross-fip` | ping | `192.0.2.10` | from `vm3`: OVN egress on the chassis holding `cr-lr1-public` (`gateway-2` at start, `gateway-3` after a failover), its kernel veth path into `vrf-provider`, BGP to the chassis holding `cr-lr0-public`, and that kernel's `iif veth-default` ingress into `br-ex` (issue #265) |
 
 The third probe kind, TCP, is a handshake through bash's `/dev/tcp`
 redirect: the gateway image carries no curl, and `pf-hairpin.sh` probes
@@ -1260,16 +1260,29 @@ sequences reproducible.
 **Start state.** The runner layers the existing scenarios' setups onto
 the bootstrap baseline, so one run can exercise all of them at once:
 `hairpin.sh`'s second FIP (`192.0.2.12` with a `vm2` responder),
-`multi-vlan.sh`'s two VLAN provider networks (tags 101/102, routers
-pinned to `gateway-1`), `pf-external.sh`'s `Load_Balancer` VIP
-(`192.0.2.50:80` in front of the `vm1` backend), and
-`cross-chassis-fip.sh`'s second flat router `lr1` (pinned to `gateway-2`,
-FIP `192.0.2.20` with a `vm3` responder). Which of them a run puts
-up is the profile's call. The layering is idempotent, so a second run on
-the same lab lands in the same state (the backends are restarted). If the
-start state is not green within 120 s the run aborts with exit code 2 — a
-fault injected into a lab that was not green to begin with would report
-false violations for the rest of the run.
+`multi-vlan.sh`'s two VLAN provider networks (tags 101/102, routers on
+`gateway-1` at priority 30 and `gateway-2` at 20), `pf-external.sh`'s
+`Load_Balancer` VIP (`192.0.2.50:80` in front of the `vm1` backend), and
+`cross-chassis-fip.sh`'s second flat router `lr1` (on `gateway-2` at
+priority 30 and `gateway-3` at 20, FIP `192.0.2.20` with a `vm3`
+responder). Which of them a run puts up is the profile's call. The
+layering is idempotent, so a second run on the same lab lands in the same
+state (the backends are restarted). If the start state is not green
+within 120 s the run aborts with exit code 2 — a fault injected into a
+lab that was not green to begin with would report false violations for
+the rest of the run.
+
+The scenarios bind each of those routers to one chassis. The chaos start
+state adds a second `Gateway_Chassis` row, so a fault on the active
+chassis fails the router over to its standby. Each group has two
+candidates, where `lr0` has three. `lr1`'s standby is `gateway-3` because
+`gateway-1` is the default owner of `lr0` and of the VLAN routers, and a
+loss of `gateway-2` must not put every router on one chassis. The agent's
+active-lead boost keeps a router on its new chassis after a failover, so
+there is no failback. A start state applied to a lab that a previous run
+used may therefore leave a router on its standby: the active agent
+re-defends the priority the layering lowers. Nothing depends on which
+candidate owns a router at start, and CI always starts from a fresh lab.
 
 Every responder, the port-forward backend and the internal probe vantages
 live on `compute-1`, a chassis that no fault targets. A container lifecycle
@@ -1305,6 +1318,11 @@ up has no responder and would be red for the whole run:
 | `api-vip` | `curl http://192.0.2.80:8080/` | the **agent's own** DNAT (`port_forwards`), on the gateways a profile configures it on |
 | `cross-fip` | `ping 192.0.2.10` from `vm3` | the cross-chassis layer |
 
+`cross-fip` leaves OVN on the chassis holding `cr-lr1-public`, which
+moves between `gateway-2` and `gateway-3`. When that chassis also holds
+`cr-lr0-public`, the probe rides the same-chassis hairpin path instead of
+the veth path.
+
 The baseline lab's second FIP, `192.0.2.11`, is deliberately **not**
 probed: `bootstrap.sh` seeds its NAT row but nothing answers behind
 `192.168.10.11`, so it would be red for the whole run.
@@ -1331,7 +1349,7 @@ The set is curated, not combinatorial:
 | `vlan-no-dnat` | hairpin + VLAN + cross-chassis | the baked lab config, unchanged | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip`, `cross-fip` |
 | `pf-only` | baseline only | **no OVN remotes** + the API VIP + `network_cidr` | `api-vip` |
 | `heterogeneous` | hairpin + VLAN + port-forward + cross-chassis | `gateway-1` API + hairpin VIP, `gateway-2` the same + drain, `gateway-3` manual `network_cidr` + 15 s cadence + cleanup | the four FIPs + `pf-vip` + `api-vip` + `hairpin-fip` + `hairpin-vip` + `cross-fip` |
-| `drain-everywhere` | hairpin + VLAN + cross-chassis | `drain_on_shutdown: true` on every gateway | `fip-vm1`, `fip-vm2`, `hairpin-fip` |
+| `drain-everywhere` | hairpin + VLAN + cross-chassis | `drain_on_shutdown: true` on every gateway | `fip-vm1`, `fip-vm2`, both VLAN FIPs, `hairpin-fip`, `cross-fip` |
 
 `pf-only` and `flat-minimal` carry neither same-node target: `pf-only`
 has no OVN connection, so the agent manages no FIP path at all, and
@@ -1339,15 +1357,12 @@ has no OVN connection, so the agent manages no FIP path at all, and
 
 `drain-everywhere` runs the drain on every gateway, as production does by
 default, and is the profile whose planned restarts the report's Planned
-restarts section is about. It probes only the paths a drain can keep up:
-the three that ride `lr0`, whose port has a `Gateway_Chassis` on every
-gateway. The VLAN and cross-chassis layers stay up without their probes.
-Their routers have a single gateway chassis each (`gateway-1` and
-`gateway-2`), so a restart of that chassis darkens their FIPs whatever the
-drain does, while the drain itself has to skip their ports rather than
-wait them out. The port-forward layer stays off, because the runner
-re-points `pf-vip`'s route only after a restore, so a drain that moves the
-master would leave it dark regardless of the agent.
+restarts section is about. Every router has a standby chassis, so the
+profile probes every FIP path: the three that ride `lr0`, both VLAN FIPs
+and `cross-fip`. A drained restart is expected to be hitless on all six.
+The port-forward layer stays off, because the runner re-points `pf-vip`'s
+route only after a restore, so a drain that moves the master would leave
+it dark regardless of the agent.
 
 The **API VIP** (`192.0.2.80:8080`) is the agent's own DNAT path, as
 opposed to `pf-vip`, which is an OVN `Load_Balancer`. Its backend is a
@@ -1645,10 +1660,13 @@ also ends the run early (journaled as `run-aborted`): the parked node's
 data path stays dark, and since convergence gates on *every* probe being
 green, no later action could converge either — the rest of the duration
 would produce nothing but violations derived from the first one.
-Budgets are measured from the *restore*, not from the injection:
-resources pinned to the node under fault (the VLAN routers and the VIP on
-`gateway-1`) are legitimately dark while it is held down. The probe-loss
-buckets still record what happened mid-hold.
+Budgets are measured from the *restore*, not from the injection, because
+two things are legitimately dark while a fault is held. `pf-vip`'s
+upstream route is re-pointed only after the restore. A `double-failover`
+that takes both candidates of a group down leaves that router unbound:
+target `gateway-1` (peer `gateway-2`) darkens the VLAN FIPs and target
+`gateway-2` (peer `gateway-3`) darkens `cross-fip`, each for the hold.
+The probe-loss buckets still record what happened mid-hold.
 
 **Baseline checks** sweep every 10 s, independently of what the engine is
 doing: every node the run considers healthy must be running an agent, and
