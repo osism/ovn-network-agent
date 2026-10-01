@@ -35,6 +35,8 @@ const (
 	evNodeState       = "node-state"
 	evProbeTransition = "probe-transition"
 	evVIPRepoint      = "vip-repoint"
+	evCROwner         = "cr-owner"
+	evUpstreamPath    = "upstream-path"
 	evOVNChurn        = "ovn-churn"
 	evSettleStart     = "settle-start"
 	evSettleResult    = "settle-result"

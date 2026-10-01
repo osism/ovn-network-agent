@@ -804,6 +804,20 @@ func TestActionRegistryOrderIsStable(t *testing.T) {
 	}
 }
 
+// The fault trace follows the one action it was asked for. Tracing another
+// one would put three more lab reads a second beside its fault.
+func TestOnlyDoubleFailoverIsTraced(t *testing.T) {
+	var traced []string
+	for _, a := range fullRegistry(t) {
+		if a.faultTrace {
+			traced = append(traced, a.name)
+		}
+	}
+	if len(traced) != 1 || traced[0] != "double-failover" {
+		t.Fatalf("traced actions = %v, want only double-failover", traced)
+	}
+}
+
 // fullRegistry builds the registry the runner drives, with the dependencies
 // the actions bind to. A nil lab is fine: the actions capture it but only
 // touch it at run time, and no test here executes one.

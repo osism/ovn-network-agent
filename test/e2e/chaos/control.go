@@ -90,6 +90,7 @@ func controlPlaneActions(p *profile) []*action {
 			holdMin:        10 * time.Second,
 			holdMax:        30 * time.Second,
 			recoveryBudget: 240 * time.Second,
+			faultTrace:     true,
 			inject:         injectDoubleFailover,
 			// The engine restores each node of the pair in turn, so the same
 			// container-lifecycle restore the starter kills use puts both the
