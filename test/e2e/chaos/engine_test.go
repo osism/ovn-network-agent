@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -826,6 +827,220 @@ func TestFollowMasterJournalsAFailedRepointUnlessThePollWasStopped(t *testing.T)
 	}
 }
 
+// followStub is the channel-backed followTick the tests drive the owner
+// poll with, so none of them sleeps. stopped counts the polls that ended
+// because their context was cancelled.
+type followStub struct {
+	entered chan struct{}
+	ticks   chan struct{}
+	stopped atomic.Int32
+}
+
+func stubFollowTick(e *engine) *followStub {
+	s := &followStub{entered: make(chan struct{}), ticks: make(chan struct{})}
+	e.followTick = func(ctx context.Context) bool {
+		select { // announces "waiting for the next tick": the previous poll is done
+		case s.entered <- struct{}{}:
+		case <-ctx.Done():
+			s.stopped.Add(1)
+			return false
+		}
+		select {
+		case <-s.ticks:
+			return true
+		case <-ctx.Done():
+			s.stopped.Add(1)
+			return false
+		}
+	}
+	return s
+}
+
+// awaitPoll blocks until the poll waits for its next tick, which is also
+// when the poll the previous tick started has finished.
+func (s *followStub) awaitPoll(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owner poll never waited for a tick")
+	}
+}
+
+// tick lets the poll run once.
+func (s *followStub) tick(t *testing.T) {
+	t.Helper()
+	select {
+	case s.ticks <- struct{}{}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owner poll never took its tick")
+	}
+}
+
+// The owner poll re-checks the owner once per tick, never before its first
+// one, and re-points only when it moved. Stopping it waits for its
+// goroutine, so the caller may read vipOwner again.
+func TestStartOwnerPollPollsUntilStopped(t *testing.T) {
+	master := &movableMaster{name: "gateway-1"}
+	e, cmd, buf := followEngine(t, master.respond)
+	follow := stubFollowTick(e)
+	plumbed := cmd.count("ip route replace")
+
+	// The owner has already moved when the poll starts: the first poll
+	// still comes one interval later.
+	master.set("gateway-2")
+	stop := e.startOwnerPoll(t.Context(), phaseHold)
+	follow.awaitPoll(t)
+	if got := cmd.count("ip route replace") - plumbed; got != 0 {
+		t.Fatalf("the owner poll re-pointed before its first tick with %d route commands: %v", got, cmd.lines())
+	}
+
+	follow.tick(t)
+	follow.awaitPoll(t)
+	if got := cmd.count("ip route replace") - plumbed; got != 2 {
+		t.Fatalf("issued %d route commands on the tick after the owner moved, want the "+
+			"forward route and the scope-link route: %v", got, cmd.lines())
+	}
+
+	// A tick with the owner where it was: nothing to re-point.
+	follow.tick(t)
+	follow.awaitPoll(t)
+	stop()
+
+	if got := cmd.count("ip route replace") - plumbed; got != 2 {
+		t.Fatalf("a tick with an unmoved owner issued %d more route commands: %v", got-2, cmd.lines())
+	}
+	if e.vipOwner != "gateway-2" {
+		t.Fatalf("vipOwner = %q after the poll saw the owner move, want gateway-2", e.vipOwner)
+	}
+	repoints := repointsIn(t, buf.String())
+	if len(repoints) != 2 {
+		t.Fatalf("journaled %d %s events, want the start one and the move: %+v",
+			len(repoints), evVIPRepoint, repoints)
+	}
+	if got := repoints[1]; got.Phase != phaseHold || got.Target != "gateway-2" || got.Detail != "" {
+		t.Fatalf("the move was journaled as %+v, want phase %s and target gateway-2", got, phaseHold)
+	}
+	if got := follow.stopped.Load(); got != 1 {
+		t.Fatalf("stop returned with %d polls stopped, want the one it started", got)
+	}
+}
+
+// An owner that moves while a fault is being injected is followed at once,
+// not at the convergence after the restore. Both polls, the one beside the
+// inject and the one beside the hold, are stopped before the restore
+// starts.
+func TestExecuteFollowsTheOwnerBesideTheInjectAndTheHold(t *testing.T) {
+	master := &movableMaster{name: "gateway-1"}
+	e, _, buf := followEngine(t, master.respond)
+	follow := stubFollowTick(e)
+
+	stoppedAtRestore := int32(-1)
+	kill := noopActions("gateway-kill")[0]
+	kill.inject = func(context.Context, *lab, string, int) error {
+		follow.awaitPoll(t)
+		master.set("gateway-2")
+		follow.tick(t)
+		follow.awaitPoll(t)
+		return nil
+	}
+	kill.restore = func(context.Context, *lab, string) error {
+		stoppedAtRestore = follow.stopped.Load()
+		return nil
+	}
+
+	e.execute(t.Context(), decision{tick: 1, action: kill, target: "gateway-1", hold: 5 * time.Second})
+
+	if stoppedAtRestore != 2 {
+		t.Fatalf("%d owner polls were stopped when the restore began, want both "+
+			"(the inject's and the hold's)", stoppedAtRestore)
+	}
+	// What the journal holds after the start re-point: the inject, the
+	// re-point that followed the owner during it, then the restore.
+	var order []string
+	var converged event
+	for _, ev := range eventsIn(t, buf.String())[1:] {
+		switch ev.Event {
+		case evInject, evRestore:
+			order = append(order, ev.Event)
+		case evVIPRepoint:
+			order = append(order, ev.Event+"/"+ev.Phase+"/"+ev.Target)
+		case evConverged:
+			converged = ev
+		}
+	}
+	want := "inject vip-repoint/inject/gateway-2 restore"
+	if got := strings.Join(order, " "); got != want {
+		t.Fatalf("journaled %q after the start re-point, want %q", got, want)
+	}
+	if converged.CROwner != "gateway-2" {
+		t.Fatalf("the converged event names cr_owner %q, want gateway-2: %+v", converged.CROwner, converged)
+	}
+}
+
+// An owner that moves while a fault is held is followed during the hold,
+// not at the convergence after the restore.
+func TestExecuteFollowsTheOwnerThroughTheHold(t *testing.T) {
+	master := &movableMaster{name: "gateway-1"}
+	e, _, buf := followEngine(t, master.respond)
+	follow := stubFollowTick(e)
+
+	wait, held := e.wait, false
+	e.wait = func(ctx context.Context, d time.Duration) bool {
+		if !held {
+			held = true
+			follow.awaitPoll(t)
+			master.set("gateway-2")
+			follow.tick(t)
+			follow.awaitPoll(t)
+		}
+		return wait(ctx, d)
+	}
+
+	kill := noopActions("gateway-kill")[0]
+	e.execute(t.Context(), decision{tick: 1, action: kill, target: "gateway-1", hold: 5 * time.Second})
+
+	var order []string
+	for _, ev := range eventsIn(t, buf.String())[1:] {
+		switch ev.Event {
+		case evInject, evRestore:
+			order = append(order, ev.Event)
+		case evVIPRepoint:
+			order = append(order, ev.Event+"/"+ev.Phase+"/"+ev.Target)
+		}
+	}
+	want := "inject vip-repoint/hold/gateway-2 restore"
+	if got := strings.Join(order, " "); got != want {
+		t.Fatalf("journaled %q after the start re-point, want %q", got, want)
+	}
+}
+
+// A failed inject is undone by the action's restore, and that restore must
+// not run beside the poll either. No hold follows, so no second poll is
+// started.
+func TestAFailedInjectStopsTheOwnerPollBeforeTheUndo(t *testing.T) {
+	e, _, _ := followEngine(t, healthyLabResponses)
+	follow := stubFollowTick(e)
+
+	stoppedAtRestore := int32(-1)
+	kill := noopActions("gateway-kill")[0]
+	kill.inject = func(context.Context, *lab, string, int) error { return errBoom }
+	kill.restore = func(context.Context, *lab, string) error {
+		stoppedAtRestore = follow.stopped.Load()
+		return nil
+	}
+
+	e.execute(t.Context(), decision{tick: 1, action: kill, target: "gateway-1", hold: 5 * time.Second})
+
+	if stoppedAtRestore != 1 {
+		t.Fatalf("%d owner polls were stopped when the undo's restore began, want the inject's",
+			stoppedAtRestore)
+	}
+	if got := follow.stopped.Load(); got != 1 {
+		t.Fatalf("%d owner polls ran for a fault that was never held, want only the inject's", got)
+	}
+}
+
 // parkedIn reports whether the journal shows gw parked as unconverged —
 // the state that keeps a node out of every later draw.
 func parkedIn(t *testing.T, journal, gw string) bool {
@@ -1475,6 +1690,22 @@ func TestFollowMasterDoesNothingWithoutTheLoadBalancerVIP(t *testing.T) {
 	}
 	if e.vipOwner != "" {
 		t.Fatalf("vipOwner = %q on a run with no Load_Balancer VIP", e.vipOwner)
+	}
+
+	// With no routes to follow, no owner poll starts either.
+	var ticks atomic.Int32
+	e.followTick = func(context.Context) bool {
+		ticks.Add(1)
+		return false
+	}
+	stop := e.startOwnerPoll(context.Background(), phaseHold)
+	stop()
+
+	if got := ticks.Load(); got != 0 {
+		t.Fatalf("a profile without the port-forward layer started the owner poll: %d ticks", got)
+	}
+	if len(cmd.lines()) != 0 {
+		t.Fatalf("a profile without the port-forward layer polled for the owner: %v", cmd.lines())
 	}
 }
 

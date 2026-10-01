@@ -321,10 +321,12 @@ func profiles() []*profile {
 			// routers and lr1 on two each), so a drained restart is
 			// expected to be hitless on all six probes.
 			//
-			// The port-forward layer stays off: the harness re-points
-			// pf-vip's upstream route only after a restore
-			// (followMaster), so a drain that moves the master leaves it
-			// dark however well the agent behaves.
+			// The port-forward layer stays off: the harness follows the
+			// owner of cr-lr0-public with a one-second poll
+			// (startOwnerPoll), so a drain that moves the master still
+			// costs pf-vip up to one poll interval plus the re-point. That
+			// is loss the agent does not cause, in a profile that expects a
+			// hitless restart.
 			name:         "drain-everywhere",
 			description:  "every gateway drains on shutdown; probes every FIP path, each behind a router with a standby chassis",
 			hairpin:      true,
