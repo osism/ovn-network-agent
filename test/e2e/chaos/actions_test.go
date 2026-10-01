@@ -613,9 +613,10 @@ func TestStartPFBackendFailsWhenTheListenerNeverBinds(t *testing.T) {
 }
 
 // The VLAN provider networks the start state layers on must land with
-// their localnet tag and their router pinned, or the FIPs behind them
-// never answer and every fault reads as a violation.
-func TestVLANLayerTagsTheLocalnetPortAndPinsTheRouter(t *testing.T) {
+// their localnet tag and their router bound to a gateway, or the FIPs
+// behind them never answer and every fault reads as a violation. The
+// router also gets a standby, so a fault on gateway-1 fails it over.
+func TestVLANLayerTagsTheLocalnetPortAndGivesTheRouterAStandby(t *testing.T) {
 	cmd := &fakeCommander{}
 	l := newTestLab(cmd, newFakeClock())
 
@@ -623,15 +624,49 @@ func TestVLANLayerTagsTheLocalnetPortAndPinsTheRouter(t *testing.T) {
 		t.Fatalf("applyVLANLayer: %v", err)
 	}
 
+	const (
+		active  = "lrp-set-gateway-chassis lr-vlan101-public gateway-1 30"
+		standby = "lrp-set-gateway-chassis lr-vlan101-public gateway-2 20"
+	)
 	for _, want := range []string{
 		"lsp-set-options ln-vlan101 network_name=physnet1",
 		"set Logical_Switch_Port ln-vlan101 tag=101",
-		"lrp-set-gateway-chassis lr-vlan101-public gateway-1 30",
+		active,
+		standby,
 		"lr-nat-add lr-vlan101 dnat_and_snat 198.51.100.10 192.168.101.10",
 	} {
 		if !cmd.called(want) {
 			t.Fatalf("vlan layer did not issue %q: %v", want, cmd.lines())
 		}
+	}
+	// The higher-priority row goes first, so on a fresh lab the router
+	// is never bound to its standby for the moment between the two calls.
+	if cmd.indexOf(active) > cmd.indexOf(standby) {
+		t.Fatalf("the standby row was issued before the active one: %v", cmd.lines())
+	}
+}
+
+// The higher-priority row goes first, so on a fresh lab lr1 binds to
+// gateway-2 and the standby never claims it between the two calls.
+func TestCrossChassisLayerIssuesTheActiveRowBeforeTheStandby(t *testing.T) {
+	cmd := &fakeCommander{}
+	l := newTestLab(cmd, newFakeClock())
+
+	if err := applyCrossChassisLayer(context.Background(), l); err != nil {
+		t.Fatalf("applyCrossChassisLayer: %v", err)
+	}
+
+	const (
+		active  = "lrp-set-gateway-chassis lr1-public gateway-2 30"
+		standby = "lrp-set-gateway-chassis lr1-public gateway-3 20"
+	)
+	for _, want := range []string{active, standby} {
+		if !cmd.called(want) {
+			t.Fatalf("cross-chassis layer did not issue %q: %v", want, cmd.lines())
+		}
+	}
+	if cmd.indexOf(active) > cmd.indexOf(standby) {
+		t.Fatalf("the standby row was issued before the active one: %v", cmd.lines())
 	}
 }
 
@@ -650,6 +685,54 @@ func TestCrossChassisLayerReportsANBFailure(t *testing.T) {
 
 	if err := applyCrossChassisLayer(context.Background(), l); err == nil {
 		t.Fatal("a failed ovn-nbctl call was swallowed")
+	}
+}
+
+// failOn answers errBoom to every call whose argv contains substr and
+// succeeds on the rest.
+func failOn(substr string) func([]string) (string, error) {
+	return func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), substr) {
+			return "", errBoom
+		}
+		return "", nil
+	}
+}
+
+// A standby row that did not land leaves the router with one candidate.
+// The layer has to stop there and name itself, so the run is abandoned
+// on a start state that never formed instead of measuring a router that
+// cannot fail over.
+func TestLayerReportsAFailedStandbyRow(t *testing.T) {
+	vlan := func(n vlanNetwork) func(context.Context, *lab) error {
+		return func(ctx context.Context, l *lab) error { return applyVLANLayer(ctx, l, n) }
+	}
+	for _, tc := range []struct {
+		name, failing, prefix string
+		apply                 func(context.Context, *lab) error
+	}{
+		{"vlan 101", "lrp-set-gateway-chassis lr-vlan101-public gateway-2", "vlan 101 layer:", vlan(vlanNetworks[0])},
+		{"vlan 102", "lrp-set-gateway-chassis lr-vlan102-public gateway-2", "vlan 102 layer:", vlan(vlanNetworks[1])},
+		{"cross-chassis", "lrp-set-gateway-chassis lr1-public gateway-3", "cross-chassis layer:", applyCrossChassisLayer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &fakeCommander{respond: failOn(tc.failing)}
+			l := newTestLab(cmd, newFakeClock())
+
+			err := tc.apply(context.Background(), l)
+			if err == nil {
+				t.Fatal("a failed standby row was swallowed")
+			}
+			if !errors.Is(err, errBoom) {
+				t.Fatalf("error %q does not wrap the ovn-nbctl failure", err)
+			}
+			if !strings.HasPrefix(err.Error(), tc.prefix) {
+				t.Fatalf("error %q does not name the layer that failed", err)
+			}
+			if cmd.called("lr-nat-add") {
+				t.Fatalf("the layer went on after its standby row failed: %v", cmd.lines())
+			}
+		})
 	}
 }
 

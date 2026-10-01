@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -35,10 +37,15 @@ func TestApplyStartStateLayersEveryScenarioSetup(t *testing.T) {
 		"lr-lb-add lr0 pf-external",
 		"ip route replace 192.0.2.50/32 via 100.64.1.2",
 		"ip route replace 192.0.2.50/32 dev br-ex scope link",
-		// cross-chassis-fip.sh: the second router pinned to gateway-2 and
-		// its FIP.
-		"lrp-set-gateway-chassis lr1-public gateway-2 30",
+		// cross-chassis-fip.sh: the second router and its FIP.
 		"lr-nat-add lr1 dnat_and_snat 192.0.2.20 192.168.20.10",
+		// Every router beside lr0 has its active chassis and a standby.
+		"lrp-set-gateway-chassis lr-vlan101-public gateway-1 30",
+		"lrp-set-gateway-chassis lr-vlan101-public gateway-2 20",
+		"lrp-set-gateway-chassis lr-vlan102-public gateway-1 30",
+		"lrp-set-gateway-chassis lr-vlan102-public gateway-2 20",
+		"lrp-set-gateway-chassis lr1-public gateway-2 30",
+		"lrp-set-gateway-chassis lr1-public gateway-3 20",
 		// Every responder behind a probed FIP.
 		"external_ids:iface-id=ls0-vm2",
 		"external_ids:iface-id=vm101",
@@ -48,6 +55,89 @@ func TestApplyStartStateLayersEveryScenarioSetup(t *testing.T) {
 		if !cmd.called(want) {
 			t.Fatalf("the start state did not issue %q", want)
 		}
+	}
+}
+
+// A router with one Gateway_Chassis row cannot fail over: a fault on that
+// chassis darkens its FIPs for the whole hold, whatever the agent does.
+// So every router the start state binds has two candidates, both
+// gateways, at two priorities, so that OVN has one owner to elect.
+func TestStartStateGivesEveryRouterTwoGatewayChassis(t *testing.T) {
+	wantRows := map[string]int{
+		"everything-on": 6, "vlan-no-dnat": 6, "heterogeneous": 6, "drain-everywhere": 6,
+		"flat-dnat": 2, // the lr1-public pair
+	}
+
+	for _, p := range profiles() {
+		t.Run(p.name, func(t *testing.T) {
+			cmd := &fakeCommander{respond: healthyLabResponses}
+			l := newTestLab(cmd, newFakeClock())
+
+			if err := applyStartState(context.Background(), l, p); err != nil {
+				t.Fatalf("applyStartState: %v", err)
+			}
+
+			rows := 0
+			priorities := map[string]map[string]int{} // LRP -> chassis -> priority
+			for _, line := range cmd.lines() {
+				_, row, found := strings.Cut(line, "lrp-set-gateway-chassis ")
+				if !found {
+					continue
+				}
+				rows++
+				fields := strings.Fields(row)
+				if len(fields) != 3 {
+					t.Fatalf("%q does not name a port, a chassis and a priority", line)
+				}
+				lrp, chassis := fields[0], fields[1]
+				priority, err := strconv.Atoi(fields[2])
+				if err != nil {
+					t.Fatalf("%q carries a priority that is not a number: %v", line, err)
+				}
+				if !slices.Contains(gatewayNames(), chassis) {
+					t.Fatalf("%s is bound to %q, which is not a gateway", lrp, chassis)
+				}
+				if priorities[lrp] == nil {
+					priorities[lrp] = map[string]int{}
+				}
+				priorities[lrp][chassis] = priority
+			}
+
+			if rows != wantRows[p.name] {
+				t.Fatalf("%s issued %d Gateway_Chassis rows, want %d: %v", p.name, rows, wantRows[p.name], priorities)
+			}
+			for lrp, byChassis := range priorities {
+				if len(byChassis) != 2 {
+					t.Fatalf("%s has %d candidate chassis, want an active one and a standby: %v", lrp, len(byChassis), byChassis)
+				}
+				distinct := map[int]bool{}
+				for _, priority := range byChassis {
+					distinct[priority] = true
+				}
+				if len(distinct) != 2 {
+					t.Fatalf("%s has both candidates at one priority, so no chassis is the elected owner: %v", lrp, byChassis)
+				}
+			}
+		})
+	}
+}
+
+// A profile without the VLAN and cross-chassis layers has no router
+// beside lr0, whose rows are the bootstrap's, so its start state writes
+// no Gateway_Chassis row at all.
+func TestStartStateWithoutLayersSetsNoGatewayChassis(t *testing.T) {
+	for _, name := range []string{"flat-minimal", "pf-only"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := &fakeCommander{respond: healthyLabResponses}
+			l := newTestLab(cmd, newFakeClock())
+
+			if err := applyStartState(context.Background(), l, testProfile(t, name)); err != nil {
+				t.Fatalf("applyStartState: %v", err)
+			}
+			if got := cmd.count("lrp-set-gateway-chassis"); got != 0 {
+				t.Fatalf("%s set %d Gateway_Chassis rows without a router to bind: %v", name, got, cmd.lines())
+			}
+		})
 	}
 }
 

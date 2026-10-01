@@ -16,12 +16,25 @@ import (
 //   - hairpin.sh      — a second FIP (192.0.2.12) with a vm2 responder,
 //     so the master carries two FIPs and the hairpin flow is live.
 //   - multi-vlan.sh   — two VLAN provider networks (tags 101/102), each
-//     with a router pinned to gateway-1 and a FIP behind a responder.
+//     with a router on gateway-1 (priority 30) and gateway-2 (priority
+//     20) and a FIP behind a responder.
 //   - pf-external.sh  — a Load_Balancer VIP (192.0.2.50:80) in front of
 //     the vm1 backend, plus the two routes the agent does not manage.
 //   - cross-chassis-fip.sh — a second flat router lr1 on the shared
-//     provider switch, pinned to gateway-2, with FIP 192.0.2.20 behind a
-//     vm3 responder, so a probe can enter another chassis' veth pair.
+//     provider switch, on gateway-2 (priority 30) and gateway-3 (priority
+//     20), with FIP 192.0.2.20 behind a vm3 responder, so a probe can
+//     enter another chassis' veth pair.
+//
+// The scenarios bind each of those routers to one chassis. The start
+// state adds a second Gateway_Chassis row, so a fault on the active
+// chassis fails the router over. Each group has exactly two candidates,
+// a shape lr0 with its three does not have. The agent's active-lead boost
+// raises the active chassis' row above its peer's, so a router stays on
+// its new chassis after a failover: there is no failback. A start state
+// applied to a lab a previous run used may leave a router on its standby,
+// because the active agent re-defends the priority these steps lower.
+// Nothing depends on which candidate owns a router at start, and CI
+// always starts from a fresh lab.
 //
 // Which of them a run puts up is the profile's call (profiles.go): a
 // profile that configures its gateways without OVN has no use for a
@@ -179,7 +192,9 @@ func applyHairpinLayer(ctx context.Context, l *lab) error {
 
 // applyVLANLayer mirrors ensure_network in multi-vlan.sh: a VLAN
 // provider network on physnet1, a gatewayless public subnet, a router
-// pinned to gateway-1, and a FIP with a backing LSP.
+// and a FIP with a backing LSP. It differs from the scenario in the
+// router's second Gateway_Chassis row: gateway-1 at priority 30 and
+// gateway-2 at 20.
 func applyVLANLayer(ctx context.Context, l *lab, n vlanNetwork) error {
 	lsPub := "ls-vlan" + n.tag
 	lnLSP := "ln-vlan" + n.tag
@@ -212,11 +227,13 @@ func applyVLANLayer(ctx context.Context, l *lab, n vlanNetwork) error {
 		{"lsp-set-addresses", lsPub + "-" + lr, "router"},
 		{"lsp-set-options", lsPub + "-" + lr, "router-port=" + lrpPub},
 
-		// The VLAN routers stay pinned to gateway-1 the way the scenario
-		// pins them. A chaos run migrates cr-lr0-public around, but these
-		// routers have a single candidate chassis — so a fault on
-		// gateway-1 legitimately darkens both VLAN FIPs until it is back.
+		// The higher-priority row goes first, so on a fresh lab the router
+		// binds to gateway-1 and the standby never claims it between the
+		// two calls. A fault on gateway-1 moves the router to gateway-2,
+		// and the agent there programs the br-ex.<tag> device, the default
+		// route and the announcements.
 		{"lrp-set-gateway-chassis", lrpPub, "gateway-1", "30"},
+		{"lrp-set-gateway-chassis", lrpPub, "gateway-2", "20"},
 
 		{"--may-exist", "lr-nat-add", lr, "dnat_and_snat", n.pub + ".10", n.tenant + ".10"},
 		{"--may-exist", "lsp-add", lsTenant, vm},
@@ -231,15 +248,17 @@ func applyVLANLayer(ctx context.Context, l *lab, n vlanNetwork) error {
 }
 
 // applyCrossChassisLayer mirrors ensure_router in cross-chassis-fip.sh: a
-// second flat router lr1 on the shared provider switch ls-public, its
-// chassisredirect port pinned to gateway-2 as the only candidate, a tenant
+// second flat router lr1 on the shared provider switch ls-public, a tenant
 // switch, a FIP and a backing LSP. The vm3 responder itself is created by
 // ensureResponders. No default route and no Static_MAC_Binding are seeded;
-// the agent on gateway-2 programs both, as it does for lr0.
+// the agent on the chassis that holds cr-lr1-public programs both, as it
+// does for lr0.
 //
-// The single candidate is deliberate, like the VLAN routers' pin to
-// gateway-1: a fault on gateway-2 legitimately darkens cross-fip until the
-// node is back, and the action's recovery budget covers it.
+// It differs from the scenario in the router's second Gateway_Chassis
+// row: gateway-2 at priority 30 and gateway-3 at 20. The standby is
+// gateway-3 and not gateway-1, because gateway-1 is the default owner of
+// lr0 and of the VLAN routers: a loss of gateway-2 must not put every
+// router on one chassis.
 func applyCrossChassisLayer(ctx context.Context, l *lab) error {
 	steps := [][]string{
 		{"--may-exist", "ls-add", "ls1"},
@@ -258,6 +277,7 @@ func applyCrossChassisLayer(ctx context.Context, l *lab) error {
 		{"lsp-set-options", "ls-public-lr1", "router-port=lr1-public"},
 
 		{"lrp-set-gateway-chassis", "lr1-public", "gateway-2", "30"},
+		{"lrp-set-gateway-chassis", "lr1-public", "gateway-3", "20"},
 
 		{"--may-exist", "lr-nat-add", "lr1", "dnat_and_snat", "192.0.2.20", "192.168.20.10"},
 		{"--may-exist", "lsp-add", "ls1", "ls1-vm3"},

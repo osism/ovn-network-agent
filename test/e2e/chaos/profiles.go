@@ -95,13 +95,15 @@ var (
 		node: workloadHost, netns: "vm1",
 	}
 
-	// The cross-chassis vantage (#265): vm3 sits behind lr1, whose
-	// chassisredirect port is pinned to gateway-2, and pings the FIP behind
-	// lr0. The packet leaves OVN on gateway-2, crosses that kernel's veth
-	// path into vrf-provider, rides BGP to whichever chassis holds
-	// cr-lr0-public and enters that kernel on veth-default — the one
-	// ingress no other probe exercises, and the one the veth-leak source
-	// rule used to loop.
+	// The cross-chassis vantage (#265): vm3 sits behind lr1 and pings the
+	// FIP behind lr0. The packet leaves OVN on whichever chassis holds
+	// cr-lr1-public (gateway-2 at start, gateway-3 after a failover),
+	// crosses that kernel's veth path into vrf-provider, rides BGP to
+	// whichever chassis holds cr-lr0-public and enters that kernel on
+	// veth-default — the one ingress no other probe exercises, and the one
+	// the veth-leak source rule used to loop. When one chassis holds both
+	// ports the probe measures the same-chassis hairpin path instead of
+	// the veth path.
 	probeCrossFIP = probeTarget{
 		name: "cross-fip", kind: probePing, addr: "192.0.2.10",
 		node: workloadHost, netns: "vm3",
@@ -171,7 +173,7 @@ type profile struct {
 	hairpin      bool // hairpin.sh's second FIP and its vm2 responder
 	vlans        bool // multi-vlan.sh's two VLAN provider networks
 	ovnLB        bool // pf-external.sh's OVN Load_Balancer VIP
-	crossChassis bool // cross-chassis-fip.sh's second flat router on gateway-2 and its vm3 responder
+	crossChassis bool // cross-chassis-fip.sh's second flat router on gateway-2 (standby gateway-3) and its vm3 responder
 
 	// gateways carries the per-gateway agent-config overlay. A gateway
 	// absent from the map runs the baked lab config unchanged.
