@@ -65,6 +65,10 @@ const (
 // node against its recovery budget.
 const convergePollInterval = 5 * time.Second
 
+// vipFollowInterval is how often the owner poll re-checks cr-lr0-public
+// while a fault is injected or held.
+const vipFollowInterval = time.Second
+
 // restoreTimeout backstops one restore. It is deliberately not the
 // action's recovery budget: the budget is the SLO the *lab* is held to
 // once the node is back, while the restore is the runner reassembling
@@ -161,6 +165,11 @@ type engine struct {
 	wait func(ctx context.Context, d time.Duration) bool
 	now  func() time.Time
 
+	// followTick paces the owner poll: it blocks for one interval and reports
+	// false once ctx is cancelled. It is a seam of its own, not wait: the poll
+	// runs beside the engine goroutine and must not advance a test's fake clock.
+	followTick func(ctx context.Context) bool
+
 	// abort ends the tick loop early: set by park, read by run, both on
 	// the engine's own goroutine.
 	abort bool
@@ -170,6 +179,9 @@ type engine struct {
 
 	// vipOwner is the master the port-forward VIP routes currently point
 	// at, so a re-point is only issued (and journaled) when it moves.
+	// The owner poll is its only writer while it runs, the engine goroutine
+	// at every other time. startOwnerPoll's stop joins the poll before the
+	// engine goroutine touches the field again, so it needs no lock.
 	vipOwner string
 }
 
@@ -187,7 +199,10 @@ func newEngine(l *lab, p *profile, actions []*action, probes probeSource, jrnl *
 		tickMax:  time.Duration(rec.Inputs.TickMaxMS) * time.Millisecond,
 		wait:     waitFor,
 		now:      time.Now,
-		nodes:    map[string]string{},
+		followTick: func(ctx context.Context) bool {
+			return waitFor(ctx, vipFollowInterval)
+		},
+		nodes: map[string]string{},
 	}
 	for _, gw := range gatewayNames() {
 		e.nodes[gw] = nodeHealthy
@@ -533,15 +548,26 @@ func (e *engine) execute(ctx context.Context, d decision) {
 	})
 	e.lastActionOffset = e.jrnl.count()
 
-	if err := d.action.inject(ctx, e.lab, d.target, d.flip); err != nil {
+	// The owner poll runs beside the inject: gateway-restart and config-flip
+	// hold nothing, so their owner move happens in here, and a draining
+	// agent-terminate moves the owner while its inject waits for the
+	// container to exit. It is joined before a failed inject is undone.
+	stopPoll := e.startOwnerPoll(ctx, phaseInject)
+	err := d.action.inject(ctx, e.lab, d.target, d.flip)
+	stopPoll()
+	if err != nil {
 		e.undo(ctx, d, err)
 		return
 	}
 
 	// The hold is interruptible, but a cancelled run still has to undo the
 	// fault it is holding — so it falls through to the restore below
-	// rather than returning here.
+	// rather than returning here. The poll follows the owner through the
+	// hold and is joined before the restore, so neither the restore nor
+	// converge runs beside it.
+	stopPoll = e.startOwnerPoll(ctx, phaseHold)
 	e.wait(ctx, d.hold)
+	stopPoll()
 
 	// An injected fault must be undone even when the run is cancelled, or
 	// the lab is left with a dead gateway whose restart policy is off and
@@ -792,6 +818,32 @@ func (e *engine) followMaster(ctx context.Context, phase string) {
 	}
 	e.vipOwner = master
 	e.jrnl.emit(event{Event: evVIPRepoint, Phase: phase, Target: master})
+}
+
+// startOwnerPoll starts the owner poll for one fault phase: it calls
+// followMaster once per followTick until stop is called. The first poll
+// comes one interval after the phase begins, never at once. stop cancels
+// the poll and waits for its goroutine to return, which gives the caller
+// a happens-before edge on vipOwner. The poll draws nothing from e.rng,
+// so it does not shift the decision stream.
+//
+// On a profile without the port-forward layer no poll is started.
+func (e *engine) startOwnerPoll(ctx context.Context, phase string) (stop func()) {
+	if !e.profile.ovnLB {
+		return func() {}
+	}
+	pollCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for e.followTick(pollCtx) {
+			e.followMaster(pollCtx, phase)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // parseWeights parses the `-weights name=n,...` flag against the action

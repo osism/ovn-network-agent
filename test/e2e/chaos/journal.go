@@ -189,10 +189,11 @@ type probeSummary struct {
 // `down_ms` is the summed length of its red windows between the inject
 // and the convergence, `down_windows` how many there were;
 // `from_restore_ms` is the part of `down_ms` after the restore, the
-// anchor the recovery budget is enforced against. Two things are
-// legitimately dark while a fault is held: pf-vip, whose upstream route
-// is re-pointed only after the restore, and a router that stays unbound
-// because a double-failover took both of its candidate chassis down.
+// anchor the recovery budget is enforced against. One thing is
+// legitimately dark for a whole hold: a router that stays unbound because
+// a double-failover took both of its candidate chassis down. pf-vip is
+// not, because the runner follows the owner of cr-lr0-public during the
+// inject and the hold (startOwnerPoll).
 // `from_inject_ms` is the older inject-to-last-recovery span; it
 // overstates a failover followed by a blink at restore and stays only so
 // old and new records read alike.
