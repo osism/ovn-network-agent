@@ -252,10 +252,12 @@ type OVNClient struct {
 
 	// drainWatchCh receives signals from the SB event handler on
 	// chassisredirect Port_Binding changes. Unlike debounceCh/immediateCh it
-	// does not feed the refresh loop; DrainGateways consumes it so the drain
-	// wait re-checks countLocalCRPorts the moment a port migrates, instead of
-	// waiting for the fixed safety re-poll. Buffered with capacity 1 so a
-	// storm of events coalesces into at most one queued wake-up.
+	// does not feed the refresh loop; DrainGateways consumes it in both of its
+	// waits, instead of waiting for the fixed safety re-poll: the migration
+	// wait re-checks countLocalCRPorts the moment a port migrates, and the
+	// takeover wait (awaitTakeoverReady) re-reads the bindings to notice a
+	// port that came back. Buffered with capacity 1 so a storm of events
+	// coalesces into at most one queued wake-up.
 	drainWatchCh chan struct{}
 
 	// loopDone is closed when refreshLoop exits. Set by Connect() before
@@ -1083,12 +1085,13 @@ func (o *OVNClient) immediateStateRefresh() {
 	}
 }
 
-// signalDrainWatch wakes a DrainGateways poll waiting for chassisredirect
-// ports to migrate away. It is fired from the SB event handler on every
-// chassisredirect Port_Binding change so the drain re-checks countLocalCRPorts
-// the moment OVN rebinds a port, instead of waiting for the fixed safety
-// re-poll. Concurrent calls coalesce: at most one wake-up is queued. Outside a
-// drain nothing reads the channel, so the queued signal is simply harmless.
+// signalDrainWatch wakes the DrainGateways wait that is currently running: the
+// migration wait, or the takeover wait that watches for a returned port. It is
+// fired from the SB event handler on every chassisredirect Port_Binding change
+// so the drain re-reads the bindings the moment OVN rebinds a port, instead of
+// waiting for the fixed safety re-poll. Concurrent calls coalesce: at most one
+// wake-up is queued. Outside a drain nothing reads the channel, so the queued
+// signal is simply harmless.
 func (o *OVNClient) signalDrainWatch() {
 	if !o.ready.Load() {
 		return // not fully connected yet
