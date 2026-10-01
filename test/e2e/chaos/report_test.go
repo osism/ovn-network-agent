@@ -523,3 +523,75 @@ func TestRenderReportLeavesOutPlannedRestartsItNeverSaw(t *testing.T) {
 		}
 	}
 }
+
+// The VIP re-points table says in which phase the runner moved the
+// port-forward VIP's routes. A failed re-point shows its error, and a
+// journal written before re-points carried a phase still renders.
+func TestRenderReportListsTheVIPRepointsByPhase(t *testing.T) {
+	t.Parallel()
+	events := []event{
+		{TS: "2026-07-16T19:00:00Z", Event: evVIPRepoint, Phase: phaseStart, Target: "gateway-1"},
+		{TS: "2026-07-16T19:00:30Z", Event: evInject, Tick: 1, Action: "gateway-kill", Target: "gateway-1"},
+		{TS: "2026-07-16T19:00:31Z", Event: evVIPRepoint, Phase: phaseHold, Target: "gateway-2",
+			Detail: "point 192.0.2.50 at gateway-2 on upstream: boom"},
+		{TS: "2026-07-16T19:00:32Z", Event: evVIPRepoint, Phase: phaseHold, Target: "gateway-2"},
+		{TS: "2026-07-16T19:01:10Z", Event: evVIPRepoint, Phase: phaseConverge, Target: "gateway-1"},
+		{TS: "2026-07-16T19:02:00Z", Event: evVIPRepoint, Target: "gateway-3"},
+	}
+
+	out := renderToString(t, reportRecord(t), events)
+
+	last := -1
+	for _, want := range []string{
+		"### VIP re-points",
+		"| at | phase | owner | detail |",
+		"| t+00:00 | start | gateway-1 | — |",
+		"| t+00:31 | hold | gateway-2 | point 192.0.2.50 at gateway-2 on upstream: boom |",
+		"| t+00:32 | hold | gateway-2 | — |",
+		"| t+01:10 | converge | gateway-1 | — |",
+		"| t+02:00 | — | gateway-3 | — |",
+	} {
+		at := strings.Index(out, want)
+		if at < 0 {
+			t.Fatalf("the VIP re-points section lacks %q:\n%s", want, out)
+		}
+		if at < last {
+			t.Fatalf("%q is out of journal order:\n%s", want, out)
+		}
+		last = at
+	}
+}
+
+// Without a re-point in the journal, or without a journal at all, there is
+// nothing to list, and the section stays out of the report. A re-point
+// whose timestamp does not parse cannot be placed in the run and gets no
+// row.
+func TestRenderReportLeavesOutVIPRepointsItNeverSaw(t *testing.T) {
+	t.Parallel()
+	withoutRepoints := []event{
+		{TS: "2026-07-16T19:00:30Z", Event: evInject, Tick: 1, Action: "frr-restart", Target: "gateway-2"},
+		{TS: "2026-07-16T19:00:40Z", Event: evConverged, Tick: 1, Action: "frr-restart", Target: "gateway-2"},
+	}
+	unplaceable := event{TS: "not-a-time", Event: evVIPRepoint, Phase: phaseHold, Target: "gateway-unplaceable"}
+	for name, events := range map[string][]event{
+		"no re-point":             withoutRepoints,
+		"no journal":              nil,
+		"only an unplaceable one": {unplaceable},
+	} {
+		if out := renderToString(t, reportRecord(t), events); strings.Contains(out, "VIP re-points") {
+			t.Fatalf("%s: the report rendered a VIP re-points section:\n%s", name, out)
+		}
+	}
+
+	out := renderToString(t, reportRecord(t), []event{
+		unplaceable,
+		{TS: "2026-07-16T19:00:32Z", Event: evVIPRepoint, Phase: phaseHold, Target: "gateway-2"},
+	})
+
+	if !strings.Contains(out, "| t+00:32 | hold | gateway-2 | — |") {
+		t.Fatalf("the re-point with a readable timestamp is missing:\n%s", out)
+	}
+	if strings.Contains(out, "gateway-unplaceable") {
+		t.Fatalf("a re-point with an unreadable timestamp got a row:\n%s", out)
+	}
+}
