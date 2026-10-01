@@ -596,6 +596,95 @@ func TestRenderReportLeavesOutVIPRepointsItNeverSaw(t *testing.T) {
 	}
 }
 
+// The fault traces section puts a traced action's owner and path changes on
+// the fault's own timeline: the baseline rows read `before`, every other row
+// carries its time since the inject, and the tick's inject, restore and
+// converged events sit between them in journal order. A baseline journaled
+// after the inject, because the reading before it failed, carries its time
+// too: it is not the state before the fault.
+func TestRenderFaultTraces(t *testing.T) {
+	t.Parallel()
+	traced := []event{
+		{TS: "2026-07-16T19:00:20Z", Event: evInject, Tick: 5, Action: "frr-restart", Target: "gateway-3"},
+		{TS: "2026-07-16T19:00:25Z", Event: evConverged, Tick: 5, Action: "frr-restart", Target: "gateway-3"},
+		{TS: "2026-07-16T19:00:59.8Z", Event: evCROwner, Tick: 6, Action: "double-failover",
+			Object: "cr-lr0-public", To: "gateway-2", Detail: traceBaseline},
+		{TS: "2026-07-16T19:00:59.9Z", Event: evUpstreamPath, Tick: 6, Action: "double-failover",
+			Object: "192.0.2.10", To: "gateway-2", Detail: traceBaseline},
+		{TS: "2026-07-16T19:01:00Z", Event: evInject, Tick: 6, Action: "double-failover",
+			Target: "gateway-1", Peer: "gateway-2"},
+		{TS: "2026-07-16T19:01:01.5Z", Event: evCROwner, Tick: 6, Action: "double-failover",
+			Object: "cr-lr0-public", From: "gateway-2", To: traceUnbound},
+		{TS: "2026-07-16T19:01:30Z", Event: evRestore, Tick: 6, Action: "double-failover", Target: "gateway-1"},
+		{TS: "2026-07-16T19:01:45Z", Event: evConverged, Tick: 6, Action: "double-failover",
+			Target: "gateway-1", Peer: "gateway-2"},
+		{TS: "2026-07-16T19:02:00Z", Event: evInject, Tick: 7, Action: "double-failover", Target: "gateway-2"},
+		{TS: "not-a-time", Event: evUpstreamPath, Tick: 7, Action: "double-failover",
+			Object: "192.0.2.12", From: "gateway-2", To: traceNone},
+		// Tick 8's owner read failed before the inject and succeeded after
+		// gateway-2 had claimed the port; its path read succeeded in time.
+		{TS: "2026-07-16T19:02:19.9Z", Event: evUpstreamPath, Tick: 8, Action: "double-failover",
+			Object: "192.0.2.14", To: "gateway-3", Detail: traceBaseline},
+		{TS: "2026-07-16T19:02:20Z", Event: evInject, Tick: 8, Action: "double-failover",
+			Target: "gateway-3", Peer: "gateway-1"},
+		{TS: "2026-07-16T19:02:21Z", Event: evCROwner, Tick: 8, Action: "double-failover",
+			Object: "cr-lr1-public", To: "gateway-2", Detail: traceBaseline},
+		// The journal was cut before tick 9's inject: its rows have no anchor.
+		{TS: "2026-07-16T19:02:40Z", Event: evCROwner, Tick: 9, Action: "double-failover",
+			Object: "cr-lr1-public", To: "gateway-3", Detail: traceBaseline},
+		{TS: "2026-07-16T19:02:41Z", Event: evCROwner, Tick: 9, Action: "double-failover",
+			Object: "cr-lr1-public", From: "gateway-3", To: traceAbsent},
+	}
+
+	out := renderToString(t, reportRecord(t), traced)
+
+	last := -1
+	for _, want := range []string{
+		"### Fault traces\n",
+		"#### Tick 6: double-failover, target gateway-1, peer gateway-2\n",
+		"| at | event | object | from | to |",
+		"| before | cr-owner | cr-lr0-public | — | gateway-2 |",
+		"| before | upstream-path | 192.0.2.10 | — | gateway-2 |",
+		"| +0 ms | inject | gateway-1 | — | — |",
+		"| +1.5 s | cr-owner | cr-lr0-public | gateway-2 | unbound |",
+		"| +30.0 s | restore | gateway-1 | — | — |",
+		"| +45.0 s | converged | gateway-1 | — | — |",
+		"#### Tick 7: double-failover, target gateway-2\n",
+		"| — | upstream-path | 192.0.2.12 | gateway-2 | none |",
+		"#### Tick 8: double-failover, target gateway-3, peer gateway-1\n",
+		"| before | upstream-path | 192.0.2.14 | — | gateway-3 |",
+		"| +0 ms | inject | gateway-3 | — | — |",
+		"| +1.0 s | cr-owner | cr-lr1-public | — | gateway-2 |",
+		"#### Tick 9\n",
+		"| — | cr-owner | cr-lr1-public | — | gateway-3 |",
+		"| — | cr-owner | cr-lr1-public | gateway-3 | absent |",
+	} {
+		at := strings.Index(out, want)
+		if at < 0 {
+			t.Fatalf("the fault traces section lacks %q:\n%s", want, out)
+		}
+		if at < last {
+			t.Fatalf("%q is out of journal order:\n%s", want, out)
+		}
+		last = at
+	}
+	if got := strings.Count(out, "### Fault traces"); got != 1 {
+		t.Fatalf("the section heading was rendered %d times:\n%s", got, out)
+	}
+	if strings.Contains(out, "#### Tick 5") {
+		t.Fatalf("a tick without a trace event got a table:\n%s", out)
+	}
+
+	for name, events := range map[string][]event{
+		"no trace event": traced[:2],
+		"no journal":     nil,
+	} {
+		if out := renderToString(t, reportRecord(t), events); strings.Contains(out, "Fault traces") {
+			t.Fatalf("%s: the report rendered a fault traces section:\n%s", name, out)
+		}
+	}
+}
+
 // The route drift table lists what the agent's route watch counted across
 // each route drop, in tick order, so a watch repair can be told from a tick
 // repair. A recovery that measured nothing gets no row.
