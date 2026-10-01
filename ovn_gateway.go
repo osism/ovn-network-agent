@@ -1330,20 +1330,37 @@ func rowToGatewayChassis(row ovsdb.Row) NBGatewayChassis {
 // the logical ports in skipCRPorts: ports with no standby, which stay bound here
 // however long the drain waits.
 func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName string, skipCRPorts map[string]bool) (int, error) {
-	// countLocalCRPorts drives the drain poll loop: a stale SB cache here makes
+	local, err := o.localCRPortNames(ctx, localChassisName)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for port := range local {
+		if !skipCRPorts[port] {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// localCRPortNames returns the logical port names of the chassisredirect ports
+// currently bound to the given chassis hostname in the SB Port_Binding table.
+// With cfg.GatewayPort set, only that port can be in the result.
+func (o *OVNClient) localCRPortNames(ctx context.Context, localChassisName string) (map[string]bool, error) {
+	// localCRPortNames drives the drain poll loop: a stale SB cache here makes
 	// the drain converge on the wrong answer (hang until timeout, or finish
 	// early while ports are still bound). Read through the consistency guard
 	// so a dropped INSERT or a stale chassis column is corrected.
 	portBindings, err := cachedList(ctx, o.sbClient, "Port_Binding",
 		pbCheckColumns, keyOfSBPortBinding, decodeSBPortBinding)
 	if err != nil {
-		return 0, fmt.Errorf("list port bindings: %w", err)
+		return nil, fmt.Errorf("list port bindings: %w", err)
 	}
 
 	chassis, err := cachedList(ctx, o.sbClient, "Chassis",
 		chCheckColumns, keyOfSBChassis, decodeSBChassis)
 	if err != nil {
-		return 0, fmt.Errorf("list chassis: %w", err)
+		return nil, fmt.Errorf("list chassis: %w", err)
 	}
 
 	chassisHostname := make(map[string]string, len(chassis))
@@ -1352,7 +1369,7 @@ func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName stri
 		chassisHostname[ch.Name] = ch.Hostname
 	}
 
-	count := 0
+	local := make(map[string]bool)
 	for _, pb := range portBindings {
 		if pb.Type != "chassisredirect" || pb.Chassis == nil || *pb.Chassis == "" {
 			continue
@@ -1360,15 +1377,12 @@ func (o *OVNClient) countLocalCRPorts(ctx context.Context, localChassisName stri
 		if o.cfg.GatewayPort != "" && pb.LogicalPort != o.cfg.GatewayPort {
 			continue
 		}
-		if skipCRPorts[pb.LogicalPort] {
-			continue
-		}
 		hostname := chassisHostname[*pb.Chassis]
 		if hostnamesEqual(hostname, localChassisName) {
-			count++
+			local[pb.LogicalPort] = true
 		}
 	}
-	return count, nil
+	return local, nil
 }
 
 // selectCRPortChassis returns, for every chassisredirect Port_Binding, the
