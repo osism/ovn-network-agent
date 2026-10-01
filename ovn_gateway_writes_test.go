@@ -1949,6 +1949,58 @@ func TestCountLocalCRPorts_SkipsOnlyTheNamedPorts(t *testing.T) {
 	}
 }
 
+// TestLocalCRPortNames_ReturnsLocalChassisredirectPorts: the result names the
+// chassisredirect ports bound to this chassis, whatever their name looks like,
+// and nothing else: not a peer's port, an unbound port or a VIF. With
+// gateway_port set it names that port only. An empty SB table is an empty set,
+// and a failed SB read is an error.
+func TestLocalCRPortNames_ReturnsLocalChassisredirectPorts(t *testing.T) {
+	c, _, sb := newOVNClientWithFakes(t, "host-a")
+	sb.setRows("Chassis",
+		&SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"},
+		&SBChassis{UUID: "ch-b", Name: "ch-b", Hostname: "host-b"},
+	)
+
+	got, err := c.localCRPortNames(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("localCRPortNames without port bindings: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("no port bindings returned %#v, want an empty map", got)
+	}
+
+	sb.setRows("Port_Binding",
+		&SBPortBinding{UUID: "pb-a", LogicalPort: "cr-lrp-a", Type: "chassisredirect", Chassis: strPtr("ch-a")},
+		&SBPortBinding{UUID: "pb-odd", LogicalPort: "odd-name", Type: "chassisredirect", Chassis: strPtr("ch-a")},
+		&SBPortBinding{UUID: "pb-b", LogicalPort: "cr-lrp-b", Type: "chassisredirect", Chassis: strPtr("ch-b")},
+		&SBPortBinding{UUID: "pb-u", LogicalPort: "cr-lrp-u", Type: "chassisredirect"},
+		&SBPortBinding{UUID: "pb-vif", LogicalPort: "vif-1", Type: "", Chassis: strPtr("ch-a")},
+	)
+	got, err = c.localCRPortNames(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("localCRPortNames: %v", err)
+	}
+	if want := map[string]bool{"cr-lrp-a": true, "odd-name": true}; !reflect.DeepEqual(got, want) {
+		t.Errorf("local ports = %v, want %v", got, want)
+	}
+
+	c.cfg.GatewayPort = "odd-name"
+	got, err = c.localCRPortNames(context.Background(), "host-a")
+	if err != nil {
+		t.Fatalf("localCRPortNames with a gateway port: %v", err)
+	}
+	if want := map[string]bool{"odd-name": true}; !reflect.DeepEqual(got, want) {
+		t.Errorf("local ports with gateway_port set = %v, want %v", got, want)
+	}
+	c.cfg.GatewayPort = ""
+
+	sb.listErr = errors.New("connection refused")
+	if _, err := c.localCRPortNames(context.Background(), "host-a"); err == nil ||
+		!strings.Contains(err.Error(), "list port bindings") || !errors.Is(err, sb.listErr) {
+		t.Errorf("a failed SB read returned %v, want the wrapped list port bindings error", err)
+	}
+}
+
 // TestSoleCandidatePorts keys each port without a standby three ways and
 // leaves every other router out.
 func TestSoleCandidatePorts(t *testing.T) {
