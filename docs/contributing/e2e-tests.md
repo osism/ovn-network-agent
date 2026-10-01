@@ -144,7 +144,12 @@ containers, which is what containerlab requires.
   with `GWNODE_ROLE=compute`. It runs OVS and `ovn-controller` only:
   it has no underlay link, no FRR, no agent and no `Gateway_Chassis`
   row, so no router port ever lands on it. The scenarios do not use it;
-  the [chaos runner](#chaos-runner) hosts its workloads there.
+  the [chaos runner](#chaos-runner) hosts its workloads there. It also
+  gives the last gateway of a double failover a live tunnel peer.
+  `ovn-controller` does not let a chassis without any BFD-active tunnel
+  claim a chassisredirect port (`ha_chassis_group_is_active()` in OVN's
+  `controller/ha-chassis.c`), so with the three gateways alone the one
+  that survives the pair would stay dark until a peer is back.
 
 ## Bootstrap state
 
@@ -1494,7 +1499,10 @@ databases answering. While the SB is paused the baseline sweep's
 violations. `double-failover` SIGTERMs the drawn gateway (which begins its
 drain) and SIGKILLs the ring-next peer before it has finished — two
 gateways down at once, restored one at a time through the same
-container-lifecycle path the starter kills use.
+container-lifecycle path the starter kills use. It is the one traced
+action: from before the inject to the convergence the runner reads the
+owner of every chassisredirect port and the upstream's selected BGP paths
+once a second and journals what changed.
 
 **Network impairment** degrades the management path from a gateway to
 `central` with `tc netem`, forcing the OVSDB connections to flap without
@@ -1878,6 +1886,14 @@ agent refused it), `ovn-churn` (each
 executed churn, with the `object` it touched and the `from`/`to` values it
 moved between), `node-state`, `probe-transition`, `vip-repoint` (with the
 `phase` it happened in: `start`, `inject`, `hold` or `converge`),
+`cr-owner` / `upstream-path` (the fault trace of a `double-failover`, each
+with `tick`, `action`, the `object` it is about and the `from`/`to` values
+it moved between: for `cr-owner` a chassisredirect port and its chassis, or
+`unbound`; for `upstream-path` a prefix and the comma-joined gateways the
+upstream has a selected path over, or `none`; `absent` for an object the
+reading no longer holds; the first successful reading of the owners and of
+the paths carries `detail` `baseline` and no `from`, and it is the one taken
+before the `inject` unless that read failed),
 `settle-start` / `settle-result` (the latter with the `converged_ms` the
 settle window took to reach its expected state), `violation` and
 `run-end`. A `decision`, `inject` or `converged` for a
@@ -1887,7 +1903,9 @@ carries it in `object` — so a run mixing all classes is triageable from the
 artifacts alone. An `inject` of a fault that stops an agent (`agent-terminate`,
 `gateway-restart`, `config-flip`, `double-failover`) carries `drain`: whether
 the target ran with the drain on, as the settle oracle resolved it. It is
-absent when that could not be read.
+absent when that could not be read. A fault trace read that fails is a
+`check-error` whose `detail` starts with `fault trace:`, journaled once
+until a read succeeds again.
 `summary.json` aggregates the run: inputs, tick and decision counts,
 actions by name, how many baseline sweeps ran and how many of them
 evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
@@ -1925,8 +1943,8 @@ copy-pasteable replay line, the slowest recoveries against their
 budgets, each with its summed probe loss, the route drift the agent
 counted across each route drop, per-probe loss totals, every
 loss window attributed to the fault whose inject→converged span it
-overlapped, the VIP re-points by phase, the planned restarts, the settle
-results, and the decisions the guardrails skipped:
+overlapped, the VIP re-points by phase, the fault traces, the planned
+restarts, the settle results, and the decisions the guardrails skipped:
 
 ```sh
 # A run directory (or its summary.json) written with -out:
@@ -1944,9 +1962,18 @@ The **Planned restarts** section lists every `agent-terminate`,
 window that overlapped it. Its summary line reads every drained restart.
 That line is where a drained restart is expected to stay under a second.
 
+The **Fault traces** section has one table per `double-failover`: the
+owner of each chassisredirect port and the upstream's selected paths
+before the fault (`before` in the `at` column), then every change with its
+time since the inject, with the tick's `inject`, `restore` and `converged`
+rows in between. A `cr-owner` or `upstream-path` row with no `from` that
+carries a time instead of `before` is a first reading taken after the
+inject, because the read before it failed: it is the state at that time,
+not the one before the fault.
+
 The report's spine is `summary.json`; the `journal.jsonl` next to it
 adds what the record alone cannot say — the loss-window attribution, the
-VIP re-points, the planned restarts and the skip reasons. Without a
+VIP re-points, the fault traces, the planned restarts and the skip reasons. Without a
 journal the report still renders, falling back to the record's 10-second
 loss buckets. Rendering exits `0` even for a run that recorded a failure:
 the report's exit code says whether the report could be produced, not

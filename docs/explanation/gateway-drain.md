@@ -199,6 +199,40 @@ A portion of the remaining gap is OVN-intrinsic (`ovn-northd` /
 handshake only has to cover the takeover node's reconcile and BGP
 advertisement.
 
+The takeover chassis can fail while the leaving node waits for its marker.
+If it was the port's only other candidate, OVN binds the chassisredirect
+port to the leaving chassis again once the BFD session to the failed chassis
+is down. No chassis stamps the marker then, so the leaving node keeps
+forwarding and waits until `drain_timeout`, the same fallback as for a
+takeover that never signals. It does not end the drain early: at that point
+it is the only chassis forwarding for the router, and a standby that is only
+restarting and returns before the deadline takes the port, stamps the
+marker, and still gets a clean handover. The agent logs the port when it
+comes back and when it leaves again (see
+[When the takeover chassis fails during the drain](../guides/gateway-drain#when-the-takeover-chassis-fails-during-the-drain)).
+
+## The last chassis standing
+
+A gateway chassis without any BFD-active tunnel does not claim a
+chassisredirect port. `ovn-controller` reads that state as a chassis that
+has lost its connectivity to the other chassis, not as the last chassis
+alive: `ha_chassis_group_is_active()` in OVN's
+[`controller/ha-chassis.c`](https://github.com/ovn-org/ovn/blob/branch-24.09/controller/ha-chassis.c)
+returns false when the set of active tunnels is empty. An isolated gateway
+therefore cannot take a port away from a chassis that still serves it.
+
+The same check applies when the other chassis are down and not merely out
+of reach. In a cluster of three gateways and no other chassis, losing two
+gateways at once leaves the third with no live tunnel peer. That gateway is
+healthy and is a candidate for the port, and it does not take over. The
+port stays unbound and its FIPs stay dark until another chassis has its
+tunnel and its BFD session back.
+
+The agent cannot change this. The check is in `ovn-controller`, and the
+agent announces only what OVN binds to its chassis. A deployment needs at
+least one other live chassis with a tunnel to the gateway for the last
+gateway to take over. A compute node counts.
+
 ## Priority semantics
 
 The agent lowers the priority to **0** rather than 1 because in typical
