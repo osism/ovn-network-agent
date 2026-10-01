@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os/exec"
 	"reflect"
@@ -2517,5 +2518,324 @@ func TestDrainOutcome(t *testing.T) {
 				t.Errorf("drainOutcome(%v, %v, %v) = %q, want %q", tt.err, tt.ctxErr, tt.drained, got, tt.want)
 			}
 		})
+	}
+}
+
+// =============================================================================
+// Route watch wiring
+// =============================================================================
+
+// attachRouteWatch gives a fixture agent a watcher that is not started, so a
+// test can read the ownership reconcile published.
+func attachRouteWatch(a *Agent) *routeWatcher {
+	a.routeWatch = newRouteWatcher(a.routing.cfg, a.triggerReconcile)
+	return a.routeWatch
+}
+
+func TestReconcilePublishesRouteOwnership(t *testing.T) {
+	const fip = "192.0.2.10"
+	_, network, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+
+	t.Run("live cycle without veth leak", func(t *testing.T) {
+		a, _, _ := newLiveFIPReconcile(t, fip)
+		a.cfg.NetworkFilters = []*net.IPNet{network}
+		w := attachRouteWatch(a)
+
+		a.reconcile(context.Background(), triggerPeriodic)
+
+		if !w.owned.KernelIPs[fip] || !w.owned.FRRIPs[fip] {
+			t.Errorf("owned = %+v, want %s as a kernel route and as an FRR static", w.owned, fip)
+		}
+		if len(w.owned.LeakNets) != 0 {
+			t.Errorf("LeakNets = %v, want none while veth_leak_enabled is false", w.owned.LeakNets)
+		}
+	})
+
+	t.Run("live cycle with veth leak", func(t *testing.T) {
+		a, _, _ := newLiveFIPReconcile(t, fip)
+		a.cfg.NetworkFilters = []*net.IPNet{network}
+		a.cfg.VethLeakEnabled = true
+		w := attachRouteWatch(a)
+
+		a.reconcile(context.Background(), triggerPeriodic)
+
+		if !w.owned.KernelIPs[fip] || !w.owned.FRRIPs[fip] {
+			t.Errorf("owned = %+v, want %s as a kernel route and as an FRR static", w.owned, fip)
+		}
+		if want := map[string]bool{"192.0.2.0/24": true}; !reflect.DeepEqual(w.owned.LeakNets, want) {
+			t.Errorf("LeakNets = %v, want the effective networks %v", w.owned.LeakNets, want)
+		}
+	})
+
+	// An announceable port-forward VIP gets a kernel /32 and no FRR static:
+	// it is announced through its connected route. The two sets differ by it.
+	t.Run("live cycle with a port-forward VIP", func(t *testing.T) {
+		const vip = "192.0.2.80"
+		a, _, _ := newLiveFIPReconcile(t, fip)
+		a.cfg.PortForwards = []PortForwardVIP{{VIP: vip, ManageVIP: true}}
+		// Both /32s already sit on the bridge, so ensureRoutes never calls
+		// the Linux-only AddKernelRoute.
+		bridge := a.routing.cfg.BridgeDev
+		a.routing.listKernelRoutesHook = func() ([]kernelRouteEntry, error) {
+			return []kernelRouteEntry{{IP: fip, Dev: bridge}, {IP: vip, Dev: bridge}}, nil
+		}
+		w := attachRouteWatch(a)
+
+		a.reconcile(context.Background(), triggerPeriodic)
+
+		if !w.owned.KernelIPs[vip] || w.owned.FRRIPs[vip] {
+			t.Errorf("owned = %+v, want %s as a kernel route and not as an FRR static", w.owned, vip)
+		}
+		if !w.owned.KernelIPs[fip] || !w.owned.FRRIPs[fip] {
+			t.Errorf("owned = %+v, want %s as a kernel route and as an FRR static", w.owned, fip)
+		}
+	})
+
+	// A standby cycle removes every route. What an earlier, active cycle
+	// published must be gone before it does.
+	t.Run("standby cycle", func(t *testing.T) {
+		rm := &RouteManager{cfg: Config{BridgeDev: "br-ex", VRFName: "vrf-provider", VethNexthop: "169.254.0.1", DryRun: true}}
+		c, _, _ := newOVNClientWithFakes(t, "host-a")
+		a := &Agent{
+			cfg:            Config{VethLeakEnabled: true, NetworkFilters: []*net.IPNet{network}},
+			ovn:            c,
+			routing:        rm,
+			reconcileCh:    make(chan struct{}, 1),
+			missingChassis: make(map[string]time.Time),
+		}
+		w := attachRouteWatch(a)
+		w.setOwned(newRouteOwnership([]string{fip}, []string{fip}, []*net.IPNet{network}))
+
+		a.reconcile(context.Background(), triggerPeriodic)
+
+		if len(w.owned.KernelIPs) != 0 || len(w.owned.FRRIPs) != 0 || len(w.owned.LeakNets) != 0 {
+			t.Errorf("owned = %+v after a standby cycle, want it empty", w.owned)
+		}
+	})
+}
+
+// The ownership has to be published before the cycle touches a route. A route
+// the cycle adds is owned by the time zebra installs it, and a route the cycle
+// removes is no longer owned by the time the kernel reports the deletion, so
+// the agent's own removal is never counted as drift.
+func TestReconcilePublishesRouteOwnershipBeforeRouteChanges(t *testing.T) {
+	const (
+		fipA = "192.0.2.10"
+		fipB = "192.0.2.11"
+	)
+	a, rec, _ := newLiveFIPReconcile(t, fipA, fipB)
+	w := attachRouteWatch(a)
+
+	// atFirst returns the ownership as it was when the first vtysh command
+	// containing marker ran during one reconcile.
+	atFirst := func(marker string) (routeOwnership, bool) {
+		var (
+			seen  routeOwnership
+			found bool
+		)
+		record := rec.hook()
+		a.routing.execVtyshHook = func(cmd *exec.Cmd) ([]byte, error) {
+			if !found && strings.Contains(strings.Join(cmd.Args, " "), marker) {
+				seen, found = w.owned, true
+			}
+			return record(cmd)
+		}
+		a.reconcile(context.Background(), triggerPeriodic)
+		return seen, found
+	}
+
+	owned, found := atFirst("conf t")
+	if !found {
+		t.Fatal("the first cycle ran no vtysh configuration command")
+	}
+	for _, ip := range []string{fipA, fipB} {
+		if !owned.KernelIPs[ip] || !owned.FRRIPs[ip] {
+			t.Errorf("at the first conf t the ownership %+v does not hold %s", owned, ip)
+		}
+	}
+
+	// Second cycle: zebra holds both statics, OVN no longer wants fipB.
+	rec.on(
+		strings.Fields("vtysh -c show ip route vrf vrf-provider static json"),
+		frrStaticRoutesJSON("169.254.0.1", fipA, fipB),
+		nil,
+	)
+	const lrpMAC = "fa:16:3e:aa:aa:aa"
+	a.ovn.state.Replace(OVNState{
+		LocalRouters:     []LocalRouterInfo{{RouterName: "r1", RouterUUID: "lr1", LRPName: "lrp-r1", LRPMAC: lrpMAC}},
+		HasLocalRouters:  true,
+		NATIPToRouterMAC: map[string]string{fipA: lrpMAC},
+	})
+
+	owned, found = atFirst("no ip route " + fipB + "/32")
+	if !found {
+		t.Fatalf("the second cycle did not remove the FRR static of %s", fipB)
+	}
+	if owned.KernelIPs[fipB] || owned.FRRIPs[fipB] {
+		t.Errorf("at its no ip route the ownership %+v still holds %s", owned, fipB)
+	}
+	if !owned.KernelIPs[fipA] || !owned.FRRIPs[fipA] {
+		t.Errorf("the ownership %+v lost %s, which is still desired", owned, fipA)
+	}
+}
+
+func TestNewAgentRouteWatchGating(t *testing.T) {
+	full := Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteWatch: true}
+	off := full
+	off.RouteWatch = false
+	dryRun := full
+	dryRun.DryRun = true
+	portForwardOnly := portForwardOnlyConfig()
+	portForwardOnly.DryRun = false
+	portForwardOnly.RouteWatch = true
+
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"route_watch on", full, true},
+		{"route_watch off", off, false},
+		{"dry-run", dryRun, false},
+		{"port-forward-only", portForwardOnly, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := NewAgent(tt.cfg, nil)
+			if err != nil {
+				t.Fatalf("NewAgent() error: %v", err)
+			}
+			if got := a.routeWatch != nil; got != tt.want {
+				t.Errorf("routeWatch set = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A drift repair must look like any other event-driven reconcile. Going
+// through the OVN client's immediate refresh instead would stamp a failover
+// observation, and the repair cycle, which adds FRR routes, would then record
+// a sample in failover_announce_seconds.
+func TestNewAgentRouteWatchTriggerQueuesOneReconcile(t *testing.T) {
+	a, err := NewAgent(Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", RouteWatch: true}, nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	if a.routeWatch == nil {
+		t.Fatal("NewAgent() built no route watch")
+	}
+
+	a.routeWatch.trigger()
+	a.routeWatch.trigger()
+
+	if got := len(a.reconcileCh); got != 1 {
+		t.Errorf("queued reconcile signals = %d, want 1 for two triggers", got)
+	}
+	if obs := a.ovn.failoverObserved.Load(); obs != nil {
+		t.Errorf("failoverObserved = %+v, want it unset after a drift trigger", obs)
+	}
+}
+
+// Run starts the watcher and, on shutdown, joins its goroutine before the
+// cleanup begins, so the routes cleanup() deletes are never classified as
+// drift.
+func TestAgentRunStartsAndJoinsRouteWatch(t *testing.T) {
+	const released = "test: route watch goroutine released"
+	logs := captureSlog(t)
+	a, err := NewAgent(portForwardOnlyConfig(), nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	// subscribe blocks until release is closed, which keeps the watcher's
+	// goroutine alive past the cancel.
+	var entered atomic.Bool
+	release := make(chan struct{})
+	w := newRouteWatcher(a.cfg, a.triggerReconcile)
+	w.subscribe = func(<-chan struct{}) (<-chan routeEvent, error) {
+		entered.Store(true)
+		<-release
+		slog.Info(released)
+		return nil, errRouteWatchUnsupported
+	}
+	a.routeWatch = w
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	waitForCondition(t, "Run to start the route watch", entered.Load)
+	cancel()
+
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("Run() returned while the route watch goroutine was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s")
+	}
+
+	// Run has returned and joined the watcher, so nothing writes the log any
+	// more. portForwardOnlyConfig cleans up on shutdown.
+	out := logs.String()
+	joined := strings.Index(out, released)
+	cleanup := strings.Index(out, "shutting down, cleaning up routes")
+	if joined < 0 || cleanup < joined {
+		t.Errorf("the shutdown cleanup began before the route watch goroutine was joined:\n%s", out)
+	}
+}
+
+// The watcher is an accelerator, not the repair. With a subscription that
+// never comes up, the periodic reconcile still puts a missing route back.
+func TestReconcileRepairsRoutesWhileRouteWatchIsDown(t *testing.T) {
+	const fip = "192.0.2.10"
+	logs := captureSlog(t)
+	a, rec, _ := newLiveFIPReconcile(t, fip)
+
+	var subscribes atomic.Int32
+	w := attachRouteWatch(a)
+	w.subscribe = func(<-chan struct{}) (<-chan routeEvent, error) {
+		subscribes.Add(1)
+		return nil, errors.New("test: netlink is not available")
+	}
+	w.backoffMin = 5 * time.Millisecond
+	w.backoffMax = 20 * time.Millisecond
+	stop := startRouteWatcher(t, w)
+	waitForCondition(t, "the watcher to retry its subscription", func() bool { return subscribes.Load() >= 3 })
+
+	// The recorder answers the FRR listing with an empty body, so the FIP's
+	// static is missing. This reconcile stands in for the tick.
+	a.reconcile(context.Background(), triggerPeriodic)
+	stop()
+
+	wantAdd := "ip route " + fip + "/32 169.254.0.1"
+	added := false
+	for _, call := range rec.calls {
+		for _, arg := range call {
+			if arg == wantAdd {
+				added = true
+			}
+		}
+	}
+	if !added {
+		t.Errorf("the reconcile did not re-add the missing static: no vtysh call carries %q in %v", wantAdd, rec.calls)
+	}
+	if len(a.reconcileCh) != 0 {
+		t.Error("a watcher that never subscribed queued a reconcile")
+	}
+	if got := strings.Count(logs.String(), "route watch unavailable"); got != 1 {
+		t.Errorf("outage warnings = %d, want 1 across %d failed subscribes", got, subscribes.Load())
 	}
 }

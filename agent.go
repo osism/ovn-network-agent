@@ -21,6 +21,12 @@ type Agent struct {
 	ovn     *OVNClient
 	routing *RouteManager
 
+	// routeWatch triggers a reconcile when a route the agent owns is deleted
+	// or replaced from outside. It is nil when route_watch is off, in dry-run
+	// (nothing is installed) and in port-forward-only mode (reconcile manages
+	// no route the watch covers). Its methods are no-ops on a nil receiver.
+	routeWatch *routeWatcher
+
 	// Channel to trigger reconciliation
 	reconcileCh chan struct{}
 
@@ -109,6 +115,13 @@ func NewAgent(cfg Config, reloadConfig func() (Config, error)) (*Agent, error) {
 	// and every OVN-dependent step is gated on cfg.PortForwardOnly.
 	if !cfg.PortForwardOnly {
 		a.ovn = NewOVNClient(cfg, a.triggerReconcile)
+	}
+
+	// The watcher goes through triggerReconcile, not the OVN client's
+	// immediate refresh: that one stamps a failover observation, so a drift
+	// repair that adds FRR routes would be recorded as a failover announce.
+	if cfg.RouteWatch && !cfg.DryRun && !cfg.PortForwardOnly {
+		a.routeWatch = newRouteWatcher(cfg, a.triggerReconcile)
 	}
 
 	return a, nil
@@ -219,6 +232,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	default:
 	}
 
+	// Started after the startup reconcile, which published what the agent
+	// owns and installed it: nothing before this point is drift.
+	a.routeWatch.start(ctx)
+	if a.routeWatch == nil && !a.cfg.PortForwardOnly {
+		slog.Info("route watch disabled")
+	}
+
 	// Main loop
 	ticker := time.NewTicker(a.cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -228,6 +248,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Stop the route watch first, so the deletions cleanup() makes
+			// below are never classified as drift.
+			a.routeWatch.wait()
 			// Wait for the OVN refresh loop (which shares the now-cancelled
 			// ctx) to fully exit before the shutdown path touches o.state, so
 			// a still-in-flight loop refresh cannot interleave with the
@@ -375,6 +398,17 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	if len(desiredIPs) > 0 {
 		slog.Debug("desired IP list", "ips", desiredIPs)
 	}
+
+	// Publish what this cycle owns to the route watch before the first
+	// removal. Every deliberate removal later in the cycle (the standby
+	// branch below, ensureRoutes, removeAllRoutes) then hits a prefix that is
+	// no longer owned, so it is neither counted as drift nor does it trigger
+	// another reconcile.
+	var leakNets []*net.IPNet
+	if state.HasLocalRouters && a.cfg.VethLeakEnabled {
+		leakNets = a.effectiveFilters
+	}
+	a.routeWatch.setOwned(newRouteOwnership(desiredIPs, frrStaticIPs, leakNets))
 
 	// The reachability-critical OVN/OVS setup runs before the BGP announce
 	// so a failover takeover reconcile starts attracting traffic as early as
