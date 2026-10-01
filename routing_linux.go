@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -1139,13 +1140,20 @@ func (rm *RouteManager) ReconcileVethLeakNetworks(desired []*net.IPNet) error {
 
 // getVRFTableID returns the routing table ID associated with the VRF.
 func (rm *RouteManager) getVRFTableID() (int, error) {
-	link, err := netlink.LinkByName(rm.cfg.VRFName)
+	return vrfTableID(rm.cfg.VRFName)
+}
+
+// vrfTableID returns the routing table ID of the named VRF device. It takes
+// the name as a parameter so the route watch can resolve the table without
+// reading a Config that a reload replaces.
+func vrfTableID(vrfName string) (int, error) {
+	link, err := netlink.LinkByName(vrfName)
 	if err != nil {
-		return 0, fmt.Errorf("find VRF %s: %w", rm.cfg.VRFName, err)
+		return 0, fmt.Errorf("find VRF %s: %w", vrfName, err)
 	}
 	vrf, ok := link.(*netlink.Vrf)
 	if !ok {
-		return 0, fmt.Errorf("%s is not a VRF device", rm.cfg.VRFName)
+		return 0, fmt.Errorf("%s is not a VRF device", vrfName)
 	}
 	return int(vrf.Table), nil
 }
@@ -1206,4 +1214,147 @@ func hasDefaultRoute(routes []netlink.Route) bool {
 		}
 	}
 	return false
+}
+
+// =============================================================================
+// Route watch event source (Linux only)
+// =============================================================================
+
+// routeWatchReceiveBuffer is the receive buffer of the route subscription's
+// socket. The subscription gets every route change of the namespace, and a
+// takeover reconcile, an FRR restart or a BGP table load produces thousands of
+// them at once. The default buffer holds a few hundred, and a burst that
+// overruns it ends the subscription with ENOBUFS.
+const routeWatchReceiveBuffer = 8 << 20
+
+// routeWatchBufferForceDenied is set once the kernel refused to force the
+// receive buffer. The capability does not come back at runtime, and every
+// refused attempt leaves a bound socket behind that the library does not
+// close, so later subscribes do not try again.
+var routeWatchBufferForceDenied atomic.Bool
+
+// subscribeRouteEvents subscribes to the kernel's route notifications and
+// returns the changes in the two tables the agent's routes live in: the table
+// AddKernelRoute writes (routeTableID, or the main table when it is 0) and the
+// table of the VRF. The returned channel is closed when the netlink socket
+// fails or after done is closed. The caller closes done to release the socket,
+// also after the channel was closed.
+func subscribeRouteEvents(done <-chan struct{}, routeTableID int, vrfName string) (<-chan routeEvent, error) {
+	kernelTable := routeTableID
+	if kernelTable == 0 {
+		kernelTable = rtTableMain
+	}
+	vrfTable, err := vrfTableID(vrfName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve VRF table for route watch: %w", err)
+	}
+	return subscribeRouteTables(done, kernelTable, vrfTable)
+}
+
+// subscribeRouteTables is subscribeRouteEvents with the two tables resolved.
+//
+// Split out because resolving the VRF table needs a real VRF device, while the
+// subscription itself opens without one and without privileges.
+func subscribeRouteTables(done <-chan struct{}, kernelTable, vrfTable int) (<-chan routeEvent, error) {
+	updates := make(chan netlink.RouteUpdate)
+	opts := netlink.RouteSubscribeOptions{
+		// The library reports a failed receive here and then closes updates.
+		// The watcher acts on the closed channel, but its outage warning
+		// cannot say why the receive failed (ENOBUFS after a route burst, or
+		// a dead socket), so the reason is logged here at the same level.
+		// Closing done fails the receive as well. That is the watcher
+		// releasing the socket and not worth a line.
+		ErrorCallback: func(err error) {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			slog.Warn("kernel route subscription error", "error", err)
+		},
+		ReceiveBufferSize: routeWatchReceiveBuffer,
+		// Without force the size is capped at rmem_max, which is the default
+		// buffer on a stock kernel.
+		ReceiveBufferForceSize: !routeWatchBufferForceDenied.Load(),
+	}
+	err := netlink.RouteSubscribeWithOptions(updates, done, opts)
+	if opts.ReceiveBufferForceSize && errors.Is(err, syscall.EPERM) {
+		// Forcing the size needs CAP_NET_ADMIN in the initial user namespace,
+		// which an agent that owns its network namespace from inside a user
+		// namespace does not have. A watch with the buffer rmem_max allows
+		// beats no watch. The library fails before it starts a goroutine, so
+		// updates and done go into the second call unused.
+		routeWatchBufferForceDenied.Store(true)
+		slog.Warn("cannot force the route watch receive buffer, using the size net.core.rmem_max allows",
+			"requested", routeWatchReceiveBuffer, "error", err)
+		opts.ReceiveBufferForceSize = false
+		err = netlink.RouteSubscribeWithOptions(updates, done, opts)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("subscribe to kernel route updates: %w", err)
+	}
+	return forwardRouteEvents(updates, done, kernelTable, vrfTable), nil
+}
+
+// forwardRouteEvents converts the updates of one subscription and returns the
+// channel the events go out on. That channel is closed when updates is.
+//
+// The goroutine keeps receiving until the library closes updates, also after
+// done: the library's goroutine sends without a way out, so a forwarder that
+// stopped early would leave it blocked and the socket open. After done nobody
+// reads the events any more, so they are dropped.
+func forwardRouteEvents(updates <-chan netlink.RouteUpdate, done <-chan struct{}, kernelTable, vrfTable int) <-chan routeEvent {
+	out := make(chan routeEvent)
+	go func() {
+		defer close(out)
+		for u := range updates {
+			ev, ok := toRouteEvent(u, kernelTable, vrfTable)
+			if !ok {
+				continue
+			}
+			select {
+			case out <- ev:
+			case <-done:
+			}
+		}
+	}()
+	return out
+}
+
+// toRouteEvent converts one netlink route update. It reports false for
+// everything the drift decision never looks at: a route without a destination,
+// a non-IPv4 destination (the route plane is IPv4-only), a message that is
+// neither a new nor a deleted route, and a table that is neither kernelTable
+// nor vrfTable.
+func toRouteEvent(u netlink.RouteUpdate, kernelTable, vrfTable int) (routeEvent, bool) {
+	// u.Type is the netlink message type. The embedded u.Route.Type is the
+	// route type (unicast, blackhole, ...) and says nothing about the change.
+	if u.Type != syscall.RTM_NEWROUTE && u.Type != syscall.RTM_DELROUTE {
+		return routeEvent{}, false
+	}
+	if u.Table != kernelTable && u.Table != vrfTable {
+		return routeEvent{}, false
+	}
+	if u.Dst == nil {
+		return routeEvent{}, false
+	}
+	// The mask length tells the families apart. The address does not: an
+	// IPv4-mapped IPv6 destination converts to an IPv4 address.
+	if _, bits := u.Dst.Mask.Size(); bits != 8*net.IPv4len {
+		return routeEvent{}, false
+	}
+
+	deleted := u.Type == syscall.RTM_DELROUTE
+	ev := routeEvent{
+		Deleted:     deleted,
+		Replaced:    !deleted && u.NlFlags&syscall.NLM_F_REPLACE != 0,
+		KernelTable: u.Table == kernelTable,
+		VRFTable:    u.Table == vrfTable,
+		AgentProto:  u.Protocol == rtProtoOVNNetworkAgent,
+		Dst:         u.Dst.String(),
+	}
+	if u.Gw != nil && len(u.MultiPath) == 0 {
+		ev.Gw = u.Gw.String()
+	}
+	return ev, true
 }

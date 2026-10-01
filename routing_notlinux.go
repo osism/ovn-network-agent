@@ -148,3 +148,9 @@ func (rm *RouteManager) TeardownVethLeak() error {
 func (rm *RouteManager) VRFDefaultRoutePresent() (bool, error) {
 	return true, nil
 }
+
+// subscribeRouteEvents has no kernel route notifications to subscribe to
+// outside Linux. The watcher stops for good on this error.
+func subscribeRouteEvents(done <-chan struct{}, routeTableID int, vrfName string) (<-chan routeEvent, error) {
+	return nil, errRouteWatchUnsupported
+}

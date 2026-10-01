@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"strings"
 )
@@ -33,6 +34,10 @@ type routeOwnership struct {
 	FRRIPs    map[string]bool // FRR statics, keyed by IP
 	LeakNets  map[string]bool // veth-leak network routes, keyed by CIDR
 }
+
+// errRouteWatchUnsupported is what subscribeRouteEvents returns on a platform
+// without kernel route notifications.
+var errRouteWatchUnsupported = errors.New("route watch is only supported on Linux")
 
 // Values of the kind label of route_drift_total.
 const (
