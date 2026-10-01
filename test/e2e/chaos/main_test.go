@@ -295,6 +295,9 @@ func TestDriveRunsTheFinalSettle(t *testing.T) {
 		if rec.Result != resultPass || len(rec.Violations) != 0 {
 			t.Fatalf("a green run did not pass: %+v", rec)
 		}
+		if got := repointsIn(t, buf.String()); len(got) == 0 || got[0].Phase != phaseStart {
+			t.Fatalf("the run-start re-point was not journaled in the %s phase: %+v", phaseStart, got)
+		}
 	})
 
 	t.Run("an aborted run skips the final settle", func(t *testing.T) {

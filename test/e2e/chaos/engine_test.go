@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -583,7 +584,7 @@ func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 		newJournal(&buf, clock.now), &runRecord{ActionsByName: map[string]int{}})
 	e.now = clock.now
 
-	e.followMaster(context.Background())
+	e.followMaster(context.Background(), phaseConverge)
 
 	if e.vipOwner != "gateway-1" {
 		t.Fatalf("vipOwner = %q after the first master was seen, want gateway-1", e.vipOwner)
@@ -597,7 +598,7 @@ func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 	// recycled owner's netns came back without its scope-link route, and
 	// this call is the only thing that puts it back — but nothing is
 	// journaled, which is what keeps the journal readable.
-	e.followMaster(context.Background())
+	e.followMaster(context.Background(), phaseConverge)
 
 	if got := cmd.count("ip route replace"); got != 4 {
 		t.Fatalf("issued %d route commands after an unmoved master, want the re-plumb "+
@@ -607,18 +608,13 @@ func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 	// Re-election, and the re-point fails: the owner must stay where the
 	// routes actually point, and the failure must be journaled.
 	master, routesFail = "gateway-2", true
-	e.followMaster(context.Background())
+	e.followMaster(context.Background(), phaseConverge)
 
 	if e.vipOwner != "gateway-1" {
 		t.Fatalf("vipOwner = %q after a failed re-point, want the routes' real owner gateway-1", e.vipOwner)
 	}
 
-	var repoints []event
-	for _, ev := range eventsIn(t, buf.String()) {
-		if ev.Event == evVIPRepoint {
-			repoints = append(repoints, ev)
-		}
-	}
+	repoints := repointsIn(t, buf.String())
 	if len(repoints) != 2 {
 		t.Fatalf("journaled %d %s events, want one per master change: %+v",
 			len(repoints), evVIPRepoint, repoints)
@@ -628,6 +624,205 @@ func TestFollowMasterRepointsTheVIPWhenTheMasterMoves(t *testing.T) {
 	}
 	if repoints[1].Target != "gateway-2" || repoints[1].Detail == "" {
 		t.Fatalf("the failed re-point was journaled without a reason: %+v", repoints[1])
+	}
+	for _, ev := range repoints {
+		if ev.Phase != phaseConverge {
+			t.Fatalf("a re-point made in the %s phase was journaled as %+v", phaseConverge, ev)
+		}
+	}
+}
+
+// movableMaster answers the lab's queries as healthyLabResponses does,
+// except that the chassis owning cr-lr0-public is whichever one the test
+// set last. The owner poll reads the name from its own goroutine while the
+// test moves it, so mu guards name.
+type movableMaster struct {
+	mu   sync.Mutex
+	name string
+}
+
+func (m *movableMaster) set(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.name = name
+}
+
+func (m *movableMaster) respond(argv []string) (string, error) {
+	if strings.Contains(strings.Join(argv, " "), "--columns=name list Chassis") {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.name + "\n", nil
+	}
+	return healthyLabResponses(argv)
+}
+
+// followEngine builds an engine on the default profile whose VIP routes
+// point at gateway-1, the state drive leaves behind at run start. The
+// journal it returns opens with that start re-point.
+func followEngine(t *testing.T, respond func(argv []string) (string, error)) (*engine, *fakeCommander, *bytes.Buffer) {
+	t.Helper()
+	cmd := &fakeCommander{respond: respond}
+	clock := newFakeClock()
+	buf := &bytes.Buffer{}
+	e := newEngine(newTestLab(cmd, clock), defaultTestProfile(t), nil, greenProbes{},
+		newJournal(buf, clock.now), &runRecord{ActionsByName: map[string]int{}})
+	e.now, e.wait = clock.now, clock.wait
+
+	e.followMaster(t.Context(), phaseStart)
+	if e.vipOwner != "gateway-1" {
+		t.Fatalf("vipOwner = %q after the start re-point, want gateway-1", e.vipOwner)
+	}
+	return e, cmd, buf
+}
+
+// repointsIn extracts the vip-repoint events from a journal, in order.
+func repointsIn(t *testing.T, journal string) []event {
+	t.Helper()
+	var out []event
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == evVIPRepoint {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// Beside a fault the routes are left alone until the owner moves: the
+// chassis SB still names may be the container the fault took down, and a
+// re-plumb into it would fail on every poll.
+func TestFollowMasterInAFaultPhaseRepointsOnlyOnAnOwnerChange(t *testing.T) {
+	for _, phase := range []string{phaseInject, phaseHold} {
+		t.Run(phase, func(t *testing.T) {
+			t.Parallel()
+			master := &movableMaster{name: "gateway-1"}
+			e, cmd, buf := followEngine(t, master.respond)
+			plumbed, journaled := cmd.count("ip route replace"), buf.String()
+
+			e.followMaster(t.Context(), phase)
+
+			if got := cmd.count("ip route replace") - plumbed; got != 0 {
+				t.Fatalf("an unmoved owner was re-plumbed in the %s phase with %d route commands: %v",
+					phase, got, cmd.lines())
+			}
+			if buf.String() != journaled {
+				t.Fatalf("an unmoved owner was journaled in the %s phase:\n%s", phase, buf.String())
+			}
+
+			master.set("gateway-2")
+			e.followMaster(t.Context(), phase)
+
+			if got := cmd.count("ip route replace") - plumbed; got != 2 {
+				t.Fatalf("issued %d route commands after the owner moved, want the forward "+
+					"route and the scope-link route: %v", got, cmd.lines())
+			}
+			for _, want := range []string{
+				"exec clab-ovn-e2e-upstream ip route replace 192.0.2.50/32 via 100.64.2.2",
+				"exec clab-ovn-e2e-gateway-2 ip route replace 192.0.2.50/32 dev br-ex scope link",
+			} {
+				if cmd.count(want) != 1 {
+					t.Fatalf("the re-point at gateway-2 lacks %q: %v", want, cmd.lines())
+				}
+			}
+			if e.vipOwner != "gateway-2" {
+				t.Fatalf("vipOwner = %q after the owner moved, want gateway-2", e.vipOwner)
+			}
+			repoints := repointsIn(t, buf.String())
+			if len(repoints) != 2 {
+				t.Fatalf("journaled %d %s events, want the start one and the move: %+v",
+					len(repoints), evVIPRepoint, repoints)
+			}
+			if got := repoints[1]; got.Phase != phase || got.Target != "gateway-2" || got.Detail != "" {
+				t.Fatalf("the move was journaled as %+v, want phase %s and target gateway-2", got, phase)
+			}
+		})
+	}
+}
+
+// An unbound cr-lr0-public (a re-election in flight) and an SB that does
+// not answer (an sb-pause hold) both leave the poll without an owner to
+// follow. It keeps the routes where they are and journals nothing.
+func TestFollowMasterInAFaultPhaseIgnoresAnUnboundPort(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		err  error
+	}{
+		{name: "the port is unbound", out: "\n"},
+		{name: "SB does not answer", err: errBoom},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var ownerless bool
+			e, cmd, buf := followEngine(t, func(argv []string) (string, error) {
+				if ownerless && strings.Contains(strings.Join(argv, " "), "--columns=chassis find Port_Binding") {
+					return tc.out, tc.err
+				}
+				return healthyLabResponses(argv)
+			})
+			ownerless = true
+			plumbed, journaled := cmd.count("ip route replace"), buf.String()
+
+			e.followMaster(t.Context(), phaseHold)
+
+			if got := cmd.count("ip route replace") - plumbed; got != 0 {
+				t.Fatalf("issued %d route commands with no owner to point the routes at: %v",
+					got, cmd.lines())
+			}
+			if buf.String() != journaled {
+				t.Fatalf("a poll that found no owner was journaled:\n%s", buf.String())
+			}
+			if e.vipOwner != "gateway-1" {
+				t.Fatalf("vipOwner = %q after a poll that found no owner, want gateway-1", e.vipOwner)
+			}
+		})
+	}
+}
+
+// A re-point that fails leaves the owner where the routes still point, so
+// the next poll retries it, and every failed attempt is journaled. A poll
+// that was stopped mid-command did not fail: its command was killed.
+func TestFollowMasterJournalsAFailedRepointUnlessThePollWasStopped(t *testing.T) {
+	master := &movableMaster{name: "gateway-1"}
+	var routesFail bool
+	e, _, buf := followEngine(t, func(argv []string) (string, error) {
+		if routesFail && strings.Contains(strings.Join(argv, " "), "ip route replace") {
+			return "", errBoom
+		}
+		return master.respond(argv)
+	})
+	master.set("gateway-2")
+	routesFail = true
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		e.followMaster(t.Context(), phaseHold)
+
+		if e.vipOwner != "gateway-1" {
+			t.Fatalf("vipOwner = %q after failed re-point %d, want the routes' real owner gateway-1",
+				e.vipOwner, attempt)
+		}
+		repoints := repointsIn(t, buf.String())
+		if len(repoints) != 1+attempt {
+			t.Fatalf("journaled %d %s events after failed re-point %d, want the start one "+
+				"and one per attempt: %+v", len(repoints), evVIPRepoint, attempt, repoints)
+		}
+		failed := repoints[attempt]
+		if failed.Phase != phaseHold || failed.Target != "gateway-2" ||
+			!strings.Contains(failed.Detail, "point 192.0.2.50 at gateway-2 on upstream: boom") {
+			t.Fatalf("failed re-point %d was journaled as %+v", attempt, failed)
+		}
+	}
+
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+	journaled := buf.String()
+	e.followMaster(stopped, phaseHold)
+
+	if buf.String() != journaled {
+		t.Fatalf("a re-point killed by the poll's stop was journaled as a failure:\n%s", buf.String())
+	}
+	if e.vipOwner != "gateway-1" {
+		t.Fatalf("vipOwner = %q after a re-point that was killed, want gateway-1", e.vipOwner)
 	}
 }
 
@@ -1273,7 +1468,7 @@ func TestFollowMasterDoesNothingWithoutTheLoadBalancerVIP(t *testing.T) {
 		newJournal(&bytes.Buffer{}, clock.now), &runRecord{ActionsByName: map[string]int{}})
 	e.now = clock.now
 
-	e.followMaster(context.Background())
+	e.followMaster(context.Background(), phaseConverge)
 
 	if len(cmd.lines()) != 0 {
 		t.Fatalf("a profile without the port-forward layer still plumbed the VIP: %v", cmd.lines())

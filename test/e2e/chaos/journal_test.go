@@ -358,3 +358,24 @@ func TestOVNChurnEventRoundTrips(t *testing.T) {
 		t.Fatalf("the ovn-churn event did not round-trip: %+v", ev)
 	}
 }
+
+// A vip-repoint says where in the run the routes moved. No other event
+// has a phase, so the key stays out of every other line.
+func TestVIPRepointJournalsItsPhase(t *testing.T) {
+	var buf bytes.Buffer
+	j := newJournal(&buf, newFakeClock().now)
+
+	j.emit(event{Event: evVIPRepoint, Phase: phaseHold, Target: "gateway-2"})
+	j.emit(event{Event: evDecision, Tick: 1, Action: "gateway-kill", Target: "gateway-1", Executed: boolPtr(true)})
+
+	raw := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if !strings.Contains(raw[0], `"phase":"hold"`) {
+		t.Fatalf("the vip-repoint event does not name its phase: %s", raw[0])
+	}
+	if ev := eventsIn(t, buf.String())[0]; ev.Phase != phaseHold || ev.Target != "gateway-2" {
+		t.Fatalf("the vip-repoint event did not round-trip: %+v", ev)
+	}
+	if strings.Contains(raw[1], `"phase"`) {
+		t.Fatalf("the phase field leaked into an event that re-pointed nothing: %s", raw[1])
+	}
+}

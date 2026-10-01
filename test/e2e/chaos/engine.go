@@ -713,7 +713,7 @@ func (e *engine) converged(ctx context.Context, d decision) bool {
 			return false
 		}
 	}
-	e.followMaster(ctx)
+	e.followMaster(ctx, phaseConverge)
 	return e.probes.allGreen()
 }
 
@@ -756,10 +756,15 @@ func bgpdAlive(ctx context.Context, l *lab) bool {
 // routes. Both routes are `ip route replace`, so re-plumbing on every
 // call is idempotent; the journal still only records actual movement.
 //
+// The two fault phases, inject and hold, are the exception: there a call
+// re-plumbs only when the owner moved. An owner recycled with its claim
+// intact gets its scope-link route back in the converge phase. Every
+// vip-repoint event carries the phase it was journaled in.
+//
 // A profile without the port-forward layer has no Load_Balancer VIP at
 // all: there are no routes to re-point, and issuing them would plumb a
 // VIP the run never put up.
-func (e *engine) followMaster(ctx context.Context) {
+func (e *engine) followMaster(ctx context.Context, phase string) {
 	if !e.profile.ovnLB {
 		return
 	}
@@ -767,15 +772,26 @@ func (e *engine) followMaster(ctx context.Context) {
 	if master == "" {
 		return
 	}
+	// A poll beside a fault only acts on a move: the owner SB still names
+	// may be the container the fault just took down, and re-plumbing into
+	// it would journal a failure every second.
+	besideFault := phase == phaseInject || phase == phaseHold
+	if besideFault && master == e.vipOwner {
+		return
+	}
 	if err := e.lab.ensureVIPRouting(ctx, master); err != nil {
-		e.jrnl.emit(event{Event: evVIPRepoint, Target: master, Detail: err.Error()})
+		// A stopped poll kills its in-flight command; that is not a
+		// failed re-point, and converge re-plumbs both routes anyway.
+		if ctx.Err() == nil {
+			e.jrnl.emit(event{Event: evVIPRepoint, Phase: phase, Target: master, Detail: err.Error()})
+		}
 		return
 	}
 	if master == e.vipOwner {
 		return
 	}
 	e.vipOwner = master
-	e.jrnl.emit(event{Event: evVIPRepoint, Target: master})
+	e.jrnl.emit(event{Event: evVIPRepoint, Phase: phase, Target: master})
 }
 
 // parseWeights parses the `-weights name=n,...` flag against the action
