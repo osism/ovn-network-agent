@@ -89,6 +89,32 @@ not lower its priority and does not wait for it to migrate, and logs
 and every router of a single-chassis deployment, therefore never delay the
 shutdown; their traffic stops when the node goes down, drained or not.
 
+## When the takeover chassis fails during the drain
+
+If the chassis that took over a gateway port fails before the drain has
+finished, and the port has no other standby, OVN binds the port to the
+draining chassis again. The node keeps forwarding and keeps waiting for a
+standby. Look for these lines in the agent log:
+
+```text
+drain: gateway port is bound to this chassis again, no standby took it over; still forwarding and waiting for a takeover
+drain: gateway port left this chassis again
+drain: takeover readiness marker not observed before timeout, proceeding with cleanup
+```
+
+The first line names the port and its router in `cr_port` and `router`. The
+second follows when a standby takes the port after all. The drain then
+finishes as usual once that standby has stamped its readiness marker.
+
+If no standby returns, the shutdown takes the full `drain_timeout`. The
+third line lists the ports that were still bound to this chassis in
+`returned_cr_ports`, and the drain counts as
+`drain_total{outcome="timeout"}`. Traffic through the node stops when it
+goes down, as it does without a drain.
+
+For why the drain waits here and does not end early, see
+[The takeover handshake](../explanation/gateway-drain#the-takeover-handshake).
+
 ## When to disable drain
 
 - **Environments where Neutron manages priorities** — if an external system

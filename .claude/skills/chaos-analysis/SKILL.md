@@ -75,6 +75,20 @@ so a fix merged in the evening first shows in the next morning's run.
   undrained events. The profile probes the VLAN FIPs and `cross-fip`
   too: their routers have a standby chassis, so loss on them during a
   drained restart is a finding.
+- `cr-owner` and `upstream-path` events are the fault trace of a
+  `double-failover`; the run report renders them per tick under Fault
+  traces. The rows with `detail` `baseline` say which chassis owned each
+  chassisredirect port and which gateways the upstream forwarded each
+  prefix over before the inject. A `baseline` row journaled after the
+  `inject` is the exception: the read before the inject failed (see the
+  `check-error` that starts with `fault trace:`), and the row is the
+  state at its own time, which the report shows instead of `before`.
+  Every later row is a change with `from` and `to`: `unbound` is a port
+  no chassis owns, `none` a prefix with no selected gateway path,
+  `absent` an object missing from the reading. The time from a port's
+  `unbound` row to its next owner is how long OVN left the port
+  unclaimed. The time from there to the prefix's `upstream-path` row is
+  the agent's reconcile plus BGP.
 
 ## 4. Known-good baseline (2026-09-26..29, runs 36230357161, 36308907967, 36405972578, 36551938602 and the dispatch runs 36596597161, 36608325274, 36608338899, 36608352426, 36608365961, 36608379365, 36608391793; 35 records)
 
@@ -112,7 +126,11 @@ comparable to it until the baseline is recomputed. The table also
 predates the standby chassis on the VLAN routers and lr1 (issue #281),
 so its single-chassis rows are not comparable to later runs. It
 predates the owner poll as well (issue #282), so its hold-length
-`pf-vip` windows are not comparable to later runs. A
+`pf-vip` windows are not comparable to later runs. Its `double-failover`
+row predates `compute-1` too and includes hold-long loss on the flat
+FIPs: with three chassis the gateway that survived the pair had no live
+tunnel peer, and OVN's guard against a chassis without any BFD-active
+tunnel kept it from claiming the port (issue #284). A
 SIGKILLed lr0 owner fails over in about 1.2 to 3 s on the flat FIPs
 (nightly 36551938602, `everything-on`, tick 8: `fip-vm1` 1.3 s in 2
 windows) while `pf-vip` and the VLAN FIPs stayed dark for the hold in

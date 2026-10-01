@@ -432,9 +432,11 @@ threshold to match the cloud rather than chasing a non-problem.
 The `drain_total` counter is labelled by `outcome`. The failure and no-op
 outcomes are the ones to watch:
 
-- `drain_total{outcome="timeout"}` — the drain did not finish migrating the
-  gateways away within `drain_timeout`; the agent proceeded with shutdown
-  anyway. Traffic may have blackholed briefly during the reboot.
+- `drain_total{outcome="timeout"}` — the drain did not finish within
+  `drain_timeout`: the gateways did not migrate away in time, or a gateway
+  port came back to this chassis because the chassis that took it over failed
+  during the drain. The agent proceeded with shutdown anyway. Traffic may have
+  blackholed briefly during the reboot.
 - `drain_total{outcome="error"}` — the drain failed (e.g. an NB write to lower
   `Gateway_Chassis` priority did not go through).
 - `drain_total{outcome="noop"}` — there was nothing to drain: no
@@ -453,7 +455,13 @@ The informative ones are `drain: no gateway chassis entries to drain on this
 chassis` (the noop path — it logs `local_chassis_name` and `cache_entries` so
 you can spot a name mismatch), `drain: gateway chassis priority lowered`,
 `drain: waiting for gateway migration`, and `drain: timeout exceeded, proceeding
-with shutdown`. Cross-check the priorities directly:
+with shutdown`. A port that came back shows as
+`drain: gateway port is bound to this chassis again`, with the port and its
+router in `cr_port` and `router`. The `returned_cr_ports` attribute of
+`drain: takeover readiness marker not observed before timeout, proceeding with
+cleanup` lists the ports that were still bound here at the deadline (see
+[When the takeover chassis fails during the drain](../guides/gateway-drain#when-the-takeover-chassis-fails-during-the-drain)).
+Cross-check the priorities directly:
 
 ```bash
 ovn-nbctl list Gateway_Chassis
