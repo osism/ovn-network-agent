@@ -662,3 +662,20 @@ func TestToRouteEvent(t *testing.T) {
 		})
 	}
 }
+
+// The watcher built by newRouteWatcher subscribes with the VRF name it copied
+// out of the Config, so a missing VRF surfaces as the error the watcher logs
+// for the outage.
+func TestNewRouteWatcherSubscribesToTheConfiguredVRF(t *testing.T) {
+	w := newRouteWatcher(Config{VRFName: nonexistentBridge}, func() {})
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+
+	_, err := w.subscribe(done)
+	if err == nil {
+		t.Fatal("subscribe should error when the VRF device is missing")
+	}
+	if !strings.Contains(err.Error(), nonexistentBridge) {
+		t.Errorf("error should mention the VRF name, got: %v", err)
+	}
+}
