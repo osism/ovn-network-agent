@@ -1,80 +1,157 @@
 ---
 name: chaos-analysis
-description: Analyze recent E2E Chaos runs for packet loss and downtime, attribute both to fault actions, compare nights, and derive concrete smoothness measures. Use when asked to analyze chaos/E2E runs, investigate packet loss or failover downtime, or check whether a change made the agent smoother.
+description: Analyze E2E Chaos runs for packet loss and downtime and look for optimisations. Attributes loss to fault actions and to the phase of the fault, separates the loss the lab causes by design, ranks what is left as optimisation candidates, drills into single events, and compares runs before and after a change. Use when asked to analyze chaos/E2E runs, investigate packet loss or failover downtime, find improvements or optimisations in failover and recovery, or check whether a change made the agent smoother.
 ---
 
-# Chaos run smoothness analysis
+# Chaos run analysis: packet loss and what to optimise
 
-Aggregate the chaos-run records of several E2E Chaos runs, attribute
-packet loss and downtime to fault actions, and turn the worst offenders
-into concrete, issue-ready measures.
+Aggregate the chaos-run records of several E2E Chaos runs, cut the loss
+down to what the agent and its deployment can change, name the mechanism
+behind each candidate, and turn the worst ones into issue-ready measures.
+The harness itself is described in `docs/contributing/e2e-tests.md`
+(Chaos runner, Configuration profiles).
 
 ## 1. Collect the runs
 
 ```sh
-gh run list --workflow "E2E Chaos" --limit 10 \
-  --json databaseId,conclusion,createdAt,event
+gh run list --workflow "E2E Chaos" --limit 40 \
+  --json databaseId,conclusion,createdAt,event,headSha \
+  --jq '.[] | [.databaseId, .createdAt, .event, .conclusion, .headSha[0:7]] | @tsv'
 ```
 
-Pick the runs to compare (default: the last 4 with artifacts — artifact
-retention is 7 days). Download each into its own directory:
+Pool only runs of one build: group by `headSha`, and take the nightly
+(7 records, one per profile) plus the dispatch runs (one record each) of
+the commit under test. Artifact retention is 7 days. Download into
+`chaos-artifacts/` (ignored by git), one directory per run:
 
 ```sh
-for run in <id...>; do
-  gh run download "$run" --repo osism/ovn-network-agent --dir e2e-runs/"$run" &
-done; wait
+printf '%s\n' <id...> | xargs -P 6 -I{} \
+  gh run download {} --repo osism/ovn-network-agent --dir chaos-artifacts/runs/{}
 ```
 
-Nightly runs hold one artifact per profile (6); a dispatch run holds one.
+A candidate needs events to stand on: one run injects each action about
+once. With fewer than about five events of an action, say so instead of
+ranking it. `make e2e-chaos-random CHAOS_RANDOM_FLAGS="-n 20"` dispatches
+20 more runs of the current branch on the self-hosted runners; ask
+before dispatching.
+
+A run that did not pass is triaged on its own first (Triaging a failed
+run in `docs/contributing/e2e-tests.md`): its loss belongs to the
+violation, not to the smoothness ranking.
 
 ## 2. Aggregate
 
 ```sh
-python3 .claude/skills/chaos-analysis/analyze.py e2e-runs/* > report.md      # all runs pooled
-python3 .claude/skills/chaos-analysis/analyze.py e2e-runs/<one-run>          # one night alone
+A=.claude/skills/chaos-analysis/analyze.py
+python3 $A chaos-artifacts/runs/* > chaos-artifacts/report.md   # all runs pooled
+python3 $A chaos-artifacts/runs/<one-run>                       # one run alone
+python3 $A chaos-artifacts/runs/* --format json                 # the same, for scripted drill-downs
 ```
 
-`--format json` emits the same aggregation for scripted drill-downs.
-Always ALSO run the per-night breakdown for each run: the pooled table
-mixes seeds, and a fix shows up as one night improving, not as the pool
-improving. Correlate nights with `git log` — nightlies run ~06:00 UTC,
-so a fix merged in the evening first shows in the next morning's run.
+The report opens with the **open loss** table, which is the list of
+optimisation candidates, and the loss the lab causes by design. The
+per-action tables follow: `down_ms` per action, the worst events, the journal
+loss windows and the loss per probe.
 
-## 3. Read the numbers — semantics that matter
+## 3. Read the numbers
 
-- Per recovery event, `down_ms` (per probe) is the summed length of the
-  probe's red windows between the inject and the convergence, and
-  `down_windows` is their count. The hold (`hold_ms` on the `decision`
-  journal event, 0–45 s by action) is the fault window itself.
-- `from_restore_ms` is the part of `down_ms` after the restore anchor.
-  The anchor is when the restore command returned, which is later than
-  the `restore` journal line by the restore's own duration. Records
-  written before `down_ms` existed carry the older restore-to-last-recovery
-  span in `from_restore_ms`; `analyze.py` leaves those out of `residual`
-  and says how many it left out.
-- `from_inject_ms` is the older span from the inject to the probe's last
-  recovery. It stays in the record for old readers and is in no table:
-  it reads a 1.2 s failover followed by a 90 ms blink at restore as 41 s.
-- A probe that stayed dark for the hold shows `down_ms ≈ hold_ms` with
-  `down_windows` 1. A failover shows a short window plus, often, a second
-  short window at restore.
-- **`from_restore_ms` (residual)** is the tail the recovery path owns —
-  the agent's reaction plus BGP re-establishment after the node returns.
-- Probe classes: `fip-vm*` = FIPs on the flat (Geneve-backed) provider
-  network, `fip-vlan10*` = FIPs on VLAN provider networks, `pf-vip` =
-  DNAT port-forward VIP, `api-vip` = LB VIP. Which classes go dark in an
-  event tells you which networks' CR ports the target chassis owned.
+### What a probe measures
+
+- A probe runs once a second. `ping` waits 1 s for its reply, the HTTP
+  and TCP probes 3 s. A probe goes red when its command returns and green
+  when the next one does, and after a timeout the next one starts at once.
+- So a window understates the outage. A `ping` window stands for an
+  outage about 1 s longer (0 to 2 s). A measured 2.3 s failover is 3.3 s
+  of lost traffic.
+- A **blip** is a window under 500 ms: exactly one lost probe. Its length
+  says nothing. For an outage shorter than a second, the share of events
+  with a blip estimates its length: blips in 3 of 5 events is about 0.6 s.
+- The HTTP and TCP probes (`pf-vip`, `api-vip`, `hairpin-vip`) ride out an
+  outage shorter than a SYN retransmission and stamp a longer one up to
+  3 s late. Use the `ping` probes of the same event for the timing.
+- Packet counts (`sent`, `lost`) are per probe for the whole run, in the
+  Runs and Loss by probe tables. They follow the seed: whether it drew a
+  double-failover or an upstream restart decides a run's loss percentage.
+  Never read a trend off pooled loss.
+
+### Phases
+
+`analyze.py` cuts every loss window at its fault's restore:
+
+| phase | the window | reads as |
+| --- | --- | --- |
+| `failover` | opened and closed during the hold | detection plus takeover; the standby works |
+| `dark` | was still open when the restore began | nothing took over, or the hold was shorter than the takeover |
+| `tail` | the rest of a dark window after the restore returned | the recovery path: BGP re-establishment, re-binding |
+| `restore` | opened after the restore began | loss the return causes; for a fault with no hold, the reaction to the fault |
+| `after` | opened after the engine declared convergence | loss no recovery budget saw |
+
+A fault with no hold (`frr-restart`, the drift actions, the churn) has
+its restore right behind the inject, so its loss lands in `restore` or
+`after`. For a restart (`gateway-restart`, a restarting `config-flip`)
+the inject is the stop and the restore the start, so the handover lands
+in `dark` or `restore`. An `after` window that opens within about 2 s of
+the convergence is that fault's own loss: the engine converged before a
+probe could go red, so no recovery budget covered it. Report it twice,
+as loss and as a gap in the harness.
+
+### Columns of the open loss table
+
+- `events hit` is the events with loss in that phase over all injected
+  faults of the action. An event's downtime is its worst probe's, so a
+  profile with seven probes weighs like one with one.
+- `per event` spreads the downtime over every event, hit or not. It is
+  the expected cost of injecting the fault once, and the number to
+  compare across builds.
+- `median hit` and `max hit` describe the events that were hit. A wide
+  gap between them is two mechanisms in one row: look at both.
+- `slow cadence` is the median of the hit events whose target reconciled
+  every 15 s instead of 5 s (a `cadence-toggle` flip, or `gateway-3`
+  under `heterogeneous`). If it is about three times the fast median,
+  the repair waits for the periodic reconcile. Production's default
+  `reconcile_interval` is 60 s, twelve times the lab's.
+- Action labels carry how the fault landed: `(drained)` for a planned
+  restart with the drain on, `(reload)`, `(restart)` or `(rejected)` for
+  a `config-flip`. A drained restart is expected to be hitless, so every
+  `(drained)` row is a finding.
+- `probes`: `fip-vm*` are FIPs on the flat provider network behind `lr0`,
+  `fip-vlan10*` FIPs behind the VLAN routers, `cross-fip` leaves OVN on
+  `lr1`'s chassis and enters on `lr0`'s, `hairpin-*` stay on one chassis,
+  `pf-vip` is an OVN load balancer the runner routes, `api-vip` the
+  agent's own DNAT. Which probes went dark tells which routers the target
+  owned.
+
+### Loss the lab causes by design
+
+`by_design` in `analyze.py` takes four classes out of the candidates:
+the hold of an `upstream-bgp-restart` (one upstream router), the routers
+a `double-failover` leaves without a chassis (the VLAN routers for
+`gateway-1` + `gateway-2`, `lr1` for `gateway-2` + `gateway-3`), the API
+VIP when `heterogeneous` loses both gateways that carry it, and `pf-vip`
+windows that a runner re-point ends. Their `tail` stays a candidate. The
+flat FIPs of the same event carry the agent's share of a `pf-vip` loss.
+
+The rules mirror `test/e2e/chaos/state.go` and `profiles.go`. When the
+lab's topology, profiles or probe cadence change, update the constants
+at the top of `analyze.py` and its tests in the same commit.
+
+### Other semantics
+
+- `down_ms` (per probe, per recovery) is the summed red windows between
+  the inject and the convergence, `down_windows` their count,
+  `from_restore_ms` the part after the restore returned. `from_inject_ms`
+  is the older inject-to-last-recovery span and is in no table.
+- `converged_ms` of a fault with no hold is the engine's first poll, not
+  the repair: `converged` only asks whether the node is back and every
+  probe is green, and a probe needs a second to go red. `ovs-flow-drop`
+  "converges" in 0.4 s and then loses `cross-fip` for seconds. Read the
+  `after` rows, never `converged_ms`, for how long a repair took (#292).
 - `check-error` events with `ovn-sbctl --timeout=5` during `sb-pause`
-  holds are harness-side sweep noise, not agent regressions.
-- Actions whose median worst downtime is 0 with occasional small `after`
-  loss windows (route drops, churn, pauses) are healthy.
-- Planned restarts (`agent-terminate`, `gateway-restart`, `config-flip`)
-  are read from the `drain-everywhere` profile's run report, whose
-  Planned restarts section splits them by drain and by how a flip landed
-  (reload or restart). `analyze.py`'s per-action rows pool drained and
-  undrained events. The profile probes the VLAN FIPs and `cross-fip`
-  too: their routers have a standby chassis, so loss on them during a
-  drained restart is a finding.
+  holds are sweep noise of the harness (#239).
+- The owner of `cr-lr0-public` is journaled only by profiles with the
+  port-forward layer (`cr_owner` on `converged`, `vip-repoint`) and by
+  the fault trace of a `double-failover`. Elsewhere infer it from the
+  probes that went dark.
 - `cr-owner` and `upstream-path` events are the fault trace of a
   `double-failover`; the run report renders them per tick under Fault
   traces. The rows with `detail` `baseline` say which chassis owned each
@@ -90,65 +167,121 @@ so a fix merged in the evening first shows in the next morning's run.
   unclaimed. The time from there to the prefix's `upstream-path` row is
   the agent's reconcile plus BGP.
 
-## 4. Known-good baseline (2026-09-26..29, runs 36230357161, 36308907967, 36405972578, 36551938602 and the dispatch runs 36596597161, 36608325274, 36608338899, 36608352426, 36608365961, 36608379365, 36608391793; 35 records)
+## 4. Find the mechanism
 
-In `down_ms` terms, computed from those records' journals with the
-window sum `downtime_from_journal` implements. `median worst probe` and
-`max worst probe` are taken over each event's worst probe; `total` sums
-every probe's `down_ms` over all events.
+Work the open loss table from the top. For each row worth more than a
+blip, read the worst event and one typical event:
 
-| action | events | with downtime | median worst probe | max worst probe | total | windows |
+```sh
+python3 $A chaos-artifacts/runs/* --timeline <run id>:<tick> [--context 20]
+```
+
+The timeline lists the journal around the fault with offsets from the
+inject: when each probe went down and for how long, when the restore
+began and returned, the re-points, the config flips, the faults that
+came before it, the target's reconcile cadence and the replay lines.
+The `worst event` column gives the record and tick.
+
+Name the mechanism before proposing anything. The journal shows when
+traffic stopped and came back, not why: a signature below is where to
+start, and stays a hypothesis until the code or a replay confirms it.
+
+| signature | likely mechanism | where to look |
+| --- | --- | --- |
+| downtime near the target's `reconcile_interval`, tripling at slow cadence | the repair waits for the periodic reconcile | the callers of `triggerReconcile` in `agent.go`; the route watch (`route_watch.go`) covers kernel routes only |
+| `after` loss on `cross-fip` behind `ovs-flow-drop` | OVS flow drift has no watch (Data-plane drift in the E2E docs) | `ovs.go`, #291 |
+| about 4.5 s `restore` after `frr-restart` on the announcing gateway, ending 6 to 7 s after the inject whatever the phase of the reconcile ticker | FRR's own restart plus the BGP re-establishment the restore forces with `no router bgp` | `restoreGatewayFRR` and `configureGatewayBGP` in `test/e2e/chaos/`, #238 |
+| one 14.3 s `frr-restart` on a gateway at slow cadence (run 36877177662 tick 11) | not named yet; the agent never writes the FRR config to disk, so statics added since the last `write memory` may wait for the next reconcile | `routing.go`, the route watch's FRR case in `route_watch.go`, #293 |
+| 2 to 3.5 s `failover` after a kill, an undrained terminate or a double-failover on the owner | detection plus the takeover on the standby | OVN's BFD on the tunnels, #128, #130 |
+| 2.5 to 3.2 s `tail` on every probe after `upstream-bgp-restart` | BGP re-establishment on FRR default timers | the FRR config in `test/e2e/bootstrap.sh` and `configureGatewayBGP` (`test/e2e/chaos/lab.go`), #237, #238 |
+| loss on a `(drained)` restart | the handover is not hitless | `docs/explanation/gateway-drain.md`, `ovn_gateway.go`; #236 (closed) made planned restarts drain, #284 |
+| one blip per probe about 1 s after a chassis returns (`controller-restart` `after`, `restore` rows) | not named yet | #235 |
+| `pf-vip` longer than the flat FIPs of the same event | the runner's owner poll and re-point | harness, not the agent |
+
+Confirming needs evidence the journal does not hold: read the code path,
+or replay the event. The lab needs a Linux host with the `openvswitch`,
+`vrf` and `sch_netem` modules, so from a Mac dispatch the replay (the
+`gh workflow run` line is in the timeline). Only a run that did not pass
+uploads `lab-state/`, with the agent logs under `agent/<gateway>.log`.
+For the agent's log of a green event, replay it on a Linux host and read
+`docker logs clab-ovn-e2e-<gateway>`.
+
+Before proposing, search the issues, open and closed: `gh issue list
+--state all --search "<keyword>"`. New evidence for a known mechanism
+goes onto its issue.
+
+## 5. Report the candidates
+
+Give the user a ranked list, most expensive first by `per event` times
+how often the fault happens in production (a planned restart on every
+rollout, a kill rarely). Per candidate:
+
+- the measured cost: events hit, per event, median and max hit, plus 1 s
+  for the probe floor, and the production figure where the loss scales
+  with `reconcile_interval`
+- the probes and so the traffic classes it hits
+- the mechanism, with the timeline lines that show it, or "hypothesis"
+  when only the signature matches
+- the proposed change and whose it is: the agent, the deployment (FRR,
+  BGP and BFD settings, documented defaults), or the harness (a
+  measurement gap, a too-generous budget)
+- the row that has to move in step 6, and the issue it belongs to
+
+Keep the by-design total and the candidates the data was too thin for in
+the report, each in a line.
+
+## 6. Check a change
+
+```sh
+python3 $A chaos-artifacts/after/* --baseline chaos-artifacts/before/*
+```
+
+appends a baseline → new table per action and phase, sorted by the
+change in `per event`. Read `events hit` first: a row with two events on
+either side proves nothing. A fix shows as its own row dropping while
+the others hold. The 2026-10-01 route watch reads like this (20 records
+each side):
+
+| action | phase | events hit | per event | median hit |
+| --- | --- | --- | --- | --- |
+| kernel-route-drop | after | 4/4 → 3/5 | 2.3 s → 57 ms | 2.3 s → 96 ms |
+| frr-route-drop | after | 6/6 → 4/6 | 2.3 s → 67 ms | 2.2 s → 94 ms |
+| upstream-bgp-restart | tail | 10/10 → 9/9 | 2.8 s → 2.9 s | 2.8 s → 2.9 s |
+
+## 7. Baseline (2026-10-01, commit 7d551c7, dispatch runs 36877145078 to 36877435520; 20 records, all passed)
+
+Probe loss 1107/69078 (1.60 %). Probe-down time 1066 s: 646 s by design
+(upstream hold 314 s, unbound routers 230 s, API VIP pair 72 s, `pf-vip`
+re-points 31 s), 420 s open. The open rows above 1 s of downtime:
+
+| action | phase | events hit | per event | median hit | max hit | slow cadence |
 | --- | --- | --- | --- | --- | --- | --- |
-| double-failover | 18 | 16 | 37.5 s | 41.2 s | 2765.1 s | 82 |
-| gateway-kill | 29 | 21 | 35.2 s | 46.4 s | 1358.6 s | 84 |
-| agent-terminate | 24 | 17 | 18.6 s | 28.9 s | 1114.5 s | 71 |
-| upstream-bgp-restart | 23 | 23 | 12.4 s | 19.1 s | 1017.7 s | 78 |
-| controller-restart | 19 | 10 | 0.1 s | 19.4 s | 277.1 s | 33 |
-| gateway-restart | 26 | 18 | 7.6 s | 9.1 s | 267.2 s | 64 |
-| frr-restart | 28 | 11 | 0.0 s | 5.7 s | 140.6 s | 30 |
-| config-flip | 25 | 8 | 0.0 s | 9.1 s | 116.9 s | 38 |
-| frr-route-drop | 16 | 2 | 0.0 s | 11.6 s | 16.9 s | 2 |
+| frr-restart | restore | 8/18 | 2.6 s | 4.6 s | 14.3 s | 14.3 s (1) |
+| ovs-flow-drop | after | 7/12 | 2.6 s | 2.3 s | 13.3 s | 12.3 s (2) |
+| upstream-bgp-restart | tail | 9/9 | 2.9 s | 2.9 s | 3.2 s | — |
+| agent-terminate | failover | 7/10 | 1.6 s | 2.3 s | 3.4 s | — |
+| double-failover | failover | 4/10 | 1.1 s | 2.4 s | 3.5 s | 2.3 s (1) |
+| gateway-restart | restore | 8/13 | 604 ms | 1.3 s | 2.3 s | — |
+| config-flip (restart, drained) | dark | 1/4 | 573 ms | 2.3 s | 2.3 s | — |
+| gateway-kill | failover | 2/7 | 473 ms | 1.7 s | 2.3 s | — |
+| gateway-restart (drained) | failover | 2/4 | 313 ms | 626 ms | 1.2 s | 1.2 s (1) |
+| config-flip (restart) | restore | 2/6 | 207 ms | 622 ms | 1.1 s | — |
+| controller-restart | after | 10/26 | 156 ms | 116 ms | 1.2 s | 894 ms (3) |
 
-Every other action (northd-pause, mgmt-loss, mgmt-delay, nb-pause,
-chassis-delete, lb-vip-churn, fip-churn, kernel-route-drop,
-ovs-flow-drop, priority-flip, nft-flush, sb-pause) had no downtime in
-those runs. Total 7074 s, against 8563 s by `from_inject_ms`.
+Every other row is blips. No downtime at all: `nft-flush`, `fip-churn`,
+`lb-vip-churn`, `nb-pause`, `sb-pause`, `northd-pause`, `mgmt-loss`,
+`mgmt-delay`. The records follow the compute chassis (#280), the standby
+chassis (#281), the owner poll (#282) and the route watch; runs older
+than those are not comparable.
 
-Most of the top four rows is loss the lab causes by design, tracked in
-#236 (a fault on the workload host `gateway-3` darkened every probe; the
-VLAN routers on `gateway-1` and lr1 on `gateway-2` had no standby
-chassis; `pf-vip`'s upstream route was re-pointed only after the
-restore), so the ranking is not an agent ranking. The table predates
-the move of the workloads from `gateway-3` to the compute chassis
-`compute-1` (issue #280): its rows include the workload-host loss of
-every fault on `gateway-3`, so runs recorded after the move are not
-comparable to it until the baseline is recomputed. The table also
-predates the standby chassis on the VLAN routers and lr1 (issue #281),
-so its single-chassis rows are not comparable to later runs. It
-predates the owner poll as well (issue #282), so its hold-length
-`pf-vip` windows are not comparable to later runs. Its `double-failover`
-row predates `compute-1` too and includes hold-long loss on the flat
-FIPs: with three chassis the gateway that survived the pair had no live
-tunnel peer, and OVN's guard against a chassis without any BFD-active
-tunnel kept it from claiming the port (issue #284). A
-SIGKILLed lr0 owner fails over in about 1.2 to 3 s on the flat FIPs
-(nightly 36551938602, `everything-on`, tick 8: `fip-vm1` 1.3 s in 2
-windows) while `pf-vip` and the VLAN FIPs stayed dark for the hold in
-that run.
+A regression is a row here whose `per event` rises with enough events
+behind it, or a new row above 1 s.
 
-Regressions are deviations from this table on the flat-FIP probes and
-on the `frr-restart` and `upstream-bgp-restart` rows.
+## 8. File issues
 
-## 5. Derive measures and file issues
-
-For each offender, name the mechanism before proposing a fix: replay it
-first (`make e2e-chaos CHAOS_FLAGS="-seed <seed> -profile <profile>
--duration 10m"` — seed and profile are in the report/summary.json) when
-the mechanism is unclear. Then propose one measure per root cause, each
-with: the measured cost (seconds of downtime × frequency), the affected
-probe classes, the suspected code/config surface, and the replay line.
-
-File issues per the user's convention: a few independent, fully-detailed
-issues (not one plan), `gh issue create` with measured evidence and
-acceptance criteria phrased against these metrics (e.g. "worst-probe
-downtime for gateway-kill on the owner drops below 5 s").
+Follow the user's convention: a few independent, fully detailed issues
+rather than one plan. `gh issue create` with the measured evidence (the
+open loss row, the timeline of the worst event, the replay line), the
+mechanism, and acceptance criteria phrased against these numbers, e.g.
+"`frr-restart` / `restore` per event below 1 s over at least 10 events,
+and no rise at slow cadence".
