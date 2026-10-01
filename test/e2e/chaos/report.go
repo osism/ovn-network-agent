@@ -237,6 +237,7 @@ func renderReport(w *mdWriter, rec *runRecord, events []event, source string) {
 
 	renderViolations(w, rec)
 	renderRecoveries(w, rec)
+	renderRouteDrift(w, rec)
 	renderProbes(w, rec)
 	renderLoss(w, rec, events, start, end)
 	renderVIPRepoints(w, events, start)
@@ -311,6 +312,33 @@ func renderRecoveries(w *mdWriter, rec *runRecord) {
 		w.printf("| %d | %s | %s | %s | %s | %s | %s |\n",
 			r.Tick, cell(r.Action), cell(r.Target),
 			fmtMS(r.ConvergedMS), fmtMS(r.BudgetMS), recoveryLoss(r), probeLoss(r.FromRestoreMS))
+	}
+	w.printf("\n")
+}
+
+// renderRouteDrift lists, for every recovery that measured it, how far the
+// agent's route_drift_total counters moved across the action. A route drop
+// with a count on its kind was seen by the agent's route watch. One with zeros
+// was repaired without it, by the periodic reconcile. The section is left out
+// when no recovery carries the measure, which includes every record written
+// before the field existed.
+func renderRouteDrift(w *mdWriter, rec *runRecord) {
+	var rows []recoveryRecord
+	for _, r := range rec.Recoveries {
+		if r.RouteDrift != nil {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Tick < rows[j].Tick })
+	w.printf("### Route drift seen by the agent\n\n")
+	w.printf("| tick | action | target | kernel | frr |\n")
+	w.printf("| --- | --- | --- | --- | --- |\n")
+	for _, r := range rows {
+		w.printf("| %d | %s | %s | %d | %d |\n",
+			r.Tick, cell(r.Action), cell(r.Target), r.RouteDrift.Kernel, r.RouteDrift.FRR)
 	}
 	w.printf("\n")
 }
