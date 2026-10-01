@@ -49,6 +49,8 @@ func driftActions(l *lab) []*action {
 			scope:          scopeGateway,
 			object:         driftFIP + "/32 dev br-ex",
 			recoveryBudget: 60 * time.Second,
+			// The agent's route watch counts this deletion.
+			countsRouteDrift: true,
 			applicable: func(ctx context.Context, gw string, _ int) bool {
 				out, err := l.sh(ctx, gw, "ip route show "+driftFIP+"/32 dev br-ex")
 				return err == nil && strings.TrimSpace(out) != ""
@@ -67,6 +69,8 @@ func driftActions(l *lab) []*action {
 			scope:          scopeGateway,
 			object:         driftFIP + "/32 vrf vrf-provider",
 			recoveryBudget: 60 * time.Second,
+			// The agent's route watch counts zebra's withdrawal of the /32.
+			countsRouteDrift: true,
 			applicable: func(ctx context.Context, gw string, _ int) bool {
 				_, err := l.sh(ctx, gw, "vtysh -c 'show running-config' | grep -q 'ip route "+
 					driftFIP+"/32 "+driftFRRNexthop+"'")

@@ -2136,3 +2136,132 @@ func TestInjectEventCarriesTheEffectiveDrain(t *testing.T) {
 		})
 	}
 }
+
+// driftScrape is one scripted answer of the agent's metrics endpoint.
+type driftScrape struct {
+	kernel, frr int
+	err         error
+}
+
+// driftScrapeLab answers every scrape of the metrics endpoint from the script,
+// in order, and every other query like a healthy lab. A scrape past the end of
+// the script repeats the last entry.
+func driftScrapeLab(script ...driftScrape) *fakeCommander {
+	var scrapes int
+	return &fakeCommander{respond: func(argv []string) (string, error) {
+		if !strings.Contains(strings.Join(argv, " "), "/dev/tcp/127.0.0.1/9273") {
+			return healthyLabResponses(argv)
+		}
+		s := script[min(scrapes, len(script)-1)]
+		scrapes++
+		if s.err != nil {
+			return "", s.err
+		}
+		return fmt.Sprintf("# TYPE ovn_network_agent_route_drift_total counter\n"+
+			"ovn_network_agent_route_drift_total{kind=\"frr\"} %d\n"+
+			"ovn_network_agent_route_drift_total{kind=\"kernel\"} %d\n", s.frr, s.kernel), nil
+	}}
+}
+
+// A route-drop action brackets its fault with two reads of the agent's drift
+// counters and records the difference on the recovery. The difference is
+// shown in the report and never asserted on: a read that fails, or a counter
+// that went down because the agent restarted, leaves the field out and adds no
+// violation.
+func TestRouteDropRecordsTheDriftCounterDelta(t *testing.T) {
+	const scrape = "/dev/tcp/127.0.0.1/9273"
+	tests := []struct {
+		name        string
+		counts      bool
+		script      []driftScrape
+		want        *routeDrift
+		wantScrapes int
+		wantError   bool
+	}{
+		{
+			name:        "both reads succeed",
+			counts:      true,
+			script:      []driftScrape{{kernel: 1}, {kernel: 2}},
+			want:        &routeDrift{Kernel: 1, FRR: 0},
+			wantScrapes: 2,
+		},
+		{
+			name:        "the read before the inject fails",
+			counts:      true,
+			script:      []driftScrape{{err: errBoom}, {kernel: 2}},
+			wantScrapes: 1,
+			wantError:   true,
+		},
+		{
+			name:        "the read after the convergence fails",
+			counts:      true,
+			script:      []driftScrape{{kernel: 1}, {err: errBoom}},
+			wantScrapes: 2,
+			wantError:   true,
+		},
+		{
+			name:        "a counter went down between the reads",
+			counts:      true,
+			script:      []driftScrape{{kernel: 5, frr: 2}, {kernel: 0, frr: 3}},
+			wantScrapes: 2,
+		},
+		{
+			name:   "an action that does not count drift",
+			script: []driftScrape{{kernel: 1}, {kernel: 2}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			actions := noopActions("kernel-route-drop")
+			actions[0].countsRouteDrift = tc.counts
+			cmd := driftScrapeLab(tc.script...)
+
+			journal, rec := runEngine(t, 42, 35*time.Second, actions, func(e *engine) { e.lab.cmd = cmd })
+
+			if rec.Decisions.Executed != 1 || len(rec.Recoveries) != 1 {
+				t.Fatalf("executed %d actions with %d recoveries, want one of each",
+					rec.Decisions.Executed, len(rec.Recoveries))
+			}
+			recovery := rec.Recoveries[0]
+			if got := recovery.RouteDrift; (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+				t.Errorf("route_drift = %+v, want %+v", got, tc.want)
+			}
+			raw, err := json.Marshal(recovery)
+			if err != nil {
+				t.Fatalf("marshal the recovery: %v", err)
+			}
+			if tc.want != nil {
+				if want := `"route_drift":{"kernel":1,"frr":0}`; !strings.Contains(string(raw), want) {
+					t.Errorf("the summary.json recovery lacks %s: %s", want, raw)
+				}
+			} else if strings.Contains(string(raw), "route_drift") {
+				t.Errorf("the summary.json recovery carries route_drift: %s", raw)
+			}
+			if got := cmd.count(scrape); got != tc.wantScrapes {
+				t.Errorf("scraped the metrics endpoint %d times, want %d", got, tc.wantScrapes)
+			}
+
+			var checkErrors []event
+			for _, ev := range eventsIn(t, journal) {
+				if ev.Event == evCheckError {
+					checkErrors = append(checkErrors, ev)
+				}
+			}
+			if !tc.wantError {
+				if len(checkErrors) != 0 {
+					t.Errorf("journaled check errors %+v, want none", checkErrors)
+				}
+			} else {
+				want := "read the route drift counters on " + recovery.Target
+				if len(checkErrors) != 1 || !strings.Contains(checkErrors[0].Detail, want) ||
+					checkErrors[0].Action != "kernel-route-drop" || checkErrors[0].Target != recovery.Target {
+					t.Errorf("journaled check errors %+v, want one for the action naming %q", checkErrors, want)
+				}
+			}
+			if len(rec.Violations) != 0 {
+				t.Errorf("violations = %+v, want none", rec.Violations)
+			}
+		})
+	}
+}

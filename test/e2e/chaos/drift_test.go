@@ -142,3 +142,24 @@ func TestOVSFlowDropRemovesBothCookies(t *testing.T) {
 		t.Fatalf("the cookies were removed out of order: %v", cmd.lines())
 	}
 }
+
+// The agent's route watch sees the two route drops and nothing else in the
+// drift class, so only those two read the drift counters around their fault.
+func TestRouteWatchCoversOnlyTheRouteDrops(t *testing.T) {
+	l := newTestLab(&fakeCommander{}, newFakeClock())
+	tests := []struct {
+		action      string
+		countsDrift bool
+	}{
+		{"kernel-route-drop", true},
+		{"frr-route-drop", true},
+		{"nft-flush", false},
+		{"ovs-flow-drop", false},
+	}
+	for _, tc := range tests {
+		act := driftActionNamed(t, l, tc.action)
+		if act.countsRouteDrift != tc.countsDrift {
+			t.Errorf("%s countsRouteDrift = %v, want %v", tc.action, act.countsRouteDrift, tc.countsDrift)
+		}
+	}
+}

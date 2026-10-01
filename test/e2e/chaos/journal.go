@@ -197,6 +197,10 @@ type probeSummary struct {
 // `from_inject_ms` is the older inject-to-last-recovery span; it
 // overstates a failover followed by a blink at restore and stays only so
 // old and new records read alike.
+// `route_drift` is set on a route-drop action only: how far the target's
+// route_drift_total counters moved between the inject and the convergence.
+// It is absent when either scrape failed or a counter went down, and on
+// every record written before the field existed.
 type recoveryRecord struct {
 	Tick          int              `json:"tick"`
 	Action        string           `json:"action"`
@@ -209,6 +213,14 @@ type recoveryRecord struct {
 	FromInjectMS  map[string]int64 `json:"from_inject_ms"`
 	FromRestoreMS map[string]int64 `json:"from_restore_ms"`
 	CROwnerAfter  string           `json:"cr_owner_after"`
+	RouteDrift    *routeDrift      `json:"route_drift,omitempty"`
+}
+
+// routeDrift is a reading of the agent's route_drift_total counters, or the
+// difference between two readings, by kind.
+type routeDrift struct {
+	Kernel int `json:"kernel"`
+	FRR    int `json:"frr"`
 }
 
 // settleRecord is the verdict of one settle window: how long the lab took
