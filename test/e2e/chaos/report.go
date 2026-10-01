@@ -11,7 +11,8 @@ package main
 // It reads what a run left behind and nothing else: summary.json is the
 // report's spine, and journal.jsonl — when it sits next to it — adds
 // what the record alone cannot say, the *when*: which fault a probe's
-// loss window overlapped, and which decisions the guardrails skipped.
+// loss window overlapped, in which phase the runner re-pointed the
+// port-forward VIP, and which decisions the guardrails skipped.
 // A record without a journal still renders; the loss table then falls
 // back to the record's 10-second buckets.
 
@@ -238,6 +239,7 @@ func renderReport(w *mdWriter, rec *runRecord, events []event, source string) {
 	renderRecoveries(w, rec)
 	renderProbes(w, rec)
 	renderLoss(w, rec, events, start, end)
+	renderVIPRepoints(w, events, start)
 	renderPlannedRestarts(w, events, end)
 	renderSettles(w, rec)
 	renderSkipped(w, events)
@@ -401,6 +403,36 @@ func renderLoss(w *mdWriter, rec *runRecord, events []event, start, end time.Tim
 	for _, r := range rows {
 		w.printf("| t+%s–%s | %s | %d/%d |\n",
 			offsetMS(r.offsetMS), offsetMS(r.offsetMS+10_000), cell(r.probe), r.lost, r.sent)
+	}
+	w.printf("\n")
+}
+
+// renderVIPRepoints lists every re-point of the port-forward VIP's routes
+// with the phase it happened in, so a pf-vip loss window can be read
+// against the moment the runner followed the owner. A failed re-point has
+// its error in the detail column. A journal written before re-points
+// carried a phase renders a dash in that column.
+func renderVIPRepoints(w *mdWriter, events []event, start time.Time) {
+	var rows []string
+	for _, ev := range events {
+		if ev.Event != evVIPRepoint {
+			continue
+		}
+		ts, ok := parseTS(ev.TS)
+		if !ok {
+			continue
+		}
+		rows = append(rows, fmt.Sprintf("| t+%s | %s | %s | %s |\n",
+			offset(start, ts), orDashS(ev.Phase), cell(ev.Target), orDashS(ev.Detail)))
+	}
+	if len(rows) == 0 {
+		return
+	}
+	w.printf("### VIP re-points\n\n")
+	w.printf("| at | phase | owner | detail |\n")
+	w.printf("| --- | --- | --- | --- |\n")
+	for _, row := range rows {
+		w.printf("%s", row)
 	}
 	w.printf("\n")
 }
