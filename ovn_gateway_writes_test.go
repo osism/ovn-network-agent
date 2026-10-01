@@ -2001,6 +2001,381 @@ func TestLocalCRPortNames_ReturnsLocalChassisredirectPorts(t *testing.T) {
 	}
 }
 
+// returnedPortDrain is the drain the returned-port tests start from: router-a
+// is local with the gateway port cr-lrp-a, its managed default route still
+// carries this chassis's readiness marker, and host-b is the standby chassis.
+type returnedPortDrain struct {
+	c      *OVNClient
+	nb, sb *fakeOVSDBClient
+}
+
+// newReturnedPortDrain builds the fixture with cr-lrp-a bound to crChassis
+// ("ch-a" for this chassis, "ch-b" for the standby).
+func newReturnedPortDrain(t *testing.T, crChassis string) *returnedPortDrain {
+	t.Helper()
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 50 * time.Millisecond
+	c.ready.Store(true)
+	c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{{
+		RouterUUID: "lr1", RouterName: "router-a", LRPName: "lrp-a", CRPort: "cr-lrp-a",
+		GatewayChassisUUIDs: []string{"g-a", "g-b"},
+	}}})
+	nb.setRows("Logical_Router", &NBLogicalRouter{UUID: "lr1", StaticRoutes: []string{"sr1"}})
+	d := &returnedPortDrain{c: c, nb: nb, sb: sb}
+	d.setMarker("host-a")
+	d.setStandby(true)
+	d.bind(crChassis)
+	return d
+}
+
+// setMarker stamps the managed default route with chassis's readiness marker.
+func (d *returnedPortDrain) setMarker(chassis string) {
+	d.nb.setRows("Logical_Router_Static_Route", &NBLogicalRouterStaticRoute{
+		UUID:        "sr1",
+		IPPrefix:    "0.0.0.0/0",
+		ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: chassis},
+	})
+}
+
+// setStandby puts the standby's SB Chassis row in place or removes it.
+func (d *returnedPortDrain) setStandby(present bool) {
+	rows := []any{&SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"}}
+	if present {
+		rows = append(rows, &SBChassis{UUID: "ch-b", Name: "ch-b", Hostname: "host-b"})
+	}
+	d.sb.setRows("Chassis", rows...)
+}
+
+func (d *returnedPortDrain) bind(chassis string) {
+	d.sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-a", LogicalPort: "cr-lrp-a", Type: "chassisredirect", Chassis: strPtr(chassis),
+	})
+}
+
+// portReturns is what a failed takeover chassis leaves behind: its Chassis row
+// is gone, the port is bound to this chassis again, and the SB event wakes the
+// drain.
+func (d *returnedPortDrain) portReturns() {
+	d.setStandby(false)
+	d.bind("ch-a")
+	d.c.signalDrainWatch()
+}
+
+// logLineWith returns the first captured log line that contains substr, or "".
+func logLineWith(buf *bytes.Buffer, substr string) string {
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, substr) {
+			return line
+		}
+	}
+	return ""
+}
+
+const (
+	returnedPortLog  = "gateway port is bound to this chassis again"
+	takeoverTimedOut = "takeover readiness marker not observed before timeout"
+)
+
+// TestAwaitTakeoverReady_LogsReturnedPortAndHoldsUntilDeadline: the takeover
+// chassis dies during the wait and the port is bound here again. The wait says
+// so once, does not end early, and names the port in the deadline warning.
+func TestAwaitTakeoverReady_LogsReturnedPortAndHoldsUntilDeadline(t *testing.T) {
+	buf := captureSlog(t)
+	d := newReturnedPortDrain(t, "ch-b")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(80 * time.Millisecond)
+		d.portReturns()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	d.c.awaitTakeoverReady(ctx, "host-a", nil)
+	elapsed := time.Since(start)
+	<-done
+
+	if elapsed < 550*time.Millisecond {
+		t.Errorf("returned after %v; a returned port must not end the wait before the ~600ms deadline", elapsed)
+	}
+	if got := strings.Count(buf.String(), returnedPortLog); got != 1 {
+		t.Errorf("the returned port was logged %d times, want once:\n%s", got, buf.String())
+	}
+	if line := logLineWith(buf, returnedPortLog); !strings.Contains(line, "cr_port=cr-lrp-a") ||
+		!strings.Contains(line, "router=router-a") {
+		t.Errorf("the returned-port warning does not name the port and its router: %q", line)
+	}
+	if line := logLineWith(buf, takeoverTimedOut); !strings.Contains(line, "returned_cr_ports=[cr-lrp-a]") {
+		t.Errorf("the deadline warning does not list the returned port: %q", line)
+	}
+}
+
+// TestAwaitTakeoverReady_CompletesWhenStandbyTakesOverAfterPortReturned: a
+// standby that comes back in time still gets a clean handover. The port leaves
+// again, the standby stamps its marker, and the wait ends after the margin.
+func TestAwaitTakeoverReady_CompletesWhenStandbyTakesOverAfterPortReturned(t *testing.T) {
+	buf := captureSlog(t)
+	d := newReturnedPortDrain(t, "ch-b")
+
+	// The steps follow the wait's own log. The hooks run inside its reads, on
+	// the waiting goroutine, so each step lands between two of them.
+	standbyBack, stamped := false, false
+	d.nb.onList = func() {
+		// The standby comes back once the wait has reported the returned port.
+		if !standbyBack && strings.Contains(buf.String(), returnedPortLog) {
+			standbyBack = true
+			d.setStandby(true)
+			d.bind("ch-b")
+			d.c.signalDrainWatch()
+		}
+	}
+	d.sb.onList = func() {
+		// It stamps its marker once the wait has started to read the bindings
+		// it changed. A marker stamped together with the wake could be seen by
+		// the marker poll first, and the wait would end without having read
+		// the bindings again.
+		if standbyBack && !stamped {
+			stamped = true
+			d.setMarker("host-b")
+		}
+	}
+	d.portReturns() // buffered: the first select of the wait takes the wake
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	d.c.awaitTakeoverReady(ctx, "host-a", nil)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("blocked %v; the standby's marker must end the wait, not the ctx deadline", elapsed)
+	}
+	for _, want := range []string{returnedPortLog, "gateway port left this chassis again"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("expected the log line %q, got:\n%s", want, buf.String())
+		}
+	}
+	if strings.Contains(buf.String(), takeoverTimedOut) {
+		t.Errorf("the wait timed out although the standby took over:\n%s", buf.String())
+	}
+}
+
+// TestAwaitTakeoverReady_RepollFindsReturnedPortWithoutAWake: an SB event that
+// never reaches drainWatchCh does not hide a returned port. The safety re-poll
+// reads the bindings and logs it.
+func TestAwaitTakeoverReady_RepollFindsReturnedPortWithoutAWake(t *testing.T) {
+	buf := captureSlog(t)
+	d := newReturnedPortDrain(t, "ch-b")
+	// The port is back before the wait reads the bindings for the first time,
+	// and nothing signals drainWatchCh: the event was missed.
+	d.setStandby(false)
+	d.bind("ch-a")
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainRecheckInterval+500*time.Millisecond)
+	defer cancel()
+	d.c.awaitTakeoverReady(ctx, "host-a", nil)
+
+	if got := strings.Count(buf.String(), returnedPortLog); got != 1 {
+		t.Errorf("the returned port was logged %d times, want once:\n%s", got, buf.String())
+	}
+	if line := logLineWith(buf, takeoverTimedOut); !strings.Contains(line, "returned_cr_ports=[cr-lrp-a]") {
+		t.Errorf("the deadline warning does not list the returned port: %q", line)
+	}
+}
+
+// TestAwaitTakeoverReady_SoleCandidatePortIsNotReportedAsReturned: a port with
+// no standby stays bound here for the whole wait. It never left, so the wait
+// neither logs it as returned nor lists it in the deadline warning.
+func TestAwaitTakeoverReady_SoleCandidatePortIsNotReportedAsReturned(t *testing.T) {
+	buf := captureSlog(t)
+	c, nb, sb := newOVNClientWithFakes(t, "host-a")
+	c.cfg.DrainSettleDelay = 50 * time.Millisecond
+	c.ready.Store(true)
+	c.state.Replace(OVNState{LocalRouters: localRoutersWithSoleCandidate()})
+	nb.setRows("Logical_Router",
+		&NBLogicalRouter{UUID: "lr-ha", StaticRoutes: []string{"sr-ha"}},
+		&NBLogicalRouter{UUID: "lr-solo", StaticRoutes: []string{"sr-solo"}},
+	)
+	nb.setRows("Logical_Router_Static_Route",
+		&NBLogicalRouterStaticRoute{
+			UUID: "sr-ha", IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-a"},
+		},
+		&NBLogicalRouterStaticRoute{
+			UUID: "sr-solo", IPPrefix: "0.0.0.0/0",
+			ExternalIDs: map[string]string{"ovn-network-agent": "managed", takeoverReadyMarkerKey: "host-a"},
+		},
+	)
+	sb.setRows("Chassis", &SBChassis{UUID: "ch-a", Name: "ch-a", Hostname: "host-a"})
+	sb.setRows("Port_Binding", &SBPortBinding{
+		UUID: "pb-solo", LogicalPort: "cr-lrp-solo", Type: "chassisredirect", Chassis: strPtr("ch-a"),
+	})
+	c.signalDrainWatch() // buffered: the first select of the wait takes it
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	c.awaitTakeoverReady(ctx, "host-a", map[string]bool{"lrp-solo": true})
+
+	if len(sb.recordedTransacts()) == 0 {
+		t.Fatal("the wake read no port bindings; the test proves nothing")
+	}
+	if strings.Contains(buf.String(), returnedPortLog) {
+		t.Errorf("a port with no standby was logged as returned:\n%s", buf.String())
+	}
+	if line := logLineWith(buf, takeoverTimedOut); !strings.Contains(line, "returned_cr_ports=[]") {
+		t.Errorf("the deadline warning lists the sole-candidate port: %q", line)
+	}
+}
+
+// TestAwaitTakeoverReady_UnresponsiveSBDoesNotHoldTheMarkerPoll: the binding
+// read only feeds a log line, so an SB server that does not answer must not
+// keep the wait from seeing the marker. The standby stamps it while the read
+// is stuck, and the wait ends well before the read's own select timeouts.
+func TestAwaitTakeoverReady_UnresponsiveSBDoesNotHoldTheMarkerPoll(t *testing.T) {
+	d := newReturnedPortDrain(t, "ch-b")
+	d.c.sbClient = &blockingTransactClient{fakeOVSDBClient: d.sb}
+	d.sb.onList = func() { d.setMarker("host-b") } // the binding read has begun
+	d.c.signalDrainWatch()                         // buffered: the first select of the wait takes it
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*consistencySelectTimeout)
+	defer cancel()
+	start := time.Now()
+	d.c.awaitTakeoverReady(ctx, "host-a", nil)
+
+	if elapsed := time.Since(start); elapsed > consistencySelectTimeout {
+		t.Errorf("blocked %v; a stuck binding read must not hold the wait past the marker", elapsed)
+	}
+}
+
+// TestAwaitTakeoverReady_BindingReadErrorKeepsWaiting: a failed SB read during
+// the wait is logged and retried. It neither ends the wait nor marks a port as
+// returned.
+func TestAwaitTakeoverReady_BindingReadErrorKeepsWaiting(t *testing.T) {
+	buf := captureSlog(t)
+	d := newReturnedPortDrain(t, "ch-b")
+	d.sb.listErr = errors.New("connection refused")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(80 * time.Millisecond)
+		d.c.signalDrainWatch()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	d.c.awaitTakeoverReady(ctx, "host-a", nil)
+	elapsed := time.Since(start)
+	<-done
+
+	if elapsed < 550*time.Millisecond {
+		t.Errorf("returned after %v; a failed binding read must not end the wait before the ~600ms deadline", elapsed)
+	}
+	if line := logLineWith(buf, "port binding check failed during the takeover wait, retrying"); !strings.Contains(line, "list port bindings") {
+		t.Errorf("expected the failed binding read to be logged with its cause, got:\n%s", buf.String())
+	}
+	if line := logLineWith(buf, takeoverTimedOut); !strings.Contains(line, "returned_cr_ports=[]") {
+		t.Errorf("the deadline warning lists a returned port after a failed read: %q", line)
+	}
+}
+
+// TestAwaitTakeoverReady_NoCRPortNamesReadsNoPortBindings: without a gateway
+// port name to watch, a wake during the wait reads nothing from SB.
+func TestAwaitTakeoverReady_NoCRPortNamesReadsNoPortBindings(t *testing.T) {
+	d := newReturnedPortDrain(t, "ch-b")
+	d.c.state.Replace(OVNState{LocalRouters: []LocalRouterInfo{{
+		RouterUUID: "lr1", RouterName: "router-a", LRPName: "lrp-a",
+	}}})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(80 * time.Millisecond)
+		d.c.signalDrainWatch()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	d.c.awaitTakeoverReady(ctx, "host-a", nil)
+	elapsed := time.Since(start)
+	<-done
+
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("returned after %v; the managed route must still hold the wait to the ~300ms deadline", elapsed)
+	}
+	if got := len(d.sb.recordedTransacts()); got != 0 {
+		t.Errorf("the wait issued %d SB transactions with no gateway port to watch, want 0", got)
+	}
+}
+
+// TestDrainGateways_TakeoverChassisDisappearsMidDrain drives the whole drain
+// through a standby that takes the port and then dies: the port migrates, the
+// handshake starts, and the port comes back. The drain lowers its own priority
+// once, writes nothing else, and holds until drain_timeout.
+func TestDrainGateways_TakeoverChassisDisappearsMidDrain(t *testing.T) {
+	buf := captureSlog(t)
+	d := newReturnedPortDrain(t, "ch-a")
+	d.nb.setRows("Gateway_Chassis",
+		&NBGatewayChassis{UUID: "g-a", Name: "lrp-a_host-a", ChassisName: "host-a", Priority: 5},
+		&NBGatewayChassis{UUID: "g-b", Name: "lrp-a_host-b", ChassisName: "host-b", Priority: 1},
+	)
+
+	// The steps follow the drain's own log. The hooks run inside its reads, on
+	// the draining goroutine, so each step lands between two of them.
+	migrated, returned := false, false
+	d.sb.onList = func() {
+		// The standby takes the port once the drain waits for the migration.
+		if !migrated && strings.Contains(buf.String(), "drain: waiting for gateway migration") {
+			migrated = true
+			d.bind("ch-b")
+		}
+	}
+	d.nb.onList = func() {
+		// It dies once the drain has seen the migration and started the
+		// handshake, whose first read this is.
+		if !returned && strings.Contains(buf.String(), "drain: complete, all gateways migrated away") {
+			returned = true
+			d.portReturns()
+		}
+	}
+	d.c.signalDrainWatch() // buffered: wakes the migration wait after its first read
+
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	drained, err := d.c.DrainGateways(ctx, "host-a")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("DrainGateways: %v", err)
+	}
+	if !drained {
+		t.Errorf("drained = false, want true — the priority was lowered")
+	}
+	if elapsed < 650*time.Millisecond {
+		t.Errorf("drain returned after %v; a returned port must hold it to the ~700ms deadline", elapsed)
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Errorf("ctx.Err() = %v, want the deadline that makes the outcome a timeout", ctx.Err())
+	}
+	if got := drainOutcome(err, ctx.Err(), drained); got != "timeout" {
+		t.Errorf("drain outcome = %q, want timeout", got)
+	}
+	if !strings.Contains(buf.String(), returnedPortLog) {
+		t.Errorf("expected the returned-port warning, got:\n%s", buf.String())
+	}
+	if got := d.nb.writeTransacts(); len(got) != 1 {
+		t.Errorf("the drain issued %d NB write transactions, want only the priority update: %+v", len(got), got)
+	}
+	if got := loweredRows(t, d.nb); len(got) != 1 || got[0] != "g-a" {
+		t.Errorf("lowered rows = %v, want only this chassis's g-a", got)
+	}
+}
+
 // TestSoleCandidatePorts keys each port without a standby three ways and
 // leaves every other router out.
 func TestSoleCandidatePorts(t *testing.T) {

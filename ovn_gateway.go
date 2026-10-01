@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -111,11 +113,13 @@ func (o *OVNClient) EnsureGatewayRouting(ctx context.Context, localRouters []Loc
 // tiebreak flapping) when a peer restarts.
 const minActivePriority = 2
 
-// drainRecheckInterval is the safety re-poll cadence of the drain migration
-// wait. The wait is primarily event-driven — a chassisredirect Port_Binding
-// change wakes it through drainWatchCh — so this ticker only bounds the worst
-// case if an event is ever missed. It is shorter than the old fixed 2s poll so
-// even the fallback path drains faster.
+// drainRecheckInterval is the safety re-poll cadence of the two drain waits
+// that read the SB bindings: the migration wait and the returned-port check of
+// awaitTakeoverReady, which it also bounds (see noteReturnedCRPorts). Both are
+// primarily event-driven — a chassisredirect Port_Binding change wakes them
+// through drainWatchCh — so this ticker only bounds the worst case if an event
+// is ever missed. It is shorter than the old fixed 2s poll so even the
+// fallback path drains faster.
 const drainRecheckInterval = 1 * time.Second
 
 // takeoverReadyMarkerKey is the external_ids key the takeover node stamps on a
@@ -799,6 +803,12 @@ func (o *OVNClient) CleanupStaleChassisManagedEntries(ctx context.Context, stale
 // instead of always paying a fixed settle delay. The whole handshake stays
 // bounded by ctx (drain_timeout).
 //
+// When the takeover chassis fails during the drain, ovn-controller binds the
+// port to this chassis again once the BFD session to that chassis is down. The
+// handshake logs the returned port and keeps waiting: this chassis forwards
+// until a standby takes the port and stamps the marker, or until drain_timeout.
+// DrainGateways issues no NB write for that case.
+//
 // On the next startup, RestoreDrainedGateways sets drained entries back to
 // priority 1 (standby level) so the chassis rejoins the HA group.
 // EnsureActivePriorityLead prevents reverse failover by ensuring the
@@ -947,6 +957,15 @@ func (o *OVNClient) DrainGateways(ctx context.Context, localChassisName string) 
 // takeover chassis will ever stamp them. The whole wait is bounded by ctx
 // (drain_timeout): a takeover that never signals falls back cleanly at the
 // deadline and proceeds with cleanup.
+//
+// A gateway port can come back during the wait: its takeover chassis failed and
+// ovn-controller bound the port to this chassis again. The marker of that
+// router stays unsatisfied, so the wait runs to the deadline unless a standby
+// takes the port and stamps the marker, and this chassis keeps forwarding in
+// the meantime. The wait reads the SB bindings on every drainWatchCh wake and
+// every drainRecheckInterval, logs a port that returned and one that left
+// again (see noteReturnedCRPorts), and lists the returned ports in the deadline
+// warning.
 func (o *OVNClient) awaitTakeoverReady(ctx context.Context, localChassisName string, skipLRPs map[string]bool) {
 	if o.cfg.DrainSettleDelay <= 0 {
 		return // handshake disabled
@@ -983,8 +1002,20 @@ func (o *OVNClient) awaitTakeoverReady(ctx context.Context, localChassisName str
 		waitUUIDs[r.UUID] = true
 	}
 
+	// The gateway ports the wait watches for a return, by router name, and
+	// the ones currently bound here again.
+	waitCRPorts := make(map[string]string, len(localRouters))
+	for _, lr := range localRouters {
+		if lr.CRPort != "" {
+			waitCRPorts[lr.CRPort] = lr.RouterName
+		}
+	}
+	returned := map[string]bool{}
+
 	ticker := time.NewTicker(takeoverMarkerPollInterval)
 	defer ticker.Stop()
+	recheck := time.NewTicker(drainRecheckInterval)
+	defer recheck.Stop()
 
 	for {
 		ready, err := o.takeoverMarkersReady(ctx, waitUUIDs, localChassisName)
@@ -998,11 +1029,53 @@ func (o *OVNClient) awaitTakeoverReady(ctx context.Context, localChassisName str
 			return
 		}
 
+		// The bindings are not read before the first wake: the ports have
+		// just left this chassis.
 		select {
 		case <-ctx.Done():
-			slog.Warn("drain: takeover readiness marker not observed before timeout, proceeding with cleanup")
+			slog.Warn("drain: takeover readiness marker not observed before timeout, proceeding with cleanup",
+				"returned_cr_ports", slices.Sorted(maps.Keys(returned)))
 			return
+		case <-o.drainWatchCh:
+			o.noteReturnedCRPorts(ctx, localChassisName, waitCRPorts, returned)
+		case <-recheck.C:
+			o.noteReturnedCRPorts(ctx, localChassisName, waitCRPorts, returned)
 		case <-ticker.C:
+		}
+	}
+}
+
+// noteReturnedCRPorts logs the gateway ports of the takeover wait that are
+// bound to this chassis again, and the ones that have left it again, and keeps
+// returned in step. waitCRPorts maps each watched chassisredirect port to its
+// router name. Each change is logged once. A failed binding read leaves
+// returned as it was: the next wake reads again.
+//
+// The read only feeds these log lines, so it must not hold up the marker poll
+// of the wait it runs in: it is bounded by drainRecheckInterval. An SB server
+// that does not answer within it makes the consistency guard fall back to the
+// monitor cache.
+func (o *OVNClient) noteReturnedCRPorts(ctx context.Context, localChassisName string, waitCRPorts map[string]string, returned map[string]bool) {
+	if len(waitCRPorts) == 0 || ctx.Err() != nil {
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, drainRecheckInterval)
+	defer cancel()
+	local, err := o.localCRPortNames(checkCtx, localChassisName)
+	if err != nil {
+		slog.Warn("drain: port binding check failed during the takeover wait, retrying", "error", err)
+		return
+	}
+	for _, port := range slices.Sorted(maps.Keys(waitCRPorts)) {
+		switch {
+		case local[port] && !returned[port]:
+			returned[port] = true
+			slog.Warn("drain: gateway port is bound to this chassis again, no standby took it over; still forwarding and waiting for a takeover",
+				"cr_port", port, "router", waitCRPorts[port])
+		case !local[port] && returned[port]:
+			delete(returned, port)
+			slog.Info("drain: gateway port left this chassis again",
+				"cr_port", port, "router", waitCRPorts[port])
 		}
 	}
 }
