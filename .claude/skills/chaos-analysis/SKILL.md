@@ -72,8 +72,9 @@ so a fix merged in the evening first shows in the next morning's run.
   are read from the `drain-everywhere` profile's run report, whose
   Planned restarts section splits them by drain and by how a flip landed
   (reload or restart). `analyze.py`'s per-action rows pool drained and
-  undrained events. The VLAN FIPs and `cross-fip` go dark on a restart of
-  their router's only chassis (`gateway-1`, `gateway-2`).
+  undrained events. The profile probes the VLAN FIPs and `cross-fip`
+  too: their routers have a standby chassis, so loss on them during a
+  drained restart is a finding.
 
 ## 4. Known-good baseline (2026-09-26..29, runs 36230357161, 36308907967, 36405972578, 36551938602 and the dispatch runs 36596597161, 36608325274, 36608338899, 36608352426, 36608365961, 36608379365, 36608391793; 35 records)
 
@@ -101,16 +102,19 @@ those runs. Total 7074 s, against 8563 s by `from_inject_ms`.
 
 Most of the top four rows is loss the lab causes by design, tracked in
 #236 (a fault on the workload host `gateway-3` darkened every probe; the
-VLAN routers on `gateway-1` and lr1 on `gateway-2` have no standby
+VLAN routers on `gateway-1` and lr1 on `gateway-2` had no standby
 chassis; `pf-vip`'s upstream route is re-pointed only after the
 restore), so the ranking is not an agent ranking. The table predates
 the move of the workloads from `gateway-3` to the compute chassis
 `compute-1` (issue #280): its rows include the workload-host loss of
 every fault on `gateway-3`, so runs recorded after the move are not
-comparable to it until the baseline is recomputed. A SIGKILLed lr0
-owner fails over in about 1.2 to 3 s on the flat FIPs (nightly
-36551938602, `everything-on`, tick 8: `fip-vm1` 1.3 s in 2 windows)
-while `pf-vip` and the VLAN FIPs stay dark for the hold.
+comparable to it until the baseline is recomputed. The table also
+predates the standby chassis on the VLAN routers and lr1 (issue #281),
+so its single-chassis rows are not comparable to later runs. A
+SIGKILLed lr0 owner fails over in about 1.2 to 3 s on the flat FIPs
+(nightly 36551938602, `everything-on`, tick 8: `fip-vm1` 1.3 s in 2
+windows) while `pf-vip` and the VLAN FIPs stayed dark for the hold in
+that run.
 
 Regressions are deviations from this table on the flat-FIP probes and
 on the `frr-restart` and `upstream-bgp-restart` rows.
