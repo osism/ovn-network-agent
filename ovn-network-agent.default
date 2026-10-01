@@ -71,6 +71,10 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # Full reconciliation interval (Go duration format)
 #OVN_NETWORK_RECONCILE_INTERVAL=60s
 
+# Watch kernel route changes and reconcile at once when a route the agent owns
+# is deleted or replaced. "false" leaves drift repair to the periodic reconcile.
+#OVN_NETWORK_ROUTE_WATCH=true
+
 # Log level: debug, info, warn, error
 #OVN_NETWORK_LOG_LEVEL=info
 

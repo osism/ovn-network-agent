@@ -77,6 +77,7 @@ func main() {
 		"route_table_id", cfg.RouteTableID,
 		"ovs_wrapper", cfg.OVSWrapper,
 		"reconcile_interval", cfg.ReconcileInterval,
+		"route_watch", cfg.RouteWatch,
 		"veth_leak_enabled", cfg.VethLeakEnabled,
 		"frr_prefix_list", cfg.FRRPrefixList,
 		"stale_chassis_grace_period", cfg.StaleChassisGracePeriod,

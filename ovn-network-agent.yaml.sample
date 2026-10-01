@@ -94,6 +94,11 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # Full reconciliation interval (default: 60s)
 # reconcile_interval: "60s"
 
+# Watch kernel route changes and reconcile at once when a route the agent owns
+# is deleted or replaced (default: true). false leaves drift repair to the
+# periodic reconcile.
+# route_watch: true
+
 # Log level: debug, info, warn, error (default: info)
 # log_level: "info"
 

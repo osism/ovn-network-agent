@@ -29,6 +29,7 @@ regenerate it with `go generate ./...`.
 | `--bridge-ip` | `169.254.169.254` | IP to add to bridge device for ARP resolution (default: 169.254.169.254) |
 | `--ovs-wrapper` |  | Command prefix for ovs-vsctl/ovs-ofctl, must forward stdin for batched flow programming (e.g. 'docker exec -i openvswitch_vswitchd') |
 | `--reconcile-interval` | `60s` | Full reconciliation interval (e.g. 60s, 5m) |
+| `--route-watch` | `true` | Watch kernel route changes and reconcile at once when a route the agent owns is deleted or replaced; false leaves drift repair to the periodic reconcile |
 | `--log-level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `false` | Dry-run mode: connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `true` | Remove all managed routes on shutdown (SIGINT/SIGTERM) |

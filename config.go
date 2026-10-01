@@ -146,6 +146,7 @@ type Config struct {
 	BridgeIP          string // IP to add to br-ex for ARP resolution (default: 169.254.169.254)
 	OVSWrapper        string // e.g. "docker exec -i openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl calls; must forward stdin, or flow adds fall back to one exec per flow
 	ReconcileInterval time.Duration
+	RouteWatch        bool // reconcile at once when a route the agent owns is deleted or replaced from outside; false leaves drift to the periodic reconcile
 	LogLevel          string
 	DryRun            bool
 
@@ -471,6 +472,8 @@ func configOptions() []configOption {
 			func(c *Config) *string { return &c.OVSWrapper }),
 		durationOpt("reconcile-interval", 60*time.Second, "Full reconciliation interval (e.g. 60s, 5m)",
 			func(c *Config) *time.Duration { return &c.ReconcileInterval }),
+		boolOpt("route-watch", true, "Watch kernel route changes and reconcile at once when a route the agent owns is deleted or replaced; false leaves drift repair to the periodic reconcile",
+			func(c *Config) *bool { return &c.RouteWatch }),
 		stringOpt("log-level", "info", "Log level (debug, info, warn, error)",
 			func(c *Config) *string { return &c.LogLevel }),
 		boolOpt("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done",
