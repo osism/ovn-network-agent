@@ -9,16 +9,18 @@ import (
 
 // The data-plane drift class is the fat-fingered-operator fault: a human
 // deletes a rule the agent owns, and the agent must notice and re-install
-// it on its next reconcile. These are the exact deletions
-// test/integration/scenario_drift_test.go proves the agent heals on a
-// single host — driven here against the multi-node lab under fault load.
+// it. These are the exact deletions test/integration/scenario_drift_test.go
+// proves the agent heals on a single host — driven here against the
+// multi-node lab under fault load.
 //
 // The deletion is the fault; the restore is a deliberate no-op, because the
-// agent's periodic reconcile is the undo. Each action carries a live
-// `applicable` so a gateway that does not carry the object is a journaled
-// skip, not a no-op deletion: the MAC-tweak flows exist only where routers
-// are locally active, and a port-forward-only profile has no FIP routes at
-// all.
+// agent is the undo. For the two route drops that is its route watch, which
+// reconciles as soon as the kernel reports the deletion. For nft-flush and
+// ovs-flow-drop it is the periodic reconcile, since the watch covers neither
+// nftables nor OVS flows. Each action carries a live `applicable` so a
+// gateway that does not carry the object is a journaled skip, not a no-op
+// deletion: the MAC-tweak flows exist only where routers are locally active,
+// and a port-forward-only profile has no FIP routes at all.
 
 const (
 	// driftFIP is the bootstrap FIP, present and probed in every profile that
@@ -29,6 +31,11 @@ const (
 	// at (gwnode-config.yaml). staticd's `no ip route` form needs it.
 	driftFRRNexthop = "169.254.0.1"
 
+	// routeWatchRecoveryBudget is the recovery budget of the two route drops,
+	// which the agent's route watch repairs. driftActions says why it is this
+	// value and must not go lower.
+	routeWatchRecoveryBudget = 10 * time.Second
+
 	// The OVS flow cookies and the nftables table the agent owns, duplicated
 	// here because the chaos runner is package main and cannot import the
 	// agent's root package. Kept in step with ovs.go and nftables.go.
@@ -38,9 +45,17 @@ const (
 )
 
 // driftActions is the data-plane drift fault class. Every action holds
-// nothing (the deletion is instantaneous) and self-heals on the next
-// reconcile, so the budget is the worst-case cadence — 15 s after a
-// cadence flip — plus probe slack.
+// nothing (the deletion is instantaneous) and self-heals.
+//
+// The two route drops are repaired by the route watch, whatever the reconcile
+// cadence is, and carry routeWatchRecoveryBudget, 10 s. That is the smallest
+// value the engine checks twice, at 0 s and 5 s (convergePollInterval), and it
+// is below the 15 s cadence a cadence flip sets, so a repair that waited for
+// the tick fails it. Do not go lower: converge would then check only once.
+//
+// nft-flush and ovs-flow-drop heal on the next periodic reconcile, so their
+// budget is the worst-case cadence, 15 s after a cadence flip, plus probe
+// slack.
 func driftActions(l *lab) []*action {
 	return []*action{
 		{
@@ -48,7 +63,7 @@ func driftActions(l *lab) []*action {
 			weight:         2,
 			scope:          scopeGateway,
 			object:         driftFIP + "/32 dev br-ex",
-			recoveryBudget: 60 * time.Second,
+			recoveryBudget: routeWatchRecoveryBudget,
 			// The agent's route watch counts this deletion.
 			countsRouteDrift: true,
 			applicable: func(ctx context.Context, gw string, _ int) bool {
@@ -68,7 +83,7 @@ func driftActions(l *lab) []*action {
 			weight:         2,
 			scope:          scopeGateway,
 			object:         driftFIP + "/32 vrf vrf-provider",
-			recoveryBudget: 60 * time.Second,
+			recoveryBudget: routeWatchRecoveryBudget,
 			// The agent's route watch counts zebra's withdrawal of the /32.
 			countsRouteDrift: true,
 			applicable: func(ctx context.Context, gw string, _ int) bool {
@@ -140,7 +155,7 @@ func driftActions(l *lab) []*action {
 }
 
 // driftSelfHeals is the restore for the drift class: the deletion is the
-// fault and the agent's next reconcile is the undo — the same self-heal
-// contract scenario_drift_test.go proves on a single host — so the runner
-// puts nothing back.
+// fault and the agent is the undo, through its route watch or its next
+// periodic reconcile — the same self-heal contract scenario_drift_test.go
+// proves on a single host — so the runner puts nothing back.
 func driftSelfHeals(context.Context, *lab, string) error { return nil }
