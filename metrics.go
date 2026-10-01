@@ -54,6 +54,7 @@ type metricsRegistry struct {
 
 	// Route stability metrics
 	routeReAddsTotal    *prometheus.CounterVec
+	routeDriftTotal     *prometheus.CounterVec
 	consecutiveReAdds   prometheus.Gauge
 	inactiveRoutes      prometheus.Gauge
 	nexthopRepairsTotal prometheus.Counter
@@ -163,6 +164,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Total routes re-added by post-change verification, labelled by route plane.",
 		}, []string{"plane"}),
 
+		routeDriftTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "route_drift_total",
+			Help:      "Total changes the route watch detected on routes the agent owns that the agent did not make, labelled by kind (kernel: an agent-installed kernel route, frr: an FRR static route as installed by zebra). Each one triggers an immediate reconcile.",
+		}, []string{"kind"}),
+
 		consecutiveReAdds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "consecutive_readds",
@@ -268,6 +275,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.announcedVIPs,
 		m.vrfDefaultRoutePresent,
 		m.routeReAddsTotal,
+		m.routeDriftTotal,
 		m.consecutiveReAdds,
 		m.inactiveRoutes,
 		m.nexthopRepairsTotal,
@@ -292,6 +300,8 @@ func newMetricsRegistry() *metricsRegistry {
 	m.reconcileTotal.WithLabelValues("startup").Add(0)
 	m.routeReAddsTotal.WithLabelValues("kernel").Add(0)
 	m.routeReAddsTotal.WithLabelValues("frr").Add(0)
+	m.routeDriftTotal.WithLabelValues("kernel").Add(0)
+	m.routeDriftTotal.WithLabelValues("frr").Add(0)
 	m.drainTotal.WithLabelValues("completed").Add(0)
 	m.drainTotal.WithLabelValues("timeout").Add(0)
 	m.drainTotal.WithLabelValues("error").Add(0)
@@ -464,6 +474,15 @@ func recordRouteReAdds(frr, kernel int) {
 	if kernel > 0 {
 		metrics.routeReAddsTotal.WithLabelValues("kernel").Add(float64(kernel))
 	}
+}
+
+// recordRouteDrift counts one change the route watch detected on a route the
+// agent owns, by kind ("kernel" or "frr").
+func recordRouteDrift(kind string) {
+	if metrics == nil {
+		return
+	}
+	metrics.routeDriftTotal.WithLabelValues(kind).Inc()
 }
 
 func setConsecutiveReAdds(n int) {
