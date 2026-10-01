@@ -80,6 +80,7 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setVRFDefaultRoute(true)
 	setVRFDefaultRoute(false)
 	recordRouteReAdds(1, 2)
+	recordRouteDrift("kernel")
 	setConsecutiveReAdds(4)
 	setInactiveRoutes(0)
 	recordFailoverAnnounce(750 * time.Millisecond)
@@ -110,6 +111,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_local_routers",
 		"ovn_network_agent_localnet_segments",
 		"ovn_network_agent_route_readds_total",
+		"ovn_network_agent_route_drift_total",
 		"ovn_network_agent_consecutive_readds",
 		"ovn_network_agent_inactive_routes",
 		"ovn_network_agent_failover_announce_seconds",
@@ -761,5 +763,29 @@ func TestConfigReloadCounter(t *testing.T) {
 	}
 	if got := counterValue(t, m, name, "outcome", "error"); got != 2 {
 		t.Errorf("%s{outcome=\"error\"} = %v, want 2", name, got)
+	}
+}
+
+// TestRouteDriftCounter pins both kind series of route_drift_total: they exist
+// at 0 from the first scrape and count one drift event each.
+func TestRouteDriftCounter(t *testing.T) {
+	const name = "ovn_network_agent_route_drift_total"
+	m := withTestMetrics(t)
+
+	for _, kind := range []string{"kernel", "frr"} {
+		if got := counterValue(t, m, name, "kind", kind); got != 0 {
+			t.Errorf("%s{kind=%q} = %v on a fresh registry, want 0", name, kind, got)
+		}
+	}
+
+	recordRouteDrift("kernel")
+	recordRouteDrift("frr")
+	recordRouteDrift("frr")
+
+	if got := counterValue(t, m, name, "kind", "kernel"); got != 1 {
+		t.Errorf("%s{kind=\"kernel\"} = %v, want 1", name, got)
+	}
+	if got := counterValue(t, m, name, "kind", "frr"); got != 2 {
+		t.Errorf("%s{kind=\"frr\"} = %v, want 2", name, got)
 	}
 }
