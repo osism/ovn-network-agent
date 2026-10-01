@@ -103,14 +103,16 @@ those runs. Total 7074 s, against 8563 s by `from_inject_ms`.
 Most of the top four rows is loss the lab causes by design, tracked in
 #236 (a fault on the workload host `gateway-3` darkened every probe; the
 VLAN routers on `gateway-1` and lr1 on `gateway-2` had no standby
-chassis; `pf-vip`'s upstream route is re-pointed only after the
+chassis; `pf-vip`'s upstream route was re-pointed only after the
 restore), so the ranking is not an agent ranking. The table predates
 the move of the workloads from `gateway-3` to the compute chassis
 `compute-1` (issue #280): its rows include the workload-host loss of
 every fault on `gateway-3`, so runs recorded after the move are not
 comparable to it until the baseline is recomputed. The table also
 predates the standby chassis on the VLAN routers and lr1 (issue #281),
-so its single-chassis rows are not comparable to later runs. A
+so its single-chassis rows are not comparable to later runs. It
+predates the owner poll as well (issue #282), so its hold-length
+`pf-vip` windows are not comparable to later runs. A
 SIGKILLed lr0 owner fails over in about 1.2 to 3 s on the flat FIPs
 (nightly 36551938602, `everything-on`, tick 8: `fip-vm1` 1.3 s in 2
 windows) while `pf-vip` and the VLAN FIPs stayed dark for the hold in
