@@ -100,7 +100,9 @@ func (f *fakeCommander) count(substr string) int {
 // the rewire has re-created it, so the two answers stand for two points in
 // the restore rather than contradicting each other. The container's identity
 // (.State.StartedAt) is stable, so no reincarnation is detected unless a test
-// varies it deliberately (#217).
+// varies it deliberately (#217). The three reads of the fault trace get an
+// empty answer in the format they parse, so a test that runs a traced action
+// against this lab journals no trace event and no read error.
 func healthyLabResponses(argv []string) (string, error) {
 	line := strings.Join(argv, " ")
 	switch {
@@ -137,6 +139,11 @@ func healthyLabResponses(argv []string) (string, error) {
 		return "0e3d-master-uuid\n", nil
 	case strings.Contains(line, "--columns=name list Chassis"):
 		return "gateway-1\n", nil
+	case strings.Contains(line, "--columns=_uuid,name list Chassis"),
+		strings.Contains(line, "--columns=logical_port,chassis find Port_Binding type=chassisredirect"):
+		return `{"headings":[],"data":[]}`, nil // the fault trace's two SB reads
+	case strings.Contains(line, "show bgp ipv4 unicast json"):
+		return `{"routes":{}}`, nil // and its read of the upstream's BGP table
 	}
 	return "", nil
 }

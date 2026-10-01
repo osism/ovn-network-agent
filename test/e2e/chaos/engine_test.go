@@ -836,9 +836,11 @@ type followStub struct {
 	stopped atomic.Int32
 }
 
-func stubFollowTick(e *engine) *followStub {
+// newTickStub returns the channel-backed stub and the tick function that
+// paces a goroutine with it.
+func newTickStub() (*followStub, func(ctx context.Context) bool) {
 	s := &followStub{entered: make(chan struct{}), ticks: make(chan struct{})}
-	e.followTick = func(ctx context.Context) bool {
+	return s, func(ctx context.Context) bool {
 		select { // announces "waiting for the next tick": the previous poll is done
 		case s.entered <- struct{}{}:
 		case <-ctx.Done():
@@ -853,6 +855,11 @@ func stubFollowTick(e *engine) *followStub {
 			return false
 		}
 	}
+}
+
+func stubFollowTick(e *engine) *followStub {
+	s, tick := newTickStub()
+	e.followTick = tick
 	return s
 }
 
@@ -863,7 +870,7 @@ func (s *followStub) awaitPoll(t *testing.T) {
 	select {
 	case <-s.entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the owner poll never waited for a tick")
+		t.Fatal("the paced goroutine never waited for a tick")
 	}
 }
 
@@ -873,7 +880,7 @@ func (s *followStub) tick(t *testing.T) {
 	select {
 	case s.ticks <- struct{}{}:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the owner poll never took its tick")
+		t.Fatal("the paced goroutine never took its tick")
 	}
 }
 

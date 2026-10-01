@@ -127,6 +127,11 @@ type action struct {
 	// convergence and records the difference on the recovery, so a report
 	// shows whether the agent's route watch saw the deletion.
 	countsRouteDrift bool
+
+	// faultTrace is set on double-failover: the engine follows the
+	// chassisredirect owners and the upstream's selected paths from before the
+	// inject to the convergence and journals every change (trace.go).
+	faultTrace bool
 }
 
 // probeSource is the slice of the prober the engine consumes.
@@ -176,6 +181,11 @@ type engine struct {
 	// runs beside the engine goroutine and must not advance a test's fake clock.
 	followTick func(ctx context.Context) bool
 
+	// traceTick paces the fault trace the same way: one interval per call,
+	// false once ctx is cancelled. It is a seam of its own for the same
+	// reason: the trace runs beside the engine goroutine too.
+	traceTick func(ctx context.Context) bool
+
 	// abort ends the tick loop early: set by park, read by run, both on
 	// the engine's own goroutine.
 	abort bool
@@ -207,6 +217,9 @@ func newEngine(l *lab, p *profile, actions []*action, probes probeSource, jrnl *
 		now:      time.Now,
 		followTick: func(ctx context.Context) bool {
 			return waitFor(ctx, vipFollowInterval)
+		},
+		traceTick: func(ctx context.Context) bool {
+			return waitFor(ctx, faultTraceInterval)
 		},
 		nodes: map[string]string{},
 	}
@@ -562,6 +575,12 @@ func (e *engine) execute(ctx context.Context, d decision) {
 		}
 	}
 
+	// The trace takes its baseline here, so that reading is not fault time
+	// either. It then follows the inject, the hold, the restores and the
+	// convergence, and is joined on every way out of execute.
+	stopTrace := e.startFaultTrace(ctx, d)
+	defer stopTrace()
+
 	injectedAt := e.now()
 	e.jrnl.emit(event{
 		Event: evInject, Tick: d.tick, Action: d.action.name,
@@ -623,9 +642,10 @@ func (e *engine) execute(ctx context.Context, d decision) {
 // detail, so a restore that had to work around something (a veth
 // re-creation that waited for the previous incarnation's end) says so in
 // the journal. Restores run inline on the engine goroutine and no prober
-// reads lab.note, so the field needs no lock. undo restores through here
-// too, so its notes are journaled as well, ahead of the `restore` event
-// that reports the undo.
+// reads lab.note, so the field needs no lock. The fault trace runs beside a
+// restore, but it calls only crPortOwners and upstreamSelected, which never
+// read the field. undo restores through here too, so its notes are journaled
+// as well, ahead of the `restore` event that reports the undo.
 func (e *engine) restoreNode(ctx context.Context, d decision, node string) error {
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreTimeout)
 	defer cancel()
