@@ -185,8 +185,8 @@ func (c *fakeClock) wait(ctx context.Context, d time.Duration) bool {
 // greenProbes is a probeSource whose targets are always up.
 type greenProbes struct{}
 
-func (greenProbes) allGreen() bool       { return true }
-func (greenProbes) redTargets() []string { return nil }
+func (greenProbes) unconfirmedSince(time.Time) []string { return nil }
+func (greenProbes) redTargets() []string                { return nil }
 func (greenProbes) recoverySince(time.Time) map[string]int64 {
 	return map[string]int64{"fip-vm1": 0}
 }
@@ -198,8 +198,8 @@ func (greenProbes) downtimeSince(time.Time) (map[string]int64, map[string]int) {
 // is up, but nothing behind it answers.
 type redProbes struct{}
 
-func (redProbes) allGreen() bool       { return false }
-func (redProbes) redTargets() []string { return []string{"fip-vm1"} }
+func (redProbes) unconfirmedSince(time.Time) []string { return []string{"fip-vm1"} }
+func (redProbes) redTargets() []string                { return []string{"fip-vm1"} }
 func (redProbes) recoverySince(time.Time) map[string]int64 {
 	return map[string]int64{"fip-vm1": 0}
 }
@@ -212,13 +212,35 @@ func (redProbes) downtimeSince(time.Time) (map[string]int64, map[string]int) {
 // field.
 type windowProbes struct{}
 
-func (windowProbes) allGreen() bool       { return true }
-func (windowProbes) redTargets() []string { return nil }
+func (windowProbes) unconfirmedSince(time.Time) []string { return nil }
+func (windowProbes) redTargets() []string                { return nil }
 func (windowProbes) recoverySince(time.Time) map[string]int64 {
 	return map[string]int64{"fip-vm1": 40_090}
 }
 func (windowProbes) downtimeSince(anchor time.Time) (map[string]int64, map[string]int) {
 	return map[string]int64{"fip-vm1": anchor.UnixMilli()}, map[string]int{"fip-vm1": 2}
+}
+
+// lateProbes is a probeSource whose targets are never red but are confirmed
+// green only delay after the anchor, as a prober's are once its samples
+// started after the restore have come back.
+type lateProbes struct {
+	now   func() time.Time
+	delay time.Duration
+}
+
+func (p lateProbes) unconfirmedSince(anchor time.Time) []string {
+	if p.now().Before(anchor.Add(p.delay)) {
+		return []string{"fip-vm1"}
+	}
+	return nil
+}
+func (lateProbes) redTargets() []string { return nil }
+func (lateProbes) recoverySince(time.Time) map[string]int64 {
+	return map[string]int64{"fip-vm1": 0}
+}
+func (lateProbes) downtimeSince(time.Time) (map[string]int64, map[string]int) {
+	return map[string]int64{"fip-vm1": 0}, map[string]int{"fip-vm1": 0}
 }
 
 // testProfile resolves a profile the tests drive the runner with. Most of

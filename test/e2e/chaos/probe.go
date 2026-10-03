@@ -211,18 +211,6 @@ func (p *prober) record(name string, up bool, started time.Time) {
 	}
 }
 
-// allGreen reports whether every target is currently up.
-func (p *prober) allGreen() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, st := range p.state {
-		if !st.up {
-			return false
-		}
-	}
-	return true
-}
-
 // redTargets names the targets that are currently down — the detail a
 // recovery-timeout violation carries.
 func (p *prober) redTargets() []string {

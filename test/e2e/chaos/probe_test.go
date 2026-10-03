@@ -120,8 +120,8 @@ func TestVantageProbeExecFailureIsLoss(t *testing.T) {
 	if sum := p.summary()["hairpin-fip"]; sum.Sent != 2 || sum.Lost != 2 {
 		t.Fatalf("sent/lost = %d/%d, want 2/2 — a failed exec is loss", sum.Sent, sum.Lost)
 	}
-	if p.allGreen() {
-		t.Error("a target whose every probe failed must not read as green")
+	if red := p.redTargets(); len(red) != 1 {
+		t.Errorf("redTargets = %v: a target whose every probe failed must read as red", red)
 	}
 }
 

@@ -61,9 +61,15 @@ const (
 	violationOracleSetup     = "oracle-setup"
 )
 
-// convergePollInterval is how often the engine re-checks a recovering
-// node against its recovery budget.
+// convergePollInterval is how often lab.waitGatewayBack and
+// applier.waitBack re-check a gateway that is coming back.
 const convergePollInterval = 5 * time.Second
+
+// recoveryPollInterval is how often converge re-checks a recovering fault
+// against its recovery budget: once per probe period. A probe confirms
+// green only with samples started after the restore, so at 5 s the check
+// at 0 s could never pass and every converged_ms would be 5 s or more.
+const recoveryPollInterval = probeInterval
 
 // vipFollowInterval is how often the owner poll re-checks cr-lr0-public
 // while a fault is injected or held.
@@ -136,7 +142,7 @@ type action struct {
 
 // probeSource is the slice of the prober the engine consumes.
 type probeSource interface {
-	allGreen() bool
+	unconfirmedSince(anchor time.Time) []string
 	redTargets() []string
 	recoverySince(anchor time.Time) map[string]int64
 	downtimeSince(anchor time.Time) (map[string]int64, map[string]int)
@@ -717,9 +723,12 @@ func (e *engine) park(gw string) {
 
 // converge polls the restored node back to health within the action's
 // recovery budget: the container healthy, the chassis back in SB, the
-// VIP routes following the current master, and every probe target green.
-// Budget expiry is the reachability-recovery violation the run asserts
-// against.
+// VIP routes following the current master, and every probe target
+// confirmed green, by two consecutive green samples started after the
+// restore returned. Budget expiry is the reachability-recovery violation
+// the run asserts against. Its detail names the red probes and the probes
+// not confirmed green; a probe that flaps, or whose prober hangs in docker
+// exec, can be in the second list only.
 //
 // A converged action records three measures per probe: down_ms is the
 // summed loss between the inject and the convergence, from_restore_ms the
@@ -736,7 +745,7 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 		if ctx.Err() != nil {
 			return
 		}
-		if e.converged(ctx, d) {
+		if e.converged(ctx, d, restoredAt) {
 			for _, n := range nodes {
 				e.setNodeState(n, nodeHealthy)
 			}
@@ -766,15 +775,25 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			})
 			return
 		}
-		e.wait(ctx, convergePollInterval)
+		e.wait(ctx, recoveryPollInterval)
 	}
 	e.violate(violationRecord{
 		Kind: violationRecoveryTimeout, Tick: d.tick,
 		Action: d.action.name, Target: d.target,
-		Detail: fmt.Sprintf("not converged within %s; red probes: %s",
-			d.action.recoveryBudget, strings.Join(e.probes.redTargets(), ",")),
+		Detail: fmt.Sprintf("not converged within %s; red probes: %s; probes not confirmed green: %s",
+			d.action.recoveryBudget, joinOrNone(e.probes.redTargets()),
+			joinOrNone(e.probes.unconfirmedSince(restoredAt))),
 	})
 	e.park(d.target)
+}
+
+// joinOrNone renders a list of probe names for a violation detail:
+// comma-joined, or "none" when it is empty.
+func joinOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ",")
 }
 
 // routeDriftSince reads the target's route drift counters again and returns
@@ -803,15 +822,20 @@ func (e *engine) routeDriftSince(ctx context.Context, d decision, before *routeD
 // service and the data path is green again. Each node is checked by the
 // signal its scope defines — a gateway's container health and chassis, the
 // central databases answering, the upstream BGP daemon back up — and the
-// probes are consulted once, after every node has returned.
-func (e *engine) converged(ctx context.Context, d decision) bool {
+// probes are consulted once, after every node has returned. followMaster
+// runs on every check, because pf-vip only turns green after the re-plumb.
+//
+// The probes count as green once each is confirmed since restoredAt, the
+// moment the last node's restore returned. A sample in flight at that
+// moment started before it and does not count.
+func (e *engine) converged(ctx context.Context, d decision, restoredAt time.Time) bool {
 	for _, n := range e.nodesFor(d) {
 		if !e.nodeConverged(ctx, d, n) {
 			return false
 		}
 	}
 	e.followMaster(ctx, phaseConverge)
-	return e.probes.allGreen()
+	return len(e.probes.unconfirmedSince(restoredAt)) == 0
 }
 
 // nodeConverged reports whether one node is back in service, by the signal
