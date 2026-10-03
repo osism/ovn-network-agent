@@ -10,6 +10,12 @@ import (
 const (
 	probeInterval   = time.Second
 	lossBucketWidth = 10 * time.Second
+
+	// confirmGreenSamples is how many consecutive green samples, all started
+	// after a fault's restore, confirm a probe green again. One is not
+	// enough: the drift faults lose the first probe sent after the restore,
+	// and a returning chassis loses one sent up to 2 s after it (#292).
+	confirmGreenSamples = 2
 )
 
 type probeKind int
@@ -73,6 +79,10 @@ type targetState struct {
 	// engine sums the ones after an anchor.
 	windows []lossWindow
 	buckets map[int64]*lossBucket
+	// greenStarts is when each of the consecutive green samples that end
+	// the target's history started, oldest first and never more than
+	// confirmGreenSamples entries. A red sample empties it.
+	greenStarts []time.Time
 }
 
 // prober measures every probe target continuously — one goroutine per
@@ -138,15 +148,18 @@ func (p *prober) stop() { p.wg.Wait() }
 // went with it mid-fault — is loss, not an error to report: the path
 // really is down, which is what the probe measures.
 func (p *prober) sample(ctx context.Context, t probeTarget) {
+	started := p.now()
 	err := probeOnce(ctx, p.lab, t)
 	if ctx.Err() != nil {
 		// The run is over; a probe cancelled mid-flight is not loss.
 		return
 	}
-	p.record(t.name, err == nil)
+	p.record(t.name, err == nil, started)
 }
 
-func (p *prober) record(name string, up bool) {
+// record folds one sample into the target's state; started is when its
+// probe was sent.
+func (p *prober) record(name string, up bool, started time.Time) {
 	now := p.now()
 
 	p.mu.Lock()
@@ -168,6 +181,14 @@ func (p *prober) record(name string, up bool) {
 	bucket.Sent++
 	if !up {
 		bucket.Lost++
+	}
+	if up {
+		st.greenStarts = append(st.greenStarts, started)
+		if n := len(st.greenStarts); n > confirmGreenSamples {
+			st.greenStarts = slices.Delete(st.greenStarts, 0, n-confirmGreenSamples)
+		}
+	} else {
+		st.greenStarts = st.greenStarts[:0]
 	}
 	changed := st.up != up
 	if changed {
@@ -214,6 +235,26 @@ func (p *prober) redTargets() []string {
 		}
 	}
 	return red
+}
+
+// unconfirmedSince names the targets not confirmed green since anchor, in
+// target order. A target is confirmed once its last confirmGreenSamples
+// samples were all green and all started at or after anchor.
+func (p *prober) unconfirmedSince(anchor time.Time) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var unconfirmed []string
+	for _, t := range p.targets {
+		st := p.state[t.name]
+		if st == nil {
+			continue
+		}
+		if len(st.greenStarts) == confirmGreenSamples && !st.greenStarts[0].Before(anchor) {
+			continue
+		}
+		unconfirmed = append(unconfirmed, t.name)
+	}
+	return unconfirmed
 }
 
 // recoverySince reports, per target, how long after `anchor` it came
