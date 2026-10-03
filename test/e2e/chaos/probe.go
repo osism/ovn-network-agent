@@ -16,6 +16,11 @@ const (
 	// enough: the drift faults lose the first probe sent after the restore,
 	// and a returning chassis loses one sent up to 2 s after it (#292).
 	confirmGreenSamples = 2
+
+	// confirmationTime bounds how long a probe confirmation takes after a
+	// restore: up to one probeInterval until the first sample started after
+	// it, plus one probeInterval per confirming sample.
+	confirmationTime = (confirmGreenSamples + 1) * probeInterval
 )
 
 type probeKind int

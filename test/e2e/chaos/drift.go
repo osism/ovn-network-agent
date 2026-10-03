@@ -33,7 +33,7 @@ const (
 
 	// routeWatchRecoveryBudget is the recovery budget of the two route drops,
 	// which the agent's route watch repairs. driftActions says why it is this
-	// value and must not go lower.
+	// value.
 	routeWatchRecoveryBudget = 10 * time.Second
 
 	// The OVS flow cookies and the nftables table the agent owns, duplicated
@@ -48,10 +48,10 @@ const (
 // nothing (the deletion is instantaneous) and self-heals.
 //
 // The two route drops are repaired by the route watch, whatever the reconcile
-// cadence is, and carry routeWatchRecoveryBudget, 10 s. That is the smallest
-// value the engine checks twice, at 0 s and 5 s (convergePollInterval), and it
-// is below the 15 s cadence a cadence flip sets, so a repair that waited for
-// the tick fails it. Do not go lower: converge would then check only once.
+// cadence is, and carry routeWatchRecoveryBudget, 10 s. That is above
+// confirmationTime, the time a probe confirmation takes, and below
+// slowCadence, the 15 s a cadence flip sets, so a repair that waited for the
+// tick fails it.
 //
 // nft-flush and ovs-flow-drop heal on the next periodic reconcile, so their
 // budget is the worst-case cadence, 15 s after a cadence flip, plus probe
