@@ -208,7 +208,7 @@ func (a *applier) waitBack(ctx context.Context, gw string) error {
 		if a.lab.gatewayBack(ctx, gw) {
 			return nil
 		}
-		a.lab.sleep(convergePollInterval)
+		a.lab.sleep(gatewayBackPollInterval)
 	}
 	return fmt.Errorf("%s did not come back within %s after its configuration was swapped",
 		gw, profileApplyTimeout)

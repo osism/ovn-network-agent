@@ -487,7 +487,7 @@ func (l *lab) waitGatewayBack(ctx context.Context, gw string) error {
 		if l.gatewayBack(ctx, gw) {
 			return nil
 		}
-		l.sleep(convergePollInterval)
+		l.sleep(gatewayBackPollInterval)
 	}
 	return fmt.Errorf("%s did not come back within %s after its container was recycled",
 		gw, gatewayBackTimeout)

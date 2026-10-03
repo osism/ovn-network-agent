@@ -146,13 +146,21 @@ func TestOVSFlowDropRemovesBothCookies(t *testing.T) {
 
 // The agent's route watch sees the two route drops and nothing else in the
 // drift class. Only those two read the drift counters around their fault, and
-// only those two are held to the watch's budget: 10 s, which the engine checks
-// twice and which a repair that waited for a 15 s tick fails. The other two
-// heal on the periodic reconcile and keep its 60 s.
+// only those two are held to the watch's budget: 10 s, which leaves room for a
+// probe confirmation and which a repair that waited for a 15 s tick fails. The
+// other two heal on the periodic reconcile and keep its 60 s.
 func TestRouteWatchCoversOnlyTheRouteDrops(t *testing.T) {
-	if polls := routeWatchRecoveryBudget / convergePollInterval; polls < 2 {
-		t.Fatalf("a %s budget is checked %d time(s) at a poll interval of %s, want at least 2",
-			routeWatchRecoveryBudget, polls, convergePollInterval)
+	if routeWatchRecoveryBudget <= confirmationTime {
+		t.Fatalf("routeWatchRecoveryBudget = %s, want above the %s a probe confirmation takes",
+			routeWatchRecoveryBudget, confirmationTime)
+	}
+	slow, err := time.ParseDuration(slowCadence)
+	if err != nil {
+		t.Fatalf("parse slowCadence %q: %v", slowCadence, err)
+	}
+	if routeWatchRecoveryBudget >= slow {
+		t.Fatalf("routeWatchRecoveryBudget = %s, want below the %s slow cadence, "+
+			"or a repair that waited for the tick passes it", routeWatchRecoveryBudget, slow)
 	}
 
 	l := newTestLab(&fakeCommander{}, newFakeClock())

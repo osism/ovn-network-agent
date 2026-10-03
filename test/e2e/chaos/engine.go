@@ -61,9 +61,9 @@ const (
 	violationOracleSetup     = "oracle-setup"
 )
 
-// convergePollInterval is how often lab.waitGatewayBack and
+// gatewayBackPollInterval is how often lab.waitGatewayBack and
 // applier.waitBack re-check a gateway that is coming back.
-const convergePollInterval = 5 * time.Second
+const gatewayBackPollInterval = 5 * time.Second
 
 // recoveryPollInterval is how often converge re-checks a recovering fault
 // against its recovery budget: once per probe period. A probe confirms
