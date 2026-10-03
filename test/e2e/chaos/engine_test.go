@@ -1532,6 +1532,164 @@ func TestConvergeRecordsSummedDowntime(t *testing.T) {
 	})
 }
 
+// noHoldActions is a one-action registry whose fault holds nothing, so its
+// restore returns at the inject and the convergence is all that is timed.
+func noHoldActions() []*action {
+	actions := noopActions("gateway-kill")
+	actions[0].holdMin, actions[0].holdMax = 0, 0
+	return actions
+}
+
+// A fault converges only once every probe is confirmed green since the
+// restore, and the engine checks once per probe period: probes confirmed
+// 1.5 s after the restore fail the checks at 0 and 1 s and pass the one at
+// 2 s.
+func TestConvergenceWaitsForEveryProbeToConfirmGreen(t *testing.T) {
+	_, rec := runEngine(t, 42, 35*time.Second, noHoldActions(), func(e *engine) {
+		e.probes = lateProbes{now: e.now, delay: 1500 * time.Millisecond}
+	})
+
+	if len(rec.Recoveries) == 0 {
+		t.Fatal("the run recorded no recovery")
+	}
+	for _, r := range rec.Recoveries {
+		if r.ConvergedMS != 2000 {
+			t.Fatalf("tick %d converged_ms = %d, want 2000 (checks at 0, 1 and 2 s)", r.Tick, r.ConvergedMS)
+		}
+	}
+	if len(rec.Violations) != 0 {
+		t.Fatalf("violations = %+v, want none", rec.Violations)
+	}
+	if rec.Result != resultPass {
+		t.Fatalf("result = %q, want %q", rec.Result, resultPass)
+	}
+}
+
+// Green samples taken during the hold do not confirm the fault: the anchor is
+// the restore, not the inject.
+func TestConfirmationCountsFromTheRestoreNotTheInject(t *testing.T) {
+	_, rec := runEngine(t, 42, 35*time.Second, noopActions("gateway-kill"), func(e *engine) {
+		e.probes = lateProbes{now: e.now, delay: 1500 * time.Millisecond}
+	})
+
+	if len(rec.Recoveries) == 0 {
+		t.Fatal("the run recorded no recovery")
+	}
+	for _, r := range rec.Recoveries {
+		// Anchored on the inject, the 5 s hold would already cover the
+		// 1.5 s delay and converged_ms would be 0.
+		if r.ConvergedMS != 2000 {
+			t.Fatalf("tick %d converged_ms = %d, want 2000", r.Tick, r.ConvergedMS)
+		}
+	}
+}
+
+// A budget can run out with no probe red: a probe that flaps, or a prober
+// stuck in docker exec, is never confirmed green. The violation names both
+// lists, so a reader can tell that case from a data path that stayed down.
+func TestRecoveryTimeoutNamesTheUnconfirmedProbes(t *testing.T) {
+	tests := []struct {
+		name   string
+		probes func(e *engine) probeSource
+		detail string
+	}{
+		{
+			name:   "a probe that is not red but never confirms",
+			probes: func(e *engine) probeSource { return lateProbes{now: e.now, delay: time.Hour} },
+			detail: "not converged within 10s; red probes: none; probes not confirmed green: fip-vm1",
+		},
+		{
+			name:   "a probe that stays red",
+			probes: func(*engine) probeSource { return redProbes{} },
+			detail: "not converged within 10s; red probes: fip-vm1; probes not confirmed green: fip-vm1",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			actions := noHoldActions()
+			actions[0].recoveryBudget = 10 * time.Second
+			journal, rec := runEngine(t, 42, 5*time.Minute, actions,
+				func(e *engine) { e.probes = tc.probes(e) })
+
+			if len(rec.Violations) != 1 || rec.Violations[0].Kind != violationRecoveryTimeout {
+				t.Fatalf("violations = %+v, want exactly one %s", rec.Violations, violationRecoveryTimeout)
+			}
+			if got := rec.Violations[0].Detail; got != tc.detail {
+				t.Fatalf("detail = %q, want %q", got, tc.detail)
+			}
+			if !parkedIn(t, journal, rec.Violations[0].Target) {
+				t.Fatalf("%s was not parked", rec.Violations[0].Target)
+			}
+			if rec.Result != resultFail {
+				t.Fatalf("result = %q, want %q", rec.Result, resultFail)
+			}
+		})
+	}
+}
+
+// A probe that goes red only after the restore, as the first probe after a
+// drift fault does, is the fault's own loss: the real prober keeps the fault
+// unconverged until the probe is back and confirmed, so the window lands in
+// the recovery's down_ms and from_restore_ms and ahead of its converged line.
+func TestAFaultsLossFallsInsideItsConvergenceSpan(t *testing.T) {
+	journal, rec := runEngine(t, 42, 35*time.Second, noHoldActions(), func(e *engine) {
+		p := newProber(nil, []probeTarget{{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}},
+			e.jrnl, e.now)
+		e.probes = p
+		// One sample per recovery poll: red after the first poll of the run,
+		// green after every later one.
+		wait, polls := e.wait, 0
+		e.wait = func(ctx context.Context, d time.Duration) bool {
+			ok := wait(ctx, d)
+			if d == recoveryPollInterval {
+				polls++
+				p.record("fip-vm1", polls > 1, e.now())
+			}
+			return ok
+		}
+	})
+
+	if len(rec.Recoveries) == 0 {
+		t.Fatal("the run recorded no recovery")
+	}
+	first := rec.Recoveries[0]
+	if first.ConvergedMS != 3000 {
+		t.Fatalf("converged_ms = %d, want 3000: red at 1 s, green at 2 and 3 s", first.ConvergedMS)
+	}
+	if first.DownMS["fip-vm1"] != 1000 || first.DownWindows["fip-vm1"] != 1 {
+		t.Fatalf("down_ms/down_windows = %v/%v, want 1000 in 1 window", first.DownMS, first.DownWindows)
+	}
+	if first.FromRestoreMS["fip-vm1"] != 1000 {
+		t.Fatalf("from_restore_ms = %v, want 1000", first.FromRestoreMS)
+	}
+
+	// The events of the first fault, from its inject to its converged line.
+	var got []string
+	for _, ev := range eventsIn(t, journal) {
+		if len(got) == 0 && ev.Event != evInject {
+			continue
+		}
+		switch ev.Event {
+		case evInject, evRestore, evConverged:
+			got = append(got, ev.Event)
+		case evProbeTransition:
+			got = append(got, fmt.Sprintf("%s up=%t", ev.Event, *ev.Up))
+		}
+		if ev.Event == evConverged {
+			break
+		}
+	}
+	want := []string{
+		evInject, evRestore,
+		evProbeTransition + " up=false", evProbeTransition + " up=true",
+		evConverged,
+	}
+	if !slicesEqual(got, want) {
+		t.Fatalf("the first fault's events = %v, want %v", got, want)
+	}
+}
+
 func TestParseWeights(t *testing.T) {
 	actions := noopActions("controller-restart", "gateway-kill")
 

@@ -245,8 +245,8 @@ func TestSummaryAggregatesLossBucketsAndRecoveries(t *testing.T) {
 	if got := p.recoverySince(clock.now())["pf-vip"]; got != 0 {
 		t.Fatalf("recovery for a target that stayed green = %dms, want 0", got)
 	}
-	if !p.allGreen() {
-		t.Fatal("the target is up again but allGreen reports red")
+	if red := p.redTargets(); len(red) != 0 {
+		t.Fatalf("the target is up again but redTargets reports %v", red)
 	}
 	// The same history, summed: one 10s window after the anchor.
 	if ms, windows := p.downtimeSince(anchor); ms["pf-vip"] != 10_000 || windows["pf-vip"] != 1 {
@@ -265,9 +265,6 @@ func TestProberReportsRedTargets(t *testing.T) {
 
 	p.record("fip-vm1", false, clock.now())
 
-	if p.allGreen() {
-		t.Fatal("allGreen reports green with a red target")
-	}
 	if red := p.redTargets(); len(red) != 1 || red[0] != "fip-vm1" {
 		t.Fatalf("redTargets = %v, want [fip-vm1]", red)
 	}
