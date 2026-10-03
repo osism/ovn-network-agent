@@ -84,16 +84,18 @@ loss windows and the loss per probe.
 | `dark` | was still open when the restore began | nothing took over, or the hold was shorter than the takeover |
 | `tail` | the rest of a dark window after the restore returned | the recovery path: BGP re-establishment, re-binding |
 | `restore` | opened after the restore began | loss the return causes; for a fault with no hold, the reaction to the fault |
-| `after` | opened after the engine declared convergence | loss no recovery budget saw |
+| `after` | opened after every probe was confirmed green | loss with no fault to blame |
 
 A fault with no hold (`frr-restart`, the drift actions, the churn) has
-its restore right behind the inject, so its loss lands in `restore` or
-`after`. For a restart (`gateway-restart`, a restarting `config-flip`)
-the inject is the stop and the restore the start, so the handover lands
-in `dark` or `restore`. An `after` window that opens within about 2 s of
-the convergence is that fault's own loss: the engine converged before a
-probe could go red, so no recovery budget covered it. Report it twice,
-as loss and as a gap in the harness.
+its restore right behind the inject. A record written since #292 has the
+reaction to such a fault in `restore`: the engine declares convergence
+only once every probe had two green samples started after the restore.
+For a restart (`gateway-restart`, a restarting `config-flip`) the inject
+is the stop and the restore the start, so the handover lands in `dark`
+or `restore`. Older records converged before a probe could go red. In
+them, and only in them, an `after` window that opens within about 2 s of
+the convergence is that fault's own loss, which no recovery budget
+covered. A record's build is its run's `headSha` (section 1).
 
 ### Columns of the open loss table
 
@@ -141,11 +143,14 @@ at the top of `analyze.py` and its tests in the same commit.
   the inject and the convergence, `down_windows` their count,
   `from_restore_ms` the part after the restore returned. `from_inject_ms`
   is the older inject-to-last-recovery span and is in no table.
-- `converged_ms` of a fault with no hold is the engine's first poll, not
-  the repair: `converged` only asks whether the node is back and every
-  probe is green, and a probe needs a second to go red. `ovs-flow-drop`
-  "converges" in 0.4 s and then loses `cross-fip` for seconds. Read the
-  `after` rows, never `converged_ms`, for how long a repair took (#292).
+- `converged_ms` is the time from the restore until every probe had two
+  green samples started after it, so it lies about 1 to 2 s behind the
+  last probe's recovery. In a record older than #292 it is the engine's
+  first poll for a fault with no hold: `converged` only asked whether the
+  node was back and every probe green, and a probe needs a second to go
+  red, so `ovs-flow-drop` "converged" in 0.4 s and then lost `cross-fip`
+  for seconds. Read the `after` rows of such a record, never its
+  `converged_ms`, for how long a repair took.
 - `check-error` events with `ovn-sbctl --timeout=5` during `sb-pause`
   holds are sweep noise of the harness (#239).
 - The owner of `cr-lr0-public` is journaled only by profiles with the
@@ -189,13 +194,13 @@ start, and stays a hypothesis until the code or a replay confirms it.
 | signature | likely mechanism | where to look |
 | --- | --- | --- |
 | downtime near the target's `reconcile_interval`, tripling at slow cadence | the repair waits for the periodic reconcile | the callers of `triggerReconcile` in `agent.go`; the route watch (`route_watch.go`) covers kernel routes only |
-| `after` loss on `cross-fip` behind `ovs-flow-drop` | OVS flow drift has no watch (Data-plane drift in the E2E docs) | `ovs.go`, #291 |
+| `restore` loss on `cross-fip` behind `ovs-flow-drop` (`after` in records before #292) | OVS flow drift has no watch (Data-plane drift in the E2E docs) | `ovs.go`, #291 |
 | about 4.5 s `restore` after `frr-restart` on the announcing gateway, ending 6 to 7 s after the inject whatever the phase of the reconcile ticker | FRR's own restart plus the BGP re-establishment the restore forces with `no router bgp` | `restoreGatewayFRR` and `configureGatewayBGP` in `test/e2e/chaos/`, #238 |
 | one 14.3 s `frr-restart` on a gateway at slow cadence (run 36877177662 tick 11) | not named yet; the agent never writes the FRR config to disk, so statics added since the last `write memory` may wait for the next reconcile | `routing.go`, the route watch's FRR case in `route_watch.go`, #293 |
 | 2 to 3.5 s `failover` after a kill, an undrained terminate or a double-failover on the owner | detection plus the takeover on the standby | OVN's BFD on the tunnels, #128, #130 |
 | 2.5 to 3.2 s `tail` on every probe after `upstream-bgp-restart` | BGP re-establishment on FRR default timers | the FRR config in `test/e2e/bootstrap.sh` and `configureGatewayBGP` (`test/e2e/chaos/lab.go`), #237, #238 |
 | loss on a `(drained)` restart | the handover is not hitless | `docs/explanation/gateway-drain.md`, `ovn_gateway.go`; #236 (closed) made planned restarts drain, #284 |
-| one blip per probe about 1 s after a chassis returns (`controller-restart` `after`, `restore` rows) | not named yet | #235 |
+| one blip per probe about 1 s after a chassis returns (`controller-restart` `restore` rows, `after` in records before #292) | not named yet | #235 |
 | `pf-vip` longer than the flat FIPs of the same event | the runner's owner poll and re-point | harness, not the agent |
 
 Confirming needs evidence the journal does not hold: read the code path,
@@ -249,6 +254,12 @@ each side):
 | upstream-bgp-restart | tail | 10/10 → 9/9 | 2.8 s → 2.9 s | 2.8 s → 2.9 s |
 
 ## 7. Baseline (2026-10-01, commit 7d551c7, dispatch runs 36877145078 to 36877435520; 20 records, all passed)
+
+This baseline predates the probe confirmation (#292). Its `after` rows
+for `ovs-flow-drop`, the route drops, `priority-flip`, `chassis-delete`
+and `controller-restart` appear under `restore` in later records, and
+its `converged_ms` medians are not comparable with theirs. Recomputing
+it needs 20 runs of a build with the confirmation.
 
 Probe loss 1107/69078 (1.60 %). Probe-down time 1066 s: 646 s by design
 (upstream hold 314 s, unbound routers 230 s, API VIP pair 72 s, `pf-vip`
