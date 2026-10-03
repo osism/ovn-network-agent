@@ -1251,7 +1251,10 @@ with settles fits fewer ticks into a given `-duration` than one without,
 so a run recorded before settles existed replays a shorter tail here —
 but for any given tick count the decision stream is exactly the one the
 seed produces. Both settle flags are echoed into `run-start` and
-`summary.json` alongside the seed and profile.
+`summary.json` alongside the seed and profile. The probe confirmation
+that ends each fault's convergence takes wall clock from `-duration` the
+way a settle does: a build with it fits fewer ticks into a given
+`-duration`, and the decision stream per tick is unchanged.
 
 ::: warning Sequences are versioned by the build, not by the seed alone
 A recorded seed replays the sequence it recorded only against the same
@@ -1523,9 +1526,9 @@ proves the agent heals on a single host, driven here against the
 multi-node lab. The deletion is the fault and the agent is the undo, so
 the restore is a no-op. The two route drops are undone by the agent's
 route watch, which reconciles as soon as the kernel reports the deletion.
-Their recovery budget is 10 s: the smallest value the 5 s convergence poll
-checks twice, and below the 15 s cadence a `cadence-toggle` flip sets, so
-a repair that waited for the periodic reconcile fails it. `nft-flush` and
+Their recovery budget is 10 s: above the time a probe confirmation takes,
+and below the 15 s cadence a `cadence-toggle` flip sets, so a repair that
+waited for the periodic reconcile fails it. `nft-flush` and
 `ovs-flow-drop` are undone by the next periodic reconcile, because the
 watch covers neither nftables nor OVS flows. Their 60 s budget is that
 worst-case cadence plus probe slack.
@@ -1661,9 +1664,9 @@ guardrail is one for every action by construction.
 
 **Convergence and recovery budgets.** After each restore the runner polls
 the node back to health: the container healthy, its **agent process
-running**, its chassis back in SB, and every probe green. The agent is
-asked for by name rather than left to the container healthcheck that also
-covers it — the run holds every node in its healthy pool to the
+running**, its chassis back in SB, and every probe confirmed green. The
+agent is asked for by name rather than left to the container healthcheck
+that also covers it — the run holds every node in its healthy pool to the
 agent-alive invariant, so it re-admits a node on that same signal. A
 gateway restarted by `gateway-restart`, `gateway-kill`, `agent-terminate`
 or `config-flip` is still running its entrypoint (OVS, `ovn-controller`,
@@ -1673,10 +1676,19 @@ was merely booting — 33 of them across the first four nightly runs, one
 config-flip restart producing eight (issue
 [#205](https://github.com/osism/ovn-network-agent/issues/205)). Reading
 the invariant off the same probe that asserts it is what keeps the two
-from drifting apart again. Budget expiry is a `recovery-timeout` violation
-and parks the node — it is never targeted again and the run fails. A park
-also ends the run early (journaled as `run-aborted`): the parked node's
-data path stays dark, and since convergence gates on *every* probe being
+from drifting apart again. A probe is confirmed green by two consecutive
+green samples that both started after the restore returned. A sample in
+flight at the restore does not count, and a red sample starts the count
+again, so a probe that goes red on its first sample after the restore
+keeps the fault open and its loss lands in the fault's `down_ms`. The
+runner checks once a second. A recovery's `converged_ms` is the time from
+the restore to the check that passed, about 2 to 3 s for a fault that lost
+nothing. Budget expiry is a `recovery-timeout` violation and parks the
+node — it is never targeted again and the run fails. Its detail names the
+red probes and the probes not confirmed green; the second list can name a
+probe the first does not, one that flaps or whose `docker exec` hangs
+until its timeout. A park also ends the run early (journaled as
+`run-aborted`): the parked node's data path stays dark, and since convergence gates on *every* probe being
 green, no later action could converge either — the rest of the duration
 would produce nothing but violations derived from the first one.
 Budgets are measured from the *restore*, not from the injection, because
