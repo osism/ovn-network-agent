@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -186,9 +187,16 @@ func TestSampleRecordsLossAndJournalsTransitions(t *testing.T) {
 }
 
 // A probe cancelled mid-flight because the run ended is not loss — it
-// would otherwise pollute the final loss bucket of every run.
+// would otherwise pollute the final loss bucket of every run. Nor does it
+// break the green streak a confirmation counts.
 func TestSampleIgnoresACancelledProbe(t *testing.T) {
-	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
+	down := true
+	cmd := &fakeCommander{respond: func([]string) (string, error) {
+		if down {
+			return "", errBoom
+		}
+		return "", nil
+	}}
 	clock := newFakeClock()
 	target := probeTarget{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}
 	p := newProber(newTestLab(cmd, clock), []probeTarget{target},
@@ -201,6 +209,185 @@ func TestSampleIgnoresACancelledProbe(t *testing.T) {
 	if sum := p.summary()["fip-vm1"]; sum.Sent != 0 || sum.Lost != 0 {
 		t.Fatalf("a cancelled probe was counted: sent/lost = %d/%d", sum.Sent, sum.Lost)
 	}
+
+	anchor := clock.now()
+	down = false
+	p.sample(context.Background(), target)
+	p.sample(context.Background(), target)
+	before := p.unconfirmedSince(anchor)
+	if len(before) != 0 {
+		t.Fatalf("two green samples left %v unconfirmed", before)
+	}
+	down = true
+	p.sample(ctx, target)
+	if after := p.unconfirmedSince(anchor); !slices.Equal(before, after) {
+		t.Fatalf("a cancelled probe changed the unconfirmed probes from %v to %v", before, after)
+	}
+	if sum := p.summary()["fip-vm1"]; sum.Sent != 2 || sum.Lost != 0 {
+		t.Fatalf("a cancelled probe was counted: sent/lost = %d/%d, want 2/0", sum.Sent, sum.Lost)
+	}
+}
+
+// confirmFixture is a prober over fip-vm1 whose every probe takes 80 ms of
+// fake time and fails while down is set. between, when set, runs half-way
+// through a probe, 40 ms after it started.
+type confirmFixture struct {
+	clock   *fakeClock
+	p       *prober
+	down    bool
+	between func()
+}
+
+var confirmTarget = probeTarget{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"}
+
+func newConfirmFixture() *confirmFixture {
+	f := &confirmFixture{clock: newFakeClock()}
+	cmd := &fakeCommander{respond: func([]string) (string, error) {
+		f.clock.sleep(40 * time.Millisecond)
+		if f.between != nil {
+			f.between()
+		}
+		f.clock.sleep(40 * time.Millisecond)
+		if f.down {
+			return "", errBoom
+		}
+		return "", nil
+	}}
+	f.p = newProber(newTestLab(cmd, f.clock), []probeTarget{confirmTarget},
+		newJournal(&bytes.Buffer{}, f.clock.now), f.clock.now)
+	return f
+}
+
+// sample runs one green or red probe of fip-vm1.
+func (f *confirmFixture) sample(t *testing.T, up bool) {
+	t.Helper()
+	f.down = !up
+	f.p.sample(t.Context(), confirmTarget)
+}
+
+// wantListed asserts whether unconfirmedSince(anchor) names fip-vm1.
+func (f *confirmFixture) wantListed(t *testing.T, anchor time.Time, listed bool, why string) {
+	t.Helper()
+	var want []string
+	if listed {
+		want = []string{"fip-vm1"}
+	}
+	if got := f.p.unconfirmedSince(anchor); !slices.Equal(got, want) {
+		t.Fatalf("%s: unconfirmedSince(t+%s) = %v, want %v",
+			why, anchor.Sub(f.p.startedAt), got, want)
+	}
+}
+
+// A fault is converged only once every probe could have seen it: a target
+// counts as confirmed green after two consecutive green samples that both
+// started at or after the anchor, the restore.
+func TestUnconfirmedSinceNeedsTwoGreenSamplesStartedAfterTheAnchor(t *testing.T) {
+	t.Run("one green sample is not enough, the second confirms", func(t *testing.T) {
+		f := newConfirmFixture()
+		anchor := f.clock.now()
+		f.sample(t, true)
+		f.wantListed(t, anchor, true, "after one green sample")
+		f.sample(t, true)
+		f.wantListed(t, anchor, false, "after two green samples")
+	})
+
+	t.Run("a sample in flight at the anchor does not count", func(t *testing.T) {
+		f := newConfirmFixture()
+		var anchor time.Time
+		f.between = func() {
+			anchor = f.clock.now()
+			f.between = nil
+		}
+		f.sample(t, true) // started 40 ms before the anchor, returned after it
+		f.sample(t, true)
+		f.wantListed(t, anchor, true, "after the in-flight sample and one more")
+		f.sample(t, true)
+		f.wantListed(t, anchor, false, "after two green samples started after the anchor")
+	})
+
+	t.Run("a red sample empties the streak", func(t *testing.T) {
+		f := newConfirmFixture()
+		anchor := f.clock.now()
+		f.sample(t, true)
+		f.sample(t, true)
+		f.sample(t, false)
+		f.sample(t, true)
+		f.wantListed(t, anchor, true, "after green, green, red, green")
+		f.sample(t, true)
+		f.wantListed(t, anchor, false, "after two green samples since the red one")
+	})
+
+	t.Run("a prober with no targets returns nil", func(t *testing.T) {
+		clock := newFakeClock()
+		p := newProber(nil, nil, newJournal(&bytes.Buffer{}, clock.now), clock.now)
+		if got := p.unconfirmedSince(clock.now()); got != nil {
+			t.Fatalf("unconfirmedSince on no targets = %#v, want nil", got)
+		}
+	})
+
+	t.Run("a target that has not completed a sample is listed", func(t *testing.T) {
+		f := newConfirmFixture()
+		if red := f.p.redTargets(); len(red) != 0 {
+			t.Fatalf("a new target reads as red: %v", red)
+		}
+		f.wantListed(t, f.clock.now(), true, "before any sample")
+	})
+
+	t.Run("the zero anchor counts every sample", func(t *testing.T) {
+		f := newConfirmFixture()
+		f.sample(t, true)
+		f.sample(t, true)
+		f.wantListed(t, time.Time{}, false, "after two green samples")
+	})
+
+	t.Run("a later anchor un-confirms a target", func(t *testing.T) {
+		f := newConfirmFixture()
+		anchor := f.clock.now()
+		f.sample(t, true)
+		f.sample(t, true)
+		f.wantListed(t, anchor, false, "after two green samples")
+		f.wantListed(t, f.clock.now(), true, "for an anchor after both samples started")
+	})
+
+	t.Run("a failed probe command is a red sample", func(t *testing.T) {
+		f := newConfirmFixture()
+		anchor := f.clock.now()
+		f.sample(t, true)
+		f.sample(t, true)
+		f.sample(t, false) // the commander answers errBoom
+		if red := f.p.redTargets(); !slices.Equal(red, []string{"fip-vm1"}) {
+			t.Fatalf("redTargets = %v, want [fip-vm1]", red)
+		}
+		f.wantListed(t, anchor, true, "after a failed probe command")
+	})
+
+	t.Run("the names come in target order", func(t *testing.T) {
+		clock := newFakeClock()
+		targets := []probeTarget{
+			{name: "pf-vip", kind: probeHTTP, addr: vipURL},
+			{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"},
+		}
+		p := newProber(nil, targets, newJournal(&bytes.Buffer{}, clock.now), clock.now)
+		if got, want := p.unconfirmedSince(clock.now()), []string{"pf-vip", "fip-vm1"}; !slices.Equal(got, want) {
+			t.Fatalf("unconfirmedSince = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a confirmed target does not hide an unconfirmed one", func(t *testing.T) {
+		clock := newFakeClock()
+		targets := []probeTarget{
+			{name: "pf-vip", kind: probeHTTP, addr: vipURL},
+			{name: "fip-vm1", kind: probePing, addr: "192.0.2.10"},
+		}
+		p := newProber(nil, targets, newJournal(&bytes.Buffer{}, clock.now), clock.now)
+		anchor := clock.now()
+		p.record("pf-vip", true, clock.now())
+		p.record("pf-vip", true, clock.now())
+		p.record("fip-vm1", true, clock.now())
+		if got, want := p.unconfirmedSince(anchor), []string{"fip-vm1"}; !slices.Equal(got, want) {
+			t.Fatalf("unconfirmedSince = %v, want %v", got, want)
+		}
+	})
 }
 
 // The sampling goroutines must stop when the run does, or the runner
@@ -255,17 +442,17 @@ func TestDowntimeSinceSumsTheWindowsAfterTheAnchor(t *testing.T) {
 	}
 
 	anchor := clock.now()
-	p.record("fip-vm1", true) // t+0: already green, no edge
+	p.record("fip-vm1", true, clock.now()) // t+0: already green, no edge
 	clock.sleep(2 * time.Second)
-	p.record("fip-vm1", false) // t+2: the failover starts
+	p.record("fip-vm1", false, clock.now()) // t+2: the failover starts
 	clock.sleep(500 * time.Millisecond)
-	p.record("fip-vm1", false) // t+2.5: still red, no new window
+	p.record("fip-vm1", false, clock.now()) // t+2.5: still red, no new window
 	clock.sleep(700 * time.Millisecond)
-	p.record("fip-vm1", true) // t+3.2: failed over
+	p.record("fip-vm1", true, clock.now()) // t+3.2: failed over
 	clock.sleep(36_800 * time.Millisecond)
-	p.record("fip-vm1", false) // t+40: the blink at restore
+	p.record("fip-vm1", false, clock.now()) // t+40: the blink at restore
 	clock.sleep(90 * time.Millisecond)
-	p.record("fip-vm1", true) // t+40.09
+	p.record("fip-vm1", true, clock.now()) // t+40.09
 
 	downtime(anchor, "fip-vm1", 1290, 2)
 	if got := p.summary()["fip-vm1"].Transitions; got != 4 {
@@ -281,7 +468,7 @@ func TestDowntimeSinceSumsTheWindowsAfterTheAnchor(t *testing.T) {
 
 	// A window still open counts up to the prober's now.
 	clock.sleep(9910 * time.Millisecond)
-	p.record("fip-vm1", false) // t+50
+	p.record("fip-vm1", false, clock.now()) // t+50
 	clock.sleep(2 * time.Second)
 	downtime(anchor.Add(51*time.Second), "fip-vm1", 1000, 1)
 
@@ -295,7 +482,7 @@ func TestDowntimeSinceSumsTheWindowsAfterTheAnchor(t *testing.T) {
 	}
 
 	// A window that ended exactly at the anchor is not after it.
-	p.record("fip-vm1", true) // t+52
+	p.record("fip-vm1", true, clock.now()) // t+52
 	downtime(clock.now(), "fip-vm1", 0, 0)
 
 	// A target without state is skipped, as recoverySince skips it.

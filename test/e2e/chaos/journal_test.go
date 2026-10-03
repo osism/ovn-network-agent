@@ -214,14 +214,14 @@ func TestSummaryAggregatesLossBucketsAndRecoveries(t *testing.T) {
 	anchor := clock.now()
 	// 0–10s: green. 10–20s: the VIP goes dark. 20s: it comes back.
 	for range 10 {
-		p.record("pf-vip", true)
+		p.record("pf-vip", true, clock.now())
 		clock.sleep(time.Second)
 	}
 	for range 10 {
-		p.record("pf-vip", false)
+		p.record("pf-vip", false, clock.now())
 		clock.sleep(time.Second)
 	}
-	p.record("pf-vip", true)
+	p.record("pf-vip", true, clock.now())
 
 	sum := p.summary()["pf-vip"]
 	if sum.Sent != 21 || sum.Lost != 10 {
@@ -263,7 +263,7 @@ func TestProberReportsRedTargets(t *testing.T) {
 	}
 	p := newProber(nil, targets, newJournal(&bytes.Buffer{}, clock.now), clock.now)
 
-	p.record("fip-vm1", false)
+	p.record("fip-vm1", false, clock.now())
 
 	if p.allGreen() {
 		t.Fatal("allGreen reports green with a red target")
