@@ -75,6 +75,13 @@ OVN_NETWORK_OVN_NB_REMOTE=tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:66
 # is deleted or replaced. "false" leaves drift repair to the periodic reconcile.
 #OVN_NETWORK_ROUTE_WATCH=true
 
+# Watch the provider bridge's flow table and reconcile at once when an OVS flow
+# the agent owns is deleted. "false" leaves drift repair to the periodic
+# reconcile. The watch runs one long-lived "ovs-ofctl monitor" and stops it with
+# "ovs-appctl"; with OVN_NETWORK_OVS_WRAPPER set both run behind the wrapper, so
+# ovs-appctl must be reachable through it.
+#OVN_NETWORK_OVS_FLOW_WATCH=true
+
 # Log level: debug, info, warn, error
 #OVN_NETWORK_LOG_LEVEL=info
 

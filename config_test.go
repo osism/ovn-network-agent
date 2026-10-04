@@ -761,6 +761,8 @@ func TestApplyEnvConfigBooleansBothDirections(t *testing.T) {
 		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT", "true", Config{PortForwardL3mdevAccept: false}, true, func(c Config) bool { return c.PortForwardL3mdevAccept }},
 		{"OVN_NETWORK_ROUTE_WATCH", "false", Config{RouteWatch: true}, false, func(c Config) bool { return c.RouteWatch }},
 		{"OVN_NETWORK_ROUTE_WATCH", "true", Config{RouteWatch: false}, true, func(c Config) bool { return c.RouteWatch }},
+		{"OVN_NETWORK_OVS_FLOW_WATCH", "false", Config{OVSFlowWatch: true}, false, func(c Config) bool { return c.OVSFlowWatch }},
+		{"OVN_NETWORK_OVS_FLOW_WATCH", "true", Config{OVSFlowWatch: false}, true, func(c Config) bool { return c.OVSFlowWatch }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
@@ -786,6 +788,7 @@ func TestApplyEnvConfigInvalidBool(t *testing.T) {
 		{"OVN_NETWORK_VETH_LEAK_ENABLED"},
 		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"},
 		{"OVN_NETWORK_ROUTE_WATCH"},
+		{"OVN_NETWORK_OVS_FLOW_WATCH"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.env, func(t *testing.T) {
@@ -848,6 +851,55 @@ func TestLoadConfigRouteWatchInvalidEnv(t *testing.T) {
 		t.Fatal("loadConfig() accepted OVN_NETWORK_ROUTE_WATCH=maybe")
 	}
 	if want := `invalid OVN_NETWORK_ROUTE_WATCH "maybe"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err, want)
+	}
+}
+
+// TestLoadConfigOVSFlowWatch pins the OVS flow watch switch through the real
+// loader: on by default, and each of the three layers can turn it off.
+func TestLoadConfigOVSFlowWatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("ovs_flow_watch: false\n"), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		args []string
+		env  string
+		want bool
+	}{
+		{name: "default", want: true},
+		{name: "flag", args: []string{"--ovs-flow-watch=false"}, want: false},
+		{name: "env", env: "false", want: false},
+		{name: "yaml", args: []string{"--config", path}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("OVN_NETWORK_OVS_FLOW_WATCH", tc.env)
+			}
+			cfg, err := loadConfig(fullModeArgs(tc.args...))
+			if err != nil {
+				t.Fatalf("loadConfig() error: %v", err)
+			}
+			if cfg.OVSFlowWatch != tc.want {
+				t.Errorf("OVSFlowWatch = %v, want %v", cfg.OVSFlowWatch, tc.want)
+			}
+		})
+	}
+}
+
+// A value ParseBool rejects must fail the load and name the variable, so a
+// typo cannot silently leave the flow watch in its default state.
+func TestLoadConfigOVSFlowWatchInvalidEnv(t *testing.T) {
+	t.Setenv("OVN_NETWORK_OVS_FLOW_WATCH", "maybe")
+
+	_, err := loadConfig(fullModeArgs())
+	if err == nil {
+		t.Fatal("loadConfig() accepted OVN_NETWORK_OVS_FLOW_WATCH=maybe")
+	}
+	if want := `invalid OVN_NETWORK_OVS_FLOW_WATCH "maybe"`; !strings.Contains(err.Error(), want) {
 		t.Errorf("error %q does not contain %q", err, want)
 	}
 }

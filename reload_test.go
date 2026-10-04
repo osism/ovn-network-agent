@@ -181,6 +181,27 @@ func TestPlanReloadRouteWatchNeedsRestart(t *testing.T) {
 	}
 }
 
+// ovs_flow_watch is read once, when NewAgent decides whether to build the
+// watcher, so a reload has to report a changed value and keep the running one.
+func TestPlanReloadOVSFlowWatchNeedsRestart(t *testing.T) {
+	running := loadedConfig(t)
+	next := loadedConfig(t, "--ovs-flow-watch=false")
+
+	p, err := planReload(running, next)
+	if err != nil {
+		t.Fatalf("planReload() error = %v", err)
+	}
+	if len(p.applied) != 0 {
+		t.Errorf("applied = %v, want none", p.applied)
+	}
+	if want := []restartChange{{"ovs_flow_watch", reasonStartupOnly}}; !reflect.DeepEqual(p.restartRequired, want) {
+		t.Errorf("restartRequired = %v, want %v", p.restartRequired, want)
+	}
+	if !p.merged.OVSFlowWatch {
+		t.Error("merged.OVSFlowWatch = false, want the running true")
+	}
+}
+
 func TestPlanReloadPortForwardToggleNeedsRestart(t *testing.T) {
 	without := loadedConfig(t)
 	with := loadedConfig(t, "--config", reloadConfigFile(t, pfYAML("198.51.100.30")))

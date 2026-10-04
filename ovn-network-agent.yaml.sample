@@ -99,6 +99,13 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # periodic reconcile.
 # route_watch: true
 
+# Watch the provider bridge's flow table and reconcile at once when an OVS flow
+# the agent owns is deleted (default: true). false leaves drift repair to the
+# periodic reconcile. The watch runs one long-lived "ovs-ofctl monitor" and
+# stops it with "ovs-appctl"; with ovs_wrapper set both run behind the wrapper,
+# so ovs-appctl must be reachable through it.
+# ovs_flow_watch: true
+
 # Log level: debug, info, warn, error (default: info)
 # log_level: "info"
 
