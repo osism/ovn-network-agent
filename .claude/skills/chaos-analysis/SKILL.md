@@ -193,10 +193,10 @@ start, and stays a hypothesis until the code or a replay confirms it.
 
 | signature | likely mechanism | where to look |
 | --- | --- | --- |
-| downtime near the target's `reconcile_interval`, tripling at slow cadence | the repair waits for the periodic reconcile | the callers of `triggerReconcile` in `agent.go`; the route watch (`route_watch.go`) covers routes and the OVS flow watch (`flow_watch.go`) the hairpin and MAC-tweak flows, no watch covers nftables |
+| downtime near the target's `reconcile_interval`, tripling at slow cadence | the repair waits for the periodic reconcile | the callers of `triggerReconcile` in `agent.go`; the route watch (`route_watch.go`) covers routes, the OVS flow watch (`flow_watch.go`) the hairpin and MAC-tweak flows and the FRR watch (`frr_watch.go`) an FRR restart, no watch covers nftables |
 | `restore` loss on `cross-fip` behind `ovs-flow-drop` (`after` in records before #292) | the OVS flow watch did not repair the flows: its `flow_drift` is 0, or absent as in every record before #291, and the periodic reconcile put them back | the `OVS flow watch` and `OVS flow monitor` lines of the target's agent log; `flow_watch.go`, `ovs.go`, #291 |
 | about 4.5 s `restore` after `frr-restart` on the announcing gateway, ending 6 to 7 s after the inject whatever the phase of the reconcile ticker | FRR's own restart plus the BGP re-establishment the restore forces with `no router bgp` | `restoreGatewayFRR` and `configureGatewayBGP` in `test/e2e/chaos/`, #238 |
-| one 14.3 s `frr-restart` on a gateway at slow cadence (run 36877177662 tick 11) | not named yet; the agent never writes the FRR config to disk, so statics added since the last `write memory` may wait for the next reconcile | `routing.go`, the route watch's FRR case in `route_watch.go`, #293 |
+| one 14.3 s `frr-restart` on a gateway at slow cadence (run 36877177662 tick 11) | the repair waited for the periodic reconcile: the agent never saves its statics and prefix-list entries, so the restarted FRR came back without them, and before #293 nothing triggered a reconcile once FRR was back (the route watch's reconcile ran while FRR stopped). Named from the code path in #293, which predicts that the repair in a replay's agent log is a `reconciling` line with `trigger=periodic` | the `FRR restart detected, reconciling` and `reconciling` lines of the target's agent log; `frr_watch.go`, #293 |
 | 2 to 3.5 s `failover` after a kill, an undrained terminate or a double-failover on the owner | detection plus the takeover on the standby | OVN's BFD on the tunnels, #128, #130 |
 | 2.5 to 3.2 s `tail` on every probe after `upstream-bgp-restart` | BGP re-establishment on FRR default timers | the FRR config in `test/e2e/bootstrap.sh` and `configureGatewayBGP` (`test/e2e/chaos/lab.go`), #237, #238 |
 | loss on a `(drained)` restart | the handover is not hitless | `docs/explanation/gateway-drain.md`, `ovn_gateway.go`; #236 (closed) made planned restarts drain, #284 |
@@ -206,10 +206,11 @@ start, and stays a hypothesis until the code or a replay confirms it.
 Confirming needs evidence the journal does not hold: read the code path,
 or replay the event. The lab needs a Linux host with the `openvswitch`,
 `vrf` and `sch_netem` modules, so from a Mac dispatch the replay (the
-`gh workflow run` line is in the timeline). Only a run that did not pass
-uploads `lab-state/`, with the agent logs under `agent/<gateway>.log`.
-For the agent's log of a green event, replay it on a Linux host and read
-`docker logs clab-ovn-e2e-<gateway>`.
+`gh workflow run` line is in the timeline). Every run uploads
+`lab-state/` (runs before #293 only when they did not pass), with the
+agent logs under `agent/<gateway>.log`. Each `reconciling` line names its
+`trigger` (`startup`, `event`, `periodic`), and the line before an
+`event` cycle names the watch that fired.
 
 Before proposing, search the issues, open and closed: `gh issue list
 --state all --search "<keyword>"`. New evidence for a known mechanism
