@@ -2812,7 +2812,7 @@ func TestReconcileRepairsRoutesWhileRouteWatchIsDown(t *testing.T) {
 	}
 	w.backoffMin = 5 * time.Millisecond
 	w.backoffMax = 20 * time.Millisecond
-	stop := startRouteWatcher(t, w)
+	stop := startWatcher(t, w)
 	waitForCondition(t, "the watcher to retry its subscription", func() bool { return subscribes.Load() >= 3 })
 
 	// The recorder answers the FRR listing with an empty body, so the FIP's

@@ -8,7 +8,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"time"
 )
 
 // The route watch subscribes to the kernel's route notifications and makes
@@ -51,25 +50,6 @@ var errRouteWatchUnsupported = fmt.Errorf("route watch is only supported on Linu
 // errRouteSubscriptionClosed is the error the outage warning carries when a
 // subscription ended because its event channel was closed.
 var errRouteSubscriptionClosed = errors.New("kernel route subscription closed")
-
-const (
-	// routeDriftDebounce is how long the watcher collects drift events before
-	// it triggers the reconcile, so a flush of many routes is one cycle.
-	routeDriftDebounce = 100 * time.Millisecond
-
-	// routeDriftMinInterval is the shortest time between two triggers. It
-	// keeps a persistent fault from spinning the agent: a competing writer, or
-	// AddKernelRoute rolling its own route back when the ip rule fails,
-	// produces a drift event per reconcile.
-	routeDriftMinInterval = time.Second
-
-	// routeWatchBackoffMin and routeWatchBackoffMax bound the wait before the
-	// watcher subscribes again after a failed subscribe or a failed socket.
-	// routeWatchBackoffMax is also how long a subscription has to hold before
-	// the wait starts over at the minimum.
-	routeWatchBackoffMin = time.Second
-	routeWatchBackoffMax = 30 * time.Second
-)
 
 // Values of the kind label of route_drift_total.
 const (
@@ -186,10 +166,10 @@ func newRouteWatcher(cfg Config, trigger func()) *routeWatcher {
 			slog.Debug("route drift event", "kind", kind, "dst", ev.Dst, "deleted", ev.Deleted, "replaced", ev.Replaced)
 		},
 		trigger:     trigger,
-		debounce:    routeDriftDebounce,
-		minInterval: routeDriftMinInterval,
-		backoffMin:  routeWatchBackoffMin,
-		backoffMax:  routeWatchBackoffMax,
+		debounce:    driftDebounce,
+		minInterval: driftMinInterval,
+		backoffMin:  driftMinBackoff,
+		backoffMax:  driftMaxBackoff,
 	}
 	return w
 }

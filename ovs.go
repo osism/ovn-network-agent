@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -93,6 +94,14 @@ func ovsArgv(wrapper []string, binary string, args ...string) []string {
 func (rm *RouteManager) ovsCmd(binary string, args ...string) *exec.Cmd {
 	argv := ovsArgv(rm.ovsWrapper, binary, args...)
 	return exec.Command(argv[0], argv[1:]...)
+}
+
+// ovsCommandContext builds an OVS command behind wrapper that is killed when
+// ctx is done. The OVS flow watch starts its monitor and the call that ends
+// it through here.
+func ovsCommandContext(ctx context.Context, wrapper []string, binary string, args ...string) *exec.Cmd {
+	argv := ovsArgv(wrapper, binary, args...)
+	return exec.CommandContext(ctx, argv[0], argv[1:]...)
 }
 
 // runOVS builds and runs an OVS command. When execOVSHook is set (tests) the
@@ -582,6 +591,18 @@ func (rm *RouteManager) addOVSFlow(flow string) error {
 		return fmt.Errorf("ovs-ofctl add-flow %s %q: %w (output: %s)", rm.cfg.BridgeDev, flow, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// flowPlaneForCookie maps an agent cookie, as ovs-ofctl prints it, to the
+// plane it marks and the priority that plane installs its flows at.
+func flowPlaneForCookie(cookie string) (plane string, priority int, ok bool) {
+	switch cookie {
+	case ovsCookieHairpin:
+		return flowPlaneHairpin, hairpinFlowPriority, true
+	case ovsCookieMACTweak:
+		return flowPlaneMACTweak, macTweakFlowPriority, true
+	}
+	return "", 0, false
 }
 
 // flowKey identifies one agent-managed flow by everything OpenFlow uses to
