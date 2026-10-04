@@ -335,6 +335,16 @@ segment bindings not yet discovered`. A non-zero
 `ovs_flow_apply_errors_total{plane="hairpin"}` names the failing mutation in the
 log line right before it.
 
+`ovs_flow_drift_total{plane="hairpin"}` tells a deletion from outside apart
+from a failing apply. With `ovs_flow_watch` on, it counts every hairpin flow
+the agent owns that OVS reported as deleted without the agent asking for it,
+and the agent reconciles at once for each. A counter that keeps rising means
+something keeps deleting the flows, so look for an outside writer or a
+restarting `ovs-vswitchd`. A flat counter while
+`ovs_flow_apply_errors_total{plane="hairpin"}` rises points at an apply that
+fails. The counter stays flat with the watch off and while the agent logs
+`OVS flow watch unavailable`.
+
 **Remediation.** A segment with no binding needs its localnet port back on the
 provider bridge (`ovs-vsctl list-ports br-ex` and the `ovn-localnet-port`
 `external_ids` on each patch port). A NAT row with an unparseable external IP is

@@ -90,16 +90,24 @@ provider bridge).
    legitimate traffic only. Requires `nft` binary and `veth_leak_enabled:
    true`.
 6. **Reconciles** periodically as a safety net (default: every 60s), and at
-   once when the route watch sees a kernel route or an FRR static route the
-   agent owns deleted or replaced from outside. The watch subscribes to the
-   kernel's route notifications, so such a route is back after about a
-   second, whatever the interval is. It is on by default (`route_watch:
-   true`). With it off, or while its subscription is down, the route stays
-   missing until the next periodic reconcile. So does a route the kernel
-   removes without a notification: when an interface goes down or is
-   deleted (the provider bridge, a VLAN subinterface, `veth-provider`), the
-   kernel drops the IPv4 routes on it silently, and the watch does not see
-   them go.
+   once when one of two watches sees something the agent owns removed from
+   outside. The route watch sees a kernel route or an FRR static route
+   deleted or replaced: it subscribes to the kernel's route notifications,
+   so such a route is back after about a second, whatever the interval is.
+   The OVS flow watch does the same for the hairpin and MAC-tweak flows on
+   the provider bridge: it keeps one `ovs-ofctl monitor` process running,
+   behind `ovs_wrapper` when one is set, and that process reports every
+   deleted flow. A restarted `ovs-vswitchd` or a re-created bridge ends the
+   process; the watch starts a new one and reconciles once it is back. Both watches are on
+   by default (`route_watch: true`, `ovs_flow_watch: true`). With a watch
+   off, or while its subscription is down, the route or flow stays missing
+   until the next periodic reconcile. So does a route the kernel removes
+   without a notification: when an interface goes down or is deleted (the
+   provider bridge, a VLAN subinterface, `veth-provider`), the kernel drops
+   the IPv4 routes on it silently, and the route watch does not see them go.
+   A re-created patch port deletes no flow either, because OVS keeps the
+   flows of a port number that is gone; the next periodic reconcile
+   re-validates the segment bindings and moves the flows to the new port.
 7. **Detects stale chassis** — when a node dies without graceful shutdown,
    surviving agents detect its chassis disappearing from the SB Chassis
    table and clean up its managed OVN NB entries (static routes and MAC
