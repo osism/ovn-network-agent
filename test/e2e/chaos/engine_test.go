@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2537,6 +2538,167 @@ func TestFlowDropRecordsTheFlowDriftCounterDelta(t *testing.T) {
 			}
 			if len(rec.Violations) != 0 {
 				t.Errorf("violations = %+v, want none", rec.Violations)
+			}
+		})
+	}
+}
+
+// heldEngine builds an engine on the fake clock against a healthy lab, for
+// the tests that read back the spans of the faults it held.
+func heldEngine(t *testing.T) (*engine, *fakeClock) {
+	t.Helper()
+	clock := newFakeClock()
+	e := newEngine(newTestLab(&fakeCommander{respond: healthyLabResponses}, clock),
+		defaultTestProfile(t), nil, greenProbes{},
+		newJournal(&bytes.Buffer{}, clock.now), &runRecord{ActionsByName: map[string]int{}})
+	e.now, e.wait = clock.now, clock.wait
+	return e, clock
+}
+
+// sbPauseAction is a noop sb-pause on central with a 5 s hold.
+func sbPauseAction() *action {
+	act := noopActions("sb-pause")[0]
+	act.scope = scopeCentral
+	return act
+}
+
+// A sweep asks whether its query overlapped a held fault it cannot be
+// answered under. Any overlap counts, both bounds included, and a fault
+// that was never undone is held for the rest of the run.
+func TestHeldDuringMatchesOverlappingSpans(t *testing.T) {
+	e, clock := heldEngine(t)
+	T := clock.now()
+	clock.sleep(10 * time.Second)
+	sb := e.beginHold(decision{tick: 1, action: &action{name: "sb-pause"}, target: centralNode})
+	clock.sleep(10 * time.Second)
+	e.endHold(sb)
+	clock.sleep(10 * time.Second)
+	e.beginHold(decision{tick: 2, action: &action{name: "nb-pause"}, target: centralNode})
+
+	at := func(d time.Duration) time.Time { return T.Add(d) }
+	tests := []struct {
+		name     string
+		actions  []string
+		from, to time.Time
+		want     bool
+	}{
+		{"before the hold", []string{"sb-pause"}, at(0), at(9 * time.Second), false},
+		{"ending at the inject", []string{"sb-pause"}, at(0), at(10 * time.Second), true},
+		{"starting at the restore", []string{"sb-pause"}, at(20 * time.Second), at(25 * time.Second), true},
+		{"spanning the whole hold", []string{"sb-pause"}, at(5 * time.Second), at(25 * time.Second), true},
+		{"inside the hold", []string{"sb-pause"}, at(12 * time.Second), at(18 * time.Second), true},
+		{"one of several actions", []string{"northd-pause", "sb-pause"}, at(12 * time.Second), at(18 * time.Second), true},
+		{"after the restore", []string{"sb-pause"}, at(21 * time.Second), at(25 * time.Second), false},
+		{"under a fault never undone", []string{"nb-pause"}, at(100 * time.Second), at(101 * time.Second), true},
+		{"no span of that action", []string{"northd-pause"}, at(0), at(100 * time.Second), false},
+		{"no action named", nil, at(0), at(100 * time.Second), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, held := e.heldDuring(tc.actions, tc.from, tc.to)
+			if held != tc.want {
+				t.Fatalf("heldDuring(%v, %s, %s) = %v, want %v", tc.actions,
+					tc.from.Sub(T), tc.to.Sub(T), held, tc.want)
+			}
+			// checkError journals the span it got back, so it has to be one
+			// of the actions asked about.
+			if held && !slices.Contains(tc.actions, span.action) {
+				t.Fatalf("heldDuring(%v) returned a span of %q", tc.actions, span.action)
+			}
+		})
+	}
+
+	t.Run("no span recorded", func(t *testing.T) {
+		empty, _ := heldEngine(t)
+		if _, held := empty.heldDuring([]string{"sb-pause"}, at(0), at(100*time.Second)); held {
+			t.Fatal("an engine that executed nothing reported a held fault")
+		}
+	})
+}
+
+// The fault is held from the inject until the last restore returned. The
+// convergence after it is not part of the span: the restored process
+// answers again.
+func TestExecuteHoldsTheFaultFromInjectToTheRestore(t *testing.T) {
+	e, clock := heldEngine(t)
+	var injected, restored time.Time
+	act := sbPauseAction()
+	act.inject = func(context.Context, *lab, string, int) error {
+		injected = clock.now()
+		return nil
+	}
+	act.restore = func(context.Context, *lab, string) error {
+		clock.sleep(2 * time.Second)
+		restored = clock.now()
+		return nil
+	}
+
+	e.execute(context.Background(), decision{tick: 1, action: act, target: centralNode, hold: 5 * time.Second})
+
+	if len(e.spans) != 1 {
+		t.Fatalf("spans = %+v, want exactly one", e.spans)
+	}
+	span := e.spans[0]
+	if span.tick != 1 || span.action != "sb-pause" || span.target != centralNode {
+		t.Fatalf("span = %+v, want tick 1, sb-pause on %s", span, centralNode)
+	}
+	if span.start.After(injected) {
+		t.Fatalf("the span starts at %s, after the inject at %s", span.start, injected)
+	}
+	if !span.end.Equal(restored) {
+		t.Fatalf("the span ends at %s, want the restore's return at %s", span.end, restored)
+	}
+	if _, held := e.heldDuring([]string{"sb-pause"}, injected.Add(5*time.Second), injected.Add(5*time.Second)); !held {
+		t.Fatal("the fault does not read as held during its hold")
+	}
+	if _, held := e.heldDuring([]string{"sb-pause"}, restored.Add(time.Second), restored.Add(2*time.Second)); held {
+		t.Fatal("the fault still reads as held after its restore returned")
+	}
+}
+
+// A restore that failed leaves a fault nothing says was undone, so it stays
+// held for the rest of the run.
+func TestAFailedRestoreLeavesTheFaultHeld(t *testing.T) {
+	e, clock := heldEngine(t)
+	act := sbPauseAction()
+	act.restore = func(context.Context, *lab, string) error { return errBoom }
+
+	e.execute(context.Background(), decision{tick: 1, action: act, target: centralNode, hold: 5 * time.Second})
+
+	if len(e.spans) != 1 || !e.spans[0].end.IsZero() {
+		t.Fatalf("spans = %+v, want one span left open by the failed restore", e.spans)
+	}
+	later := clock.now().Add(time.Hour)
+	if _, held := e.heldDuring([]string{"sb-pause"}, later, later); !held {
+		t.Fatal("a fault whose restore failed does not read as held an hour later")
+	}
+}
+
+// A failed inject is undone. The hold ends only when every undo restore
+// returned nil; otherwise the fault may still be in place.
+func TestAnUndoneInjectEndsTheHold(t *testing.T) {
+	tests := []struct {
+		name       string
+		restoreErr error
+		wantEnded  bool
+	}{
+		{"the undo restored the fault", nil, true},
+		{"the undo failed", errBoom, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := heldEngine(t)
+			act := sbPauseAction()
+			act.inject = func(context.Context, *lab, string, int) error { return errBoom }
+			act.restore = func(context.Context, *lab, string) error { return tc.restoreErr }
+
+			e.execute(context.Background(), decision{tick: 1, action: act, target: centralNode, hold: 5 * time.Second})
+
+			if len(e.spans) != 1 {
+				t.Fatalf("spans = %+v, want exactly one", e.spans)
+			}
+			if ended := !e.spans[0].end.IsZero(); ended != tc.wantEnded {
+				t.Fatalf("span = %+v: ended %v, want %v", e.spans[0], ended, tc.wantEnded)
 			}
 		})
 	}
