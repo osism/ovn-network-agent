@@ -227,9 +227,9 @@ func renderReport(w *mdWriter, rec *runRecord, events []event, source string) {
 	if startOK && endOK {
 		wall = end.Sub(start).Round(time.Second).String()
 	}
-	w.printf("%d ticks — %d executed, %d skipped · %d violations · %d baseline sweeps (%d dual-claim, %d errors) · wall clock %s\n\n",
+	w.printf("%d ticks — %d executed, %d skipped · %d violations · %d baseline sweeps (%d dual-claim, %d errors, %d skipped under fault) · wall clock %s\n\n",
 		rec.Ticks, rec.Decisions.Executed, rec.Decisions.Skipped, len(rec.Violations),
-		rec.Checks.Sweeps, rec.Checks.DualClaim, rec.Checks.Errors, wall)
+		rec.Checks.Sweeps, rec.Checks.DualClaim, rec.Checks.Errors, rec.Checks.SkippedUnderFault, wall)
 	if line := actionsLine(rec.ActionsByName); line != "" {
 		w.printf("Faults injected: %s\n\n", line)
 	}
