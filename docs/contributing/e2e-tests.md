@@ -1478,7 +1478,7 @@ part of the replay contract: a new action is appended, never inserted.
 | `kernel-route-drop` | gateway | 2 | — | 10 s | `ip route del 192.0.2.10/32 dev br-ex` |
 | `frr-route-drop` | gateway | 2 | — | 10 s | `no ip route 192.0.2.10/32 169.254.0.1` in `vrf-provider` |
 | `nft-flush` | gateway | 2 | — | 60 s | `nft flush table ip ovn-network-agent` |
-| `ovs-flow-drop` | gateway | 2 | — | 60 s | `ovs-ofctl del-flows` the hairpin (`0x998`) and MAC-tweak (`0x999`) cookies on `br-ex` |
+| `ovs-flow-drop` | gateway | 2 | — | 10 s | `ovs-ofctl del-flows` the hairpin (`0x998`) and MAC-tweak (`0x999`) cookies on `br-ex` |
 | `frr-restart` | gateway | 2 | — | 120 s | `frrinit.sh` stop/clear/start, then re-assert BGP |
 | `upstream-bgp-restart` | upstream | 1 | 5–20 s | 90 s | `pkill -x bgpd` on `upstream`, then start it back in place |
 | `fip-churn` | central | 2 | — | 60 s | add/remove a spare FIP (`192.0.2.60`) on `lr0` |
@@ -1525,15 +1525,17 @@ MAC-rewrite OVS flow, remove an FRR static route — the exact deletions
 proves the agent heals on a single host, driven here against the
 multi-node lab. The deletion is the fault and the agent is the undo, so
 the restore is a no-op. The two route drops are undone by the agent's
-route watch, which reconciles as soon as the kernel reports the deletion.
-Their recovery budget is 10 s: above the time a probe confirmation takes,
-and below the 15 s cadence a `cadence-toggle` flip sets, so a repair that
-waited for the periodic reconcile fails it. `nft-flush` and
-`ovs-flow-drop` are undone by the next periodic reconcile, because the
-watch covers neither nftables nor OVS flows. Their 60 s budget is that
+route watch, which reconciles as soon as the kernel reports the deletion,
+and `ovs-flow-drop` by its OVS flow watch, which reconciles as soon as its
+`ovs-ofctl monitor` reports the deleted flows. Their recovery budget is
+10 s: above the time a probe confirmation takes, and below the 15 s
+cadence a `cadence-toggle` flip sets, so a repair that waited for the
+periodic reconcile fails it. `nft-flush` is undone by the next periodic
+reconcile, because no watch covers nftables. Its 60 s budget is that
 worst-case cadence plus probe slack.
 For a route drop the runner also reads the target's `route_drift_total`
-counters before the inject and after the convergence. It records the
+counters before the inject and after the convergence, and for
+`ovs-flow-drop` its `ovs_flow_drift_total` counters. It records the
 difference on the recovery and shows it in the report, and does not
 assert on it. Each action skips a gateway that does not carry the object
 — the MAC-tweak flows exist only where routers are locally active, a
@@ -1929,7 +1931,9 @@ recovery its `route_drift` (the `kernel` and `frr` difference of the
 target's `route_drift_total` counters between the inject and the
 convergence; absent when a scrape failed, which the journal records as a
 `check-error`, or when a counter went down because the agent restarted in
-between), a `settles` section (one
+between), for an `ovs-flow-drop` recovery its `flow_drift` (the `mactweak`
+and `hairpin` difference of the target's `ovs_flow_drift_total` counters,
+absent in the same cases), a `settles` section (one
 entry per settle window: its tick, `converged_ms`, whether it passed, and
 how many violations it raised), and every violation — each now stamped
 with the `journal_offset` of the last executed action, so it points back
@@ -1953,7 +1957,8 @@ dumped into `<out>/lab-state`.
 GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
 copy-pasteable replay line, the slowest recoveries against their
 budgets, each with its summed probe loss, the route drift the agent
-counted across each route drop, per-probe loss totals, every
+counted across each route drop, the OVS flow drift it counted across each
+`ovs-flow-drop`, per-probe loss totals, every
 loss window attributed to the fault whose inject→converged span it
 overlapped, the VIP re-points by phase, the fault traces, the planned
 restarts, the settle results, and the decisions the guardrails skipped:
