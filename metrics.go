@@ -77,6 +77,7 @@ type metricsRegistry struct {
 	hairpinFlowsDesired   prometheus.Gauge
 	hairpinFlowsInstalled prometheus.Gauge
 	ovsFlowApplyErrors    *prometheus.CounterVec
+	ovsFlowDriftTotal     *prometheus.CounterVec
 
 	// Configuration reloads (SIGHUP)
 	configReloadTotal *prometheus.CounterVec
@@ -256,6 +257,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Total failed OVS flow mutations, labelled by flow plane (hairpin, mactweak).",
 		}, []string{"plane"}),
 
+		ovsFlowDriftTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "ovs_flow_drift_total",
+			Help:      "Total deletions the OVS flow watch detected on flows the agent owns that the agent did not make, labelled by flow plane (hairpin, mactweak). Each one triggers an immediate reconcile.",
+		}, []string{"plane"}),
+
 		configReloadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "config_reload_total",
@@ -288,6 +295,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.hairpinFlowsDesired,
 		m.hairpinFlowsInstalled,
 		m.ovsFlowApplyErrors,
+		m.ovsFlowDriftTotal,
 		m.configReloadTotal,
 	)
 
@@ -312,6 +320,8 @@ func newMetricsRegistry() *metricsRegistry {
 	m.ovnConnectionState.WithLabelValues("sb").Set(0)
 	m.ovsFlowApplyErrors.WithLabelValues("hairpin").Add(0)
 	m.ovsFlowApplyErrors.WithLabelValues("mactweak").Add(0)
+	m.ovsFlowDriftTotal.WithLabelValues("hairpin").Add(0)
+	m.ovsFlowDriftTotal.WithLabelValues("mactweak").Add(0)
 	m.configReloadTotal.WithLabelValues("success").Add(0)
 	m.configReloadTotal.WithLabelValues("error").Add(0)
 
@@ -575,6 +585,15 @@ func recordOVSFlowApplyError(plane string) {
 		return
 	}
 	metrics.ovsFlowApplyErrors.WithLabelValues(plane).Inc()
+}
+
+// recordOVSFlowDrift counts one deletion the OVS flow watch detected on a flow
+// the agent owns, by plane (hairpin, mactweak).
+func recordOVSFlowDrift(plane string) {
+	if metrics == nil {
+		return
+	}
+	metrics.ovsFlowDriftTotal.WithLabelValues(plane).Inc()
 }
 
 // recordConfigReload counts one SIGHUP reload by outcome ("success" or

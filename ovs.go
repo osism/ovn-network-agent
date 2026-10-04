@@ -19,7 +19,8 @@ const (
 )
 
 // The names the two agent-managed flow planes report themselves under in
-// ovn_network_agent_ovs_flow_apply_errors_total.
+// ovn_network_agent_ovs_flow_apply_errors_total and
+// ovn_network_agent_ovs_flow_drift_total.
 const (
 	flowPlaneMACTweak = "mactweak"
 	flowPlaneHairpin  = "hairpin"
