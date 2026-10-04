@@ -1236,7 +1236,7 @@ a PCG stream seeded by `-seed` alone:
 | `-weights` | registry defaults | `name=n,…`; an unknown action name is rejected. `-weights gateway-kill=0` disables a fault. |
 | `-lab` | `ovn-e2e` | containerlab lab name. |
 | `-out` | `chaos-artifacts` | Where the journal, the run record and the lab-state dump land. |
-| `-collect` | `test/e2e/scenarios/collect-artifacts.sh` | The lab-state collector, run into `<out>/lab-state` when the run does not pass. The default is repo-relative, so run the binary from the repo root (`make e2e-chaos` does). |
+| `-collect` | `test/e2e/scenarios/collect-artifacts.sh` | The lab-state collector, run into `<out>/lab-state` after every run. The default is repo-relative, so run the binary from the repo root (`make e2e-chaos` does). |
 | `-gwnode-config` | `test/e2e/gwnode-config.yaml` | The baked gateway agent config a profile's overlays are layered over. Also repo-relative. It now binds `metrics_listen` on loopback so the settle oracle can scrape each agent's own flap-indicator metrics. |
 
 Two runs with identical inputs against identically-behaving labs replay
@@ -1897,7 +1897,7 @@ bootstrap master.
 <out>/
   journal.jsonl   — one JSON object per decision and phase, in order
   summary.json    — the run record (schema chaos-run-record/v1)
-  lab-state/      — collect-artifacts.sh dump, on a non-zero exit only
+  lab-state/      — collect-artifacts.sh dump, after every run
 ```
 
 `journal.jsonl` carries `run-start` (the echoed inputs, profile included),
@@ -1966,8 +1966,10 @@ oracle that could not prime against it). A `harness-fault` run also exits
 `1`: the failing action parks its node and aborts injection, so the run's
 fault coverage was cut short whoever's defect it was — the verdict tells
 the two apart, the exit code keeps the job red.
-On any non-zero exit the lab's existing `collect-artifacts.sh` bundle is
-dumped into `<out>/lab-state`.
+Every run that wrote its run record dumps the lab's existing
+`collect-artifacts.sh` bundle into `<out>/lab-state`, whatever its exit
+code: the agent logs of a passing run are what attributes a recovery that
+was slow but stayed inside its budget.
 
 **Reading a run back.** `-report` renders a recorded run as
 GitHub-flavored Markdown — the verdict, the injected-fault histogram, a
@@ -2028,8 +2030,8 @@ a short smoke (3 minutes, seed 42, `everything-on`) by carrying the
 `chaos-smoke` label, rather than chaos running on every PR — and that
 smoke stays on `ubuntu-latest`, because it is the one trigger that
 builds and runs a fork's own code. Each profile's journal and summary
-upload on every outcome, with the lab-state dump added on failure —
-and each job renders its own `-report` into the Actions job summary,
+upload on every outcome, together with the lab-state dump the runner
+writes after every run — and each job renders its own `-report` into the Actions job summary,
 so the verdict, the recovery durations and the loss windows are
 readable on the run page without downloading the artifact. It
 is deliberately not part of `e2e.yml`'s PR path: the scenarios there

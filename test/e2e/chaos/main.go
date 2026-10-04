@@ -38,9 +38,9 @@
 // Exit codes: 0 the run passed, 1 the run recorded a violation, 2 the
 // runner could not set the run up. A harness-fault run — every violation
 // is the runner's own inject or restore command failing — also exits 1,
-// because the fault parked a node and cut the run's coverage short. On a
-// non-zero exit the lab's existing artifact collector is invoked into
-// <out>/lab-state.
+// because the fault parked a node and cut the run's coverage short. Every
+// run that wrote its run record invokes the lab's existing artifact
+// collector into <out>/lab-state, whatever its exit code.
 package main
 
 import (
@@ -72,8 +72,8 @@ const minTick = 100 * time.Millisecond
 // duration would truncate to a zero-tick run reporting "pass".
 const minDuration = time.Second
 
-// collectTimeout bounds the lab-state collector: it runs against a lab
-// that is already broken, where a `docker exec` can hang for good.
+// collectTimeout bounds the lab-state collector: the lab it runs against
+// can be broken, where a `docker exec` can hang for good.
 const collectTimeout = 2 * time.Minute
 
 // minSettleTimeout is the floor under -settle-timeout. The timeout bounds how
@@ -117,7 +117,7 @@ func main() {
 	flag.StringVar(&cfg.labName, "lab", "ovn-e2e", "containerlab lab name")
 	flag.StringVar(&cfg.outDir, "out", "chaos-artifacts", "directory for the journal, the run record and the lab-state dump")
 	flag.StringVar(&cfg.collect, "collect", "test/e2e/scenarios/collect-artifacts.sh",
-		"lab-state collector, run into <out>/lab-state when the run does not pass")
+		"lab-state collector, run into <out>/lab-state after every run")
 	flag.StringVar(&cfg.gwnodeConfig, "gwnode-config", "test/e2e/gwnode-config.yaml",
 		"the baked gateway agent config a profile's overlays are layered over")
 	flag.StringVar(&cfg.report, "report", "",
@@ -257,9 +257,7 @@ func run(cfg config) (int, error) {
 	fmt.Fprintf(os.Stderr, "[chaos] %s: %d ticks, %d executed, %d skipped, %d violations (%s, %s)\n",
 		rec.Result, rec.Ticks, rec.Decisions.Executed, rec.Decisions.Skipped,
 		len(rec.Violations), journalPath, filepath.Join(cfg.outDir, summaryFile))
-	if code != exitPass {
-		collectLabState(cfg.collect, cfg.labName, cfg.outDir)
-	}
+	collectLabState(cfg.collect, cfg.labName, cfg.outDir)
 	return code, nil
 }
 
@@ -360,14 +358,16 @@ func writeRecord(rec *runRecord, path string) error {
 	return rec.write(f)
 }
 
-// collectLabState reuses the lab's existing artifact collector so a
-// failed chaos run leaves the same bundle every scenario leaves.
-// Best-effort: a missing collector must not mask the run's own verdict.
+// collectLabState reuses the lab's existing artifact collector so every
+// chaos run leaves the same bundle every scenario leaves. A passing run
+// needs it too: its agent logs are what attributes a recovery that was
+// slow but stayed inside its budget. Best-effort: a missing collector
+// must not mask the run's own verdict.
 //
-// It only runs when the lab is already in a bad state, which is exactly
-// when one of its `docker exec`s can wedge — hence the deadline. Without
-// it the runner would hang with its exit code undelivered until CI kills
-// the job, and no artifacts would be uploaded at all.
+// The lab can be in a bad state when it runs, which is exactly when one
+// of its `docker exec`s can wedge — hence the deadline. Without it the
+// runner would hang with its exit code undelivered until CI kills the
+// job, and no artifacts would be uploaded at all.
 func collectLabState(collect, labName, outDir string) {
 	dest := filepath.Join(outDir, "lab-state")
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)

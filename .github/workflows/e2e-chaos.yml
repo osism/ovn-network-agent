@@ -214,7 +214,7 @@ jobs:
     # plus confirmation), ≤2 min of lab-state collection and teardown. A
     # `timeout-minutes` cancellation is not a failure, so keeping the cap
     # a backstop (rather than the thing that ends the run) is what lets
-    # the runner still dump its own lab-state bundle on the failure path.
+    # the runner still dump its own lab-state bundle.
     timeout-minutes: 40
 
     env:
@@ -280,11 +280,11 @@ jobs:
           fi
           go run ./test/e2e/chaos -report "${RUNNER_TEMP}/chaos" >> "${GITHUB_STEP_SUMMARY}"
 
-      # The runner dumps `lab-state/` into the out directory itself on any
-      # non-zero exit, but a `make e2e-up` failure dies before the runner
-      # ever starts. This guard collects lab state in exactly that case
-      # and never double-collects. (The job-level LAB env already serves
-      # collect-artifacts.sh.)
+      # The runner dumps `lab-state/` into the out directory itself after
+      # every run, whatever its outcome, but a `make e2e-up` failure dies
+      # before the runner ever starts. This guard collects lab state in
+      # exactly that case and never double-collects. (The job-level LAB
+      # env already serves collect-artifacts.sh.)
       - name: Collect failure artifacts
         if: failure()
         run: |
@@ -294,7 +294,8 @@ jobs:
       # run summary are the artifact the run exists to produce, and a
       # green run's recovery durations are what a later regression is
       # compared against. The runner dumps `lab-state/` into the same
-      # directory itself when it does not pass.
+      # directory itself after every run, so a green run's agent logs are
+      # in the artifact too.
       - name: Upload the chaos artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
