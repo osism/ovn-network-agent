@@ -410,6 +410,7 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 	setLocalnetSegments(len(desiredSegments))
 
 	slog.Info("reconciling",
+		"trigger", trigger,
 		"has_local_routers", state.HasLocalRouters,
 		"local_routers", len(state.LocalRouters),
 		"local_host", state.LocalChassisName,
