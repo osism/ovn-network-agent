@@ -2839,3 +2839,255 @@ func TestReconcileRepairsRoutesWhileRouteWatchIsDown(t *testing.T) {
 		t.Errorf("outage warnings = %d, want 1 across %d failed subscribes", got, subscribes.Load())
 	}
 }
+
+// =============================================================================
+// OVS flow watch wiring
+// =============================================================================
+
+// attachFlowWatch gives a fixture agent and its RouteManager one watcher that
+// is not started, as NewAgent does, so a test can read the ownership the
+// reconcile published.
+func attachFlowWatch(a *Agent) *flowWatcher {
+	a.flowWatch = newFlowWatcher(a.routing.cfg, a.triggerReconcile)
+	a.routing.flowWatch = a.flowWatch
+	return a.flowWatch
+}
+
+// newLiveFlowReconcile is newLiveFIPReconcile with a working OVS: the cached
+// fallback binding's patch port still resolves to ofport 42 and every flow
+// dump comes back empty. The binding's kernel interface is the fixture's
+// bridge, so the FIP's /32 stays where it is.
+func newLiveFlowReconcile(t *testing.T, fip string) (*Agent, *ovsRecorder, *flowWatcher) {
+	t.Helper()
+	a, _, _ := newLiveFIPReconcile(t, fip)
+	rec := newOVSRecorder()
+	rec.on([]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"}, "42\n", nil)
+	a.routing.execOVSHook = rec.hook()
+	a.routing.segments = map[string]*segmentBinding{
+		"": {patchPort: "patch-provnet-0", ofport: "42", kernelDev: a.routing.cfg.BridgeDev, kernelMAC: "aa:bb:cc:dd:ee:ff"},
+	}
+	return a, rec, attachFlowWatch(a)
+}
+
+func TestNewAgentFlowWatchGating(t *testing.T) {
+	full := Config{BridgeDev: "br-ex", VethNexthop: "169.254.0.1", VRFName: "vrf-provider", OVSFlowWatch: true}
+	off := full
+	off.OVSFlowWatch = false
+	dryRun := full
+	dryRun.DryRun = true
+	portForwardOnly := portForwardOnlyConfig()
+	portForwardOnly.DryRun = false
+	portForwardOnly.OVSFlowWatch = true
+
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"ovs_flow_watch on", full, true},
+		{"ovs_flow_watch off", off, false},
+		{"dry-run", dryRun, false},
+		{"port-forward-only", portForwardOnly, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := NewAgent(tt.cfg, nil)
+			if err != nil {
+				t.Fatalf("NewAgent() error: %v", err)
+			}
+			if got := a.flowWatch != nil; got != tt.want {
+				t.Errorf("flowWatch set = %v, want %v", got, tt.want)
+			}
+			if a.routing.flowWatch != a.flowWatch {
+				t.Errorf("routing.flowWatch = %p, want the agent's watcher %p", a.routing.flowWatch, a.flowWatch)
+			}
+		})
+	}
+}
+
+// A flow drift repair must look like any other event-driven reconcile, for
+// the reason TestNewAgentRouteWatchTriggerQueuesOneReconcile gives.
+func TestNewAgentFlowWatchTriggerQueuesOneReconcile(t *testing.T) {
+	a, err := NewAgent(Config{BridgeDev: "br-ex", VethNexthop: "169.254.0.1", VRFName: "vrf-provider", OVSFlowWatch: true}, nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	if a.flowWatch == nil {
+		t.Fatal("NewAgent() built no OVS flow watch")
+	}
+
+	a.flowWatch.trigger()
+	a.flowWatch.trigger()
+
+	if got := len(a.reconcileCh); got != 1 {
+		t.Errorf("queued reconcile signals = %d, want 1 for two triggers", got)
+	}
+	if obs := a.ovn.failoverObserved.Load(); obs != nil {
+		t.Errorf("failoverObserved = %+v, want it unset after a drift trigger", obs)
+	}
+}
+
+func TestReconcilePublishesFlowOwnership(t *testing.T) {
+	const fip = "192.0.2.10"
+	owned := []struct {
+		plane string
+		key   flowKey
+	}{
+		{flowPlaneHairpin, flowKey{priority: hairpinFlowPriority, inPort: "42", dst: fip}},
+		{flowPlaneMACTweak, flowKey{priority: macTweakFlowPriority, inPort: "42"}},
+		{flowPlaneMACTweak, flowKey{priority: macTweakFlowPriority, ipv6: true, inPort: "42"}},
+	}
+
+	t.Run("live cycle", func(t *testing.T) {
+		a, _, w := newLiveFlowReconcile(t, fip)
+
+		a.reconcile(context.Background(), triggerPeriodic)
+
+		for _, o := range owned {
+			if !w.owns(o.plane, o.key) {
+				t.Errorf("after a live cycle the %s key %+v is not owned", o.plane, o.key)
+			}
+		}
+	})
+
+	// A standby runs no EnsureSegments and has no hairpin target, so it
+	// repairs neither plane. What an earlier, active cycle published must be
+	// gone, whether the segment bindings are still cached or not.
+	for _, cached := range []bool{true, false} {
+		t.Run(fmt.Sprintf("standby cycle with cached bindings %v", cached), func(t *testing.T) {
+			a, _, w := newLiveFlowReconcile(t, fip)
+			if !cached {
+				a.routing.segments = nil
+			}
+			a.ovn.state.Replace(OVNState{})
+			a.routing.listKernelRoutesHook = func() ([]kernelRouteEntry, error) { return nil, nil }
+			for _, o := range owned {
+				w.setOwned(o.plane, ownedFlows(o.key))
+			}
+
+			a.reconcile(context.Background(), triggerPeriodic)
+
+			for _, o := range owned {
+				if w.owns(o.plane, o.key) {
+					t.Errorf("after a standby cycle the %s key %+v is still owned", o.plane, o.key)
+				}
+			}
+		})
+	}
+}
+
+// Run joins the flow watch on shutdown before the cleanup begins, so the flows
+// cleanup() deletes are never classified as drift and no monitor process
+// outlives Run.
+func TestAgentRunJoinsFlowWatchBeforeCleanup(t *testing.T) {
+	const released = "test: flow watch goroutine released"
+	logs := captureSlog(t)
+	a, err := NewAgent(portForwardOnlyConfig(), nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	// subscribe blocks until release is closed, which keeps the watcher's
+	// goroutine alive past the cancel.
+	var entered atomic.Bool
+	release := make(chan struct{})
+	w := newFlowWatcher(a.cfg, a.triggerReconcile)
+	w.subscribe = func(<-chan struct{}) (<-chan flowEvent, error) {
+		entered.Store(true)
+		<-release
+		slog.Info(released)
+		return nil, errDriftWatchUnsupported
+	}
+	a.flowWatch = w
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	waitForCondition(t, "Run to start the OVS flow watch", entered.Load)
+	cancel()
+
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("Run() returned while the OVS flow watch goroutine was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s")
+	}
+
+	out := logs.String()
+	joined := strings.Index(out, released)
+	cleanup := strings.Index(out, "shutting down, cleaning up routes")
+	if joined < 0 || cleanup < joined {
+		t.Errorf("the shutdown cleanup began before the OVS flow watch goroutine was joined:\n%s", out)
+	}
+}
+
+// Port-forward-only mode manages no OVS flow, so a missing watcher is not
+// worth a line there.
+func TestAgentRunPortForwardOnlyDoesNotReportTheFlowWatch(t *testing.T) {
+	logs := captureSlog(t)
+	a, err := NewAgent(portForwardOnlyConfig(), nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+
+	// Port-forward-only mode checks the context only in its loop, so a
+	// cancelled one still runs the whole startup and then shuts down.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.Run(ctx); err != nil {
+		t.Fatalf("Run() returned error: %v", err)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "agent running") {
+		t.Fatalf("Run() did not get past the start of the watches:\n%s", out)
+	}
+	if strings.Contains(out, "OVS flow watch disabled") {
+		t.Errorf("port-forward-only mode reported the OVS flow watch as disabled:\n%s", out)
+	}
+}
+
+// The flow watch is an accelerator, not the repair. With a monitor that never
+// comes up, the periodic reconcile still puts a missing flow back.
+func TestReconcileRepairsFlowsWhileFlowWatchIsDown(t *testing.T) {
+	const fip = "192.0.2.10"
+	logs := captureSlog(t)
+	a, rec, w := newLiveFlowReconcile(t, fip)
+
+	var subscribes atomic.Int32
+	w.subscribe = func(<-chan struct{}) (<-chan flowEvent, error) {
+		subscribes.Add(1)
+		return nil, errors.New("test: the OVS flow monitor cannot start")
+	}
+	w.backoffMin = 5 * time.Millisecond
+	w.backoffMax = 20 * time.Millisecond
+	stop := startWatcher(t, w)
+	waitForCondition(t, "the watcher to retry its subscription", func() bool { return subscribes.Load() >= 3 })
+
+	// Every dump comes back empty, so the FIP's hairpin flow is missing.
+	// This reconcile stands in for the tick.
+	a.reconcile(context.Background(), triggerPeriodic)
+	stop()
+
+	want := HairpinFlow(ovsCookieHairpin, "42", fip, "aa:bb:cc:dd:ee:ff", "fa:16:3e:aa:aa:aa", false)
+	if flows := rec.findBatchedFlows(); !containsFlow(flows, want) {
+		t.Errorf("the reconcile did not re-add the missing hairpin flow %q: added %q", want, flows)
+	}
+	if len(a.reconcileCh) != 0 {
+		t.Error("a watcher that never subscribed queued a reconcile")
+	}
+	if got := strings.Count(logs.String(), "OVS flow watch unavailable"); got != 1 {
+		t.Errorf("outage warnings = %d, want 1 across %d failed subscribes", got, subscribes.Load())
+	}
+}

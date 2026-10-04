@@ -27,6 +27,13 @@ type Agent struct {
 	// no route the watch covers). Its methods are no-ops on a nil receiver.
 	routeWatch *routeWatcher
 
+	// flowWatch triggers a reconcile when an OVS flow the agent owns is
+	// deleted from outside. It is nil when ovs_flow_watch is off, in dry-run
+	// and in port-forward-only mode, for the same reasons as routeWatch.
+	// routing.flowWatch is the same pointer. Its methods are no-ops on a nil
+	// receiver.
+	flowWatch *flowWatcher
+
 	// Channel to trigger reconciliation
 	reconcileCh chan struct{}
 
@@ -122,6 +129,10 @@ func NewAgent(cfg Config, reloadConfig func() (Config, error)) (*Agent, error) {
 	// repair that adds FRR routes would be recorded as a failover announce.
 	if cfg.RouteWatch && !cfg.DryRun && !cfg.PortForwardOnly {
 		a.routeWatch = newRouteWatcher(cfg, a.triggerReconcile)
+	}
+	if cfg.OVSFlowWatch && !cfg.DryRun && !cfg.PortForwardOnly {
+		a.flowWatch = newFlowWatcher(cfg, a.triggerReconcile)
+		a.routing.flowWatch = a.flowWatch
 	}
 
 	return a, nil
@@ -238,6 +249,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.routeWatch == nil && !a.cfg.PortForwardOnly {
 		slog.Info("route watch disabled")
 	}
+	a.flowWatch.start(ctx)
+	if a.flowWatch == nil && !a.cfg.PortForwardOnly {
+		slog.Info("OVS flow watch disabled")
+	}
 
 	// Main loop
 	ticker := time.NewTicker(a.cfg.ReconcileInterval)
@@ -285,6 +300,12 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.ovn.refreshState(refreshCtx)
 				refreshCancel()
 			}
+			// Stop the flow watch before the cleanup deletes the flows, and
+			// on both branches, so Run never returns with a monitor process
+			// still running. It is not joined before the drain: ending the
+			// monitor can take an exec through the OVS wrapper, and the
+			// drain must not wait for that.
+			a.flowWatch.wait()
 			if a.cfg.CleanupOnShutdown {
 				slog.Info("shutting down, cleaning up routes")
 				a.cleanup()
@@ -476,6 +497,10 @@ func (a *Agent) reconcile(ctx context.Context, trigger string) {
 			slog.Error("failed to reconcile FRR prefix-list", "error", err)
 		}
 	default:
+		// A standby never runs EnsureSegments, so the MAC-tweak flows of an
+		// earlier active period are not repaired and not owned.
+		a.flowWatch.setOwned(flowPlaneMACTweak, nil)
+
 		// No locally active routers — remove per-network veth leak and prefix-list entries.
 		if err := a.routing.ReconcileVethLeakNetworks(nil); err != nil {
 			slog.Error("failed to clean veth leak networks", "error", err)
