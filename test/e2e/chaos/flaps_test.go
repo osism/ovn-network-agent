@@ -18,6 +18,15 @@ func flapActionNamed(t *testing.T, name string) *action {
 	return nil
 }
 
+// The agent's FRR watch repairs an FRR restart once the daemons have settled,
+// so frr-restart is held to the watches' budget: a repair that waited for the
+// 15 s tick of a cadence flip fails it.
+func TestFRRRestartCarriesTheWatchBudget(t *testing.T) {
+	if got := flapActionNamed(t, "frr-restart").recoveryBudget; got != watchRecoveryBudget {
+		t.Errorf("frr-restart recoveryBudget = %s, want watchRecoveryBudget (%s)", got, watchRecoveryBudget)
+	}
+}
+
 // lineContaining returns the first recorded call containing substr, or "".
 func lineContaining(f *fakeCommander, substr string) string {
 	for _, line := range f.lines() {
