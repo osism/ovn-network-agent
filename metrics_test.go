@@ -41,6 +41,24 @@ func gaugeValue(t *testing.T, m *metricsRegistry, name string) float64 {
 	return 0
 }
 
+// plainCounterValue reads one unlabelled counter back out of a registry. It
+// fails the test when the metric is absent, so a renamed collector is a
+// failure rather than a silent zero.
+func plainCounterValue(t *testing.T, m *metricsRegistry, name string) float64 {
+	t.Helper()
+	got, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error: %v", err)
+	}
+	for _, mf := range got {
+		if mf.GetName() == name {
+			return mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	t.Fatalf("counter %s missing from the registry", name)
+	return 0
+}
+
 // counterValue reads one label series of a counter vector back out of a
 // registry, failing the test when the series is absent.
 func counterValue(t *testing.T, m *metricsRegistry, name, label, value string) float64 {
@@ -91,6 +109,7 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setHairpinFlowPlane(3, 2)
 	recordOVSFlowApplyError("hairpin")
 	recordOVSFlowDrift("hairpin")
+	recordFRRRestart()
 	setLastReconcileStatus(true)
 	recordConfigReload("success")
 }
@@ -125,6 +144,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_hairpin_flows_installed",
 		"ovn_network_agent_ovs_flow_apply_errors_total",
 		"ovn_network_agent_ovs_flow_drift_total",
+		"ovn_network_agent_frr_restarts_total",
 		"ovn_network_agent_config_reload_total",
 	}
 	gotNames := make(map[string]bool, len(got))
@@ -813,5 +833,23 @@ func TestOVSFlowDriftCounter(t *testing.T) {
 	}
 	if got := counterValue(t, m, name, "plane", "mactweak"); got != 2 {
 		t.Errorf("%s{plane=\"mactweak\"} = %v, want 2", name, got)
+	}
+}
+
+// TestFRRRestartsCounter pins frr_restarts_total: it exists at 0 from the
+// first scrape and counts one detected restart per call.
+func TestFRRRestartsCounter(t *testing.T) {
+	const name = "ovn_network_agent_frr_restarts_total"
+	m := withTestMetrics(t)
+
+	if got := plainCounterValue(t, m, name); got != 0 {
+		t.Errorf("%s = %v on a fresh registry, want 0", name, got)
+	}
+
+	recordFRRRestart()
+	recordFRRRestart()
+
+	if got := plainCounterValue(t, m, name); got != 2 {
+		t.Errorf("%s = %v, want 2", name, got)
 	}
 }

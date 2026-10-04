@@ -79,6 +79,9 @@ type metricsRegistry struct {
 	ovsFlowApplyErrors    *prometheus.CounterVec
 	ovsFlowDriftTotal     *prometheus.CounterVec
 
+	// FRR restarts
+	frrRestartsTotal prometheus.Counter
+
 	// Configuration reloads (SIGHUP)
 	configReloadTotal *prometheus.CounterVec
 
@@ -263,6 +266,12 @@ func newMetricsRegistry() *metricsRegistry {
 			Help:      "Total deletions the OVS flow watch detected on flows the agent owns that the agent did not make, labelled by flow plane (hairpin, mactweak). Each one triggers an immediate reconcile.",
 		}, []string{"plane"}),
 
+		frrRestartsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "frr_restarts_total",
+			Help:      "Total FRR restarts the FRR watch detected: a settled change in the process IDs of the FRR daemons, or FRR coming up after the agent started without it. Each one triggers an immediate reconcile and a second one 5 s later.",
+		}),
+
 		configReloadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "config_reload_total",
@@ -296,6 +305,7 @@ func newMetricsRegistry() *metricsRegistry {
 		m.hairpinFlowsInstalled,
 		m.ovsFlowApplyErrors,
 		m.ovsFlowDriftTotal,
+		m.frrRestartsTotal,
 		m.configReloadTotal,
 	)
 
@@ -594,6 +604,14 @@ func recordOVSFlowDrift(plane string) {
 		return
 	}
 	metrics.ovsFlowDriftTotal.WithLabelValues(plane).Inc()
+}
+
+// recordFRRRestart counts one FRR restart the FRR watch detected.
+func recordFRRRestart() {
+	if metrics == nil {
+		return
+	}
+	metrics.frrRestartsTotal.Inc()
 }
 
 // recordConfigReload counts one SIGHUP reload by outcome ("success" or
