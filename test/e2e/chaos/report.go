@@ -38,7 +38,7 @@ import (
 var runURLPattern = regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/actions/runs/(\d+)`)
 
 // reportDownloadTimeout bounds the `gh run download`. The chaos record
-// itself is a few kilobytes, but a failed run's artifact carries the
+// itself is a few kilobytes, but every run's artifact carries the
 // lab-state bundle alongside it, and a nightly run has one artifact per
 // profile — so this is minutes, not the commander's 30-second default.
 const reportDownloadTimeout = 5 * time.Minute
