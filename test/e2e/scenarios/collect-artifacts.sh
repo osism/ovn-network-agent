@@ -129,9 +129,10 @@ collect_frr() {
     done
     capture "${OUT_DIR}/frr/upstream-running-config.txt" \
         exec_in "${UPSTREAM}" vtysh -c "show running-config"
-    # The upstream bgpd start is the one daemon bring-up performs itself
-    # (see bootstrap.sh:configure_upstream_frr); capture the same state
-    # its failure path dumps into the job log so a bring-up flake can be
+    # Bring-up starts the upstream bgpd itself and restarts a missing
+    # zebra in place (see bootstrap.sh:ensure_upstream_zebra and
+    # configure_upstream_frr); capture the same state their failure path
+    # dumps into the job log so a zebra or bgpd bring-up failure can be
     # root-caused from the artifact bundle alone.
     capture "${OUT_DIR}/frr/upstream-show-daemons.txt" \
         exec_in "${UPSTREAM}" vtysh -c "show daemons"
