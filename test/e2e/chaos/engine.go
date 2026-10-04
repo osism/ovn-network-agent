@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -203,6 +204,10 @@ type engine struct {
 
 	mu    sync.Mutex
 	nodes map[string]string
+	// spans is every executed action's fault, in execute order. The engine
+	// goroutine opens and closes them while the baseline sweep reads them
+	// (heldDuring), so they are guarded by mu like nodes.
+	spans []heldFault
 
 	// vipOwner is the master the port-forward VIP routes currently point
 	// at, so a re-point is only issued (and journaled) when it moves.
@@ -299,6 +304,41 @@ func (e *engine) violate(v violationRecord) {
 	})
 }
 
+// beginHold opens the span of d's fault and returns its index for endHold.
+func (e *engine) beginHold(d decision) int {
+	start := e.now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.spans = append(e.spans, heldFault{tick: d.tick, action: d.action.name, target: d.target, start: start})
+	return len(e.spans) - 1
+}
+
+// endHold closes the span beginHold opened: the fault is undone.
+func (e *engine) endHold(i int) {
+	end := e.now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.spans[i].end = end
+}
+
+// heldDuring reports the first span, in execute order, of one of actions
+// that was held at any point of [from, to], both bounds inclusive. A span
+// that never ended is held for the rest of the run.
+func (e *engine) heldDuring(actions []string, from, to time.Time) (heldFault, bool) {
+	if len(actions) == 0 {
+		return heldFault{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, s := range e.spans {
+		if slices.Contains(actions, s.action) && !s.start.After(to) &&
+			(s.end.IsZero() || !s.end.Before(from)) {
+			return s, true
+		}
+	}
+	return heldFault{}, false
+}
+
 // recordChecks folds what the baseline sweep evaluated into the run
 // record, so a reader of summary.json can tell a run that asserted the
 // invariants from one that never got to.
@@ -318,6 +358,19 @@ type decision struct {
 	peer     string
 	hold     time.Duration
 	flip     int
+}
+
+// heldFault is one executed action's fault on the engine clock: from the
+// moment execute begins its inject to the moment its last restore returned.
+// end stays zero while the fault is held, and for good when its restore
+// failed: the runner cannot tell that fault was ever undone. Unlike the
+// report's faultSpan it ends at the restore, not at the convergence.
+type heldFault struct {
+	tick   int
+	action string
+	target string
+	start  time.Time
+	end    time.Time
 }
 
 // draw takes exactly five values from the stream, in a fixed order:
@@ -602,6 +655,7 @@ func (e *engine) execute(ctx context.Context, d decision) {
 	stopTrace := e.startFaultTrace(ctx, d)
 	defer stopTrace()
 
+	span := e.beginHold(d)
 	injectedAt := e.now()
 	e.jrnl.emit(event{
 		Event: evInject, Tick: d.tick, Action: d.action.name,
@@ -617,7 +671,7 @@ func (e *engine) execute(ctx context.Context, d decision) {
 	err := d.action.inject(ctx, e.lab, d.target, d.flip)
 	stopPoll()
 	if err != nil {
-		e.undo(ctx, d, err)
+		e.undo(ctx, d, span, err)
 		return
 	}
 
@@ -643,10 +697,12 @@ func (e *engine) execute(ctx context.Context, d decision) {
 	for _, n := range nodes {
 		e.jrnl.emit(event{Event: evRestore, Tick: d.tick, Action: d.action.name, Target: n})
 		if err := e.restoreNode(ctx, d, n); err != nil {
+			// The span stays open: nothing says this fault was undone.
 			e.failAction(d, "restore", n, err)
 			return
 		}
 	}
+	e.endHold(span)
 	if ctx.Err() != nil {
 		return
 	}
@@ -689,17 +745,23 @@ func (e *engine) restoreNode(ctx context.Context, d decision, node string) error
 // that puts the policy back (and re-wires the underlay), so it runs even
 // here: on the same detached, bounded context the held-fault restore uses,
 // since the inject may well have failed because the run was cancelled
-// underneath it.
-func (e *engine) undo(ctx context.Context, d decision, injectErr error) {
+// underneath it. The hold of span ends only when every restore returned
+// nil.
+func (e *engine) undo(ctx context.Context, d decision, span int, injectErr error) {
+	undone := true
 	for _, n := range e.nodesFor(d) {
 		detail := "undo after a failed inject"
 		if err := e.restoreNode(ctx, d, n); err != nil {
 			detail += ": " + err.Error()
+			undone = false
 		}
 		e.jrnl.emit(event{
 			Event: evRestore, Tick: d.tick, Action: d.action.name,
 			Target: n, Detail: detail,
 		})
+	}
+	if undone {
+		e.endHold(span)
 	}
 	e.failAction(d, "inject", d.target, injectErr)
 }
