@@ -144,9 +144,10 @@ type Config struct {
 	GatewayPort       string
 	RouteTableID      int
 	BridgeIP          string // IP to add to br-ex for ARP resolution (default: 169.254.169.254)
-	OVSWrapper        string // e.g. "docker exec -i openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl calls; must forward stdin, or flow adds fall back to one exec per flow
+	OVSWrapper        string // e.g. "docker exec -i openvswitch_vswitchd" — prepended to ovs-vsctl/ovs-ofctl/ovs-appctl calls; must forward stdin, or flow adds fall back to one exec per flow; with ovs_flow_watch on it also runs a long-lived ovs-ofctl monitor that ovs-appctl ends
 	ReconcileInterval time.Duration
 	RouteWatch        bool // reconcile at once when a route the agent owns is deleted or replaced from outside; false leaves drift to the periodic reconcile
+	OVSFlowWatch      bool // reconcile at once when an OVS flow the agent owns is deleted from outside; false leaves drift to the periodic reconcile
 	LogLevel          string
 	DryRun            bool
 
@@ -468,12 +469,14 @@ func configOptions() []configOption {
 			func(c *Config) *int { return &c.RouteTableID }),
 		stringOpt("bridge-ip", "169.254.169.254", "IP to add to bridge device for ARP resolution (default: 169.254.169.254)",
 			func(c *Config) *string { return &c.BridgeIP }),
-		stringOpt("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl, must forward stdin for batched flow programming (e.g. 'docker exec -i openvswitch_vswitchd')",
+		stringOpt("ovs-wrapper", "", "Command prefix for ovs-vsctl/ovs-ofctl/ovs-appctl, must forward stdin for batched flow programming; with ovs-flow-watch on it also runs a long-lived ovs-ofctl monitor ended through ovs-appctl (e.g. 'docker exec -i openvswitch_vswitchd')",
 			func(c *Config) *string { return &c.OVSWrapper }),
 		durationOpt("reconcile-interval", 60*time.Second, "Full reconciliation interval (e.g. 60s, 5m)",
 			func(c *Config) *time.Duration { return &c.ReconcileInterval }),
 		boolOpt("route-watch", true, "Watch kernel route changes and reconcile at once when a route the agent owns is deleted or replaced; false leaves drift repair to the periodic reconcile",
 			func(c *Config) *bool { return &c.RouteWatch }),
+		boolOpt("ovs-flow-watch", true, "Watch the provider bridge's flow table and reconcile at once when an OVS flow the agent owns is deleted; false leaves drift repair to the periodic reconcile",
+			func(c *Config) *bool { return &c.OVSFlowWatch }),
 		stringOpt("log-level", "info", "Log level (debug, info, warn, error)",
 			func(c *Config) *string { return &c.LogLevel }),
 		boolOpt("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done",

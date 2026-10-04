@@ -33,9 +33,10 @@ regenerate this page with `go generate ./...`.
 | `--gateway-port` | `OVN_NETWORK_GATEWAY_PORT` | `gateway_port` |  | Chassisredirect port filter; empty = track all routers automatically |
 | `--route-table-id` | `OVN_NETWORK_ROUTE_TABLE_ID` | `route_table_id` | `0` | Routing table ID for FIP routes (1-252); 0 = main table |
 | `--bridge-ip` | `OVN_NETWORK_BRIDGE_IP` | `bridge_ip` | `169.254.169.254` | IP to add to bridge device for ARP resolution (default: 169.254.169.254) |
-| `--ovs-wrapper` | `OVN_NETWORK_OVS_WRAPPER` | `ovs_wrapper` |  | Command prefix for ovs-vsctl/ovs-ofctl, must forward stdin for batched flow programming (e.g. 'docker exec -i openvswitch_vswitchd') |
+| `--ovs-wrapper` | `OVN_NETWORK_OVS_WRAPPER` | `ovs_wrapper` |  | Command prefix for ovs-vsctl/ovs-ofctl/ovs-appctl, must forward stdin for batched flow programming; with ovs-flow-watch on it also runs a long-lived ovs-ofctl monitor ended through ovs-appctl (e.g. 'docker exec -i openvswitch_vswitchd') |
 | `--reconcile-interval` | `OVN_NETWORK_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval (e.g. 60s, 5m) |
 | `--route-watch` | `OVN_NETWORK_ROUTE_WATCH` | `route_watch` | `true` | Watch kernel route changes and reconcile at once when a route the agent owns is deleted or replaced; false leaves drift repair to the periodic reconcile |
+| `--ovs-flow-watch` | `OVN_NETWORK_OVS_FLOW_WATCH` | `ovs_flow_watch` | `true` | Watch the provider bridge's flow table and reconcile at once when an OVS flow the agent owns is deleted; false leaves drift repair to the periodic reconcile |
 | `--log-level` | `OVN_NETWORK_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_NETWORK_DRY_RUN` | `dry_run` | `false` | Dry-run mode: connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `OVN_NETWORK_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown (SIGINT/SIGTERM) |
