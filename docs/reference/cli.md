@@ -31,6 +31,7 @@ regenerate it with `go generate ./...`.
 | `--reconcile-interval` | `60s` | Full reconciliation interval (e.g. 60s, 5m) |
 | `--route-watch` | `true` | Watch kernel route changes and reconcile at once when a route the agent owns is deleted or replaced; false leaves drift repair to the periodic reconcile |
 | `--ovs-flow-watch` | `true` | Watch the provider bridge's flow table and reconcile at once when an OVS flow the agent owns is deleted; false leaves drift repair to the periodic reconcile |
+| `--frr-watch` | `true` | Poll the FRR daemons' process IDs once a second and reconcile at once when FRR restarted; false leaves the repair after an FRR restart to the periodic reconcile |
 | `--log-level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `false` | Dry-run mode: connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `true` | Remove all managed routes on shutdown (SIGINT/SIGTERM) |

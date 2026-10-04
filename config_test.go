@@ -763,6 +763,8 @@ func TestApplyEnvConfigBooleansBothDirections(t *testing.T) {
 		{"OVN_NETWORK_ROUTE_WATCH", "true", Config{RouteWatch: false}, true, func(c Config) bool { return c.RouteWatch }},
 		{"OVN_NETWORK_OVS_FLOW_WATCH", "false", Config{OVSFlowWatch: true}, false, func(c Config) bool { return c.OVSFlowWatch }},
 		{"OVN_NETWORK_OVS_FLOW_WATCH", "true", Config{OVSFlowWatch: false}, true, func(c Config) bool { return c.OVSFlowWatch }},
+		{"OVN_NETWORK_FRR_WATCH", "false", Config{FRRWatch: true}, false, func(c Config) bool { return c.FRRWatch }},
+		{"OVN_NETWORK_FRR_WATCH", "true", Config{FRRWatch: false}, true, func(c Config) bool { return c.FRRWatch }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
@@ -789,6 +791,7 @@ func TestApplyEnvConfigInvalidBool(t *testing.T) {
 		{"OVN_NETWORK_PORT_FORWARD_L3MDEV_ACCEPT"},
 		{"OVN_NETWORK_ROUTE_WATCH"},
 		{"OVN_NETWORK_OVS_FLOW_WATCH"},
+		{"OVN_NETWORK_FRR_WATCH"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.env, func(t *testing.T) {
@@ -900,6 +903,55 @@ func TestLoadConfigOVSFlowWatchInvalidEnv(t *testing.T) {
 		t.Fatal("loadConfig() accepted OVN_NETWORK_OVS_FLOW_WATCH=maybe")
 	}
 	if want := `invalid OVN_NETWORK_OVS_FLOW_WATCH "maybe"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err, want)
+	}
+}
+
+// TestLoadConfigFRRWatch pins the FRR watch switch through the real loader:
+// on by default, and each of the three layers can turn it off.
+func TestLoadConfigFRRWatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("frr_watch: false\n"), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		args []string
+		env  string
+		want bool
+	}{
+		{name: "default", want: true},
+		{name: "flag", args: []string{"--frr-watch=false"}, want: false},
+		{name: "env", env: "false", want: false},
+		{name: "yaml", args: []string{"--config", path}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("OVN_NETWORK_FRR_WATCH", tc.env)
+			}
+			cfg, err := loadConfig(fullModeArgs(tc.args...))
+			if err != nil {
+				t.Fatalf("loadConfig() error: %v", err)
+			}
+			if cfg.FRRWatch != tc.want {
+				t.Errorf("FRRWatch = %v, want %v", cfg.FRRWatch, tc.want)
+			}
+		})
+	}
+}
+
+// A value ParseBool rejects must fail the load and name the variable, so a
+// typo cannot silently leave the FRR watch in its default state.
+func TestLoadConfigFRRWatchInvalidEnv(t *testing.T) {
+	t.Setenv("OVN_NETWORK_FRR_WATCH", "maybe")
+
+	_, err := loadConfig(fullModeArgs())
+	if err == nil {
+		t.Fatal("loadConfig() accepted OVN_NETWORK_FRR_WATCH=maybe")
+	}
+	if want := `invalid OVN_NETWORK_FRR_WATCH "maybe"`; !strings.Contains(err.Error(), want) {
 		t.Errorf("error %q does not contain %q", err, want)
 	}
 }

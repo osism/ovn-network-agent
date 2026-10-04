@@ -79,6 +79,7 @@ func main() {
 		"reconcile_interval", cfg.ReconcileInterval,
 		"route_watch", cfg.RouteWatch,
 		"ovs_flow_watch", cfg.OVSFlowWatch,
+		"frr_watch", cfg.FRRWatch,
 		"veth_leak_enabled", cfg.VethLeakEnabled,
 		"frr_prefix_list", cfg.FRRPrefixList,
 		"stale_chassis_grace_period", cfg.StaleChassisGracePeriod,
