@@ -76,6 +76,10 @@ Substitute the values you configured for `vrf_name`, `frr_prefix_list`,
 
    Interpret its fields:
 
+   - `trigger` — why the cycle ran: `startup` (the first cycle), `periodic`
+     (the `reconcile_interval` tick) or `event` (an OVN change or one of the
+     watches). The line before an `event` cycle names the watch that fired,
+     for example `route drift detected, reconciling`.
    - `has_local_routers=false` (and `local_routers=0`) — **no logical router
      has its chassisredirect port active on this chassis.** This node is not
      the gateway for anything right now, so it announces nothing. On a standby

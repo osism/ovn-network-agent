@@ -2447,6 +2447,25 @@ func TestReconcilePortForwardOnly(t *testing.T) {
 	}
 }
 
+// The lab and production log at info, where the Debug lines of Run's loop
+// are not shown, so the reconciling line itself has to say why the cycle ran.
+func TestReconcileLogsItsTrigger(t *testing.T) {
+	logs := captureSlog(t)
+	cfg := portForwardOnlyConfig()
+	a := &Agent{
+		cfg:            cfg,
+		routing:        NewRouteManager(cfg),
+		reconcileCh:    make(chan struct{}, 1),
+		missingChassis: make(map[string]time.Time),
+	}
+
+	a.reconcile(context.Background(), triggerPeriodic)
+
+	if out := logs.String(); !strings.Contains(out, "msg=reconciling trigger=periodic") {
+		t.Errorf("the reconciling line does not lead with trigger=periodic:\n%s", out)
+	}
+}
+
 // TestCleanupPortForwardOnly verifies that cleanup() runs the port-forward
 // teardown path without dereferencing the nil OVN client (OVN NB cleanup is
 // skipped in port-forward-only mode).
