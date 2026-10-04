@@ -16,7 +16,7 @@ test/integration/
   scenario_failover_test.go                   — failover, stale-chassis cleanup (incl. multi-stale + one-stale-one-returning), drain & restore-drained
   scenario_reconnect_test.go                  — OVN pause/resume resilience + reconnect through the 30s inactivity probe (#64, #160)
   scenario_drain_edges_test.go                — drain edge cases (timeout, no local routers, cleanup_on_shutdown=false, stuck NB write)
-  scenario_drift_test.go                      — periodic-reconcile, verifyRoutes, route-watch and OVS-flow-watch drift recovery (#55, #279, #291)
+  scenario_drift_test.go                      — periodic-reconcile, verifyRoutes, route-watch, OVS-flow-watch and FRR-watch drift recovery (#55, #279, #291, #293)
   scenario_network_cidrs_test.go              — manual network_cidr override vs. auto-discovery, empty-filter sweep
   scenario_gateway_port_test.go               — legacy single-router gateway_port filter (#62)
   scenario_nat_types_test.go                  — `snat` vs `dnat_and_snat` rows + distributed `external_mac` (#62)

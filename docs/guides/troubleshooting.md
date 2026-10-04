@@ -79,7 +79,8 @@ Substitute the values you configured for `vrf_name`, `frr_prefix_list`,
    - `trigger` — why the cycle ran: `startup` (the first cycle), `periodic`
      (the `reconcile_interval` tick) or `event` (an OVN change or one of the
      watches). The line before an `event` cycle names the watch that fired,
-     for example `route drift detected, reconciling`.
+     for example `route drift detected, reconciling` or `FRR restart
+     detected, reconciling`.
    - `has_local_routers=false` (and `local_routers=0`) — **no logical router
      has its chassisredirect port active on this chassis.** This node is not
      the gateway for anything right now, so it announces nothing. On a standby
@@ -273,6 +274,16 @@ reached the kernel, which points at a `vtysh` race inside the agent's own
 change, or the kernel removed it without a notification, as it does with the
 IPv4 routes on an interface that went down or was deleted (the provider bridge,
 a VLAN subinterface, `veth-provider`).
+
+Compare the re-adds with `frr_restarts_total` as well. It counts the FRR
+restarts the FRR watch detected: the process IDs of the FRR daemons changed
+and held for two polls, or FRR came up after the agent started without it.
+Re-adds that rise with it come from an FRR restart, which drops every static
+route and prefix-list entry the agent wrote, because the agent never saves
+them. With `frr_watch` on, they were repaired once the restarted daemons had
+settled. A warning `FRR watch cannot read the FRR daemons, an FRR restart
+waits for the periodic reconcile until it can` means vtysh has not answered the
+watch for 30 s; `FRR watch can read the FRR daemons again` ends that window.
 
 **Remediation.** Same as route instability: identify the competing writer. Brief
 flapping around an FRR reload or a deploy is expected; sustained flapping is

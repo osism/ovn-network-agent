@@ -137,5 +137,6 @@ sudo apt install --allow-downgrades ./ovn-network-agent_<older>_<arch>.deb
 
 The unit declares `Wants=frr.service` (not `Requires=`), so FRR package
 upgrades and restarts do **not** restart or drain the agent. If FRR is
-briefly unavailable, route writes that fail are logged and retried on the
-next reconcile (default 60s); no manual action is needed.
+briefly unavailable, route writes that fail are logged and retried once FRR
+is back (`frr_watch`) or on the next reconcile (default 60s); no manual
+action is needed.
