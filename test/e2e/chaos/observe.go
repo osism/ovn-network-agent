@@ -435,6 +435,12 @@ type gatewayMetrics struct {
 	// A route-drop action reads them either side of its fault.
 	routeDriftKernel int
 	routeDriftFRR    int
+
+	// flowDriftMACTweak and flowDriftHairpin are the agent's OVS flow watch
+	// counters: the deletions it detected on flows it owns and did not
+	// make. ovs-flow-drop reads them either side of its fault.
+	flowDriftMACTweak int
+	flowDriftHairpin  int
 }
 
 // observeGateway gathers every data plane the oracle verifies on one gateway.
@@ -742,6 +748,10 @@ func parseMetrics(body string) gatewayMetrics {
 			m.routeDriftKernel = value
 		case name == `ovn_network_agent_route_drift_total{kind="frr"}`:
 			m.routeDriftFRR = value
+		case name == `ovn_network_agent_ovs_flow_drift_total{plane="mactweak"}`:
+			m.flowDriftMACTweak = value
+		case name == `ovn_network_agent_ovs_flow_drift_total{plane="hairpin"}`:
+			m.flowDriftHairpin = value
 		}
 	}
 	return m
@@ -767,6 +777,17 @@ func (l *lab) routeDriftCounters(ctx context.Context, gw string) (routeDrift, er
 	}
 	m := parseMetrics(out)
 	return routeDrift{Kernel: m.routeDriftKernel, FRR: m.routeDriftFRR}, nil
+}
+
+// flowDriftCounters reads the agent's OVS flow drift counters off its loopback
+// metrics endpoint. A scrape without the series reads as zero for both.
+func (l *lab) flowDriftCounters(ctx context.Context, gw string) (flowDrift, error) {
+	out, err := l.exec(ctx, gw, "bash", "-c", metricsScrapeScript)
+	if err != nil {
+		return flowDrift{}, fmt.Errorf("read the flow drift counters on %s: %w", gw, err)
+	}
+	m := parseMetrics(out)
+	return flowDrift{MACTweak: m.flowDriftMACTweak, Hairpin: m.flowDriftHairpin}, nil
 }
 
 func parseMetricValue(s string) int {
