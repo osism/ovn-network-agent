@@ -1514,11 +1514,12 @@ short hold, or one long enough to force every `ovn-controller` and agent
 to reconnect and resync — without tearing the container down. Convergence
 is `central`'s container health, which the image's HEALTHCHECK ties to both
 databases answering. While the SB is paused the baseline sweep's
-`ovn-sbctl --timeout=5` calls fail and are journaled as `check-error`s, not
-violations. `double-failover` SIGTERMs the drawn gateway (which begins its
-drain) and SIGKILLs the ring-next peer before it has finished — two
-gateways down at once, restored one at a time through the same
-container-lifecycle path the starter kills use. It is the one traced
+`ovn-sbctl --timeout=5` calls fail, and the sweep journals them as
+`check-skipped` and counts them under `checks.skipped_under_fault`, not as
+check errors or violations. `double-failover` SIGTERMs the drawn gateway
+(which begins its drain) and SIGKILLs the ring-next peer before it has
+finished — two gateways down at once, restored one at a time through the
+same container-lifecycle path the starter kills use. It is the one traced
 action: from before the inject to the convergence the runner reads the
 owner of every chassisredirect port and the upstream's selected BGP paths
 once a second and journals what changed.
@@ -1726,10 +1727,17 @@ doing: every node the run considers healthy must be running an agent, and
 no `chassisredirect` port may be claimed by two chassis at once
 (`chassis` ∪ `additional_chassis`). A sweep the runner could not answer —
 central under load, the `sbctl --timeout=5` expiring — is journaled as
-`check-error` and counted, not swallowed. The counts are the record's
-evidence that the invariants were evaluated at all: a run whose every
-dual-claim lookup failed asserted nothing, and fails with a
-`checks-never-ran` violation instead of reporting a clean pass.
+`check-error` and counted in `errors`, not swallowed. A sweep that failed
+while a fault stalling what it reads was held (`sb-pause` for the
+dual-claim lookup, from the inject until its restore returned) is
+journaled as `check-skipped` instead, with the fault's `tick`, `action` and
+`target` and the error in `detail`, and counted in `skipped_under_fault`:
+the run caused that failure itself. Every other failure stays a counted
+`check-error`. The counts are the record's evidence that the invariants
+were evaluated at all: a run whose every dual-claim lookup failed asserted
+nothing, and fails with a `checks-never-ran` violation instead of
+reporting a clean pass. A skipped sweep is not an evaluation, so a run
+whose every lookup was skipped fails with `checks-never-ran` too.
 
 **The expected-state oracle.** A green probe proves a FIP is
 reachable; it cannot prove the lab is *configured the way it says it
@@ -1931,7 +1939,12 @@ reading no longer holds; the first successful reading of the owners and of
 the paths carries `detail` `baseline` and no `from`, and it is the one taken
 before the `inject` unless that read failed),
 `settle-start` / `settle-result` (the latter with the `converged_ms` the
-settle window took to reach its expected state), `violation` and
+settle window took to reach its expected state), `check-error` (a check
+the runner could not answer, with the error in `detail`; a baseline
+sweep's also names the check in `kind`), `check-skipped` (a baseline sweep
+that failed while a fault stalling what it reads was held, with that
+fault's `tick`, `action` and `target`, the check's `kind` and the error in
+`detail`), `violation` and
 `run-end`. A `decision`, `inject` or `converged` for a
 multi-node fault carries the `peer` it also disrupted, and a decision that
 touched a named object (a route, a database server, an nftables table)
@@ -1943,8 +1956,10 @@ absent when that could not be read. A fault trace read that fails is a
 `check-error` whose `detail` starts with `fault trace:`, journaled once
 until a read succeeds again.
 `summary.json` aggregates the run: inputs, tick and decision counts,
-actions by name, how many baseline sweeps ran and how many of them
-evaluated the dual-claim invariant, per-probe sent/lost plus 10-second
+actions by name, how many baseline sweeps ran, how many of them
+evaluated the dual-claim invariant, how many checks the runner could not
+answer (`errors`) and how many failed under a held fault
+(`skipped_under_fault`), per-probe sent/lost plus 10-second
 loss buckets, per-recovery downtime (`down_ms` and `down_windows` per
 probe: the summed red windows between inject and convergence and their
 count; `from_restore_ms`, the part after the restore; and the legacy
