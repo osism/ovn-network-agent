@@ -3051,9 +3051,9 @@ func TestAgentRunJoinsFlowWatchBeforeCleanup(t *testing.T) {
 	}
 }
 
-// Port-forward-only mode manages no OVS flow, so a missing watcher is not
-// worth a line there.
-func TestAgentRunPortForwardOnlyDoesNotReportTheFlowWatch(t *testing.T) {
+// Port-forward-only mode manages no OVS flow and never runs vtysh, so a
+// missing flow or FRR watcher is not worth a line there.
+func TestAgentRunPortForwardOnlyDoesNotReportTheWatches(t *testing.T) {
 	logs := captureSlog(t)
 	a, err := NewAgent(portForwardOnlyConfig(), nil)
 	if err != nil {
@@ -3074,6 +3074,9 @@ func TestAgentRunPortForwardOnlyDoesNotReportTheFlowWatch(t *testing.T) {
 	}
 	if strings.Contains(out, "OVS flow watch disabled") {
 		t.Errorf("port-forward-only mode reported the OVS flow watch as disabled:\n%s", out)
+	}
+	if strings.Contains(out, "FRR watch disabled") {
+		t.Errorf("port-forward-only mode reported the FRR watch as disabled:\n%s", out)
 	}
 }
 
@@ -3108,5 +3111,141 @@ func TestReconcileRepairsFlowsWhileFlowWatchIsDown(t *testing.T) {
 	}
 	if got := strings.Count(logs.String(), "OVS flow watch unavailable"); got != 1 {
 		t.Errorf("outage warnings = %d, want 1 across %d failed subscribes", got, subscribes.Load())
+	}
+}
+
+// =============================================================================
+// FRR watch wiring
+// =============================================================================
+
+func TestNewAgentFRRWatchGating(t *testing.T) {
+	full := Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", FRRWatch: true}
+	off := full
+	off.FRRWatch = false
+	dryRun := full
+	dryRun.DryRun = true
+	portForwardOnly := portForwardOnlyConfig()
+	portForwardOnly.DryRun = false
+	portForwardOnly.FRRWatch = true
+
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"frr_watch on", full, true},
+		{"frr_watch off", off, false},
+		{"dry-run", dryRun, false},
+		{"port-forward-only", portForwardOnly, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := NewAgent(tt.cfg, nil)
+			if err != nil {
+				t.Fatalf("NewAgent() error: %v", err)
+			}
+			if got := a.frrWatch != nil; got != tt.want {
+				t.Errorf("frrWatch set = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The repair after an FRR restart adds FRR routes, so it must look like any
+// other event-driven reconcile, for the reason
+// TestNewAgentRouteWatchTriggerQueuesOneReconcile gives.
+func TestNewAgentFRRWatchTriggerQueuesOneReconcile(t *testing.T) {
+	a, err := NewAgent(Config{VethNexthop: "169.254.0.1", VRFName: "vrf-provider", FRRWatch: true}, nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	if a.frrWatch == nil {
+		t.Fatal("NewAgent() built no FRR watch")
+	}
+
+	a.frrWatch.trigger()
+	a.frrWatch.trigger()
+
+	if got := len(a.reconcileCh); got != 1 {
+		t.Errorf("queued reconcile signals = %d, want 1 for two triggers", got)
+	}
+	if obs := a.ovn.failoverObserved.Load(); obs != nil {
+		t.Errorf("failoverObserved = %+v, want it unset after an FRR restart trigger", obs)
+	}
+}
+
+// Run primes the FRR watch before the startup reconcile, so an FRR that comes
+// up while that reconcile runs is a restart rather than the baseline, starts
+// the watch after it, and on shutdown does not return while a poll is still
+// in flight.
+func TestAgentRunPrimesStartsAndJoinsFRRWatch(t *testing.T) {
+	const (
+		primed   = "test: FRR watch primed"
+		polling  = "test: FRR watch poll entered"
+		released = "test: FRR watch poll released"
+	)
+	logs := captureSlog(t)
+	a, err := NewAgent(portForwardOnlyConfig(), nil)
+	if err != nil {
+		t.Fatalf("NewAgent() error: %v", err)
+	}
+	// The first poll primes the watch. The second blocks until release is
+	// closed, whatever its context says, which keeps the watcher's goroutine
+	// alive past the cancel.
+	var polls atomic.Int32
+	release := make(chan struct{})
+	w := newFRRWatcher(a.triggerReconcile)
+	w.poll = func(context.Context) ([]byte, error) {
+		switch polls.Add(1) {
+		case 1:
+			slog.Info(primed)
+		case 2:
+			slog.Info(polling)
+			<-release
+			slog.Info(released)
+		}
+		return nil, errTestVtyshDown
+	}
+	a.frrWatch = w
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	waitForCondition(t, "Run to start the FRR watch", func() bool { return polls.Load() >= 2 })
+	cancel()
+
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("Run() returned while an FRR watch poll was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s")
+	}
+
+	out := logs.String()
+	prime := strings.Index(out, primed)
+	startup := strings.Index(out, "msg=reconciling trigger=startup")
+	poll := strings.Index(out, polling)
+	joined := strings.Index(out, released)
+	cleanup := strings.Index(out, "shutting down, cleaning up routes")
+	if prime < 0 || startup < prime {
+		t.Errorf("the FRR watch was not primed before the startup reconcile:\n%s", out)
+	}
+	if startup < 0 || poll < startup {
+		t.Errorf("the FRR watch polled before the startup reconcile:\n%s", out)
+	}
+	if joined < 0 || cleanup < joined {
+		t.Errorf("the shutdown cleanup began before the FRR watch goroutine was joined:\n%s", out)
 	}
 }

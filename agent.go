@@ -34,6 +34,13 @@ type Agent struct {
 	// receiver.
 	flowWatch *flowWatcher
 
+	// frrWatch triggers a reconcile when a restarted FRR has settled, because
+	// FRR comes back without the statics and prefix-list entries the agent
+	// never saves. It is nil when frr_watch is off, in dry-run (the agent
+	// writes nothing to FRR) and in port-forward-only mode (the agent never
+	// runs vtysh). Its methods are no-ops on a nil receiver.
+	frrWatch *frrWatcher
+
 	// Channel to trigger reconciliation
 	reconcileCh chan struct{}
 
@@ -124,7 +131,7 @@ func NewAgent(cfg Config, reloadConfig func() (Config, error)) (*Agent, error) {
 		a.ovn = NewOVNClient(cfg, a.triggerReconcile)
 	}
 
-	// The watcher goes through triggerReconcile, not the OVN client's
+	// The watchers go through triggerReconcile, not the OVN client's
 	// immediate refresh: that one stamps a failover observation, so a drift
 	// repair that adds FRR routes would be recorded as a failover announce.
 	if cfg.RouteWatch && !cfg.DryRun && !cfg.PortForwardOnly {
@@ -133,6 +140,9 @@ func NewAgent(cfg Config, reloadConfig func() (Config, error)) (*Agent, error) {
 	if cfg.OVSFlowWatch && !cfg.DryRun && !cfg.PortForwardOnly {
 		a.flowWatch = newFlowWatcher(cfg, a.triggerReconcile)
 		a.routing.flowWatch = a.flowWatch
+	}
+	if cfg.FRRWatch && !cfg.DryRun && !cfg.PortForwardOnly {
+		a.frrWatch = newFRRWatcher(a.triggerReconcile)
 	}
 
 	return a, nil
@@ -233,6 +243,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.ovn.RestoreDrainedGateways(ctx, a.ovn.GetState().LocalChassisName)
 	}
 
+	// The FRR watch reads the FRR the startup reconcile is about to run
+	// against, so an FRR that comes up or restarts while it runs is a
+	// restart rather than the watch's baseline.
+	a.frrWatch.prime(ctx)
+
 	// Initial reconciliation
 	a.reconcile(ctx, triggerStartup)
 
@@ -252,6 +267,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.flowWatch.start(ctx)
 	if a.flowWatch == nil && !a.cfg.PortForwardOnly {
 		slog.Info("OVS flow watch disabled")
+	}
+	a.frrWatch.start(ctx)
+	if a.frrWatch == nil && !a.cfg.PortForwardOnly {
+		slog.Info("FRR watch disabled")
 	}
 
 	// Main loop
@@ -306,6 +325,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			// monitor can take an exec through the OVS wrapper, and the
 			// drain must not wait for that.
 			a.flowWatch.wait()
+			// Joined after the drain for the same reason: a vtysh poll in
+			// flight can take up to frrWatchPollTimeout. The watch writes
+			// nothing, so the cleanup cannot race it.
+			a.frrWatch.wait()
 			if a.cfg.CleanupOnShutdown {
 				slog.Info("shutting down, cleaning up routes")
 				a.cleanup()
