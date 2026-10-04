@@ -151,8 +151,11 @@ at the top of `analyze.py` and its tests in the same commit.
   red, so `ovs-flow-drop` "converged" in 0.4 s and then lost `cross-fip`
   for seconds. Read the `after` rows of such a record, never its
   `converged_ms`, for how long a repair took.
-- `check-error` events with `ovn-sbctl --timeout=5` during `sb-pause`
-  holds are sweep noise of the harness (#239).
+- `check-skipped` events are dual-claim sweeps that failed while
+  `sb-pause` held the SB, and `checks.errors` leaves them out. The Runs
+  table counts them under `skipped under fault`. Records written before
+  #239 journal the same failures as `check-error`, count them in
+  `checks.errors` and show `n/a` under `skipped under fault`.
 - The owner of `cr-lr0-public` is journaled only by profiles with the
   port-forward layer (`cr_owner` on `converged`, `vip-repoint`) and by
   the fault trace of a `double-failover`. Elsewhere infer it from the
