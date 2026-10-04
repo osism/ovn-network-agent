@@ -16,9 +16,9 @@ import (
 )
 
 // All scenarios in this file cover the agent's drift-recovery layer (#55,
-// #279, #291).
+// #279, #291, #293).
 //
-// Four mechanisms are under test:
+// Five mechanisms are under test:
 //   - the periodic reconcile ticker (`reconcile_interval`) that re-derives
 //     desired vs. actual every cycle and reinstalls anything missing,
 //   - `verifyRoutes`, the post-mutation safety net that catches routes that
@@ -26,7 +26,10 @@ import (
 //   - the route watch (`route_watch`), which reconciles at once when the
 //     kernel reports that an owned route was deleted or replaced, and
 //   - the OVS flow watch (`ovs_flow_watch`), which reconciles at once when
-//     its `ovs-ofctl monitor` reports that an owned flow was deleted.
+//     its `ovs-ofctl monitor` reports that an owned flow was deleted, and
+//   - the FRR watch (`frr_watch`), which reconciles at once when a restarted
+//     FRR has settled, because FRR comes back without the statics and
+//     prefix-list entries the agent never saves.
 //
 // Without coverage here, a refactor that drops one of the layers would not be
 // caught: the unit tests in agent_test.go, route_watch_test.go and
@@ -595,6 +598,10 @@ const ovsFlowDriftMetric = "ovn_network_agent_ovs_flow_drift_total"
 // reconcile.
 var ovsFlowWatchOff = false
 
+// frrWatchOff keeps the FRR watch's once-a-second vtysh polls out of a
+// scenario.
+var frrWatchOff = false
+
 // flowMonitorPattern matches the argv of the agent's OVS flow monitor, and not
 // the ovs-appctl call that ends it.
 const flowMonitorPattern = "ovs-ofctl.*ovn-network-agent-flow-monitor.ctl"
@@ -807,4 +814,87 @@ func TestScenario_DriftOVSFlowMonitorRestarted(t *testing.T) {
 	}
 	testenv.Eventually(t, func() bool { return len(flowMonitorPids(t)) == 0 },
 		5*time.Second, 100*time.Millisecond, "no OVS flow monitor process after the agent stopped")
+}
+
+// frrRestartsMetric counts the FRR restarts the FRR watch detected.
+const frrRestartsMetric = "ovn_network_agent_frr_restarts_total"
+
+// TestScenario_FRRRestartWatched (#293):
+//
+// The agent writes its statics and prefix-list entries into FRR's running
+// configuration and never saves them, so `systemctl restart frr` brings FRR
+// back from the base config setup.sh saved, without either. The FRR watch sees
+// the daemons' process IDs change and reconciles once they have settled.
+//
+// The scenario runs at `reconcile_interval: 60s` with the route watch off: the
+// route watch's reconcile while FRR stops cannot be the repair, and neither
+// can the tick.
+func TestScenario_FRRRestartWatched(t *testing.T) {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Skipf("systemctl not found in PATH: %v", err)
+	}
+	ctx, cancel, nb, sb := startScenario(t)
+	defer cancel()
+
+	const listName = "OVN-AGENT-TEST-293"
+	prefixListCleanup(t, listName)
+
+	router := testenv.MakeLocalRouter(t, ctx, nb, sb, testenv.LocalRouterOpts{
+		Name:        "frrrestart",
+		LRPNetworks: []string{"198.51.100.11/24"},
+	})
+
+	cfg := testenv.Defaults()
+	cfg.ReconcileInterval = "60s"
+	cfg.FRRPrefixList = listName
+	cfg.RouteWatch = &routeWatchOff
+	addr := testenv.FreeLoopbackAddr(t)
+	cfg.MetricsListen = addr
+	a := readyAgent(t, cfg)
+	defer a.Stop(15 * time.Second)
+
+	const fip = "198.51.100.45"
+	testenv.AddFIP(t, ctx, nb, router, fip, "10.0.0.45")
+	testenv.AssertFRRRoute(t, fip, 10*time.Second)
+	testenv.AssertFRRPrefixListContains(t, listName, "198.51.100.0/24", 15*time.Second)
+
+	// The watch takes its baseline from two equal polls one second apart,
+	// and a restart before it has one is not seen.
+	time.Sleep(3 * time.Second)
+
+	periodic := map[string]string{"trigger": "periodic"}
+	before, _ := testenv.ScrapeMetrics(t, addr).Value("ovn_network_agent_reconcile_total", periodic)
+
+	if out, err := exec.Command("systemctl", "restart", "frr").CombinedOutput(); err != nil {
+		t.Fatalf("systemctl restart frr: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	repairDeadline := time.Now().Add(15 * time.Second)
+
+	testenv.AssertFRRRoute(t, fip, time.Until(repairDeadline))
+	testenv.AssertFRRPrefixListContains(t, listName, "198.51.100.0/24", time.Until(repairDeadline))
+	// The watch counts the restart before it triggers the repair.
+	testenv.AssertMetricEventually(t, addr, frrRestartsMetric, nil,
+		func(v float64, present bool) bool { return present && v >= 1 },
+		2*time.Second)
+	if !strings.Contains(a.LogTail(100000), "FRR restart detected, reconciling") {
+		t.Errorf("expected 'FRR restart detected, reconciling' in the agent log; last logs:\n%s", a.LogTail(40))
+	}
+
+	after, _ := testenv.ScrapeMetrics(t, addr).Value("ovn_network_agent_reconcile_total", periodic)
+	if after != before {
+		t.Errorf("reconcile_total{trigger=\"periodic\"} went from %v to %v across the repair, want it unchanged", before, after)
+	}
+
+	// The follow-up is due 5 s after the last restart the watch detected, so
+	// once it has run, a second detection would have shown.
+	testenv.Eventually(t, func() bool {
+		return strings.Contains(a.LogTail(100000), "reconciling again after the FRR restart")
+	}, 10*time.Second, 100*time.Millisecond, "the follow-up reconcile after the FRR restart")
+	// One restart is one detection, also while the daemons stopped one by one.
+	if v, _ := testenv.ScrapeMetrics(t, addr).Value(frrRestartsMetric, nil); v != 1 {
+		t.Errorf("%s = %v after one restart, want 1", frrRestartsMetric, v)
+	}
+	if n := strings.Count(a.LogTail(100000), "FRR restart detected, reconciling"); n != 1 {
+		t.Errorf("'FRR restart detected, reconciling' logged %d times for one restart, want 1; last logs:\n%s", n, a.LogTail(40))
+	}
 }

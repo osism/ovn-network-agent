@@ -51,6 +51,9 @@ func TestScenario_FailureInjection_VtyshFailsOnce(t *testing.T) {
 	shim := testenv.WithFailingTool(t, "vtysh", 3)
 	cfg := testenv.FastDefaults()
 	cfg.ExtraEnv = append(cfg.ExtraEnv, shim.Env())
+	// The FRR watch's once-a-second polls would use up the forced vtysh
+	// failures before the reconcile the scenario is about.
+	cfg.FRRWatch = &frrWatchOff
 	shim.Arm()
 
 	a := readyAgent(t, cfg)
@@ -74,6 +77,9 @@ func TestScenario_FailureInjection_VtyshFailsOnce(t *testing.T) {
 	logs := a.LogTail(100000)
 	if !strings.Contains(logs, "test shim: forced failure of vtysh") {
 		t.Errorf("expected forced-failure marker for vtysh in agent log; tail:\n%s", a.LogTail(40))
+	}
+	if !strings.Contains(logs, "FRR watch disabled") {
+		t.Errorf("expected 'FRR watch disabled' in the agent log; tail:\n%s", a.LogTail(40))
 	}
 }
 
