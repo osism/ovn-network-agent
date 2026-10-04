@@ -193,8 +193,8 @@ start, and stays a hypothesis until the code or a replay confirms it.
 
 | signature | likely mechanism | where to look |
 | --- | --- | --- |
-| downtime near the target's `reconcile_interval`, tripling at slow cadence | the repair waits for the periodic reconcile | the callers of `triggerReconcile` in `agent.go`; the route watch (`route_watch.go`) covers kernel routes only |
-| `restore` loss on `cross-fip` behind `ovs-flow-drop` (`after` in records before #292) | OVS flow drift has no watch (Data-plane drift in the E2E docs) | `ovs.go`, #291 |
+| downtime near the target's `reconcile_interval`, tripling at slow cadence | the repair waits for the periodic reconcile | the callers of `triggerReconcile` in `agent.go`; the route watch (`route_watch.go`) covers routes and the OVS flow watch (`flow_watch.go`) the hairpin and MAC-tweak flows, no watch covers nftables |
+| `restore` loss on `cross-fip` behind `ovs-flow-drop` (`after` in records before #292) | the OVS flow watch did not repair the flows: its `flow_drift` is 0, or absent as in every record before #291, and the periodic reconcile put them back | the `OVS flow watch` and `OVS flow monitor` lines of the target's agent log; `flow_watch.go`, `ovs.go`, #291 |
 | about 4.5 s `restore` after `frr-restart` on the announcing gateway, ending 6 to 7 s after the inject whatever the phase of the reconcile ticker | FRR's own restart plus the BGP re-establishment the restore forces with `no router bgp` | `restoreGatewayFRR` and `configureGatewayBGP` in `test/e2e/chaos/`, #238 |
 | one 14.3 s `frr-restart` on a gateway at slow cadence (run 36877177662 tick 11) | not named yet; the agent never writes the FRR config to disk, so statics added since the last `write memory` may wait for the next reconcile | `routing.go`, the route watch's FRR case in `route_watch.go`, #293 |
 | 2 to 3.5 s `failover` after a kill, an undrained terminate or a double-failover on the owner | detection plus the takeover on the standby | OVN's BFD on the tunnels, #128, #130 |
