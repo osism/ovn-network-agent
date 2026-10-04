@@ -1495,7 +1495,7 @@ part of the replay contract: a new action is appended, never inserted.
 | `frr-route-drop` | gateway | 2 | — | 10 s | `no ip route 192.0.2.10/32 169.254.0.1` in `vrf-provider` |
 | `nft-flush` | gateway | 2 | — | 60 s | `nft flush table ip ovn-network-agent` |
 | `ovs-flow-drop` | gateway | 2 | — | 10 s | `ovs-ofctl del-flows` the hairpin (`0x998`) and MAC-tweak (`0x999`) cookies on `br-ex` |
-| `frr-restart` | gateway | 2 | — | 120 s | `frrinit.sh` stop/clear/start, then re-assert BGP |
+| `frr-restart` | gateway | 2 | — | 10 s | `frrinit.sh` stop/clear/start, then re-assert BGP |
 | `upstream-bgp-restart` | upstream | 1 | 5–20 s | 90 s | `pkill -x bgpd` on `upstream`, then start it back in place |
 | `fip-churn` | central | 2 | — | 60 s | add/remove a spare FIP (`192.0.2.60`) on `lr0` |
 | `lb-vip-churn` | central | 2 | — | 60 s | add/remove a `vips` entry (`192.0.2.50:81`) on `pf-external` |
@@ -1546,7 +1546,8 @@ and `ovs-flow-drop` by its OVS flow watch, which reconciles as soon as its
 `ovs-ofctl monitor` reports the deleted flows. Their recovery budget is
 10 s: above the time a probe confirmation takes, and below the 15 s
 cadence a `cadence-toggle` flip sets, so a repair that waited for the
-periodic reconcile fails it. `nft-flush` is undone by the next periodic
+periodic reconcile fails it. The routing flap `frr-restart` below carries
+the same budget, because the agent's FRR watch repairs it. `nft-flush` is undone by the next periodic
 reconcile, because no watch covers nftables. Its 60 s budget is that
 worst-case cadence plus probe slack.
 For a route drop the runner also reads the target's `route_drift_total`
@@ -1567,7 +1568,12 @@ announcements return — the probes from `client-1` are only reachable over
 the routes `upstream` re-learns over BGP, so a green probe set is the
 proof. `frr-restart` recycles a gateway's FRR the way the gwnode entrypoint
 does (stop, clear the stale `watchfrr` state, start) and re-asserts the
-session on restore. The recycle runs backgrounded inside the container and
+session on restore. The restarted FRR comes back without the agent's static
+routes and prefix-list entries, which the agent never saves. The agent's FRR
+watch re-applies them once the restarted daemons have settled, whatever the
+reconcile cadence, so `frr-restart` carries the 10 s watch budget, measured
+from the restore's return: a repair that waited for the 15 s tick of a
+`cadence-toggle` flip fails it. The recycle runs backgrounded inside the container and
 touches a completion marker the restore gates on: run synchronously, a
 slow stop+start rides the exec into the runner's 30 s command timeout —
 the SIGKILL reaps only the `docker exec` client while FRR restarts

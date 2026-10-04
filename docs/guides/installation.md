@@ -10,7 +10,7 @@ Pick the method that matches how you manage software on the target host.
 | Component | Version | Why |
 |-----------|---------|-----|
 | OVN | **24.09 or newer** (tested against 25.09) | The agent's NAT model uses the `match` and `priority` columns added in OVN 24.09. libovsdb validates the client model against the server schema at connect time, so an older Northbound is rejected outright. |
-| FRR | **8.0 or newer** | Routes and prefix-lists are read as JSON (`show ip route vrf … static json`, `show ip prefix-list … json`) rather than by scraping the human-readable tables. |
+| FRR | **8.0 or newer** | Routes and prefix-lists are read as JSON (`show ip route vrf … static json`, `show ip prefix-list … json`) rather than by scraping the human-readable tables. The FRR watch (`frr_watch`) reads the process ID of each daemon from `show modules`, which prints a `pid:` line per daemon from FRR 8.0 on. |
 | Open vSwitch | Any version matching your OVN | Hairpin flows are programmed with `ovs-ofctl`. The OVS flow watch (`ovs_flow_watch`) keeps an `ovs-ofctl monitor` running on the provider bridge and ends it with `ovs-appctl`; both are reached through `ovs_wrapper` when one is set. |
 | nftables | Any recent version | Required only when port forwarding (DNAT) is enabled. |
 
