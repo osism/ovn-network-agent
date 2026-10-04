@@ -77,6 +77,9 @@
 # start honours:
 #   BGPD_WAIT_SECS=30      # readiness wait per start attempt, seconds
 #   BGPD_START_ATTEMPTS=3  # bounded retries before bring-up is failed
+# the upstream zebra gate honours:
+#   ZEBRA_WAIT_SECS=30      # readiness wait per start attempt, seconds
+#   ZEBRA_START_ATTEMPTS=3  # bounded retries before bring-up is failed
 # the gateway-entrypoint gate honours:
 #   GWNODE_READY_SECS=120  # wait for the agent process per bring-up
 # and the next-hop MAC binding write honours:
@@ -136,6 +139,14 @@ BGP_ROUTER_ID_UPSTREAM="${BGP_ROUTER_ID_UPSTREAM:-100.64.0.1}"
 # full job re-run.
 BGPD_WAIT_SECS="${BGPD_WAIT_SECS:-30}"
 BGPD_START_ATTEMPTS="${BGPD_START_ATTEMPTS:-3}"
+
+# Upstream zebra start budget. watchfrr starts zebra at container start,
+# and the pinned FRR 8.4 can crash it there; ensure_upstream_zebra checks
+# it before the bgpd start and starts it in-place when it is missing.
+# ZEBRA_WAIT_SECS is the readiness wait per start attempt, and the start
+# is retried up to ZEBRA_START_ATTEMPTS times before the bring-up fails.
+ZEBRA_WAIT_SECS="${ZEBRA_WAIT_SECS:-30}"
+ZEBRA_START_ATTEMPTS="${ZEBRA_START_ATTEMPTS:-3}"
 
 # Budget for wait_for_gateway_agents. The gwnode entrypoint's own
 # readiness probes allow up to ~2 minutes of legitimate daemon start
@@ -468,11 +479,11 @@ configure_upstream() {
 }
 
 # Dump the upstream container's FRR daemon state to stderr (the job
-# log) so a bgpd bring-up failure can be root-caused after the fact. The
-# upstream image is pinned by digest in topology.clab.yml, but every
-# command stays individually best-effort and drawn from an independent
-# source: a future image bump degrades one section, not the whole
-# report.
+# log) so a zebra or bgpd bring-up failure can be root-caused after the
+# fact. The upstream image is pinned by digest in topology.clab.yml, but
+# every command stays individually best-effort and drawn from an
+# independent source: a future image bump degrades one section, not the
+# whole report.
 dump_upstream_frr_state() {
     log "dumping ${UPSTREAM_NODE} FRR state for triage"
     log "--- /etc/frr/daemons ---"
@@ -536,6 +547,123 @@ if [ -n "${start_out}" ]; then
 fi
 exit 1
 EOSH
+}
+
+# Start zebra on the upstream container when it is not running and wait
+# for it to register, once. Returns non-zero (without exiting the script)
+# when zebra does not come up within ${ZEBRA_WAIT_SECS}, so the caller
+# can retry. The pgrep/pkill patterns anchor the full path because the
+# image's BusyBox applets match argv[0] (see start_upstream_bgpd).
+#
+# The start command is the one the image's own start path runs:
+# /usr/lib/frr/frrcommon.sh builds it from zebra_options in
+# /etc/frr/daemons plus the default profile, and a healthy container runs
+# exactly this one:
+#   /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000
+# zebra drops to user frr by itself, so there is no `-u frr -g frr`.
+#
+# A start that exits non-zero and leaves no zebra process is a crash, so
+# the attempt fails at once instead of waiting ZEBRA_WAIT_SECS. That
+# keeps three attempts within a few seconds, well before watchfrr's 55 s
+# startup timeout. A start that exits non-zero while a zebra process
+# exists lost the race against watchfrr's own start (the second zebra
+# exits on `Could not lock pid_file /var/run/frr/zebra.pid` and the first
+# keeps running), so the poll decides.
+#
+# bgpd is stopped before zebra is started in-place. On a fresh lab there
+# is none and the pkill is a no-op. On a re-run against a lab whose zebra
+# died, it makes configure_upstream_frr start bgpd against the new zebra,
+# the order the image's own `restart all` produces. The restarted bgpd
+# reads /etc/frr/bgpd.conf, which the earlier `write memory` saved, and
+# the config push that follows is idempotent.
+#
+# ZEBRA_WAIT_SECS=0 or a non-numeric value fails closed: BusyBox
+# `seq 1 0` prints nothing and `seq 1 abc` prints an error, so the poll
+# never runs, every attempt exits 1 and ensure_upstream_zebra aborts.
+#
+# staticd is left alone. It runs since container start, reconnects to
+# zebra by itself, and the lab configures no static route on the
+# upstream.
+start_upstream_zebra() {
+    docker exec -i --env "ZEBRA_WAIT_SECS=${ZEBRA_WAIT_SECS}" \
+        "${UPSTREAM_NODE}" sh -eu <<'EOSH'
+start_out=""
+if ! pgrep -f '^/usr/lib/frr/zebra' >/dev/null; then
+    pkill -f '^/usr/lib/frr/bgpd' || true
+    if start_out=$(/usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000 2>&1); then
+        :
+    else
+        rc=$?
+        printf 'zebra start exited %s: %s\n' "${rc}" "${start_out}" >&2
+        if ! pgrep -f '^/usr/lib/frr/zebra' >/dev/null; then
+            exit 1
+        fi
+    fi
+fi
+for _ in $(seq 1 "${ZEBRA_WAIT_SECS}"); do
+    if vtysh -c "show daemons" 2>/dev/null | grep -qw zebra; then
+        exit 0
+    fi
+    sleep 1
+done
+echo "zebra did not come up on $(hostname) within ${ZEBRA_WAIT_SECS}s" >&2
+if [ -n "${start_out}" ]; then
+    printf 'last zebra start output: %s\n' "${start_out}" >&2
+fi
+exit 1
+EOSH
+}
+
+# Make sure zebra runs on the upstream before bgpd is started against it,
+# retrying the start within a bounded budget. The loop is a counter, not
+# the `seq` loop of configure_upstream_frr: BSD `seq 1 0` counts down and
+# prints `1 0` while GNU `seq 1 0` prints nothing, so a budget of 0 would
+# run one attempt on macOS and none on Linux. With the counter, a budget
+# of 0 and a non-numeric budget both skip the loop and reach the abort.
+# The test is `[`, not `[[`: `[[` evaluates a non-numeric operand as an
+# arithmetic expression, which under `set -u` exits before the dump. The
+# abort sits after the loop, so no path leaves the function without a
+# running zebra or exit 1. A zebra that started but never registered is
+# killed between attempts so it cannot hold the pid-file lock against the
+# next one, and so the next attempt does not find it and skip the start.
+# The kill is SIGKILL: FRR acts on SIGTERM only from its event loop, which
+# a zebra that never registered may not be running. The last attempt's
+# zebra is left alone, so the state dump still shows it.
+ensure_upstream_zebra() {
+    local attempt=1
+    while [ "${attempt}" -le "${ZEBRA_START_ATTEMPTS}" ]; do
+        if start_upstream_zebra; then
+            log "zebra up on ${UPSTREAM_NODE} (attempt ${attempt}/${ZEBRA_START_ATTEMPTS})"
+            return 0
+        fi
+        log "zebra start attempt ${attempt}/${ZEBRA_START_ATTEMPTS} failed on ${UPSTREAM_NODE}"
+        if [ "${attempt}" -lt "${ZEBRA_START_ATTEMPTS}" ]; then
+            docker exec "${UPSTREAM_NODE}" pkill -KILL -f '^/usr/lib/frr/zebra' || true
+            sleep 1
+        fi
+        attempt=$(( attempt + 1 ))
+    done
+    dump_upstream_frr_state
+    echo "zebra did not come up on ${UPSTREAM_NODE} after ${ZEBRA_START_ATTEMPTS} attempts; without zebra the upstream installs no BGP route and no client reaches a floating IP" >&2
+    exit 1
+}
+
+# Look at the upstream zebra once more before bring-up reports success.
+# This never starts zebra: a zebra that registered and then died within
+# the same bring-up is not a one-off, bgpd has already connected to it,
+# and watchfrr is about to run its own `restart all`. Aborting with the
+# named cause is the honest outcome. It checks the process, not
+# `show daemons`, so a vtysh hiccup cannot fail a healthy lab. Any
+# non-zero exit of the docker exec, a missing container included, counts
+# as gone.
+verify_upstream_zebra() {
+    if docker exec "${UPSTREAM_NODE}" pgrep -f '^/usr/lib/frr/zebra' >/dev/null; then
+        log "zebra still running on ${UPSTREAM_NODE}"
+        return 0
+    fi
+    dump_upstream_frr_state
+    echo "zebra on ${UPSTREAM_NODE} died after it came up; without zebra the upstream installs no BGP route and no client reaches a floating IP" >&2
+    exit 1
 }
 
 configure_upstream_frr() {
@@ -866,7 +994,9 @@ main() {
     configure_client
 
     # FRR / BGP — must come after the underlay is up so the BGP TCP
-    # sessions have somewhere to land.
+    # sessions have somewhere to land. zebra is checked first: without it
+    # the routes bgpd learns never reach the upstream's kernel.
+    ensure_upstream_zebra
     configure_upstream_frr
     configure_gateway_frr
 
@@ -877,6 +1007,9 @@ main() {
     # Last, because the agents (running since container start) may have
     # already locked the election onto a bring-up-race winner.
     converge_master_chassis
+    # After every other step, so the most time passes between bgpd
+    # connecting to zebra and this look.
+    verify_upstream_zebra
     log "bootstrap complete"
 }
 
