@@ -644,6 +644,55 @@ func TestParseMetricsReadsTheRouteDriftCounters(t *testing.T) {
 	}
 }
 
+// The OVS flow drift counters are read off the same scrape. A scrape without
+// them reads as zero for both, and the route drift counters beside them keep
+// their meaning.
+func TestParseMetricsReadsTheFlowDriftCounters(t *testing.T) {
+	tests := []struct {
+		name              string
+		body              string
+		mactweak, hairpin int
+		kernel, frr       int
+	}{
+		{"empty body", "", 0, 0, 0, 0},
+		{"no flow drift series", "ovn_network_agent_route_drift_total{kind=\"kernel\"} 2\n", 0, 0, 2, 0},
+		{"both series beside the route drift", "# TYPE ovn_network_agent_ovs_flow_drift_total counter\n" +
+			"ovn_network_agent_ovs_flow_drift_total{plane=\"hairpin\"} 5\n" +
+			"ovn_network_agent_ovs_flow_drift_total{plane=\"mactweak\"} 2\n" +
+			"ovn_network_agent_route_drift_total{kind=\"frr\"} 4\n" +
+			"ovn_network_agent_route_drift_total{kind=\"kernel\"} 7\n", 2, 5, 7, 4},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := parseMetrics(tc.body)
+			if m.flowDriftMACTweak != tc.mactweak || m.flowDriftHairpin != tc.hairpin {
+				t.Errorf("flow drift counters = %d/%d, want %d/%d",
+					m.flowDriftMACTweak, m.flowDriftHairpin, tc.mactweak, tc.hairpin)
+			}
+			if m.routeDriftKernel != tc.kernel || m.routeDriftFRR != tc.frr {
+				t.Errorf("route drift counters = %d/%d, want %d/%d",
+					m.routeDriftKernel, m.routeDriftFRR, tc.kernel, tc.frr)
+			}
+		})
+	}
+}
+
+// A scrape that fails names the gateway and keeps the cause, since the engine
+// journals the text as the reason a recovery carries no drift delta.
+func TestFlowDriftCountersWrapsAFailedScrape(t *testing.T) {
+	cmd := &fakeCommander{respond: func([]string) (string, error) { return "", errBoom }}
+	l := newTestLab(cmd, newFakeClock())
+
+	_, err := l.flowDriftCounters(context.Background(), "gateway-2")
+	if err == nil {
+		t.Fatal("flowDriftCounters succeeded on a failed scrape")
+	}
+	if !strings.HasPrefix(err.Error(), "read the flow drift counters on gateway-2: ") || !errors.Is(err, errBoom) {
+		t.Fatalf("error = %q, want it to name gateway-2 and wrap the scrape error", err)
+	}
+}
+
 // A scrape that fails names the gateway and keeps the cause, since the engine
 // journals the text as the reason a recovery carries no drift delta.
 func TestRouteDriftCountersWrapsAFailedScrape(t *testing.T) {

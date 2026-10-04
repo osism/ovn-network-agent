@@ -203,6 +203,8 @@ type probeSummary struct {
 // route_drift_total counters moved between the inject and the convergence.
 // It is absent when either scrape failed or a counter went down, and on
 // every record written before the field existed.
+// `flow_drift` is the same for ovs-flow-drop and the target's
+// ovs_flow_drift_total counters.
 type recoveryRecord struct {
 	Tick          int              `json:"tick"`
 	Action        string           `json:"action"`
@@ -216,6 +218,7 @@ type recoveryRecord struct {
 	FromRestoreMS map[string]int64 `json:"from_restore_ms"`
 	CROwnerAfter  string           `json:"cr_owner_after"`
 	RouteDrift    *routeDrift      `json:"route_drift,omitempty"`
+	FlowDrift     *flowDrift       `json:"flow_drift,omitempty"`
 }
 
 // routeDrift is a reading of the agent's route_drift_total counters, or the
@@ -223,6 +226,13 @@ type recoveryRecord struct {
 type routeDrift struct {
 	Kernel int `json:"kernel"`
 	FRR    int `json:"frr"`
+}
+
+// flowDrift is a reading of the agent's ovs_flow_drift_total counters, or the
+// difference between two readings, by plane.
+type flowDrift struct {
+	MACTweak int `json:"mactweak"`
+	Hairpin  int `json:"hairpin"`
 }
 
 // settleRecord is the verdict of one settle window: how long the lab took

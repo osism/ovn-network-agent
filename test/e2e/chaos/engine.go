@@ -134,6 +134,11 @@ type action struct {
 	// shows whether the agent's route watch saw the deletion.
 	countsRouteDrift bool
 
+	// countsFlowDrift is set on ovs-flow-drop, the same way for the
+	// target's ovs_flow_drift_total counters, so a report shows whether the
+	// agent's OVS flow watch saw the deletion.
+	countsFlowDrift bool
+
 	// faultTrace is set on double-failover: the engine follows the
 	// chassisredirect owners and the upstream's selected paths from before the
 	// inject to the convergence and journals every change (trace.go).
@@ -580,6 +585,16 @@ func (e *engine) execute(ctx context.Context, d decision) {
 			driftBefore = &before
 		}
 	}
+	var flowDriftBefore *flowDrift
+	if d.action.countsFlowDrift {
+		before, err := e.lab.flowDriftCounters(ctx, d.target)
+		if err != nil {
+			e.jrnl.emit(event{Event: evCheckError, Tick: d.tick, Action: d.action.name,
+				Target: d.target, Detail: err.Error()})
+		} else {
+			flowDriftBefore = &before
+		}
+	}
 
 	// The trace takes its baseline here, so that reading is not fault time
 	// either. It then follows the inject, the hold, the restores and the
@@ -640,7 +655,7 @@ func (e *engine) execute(ctx context.Context, d decision) {
 		e.setNodeState(n, nodeConverging)
 	}
 
-	e.converge(ctx, d, injectedAt, restoredAt, driftBefore)
+	e.converge(ctx, d, injectedAt, restoredAt, driftBefore, flowDriftBefore)
 }
 
 // restoreNode runs one node's restore on its own detached, bounded
@@ -737,8 +752,9 @@ func (e *engine) park(gw string) {
 //
 // driftBefore is the target's route drift counters from before the inject,
 // nil when the action does not measure them or the read failed. With it the
-// converged action also records how far the counters moved.
-func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time, driftBefore *routeDrift) {
+// converged action also records how far the counters moved. flowDriftBefore
+// is the same for the target's OVS flow drift counters.
+func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredAt time.Time, driftBefore *routeDrift, flowDriftBefore *flowDrift) {
 	nodes := e.nodesFor(d)
 	deadline := restoredAt.Add(d.action.recoveryBudget)
 	for e.now().Before(deadline) {
@@ -767,6 +783,7 @@ func (e *engine) converge(ctx context.Context, d decision, injectedAt, restoredA
 			// Read after the record is built, so the scrape does not
 			// lengthen converged_ms.
 			recovery.RouteDrift = e.routeDriftSince(ctx, d, driftBefore)
+			recovery.FlowDrift = e.flowDriftSince(ctx, d, flowDriftBefore)
 			e.rec.Recoveries = append(e.rec.Recoveries, recovery)
 			e.jrnl.emit(event{
 				Event: evConverged, Tick: d.tick, Action: d.action.name,
@@ -813,6 +830,24 @@ func (e *engine) routeDriftSince(ctx context.Context, d decision, before *routeD
 	}
 	delta := routeDrift{Kernel: after.Kernel - before.Kernel, FRR: after.FRR - before.FRR}
 	if delta.Kernel < 0 || delta.FRR < 0 {
+		return nil
+	}
+	return &delta
+}
+
+// flowDriftSince is routeDriftSince for the target's OVS flow drift counters.
+func (e *engine) flowDriftSince(ctx context.Context, d decision, before *flowDrift) *flowDrift {
+	if before == nil {
+		return nil
+	}
+	after, err := e.lab.flowDriftCounters(ctx, d.target)
+	if err != nil {
+		e.jrnl.emit(event{Event: evCheckError, Tick: d.tick, Action: d.action.name,
+			Target: d.target, Detail: err.Error()})
+		return nil
+	}
+	delta := flowDrift{MACTweak: after.MACTweak - before.MACTweak, Hairpin: after.Hairpin - before.Hairpin}
+	if delta.MACTweak < 0 || delta.Hairpin < 0 {
 		return nil
 	}
 	return &delta

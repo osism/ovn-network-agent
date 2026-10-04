@@ -2304,8 +2304,9 @@ func TestInjectEventCarriesTheEffectiveDrain(t *testing.T) {
 
 // driftScrape is one scripted answer of the agent's metrics endpoint.
 type driftScrape struct {
-	kernel, frr int
-	err         error
+	kernel, frr       int
+	mactweak, hairpin int
+	err               error
 }
 
 // driftScrapeLab answers every scrape of the metrics endpoint from the script,
@@ -2324,7 +2325,11 @@ func driftScrapeLab(script ...driftScrape) *fakeCommander {
 		}
 		return fmt.Sprintf("# TYPE ovn_network_agent_route_drift_total counter\n"+
 			"ovn_network_agent_route_drift_total{kind=\"frr\"} %d\n"+
-			"ovn_network_agent_route_drift_total{kind=\"kernel\"} %d\n", s.frr, s.kernel), nil
+			"ovn_network_agent_route_drift_total{kind=\"kernel\"} %d\n"+
+			"# TYPE ovn_network_agent_ovs_flow_drift_total counter\n"+
+			"ovn_network_agent_ovs_flow_drift_total{plane=\"hairpin\"} %d\n"+
+			"ovn_network_agent_ovs_flow_drift_total{plane=\"mactweak\"} %d\n",
+			s.frr, s.kernel, s.hairpin, s.mactweak), nil
 	}}
 }
 
@@ -2421,6 +2426,112 @@ func TestRouteDropRecordsTheDriftCounterDelta(t *testing.T) {
 				want := "read the route drift counters on " + recovery.Target
 				if len(checkErrors) != 1 || !strings.Contains(checkErrors[0].Detail, want) ||
 					checkErrors[0].Action != "kernel-route-drop" || checkErrors[0].Target != recovery.Target {
+					t.Errorf("journaled check errors %+v, want one for the action naming %q", checkErrors, want)
+				}
+			}
+			if len(rec.Violations) != 0 {
+				t.Errorf("violations = %+v, want none", rec.Violations)
+			}
+		})
+	}
+}
+
+// ovs-flow-drop brackets its fault with two reads of the agent's OVS flow
+// drift counters, the way a route drop reads its route drift counters, and
+// with the same tolerance: a failed read or a counter that went down leaves
+// the field out and adds no violation. An action that counts neither kind of
+// drift does not scrape at all.
+func TestFlowDropRecordsTheFlowDriftCounterDelta(t *testing.T) {
+	const scrape = "/dev/tcp/127.0.0.1/9273"
+	tests := []struct {
+		name        string
+		counts      bool
+		script      []driftScrape
+		want        *flowDrift
+		wantScrapes int
+		wantError   bool
+	}{
+		{
+			name:        "both reads succeed",
+			counts:      true,
+			script:      []driftScrape{{hairpin: 1}, {hairpin: 3}},
+			want:        &flowDrift{MACTweak: 0, Hairpin: 2},
+			wantScrapes: 2,
+		},
+		{
+			name:        "the read before the inject fails",
+			counts:      true,
+			script:      []driftScrape{{err: errBoom}, {hairpin: 3}},
+			wantScrapes: 1,
+			wantError:   true,
+		},
+		{
+			name:        "the read after the convergence fails",
+			counts:      true,
+			script:      []driftScrape{{hairpin: 1}, {err: errBoom}},
+			wantScrapes: 2,
+			wantError:   true,
+		},
+		{
+			name:        "a counter went down between the reads",
+			counts:      true,
+			script:      []driftScrape{{mactweak: 4, hairpin: 1}, {mactweak: 0, hairpin: 3}},
+			wantScrapes: 2,
+		},
+		{
+			name:   "an action that counts no drift",
+			script: []driftScrape{{hairpin: 1}, {hairpin: 3}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			actions := noopActions("ovs-flow-drop")
+			actions[0].countsFlowDrift = tc.counts
+			cmd := driftScrapeLab(tc.script...)
+
+			journal, rec := runEngine(t, 42, 35*time.Second, actions, func(e *engine) { e.lab.cmd = cmd })
+
+			if rec.Decisions.Executed != 1 || len(rec.Recoveries) != 1 {
+				t.Fatalf("executed %d actions with %d recoveries, want one of each",
+					rec.Decisions.Executed, len(rec.Recoveries))
+			}
+			recovery := rec.Recoveries[0]
+			if got := recovery.FlowDrift; (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+				t.Errorf("flow_drift = %+v, want %+v", got, tc.want)
+			}
+			if recovery.RouteDrift != nil {
+				t.Errorf("route_drift = %+v on an action that counts no route drift", recovery.RouteDrift)
+			}
+			raw, err := json.Marshal(recovery)
+			if err != nil {
+				t.Fatalf("marshal the recovery: %v", err)
+			}
+			if tc.want != nil {
+				if want := `"flow_drift":{"mactweak":0,"hairpin":2}`; !strings.Contains(string(raw), want) {
+					t.Errorf("the summary.json recovery lacks %s: %s", want, raw)
+				}
+			} else if strings.Contains(string(raw), "flow_drift") {
+				t.Errorf("the summary.json recovery carries flow_drift: %s", raw)
+			}
+			if got := cmd.count(scrape); got != tc.wantScrapes {
+				t.Errorf("scraped the metrics endpoint %d times, want %d", got, tc.wantScrapes)
+			}
+
+			var checkErrors []event
+			for _, ev := range eventsIn(t, journal) {
+				if ev.Event == evCheckError {
+					checkErrors = append(checkErrors, ev)
+				}
+			}
+			if !tc.wantError {
+				if len(checkErrors) != 0 {
+					t.Errorf("journaled check errors %+v, want none", checkErrors)
+				}
+			} else {
+				want := "read the flow drift counters on " + recovery.Target
+				if len(checkErrors) != 1 || !strings.Contains(checkErrors[0].Detail, want) ||
+					checkErrors[0].Action != "ovs-flow-drop" || checkErrors[0].Target != recovery.Target {
 					t.Errorf("journaled check errors %+v, want one for the action naming %q", checkErrors, want)
 				}
 			}
