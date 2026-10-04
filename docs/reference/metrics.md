@@ -51,6 +51,7 @@ regenerate it with `go generate ./...`.
 | `ovn_network_agent_hairpin_flows_installed` | gauge | — | Number of hairpin flows found on the provider bridge at the start of the last reconcile, before the agent touched them. Below desired means same-chassis peers cannot reach those IPs. |
 | `ovn_network_agent_ovs_flow_apply_errors_total` | counter (vec) | `plane`={`hairpin`,`mactweak`} | Total failed OVS flow mutations, labelled by flow plane (hairpin, mactweak). |
 | `ovn_network_agent_ovs_flow_drift_total` | counter (vec) | `plane`={`hairpin`,`mactweak`} | Total deletions the OVS flow watch detected on flows the agent owns that the agent did not make, labelled by flow plane (hairpin, mactweak). Each one triggers an immediate reconcile. |
+| `ovn_network_agent_frr_restarts_total` | counter | — | Total FRR restarts the FRR watch detected: a settled change in the process IDs of the FRR daemons, or FRR coming up after the agent started without it. Each one triggers an immediate reconcile and a second one 5 s later. |
 | `ovn_network_agent_config_reload_total` | counter (vec) | `outcome`={`success`,`error`} | Total configuration reloads triggered by SIGHUP, labelled by outcome (success, error). success means the file loaded and validated; restart-only changes it contained are logged and skipped. |
 
 ## Suggested alerts
