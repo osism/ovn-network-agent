@@ -106,6 +106,14 @@ ovn_nb_remote: "tcp:10.10.0.1:6641,tcp:10.10.0.2:6641,tcp:10.10.0.3:6641"
 # so ovs-appctl must be reachable through it.
 # ovs_flow_watch: true
 
+# Poll the FRR daemons' process IDs once a second ("vtysh -c 'show modules'")
+# and reconcile at once when FRR restarted (default: true). The agent never
+# saves its static routes and prefix-list entries to FRR's configuration, so a
+# restarted FRR comes back without them. false leaves the repair after an FRR
+# restart to the periodic reconcile. vtysh is run from PATH, so a vtysh wrapper
+# for a containerized FRR is polled too.
+# frr_watch: true
+
 # Log level: debug, info, warn, error (default: info)
 # log_level: "info"
 

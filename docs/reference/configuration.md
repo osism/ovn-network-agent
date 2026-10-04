@@ -37,6 +37,7 @@ regenerate this page with `go generate ./...`.
 | `--reconcile-interval` | `OVN_NETWORK_RECONCILE_INTERVAL` | `reconcile_interval` | `60s` | Full reconciliation interval (e.g. 60s, 5m) |
 | `--route-watch` | `OVN_NETWORK_ROUTE_WATCH` | `route_watch` | `true` | Watch kernel route changes and reconcile at once when a route the agent owns is deleted or replaced; false leaves drift repair to the periodic reconcile |
 | `--ovs-flow-watch` | `OVN_NETWORK_OVS_FLOW_WATCH` | `ovs_flow_watch` | `true` | Watch the provider bridge's flow table and reconcile at once when an OVS flow the agent owns is deleted; false leaves drift repair to the periodic reconcile |
+| `--frr-watch` | `OVN_NETWORK_FRR_WATCH` | `frr_watch` | `true` | Poll the FRR daemons' process IDs once a second and reconcile at once when FRR restarted; false leaves the repair after an FRR restart to the periodic reconcile |
 | `--log-level` | `OVN_NETWORK_LOG_LEVEL` | `log_level` | `info` | Log level (debug, info, warn, error) |
 | `--dry-run` | `OVN_NETWORK_DRY_RUN` | `dry_run` | `false` | Dry-run mode: connect and reconcile but only log what would be done |
 | `--cleanup-on-shutdown` | `OVN_NETWORK_CLEANUP_ON_SHUTDOWN` | `cleanup_on_shutdown` | `true` | Remove all managed routes on shutdown (SIGINT/SIGTERM) |

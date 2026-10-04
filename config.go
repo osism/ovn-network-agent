@@ -148,6 +148,7 @@ type Config struct {
 	ReconcileInterval time.Duration
 	RouteWatch        bool // reconcile at once when a route the agent owns is deleted or replaced from outside; false leaves drift to the periodic reconcile
 	OVSFlowWatch      bool // reconcile at once when an OVS flow the agent owns is deleted from outside; false leaves drift to the periodic reconcile
+	FRRWatch          bool // reconcile at once when a restarted FRR has settled; false leaves the repair after an FRR restart to the periodic reconcile
 	LogLevel          string
 	DryRun            bool
 
@@ -477,6 +478,8 @@ func configOptions() []configOption {
 			func(c *Config) *bool { return &c.RouteWatch }),
 		boolOpt("ovs-flow-watch", true, "Watch the provider bridge's flow table and reconcile at once when an OVS flow the agent owns is deleted; false leaves drift repair to the periodic reconcile",
 			func(c *Config) *bool { return &c.OVSFlowWatch }),
+		boolOpt("frr-watch", true, "Poll the FRR daemons' process IDs once a second and reconcile at once when FRR restarted; false leaves the repair after an FRR restart to the periodic reconcile",
+			func(c *Config) *bool { return &c.FRRWatch }),
 		stringOpt("log-level", "info", "Log level (debug, info, warn, error)",
 			func(c *Config) *string { return &c.LogLevel }),
 		boolOpt("dry-run", false, "Dry-run mode: connect and reconcile but only log what would be done",
