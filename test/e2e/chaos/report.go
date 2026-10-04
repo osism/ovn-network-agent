@@ -238,6 +238,7 @@ func renderReport(w *mdWriter, rec *runRecord, events []event, source string) {
 	renderViolations(w, rec)
 	renderRecoveries(w, rec)
 	renderRouteDrift(w, rec)
+	renderFlowDrift(w, rec)
 	renderProbes(w, rec)
 	renderLoss(w, rec, events, start, end)
 	renderVIPRepoints(w, events, start)
@@ -340,6 +341,33 @@ func renderRouteDrift(w *mdWriter, rec *runRecord) {
 	for _, r := range rows {
 		w.printf("| %d | %s | %s | %d | %d |\n",
 			r.Tick, cell(r.Action), cell(r.Target), r.RouteDrift.Kernel, r.RouteDrift.FRR)
+	}
+	w.printf("\n")
+}
+
+// renderFlowDrift lists, for every recovery that measured it, how far the
+// agent's ovs_flow_drift_total counters moved across the action. An
+// ovs-flow-drop with counts was seen by the agent's OVS flow watch. One with
+// zeros was repaired without it, by the periodic reconcile. The section is
+// left out when no recovery carries the measure, which includes every record
+// written before the field existed.
+func renderFlowDrift(w *mdWriter, rec *runRecord) {
+	var rows []recoveryRecord
+	for _, r := range rec.Recoveries {
+		if r.FlowDrift != nil {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Tick < rows[j].Tick })
+	w.printf("### OVS flow drift seen by the agent\n\n")
+	w.printf("| tick | action | target | mactweak | hairpin |\n")
+	w.printf("| --- | --- | --- | --- | --- |\n")
+	for _, r := range rows {
+		w.printf("| %d | %s | %s | %d | %d |\n",
+			r.Tick, cell(r.Action), cell(r.Target), r.FlowDrift.MACTweak, r.FlowDrift.Hairpin)
 	}
 	w.printf("\n")
 }
