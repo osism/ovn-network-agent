@@ -15,12 +15,14 @@ import (
 //
 // The deletion is the fault; the restore is a deliberate no-op, because the
 // agent is the undo. For the two route drops that is its route watch, which
-// reconciles as soon as the kernel reports the deletion. For nft-flush and
-// ovs-flow-drop it is the periodic reconcile, since the watch covers neither
-// nftables nor OVS flows. Each action carries a live `applicable` so a
-// gateway that does not carry the object is a journaled skip, not a no-op
-// deletion: the MAC-tweak flows exist only where routers are locally active,
-// and a port-forward-only profile has no FIP routes at all.
+// reconciles as soon as the kernel reports the deletion, and for
+// ovs-flow-drop its OVS flow watch, which reconciles as soon as its
+// `ovs-ofctl monitor` reports the deleted flows. For nft-flush it is the
+// periodic reconcile, since no watch covers nftables. Each action carries a
+// live `applicable` so a gateway that does not carry the object is a
+// journaled skip, not a no-op deletion: the MAC-tweak flows exist only where
+// routers are locally active, and a port-forward-only profile has no FIP
+// routes at all.
 
 const (
 	// driftFIP is the bootstrap FIP, present and probed in every profile that
@@ -31,10 +33,10 @@ const (
 	// at (gwnode-config.yaml). staticd's `no ip route` form needs it.
 	driftFRRNexthop = "169.254.0.1"
 
-	// routeWatchRecoveryBudget is the recovery budget of the two route drops,
-	// which the agent's route watch repairs. driftActions says why it is this
-	// value.
-	routeWatchRecoveryBudget = 10 * time.Second
+	// watchRecoveryBudget is the recovery budget of the drift actions one of
+	// the agent's watches repairs: the two route drops and ovs-flow-drop.
+	// driftActions says why it is this value.
+	watchRecoveryBudget = 10 * time.Second
 
 	// The OVS flow cookies and the nftables table the agent owns, duplicated
 	// here because the chaos runner is package main and cannot import the
@@ -47,15 +49,14 @@ const (
 // driftActions is the data-plane drift fault class. Every action holds
 // nothing (the deletion is instantaneous) and self-heals.
 //
-// The two route drops are repaired by the route watch, whatever the reconcile
-// cadence is, and carry routeWatchRecoveryBudget, 10 s. That is above
-// confirmationTime, the time a probe confirmation takes, and below
-// slowCadence, the 15 s a cadence flip sets, so a repair that waited for the
-// tick fails it.
+// The two route drops are repaired by the route watch and ovs-flow-drop by
+// the OVS flow watch, whatever the reconcile cadence is. They carry
+// watchRecoveryBudget, 10 s. That is above confirmationTime, the time a probe
+// confirmation takes, and below slowCadence, the 15 s a cadence flip sets, so
+// a repair that waited for the tick fails it.
 //
-// nft-flush and ovs-flow-drop heal on the next periodic reconcile, so their
-// budget is the worst-case cadence, 15 s after a cadence flip, plus probe
-// slack.
+// nft-flush heals on the next periodic reconcile, so its budget is the
+// worst-case cadence, 15 s after a cadence flip, plus probe slack.
 func driftActions(l *lab) []*action {
 	return []*action{
 		{
@@ -63,7 +64,7 @@ func driftActions(l *lab) []*action {
 			weight:         2,
 			scope:          scopeGateway,
 			object:         driftFIP + "/32 dev br-ex",
-			recoveryBudget: routeWatchRecoveryBudget,
+			recoveryBudget: watchRecoveryBudget,
 			// The agent's route watch counts this deletion.
 			countsRouteDrift: true,
 			applicable: func(ctx context.Context, gw string, _ int) bool {
@@ -83,7 +84,7 @@ func driftActions(l *lab) []*action {
 			weight:         2,
 			scope:          scopeGateway,
 			object:         driftFIP + "/32 vrf vrf-provider",
-			recoveryBudget: routeWatchRecoveryBudget,
+			recoveryBudget: watchRecoveryBudget,
 			// The agent's route watch counts zebra's withdrawal of the /32.
 			countsRouteDrift: true,
 			applicable: func(ctx context.Context, gw string, _ int) bool {
@@ -129,7 +130,9 @@ func driftActions(l *lab) []*action {
 			weight:         2,
 			scope:          scopeGateway,
 			object:         "cookies " + driftHairpinCookie + "," + driftMACTweakCookie + " on br-ex",
-			recoveryBudget: 60 * time.Second,
+			recoveryBudget: watchRecoveryBudget,
+			// The agent's OVS flow watch counts each deleted flow.
+			countsFlowDrift: true,
 			// The MAC-tweak flows exist only where the routers are locally
 			// active, so a gateway that carries none is a skip. Removing them
 			// darkens external probes and is measured; the hairpin flow's
@@ -155,7 +158,8 @@ func driftActions(l *lab) []*action {
 }
 
 // driftSelfHeals is the restore for the drift class: the deletion is the
-// fault and the agent is the undo, through its route watch or its next
-// periodic reconcile — the same self-heal contract scenario_drift_test.go
-// proves on a single host — so the runner puts nothing back.
+// fault and the agent is the undo, through its route watch, its OVS flow
+// watch or its next periodic reconcile — the same self-heal contract
+// scenario_drift_test.go proves on a single host — so the runner puts nothing
+// back.
 func driftSelfHeals(context.Context, *lab, string) error { return nil }

@@ -144,43 +144,47 @@ func TestOVSFlowDropRemovesBothCookies(t *testing.T) {
 	}
 }
 
-// The agent's route watch sees the two route drops and nothing else in the
-// drift class. Only those two read the drift counters around their fault, and
-// only those two are held to the watch's budget: 10 s, which leaves room for a
-// probe confirmation and which a repair that waited for a 15 s tick fails. The
-// other two heal on the periodic reconcile and keep its 60 s.
-func TestRouteWatchCoversOnlyTheRouteDrops(t *testing.T) {
-	if routeWatchRecoveryBudget <= confirmationTime {
-		t.Fatalf("routeWatchRecoveryBudget = %s, want above the %s a probe confirmation takes",
-			routeWatchRecoveryBudget, confirmationTime)
+// The agent's route watch sees the two route drops and its OVS flow watch sees
+// ovs-flow-drop. Each of the three reads the drift counters of its watch
+// around the fault, and only those three are held to the watches' budget:
+// 10 s, which leaves room for a probe confirmation and which a repair that
+// waited for a 15 s tick fails. nft-flush heals on the periodic reconcile and
+// keeps its 60 s.
+func TestWatchesCoverTheRouteAndFlowDrops(t *testing.T) {
+	if watchRecoveryBudget <= confirmationTime {
+		t.Fatalf("watchRecoveryBudget = %s, want above the %s a probe confirmation takes",
+			watchRecoveryBudget, confirmationTime)
 	}
 	slow, err := time.ParseDuration(slowCadence)
 	if err != nil {
 		t.Fatalf("parse slowCadence %q: %v", slowCadence, err)
 	}
-	if routeWatchRecoveryBudget >= slow {
-		t.Fatalf("routeWatchRecoveryBudget = %s, want below the %s slow cadence, "+
-			"or a repair that waited for the tick passes it", routeWatchRecoveryBudget, slow)
+	if watchRecoveryBudget >= slow {
+		t.Fatalf("watchRecoveryBudget = %s, want below the %s slow cadence, "+
+			"or a repair that waited for the tick passes it", watchRecoveryBudget, slow)
 	}
 
 	l := newTestLab(&fakeCommander{}, newFakeClock())
 	tests := []struct {
-		action      string
-		budget      time.Duration
-		countsDrift bool
+		action                string
+		budget                time.Duration
+		routeDrift, flowDrift bool
 	}{
-		{"kernel-route-drop", routeWatchRecoveryBudget, true},
-		{"frr-route-drop", routeWatchRecoveryBudget, true},
-		{"nft-flush", 60 * time.Second, false},
-		{"ovs-flow-drop", 60 * time.Second, false},
+		{"kernel-route-drop", 10 * time.Second, true, false},
+		{"frr-route-drop", 10 * time.Second, true, false},
+		{"nft-flush", 60 * time.Second, false, false},
+		{"ovs-flow-drop", 10 * time.Second, false, true},
 	}
 	for _, tc := range tests {
 		act := driftActionNamed(t, l, tc.action)
 		if act.recoveryBudget != tc.budget {
 			t.Errorf("%s recoveryBudget = %s, want %s", tc.action, act.recoveryBudget, tc.budget)
 		}
-		if act.countsRouteDrift != tc.countsDrift {
-			t.Errorf("%s countsRouteDrift = %v, want %v", tc.action, act.countsRouteDrift, tc.countsDrift)
+		if act.countsRouteDrift != tc.routeDrift {
+			t.Errorf("%s countsRouteDrift = %v, want %v", tc.action, act.countsRouteDrift, tc.routeDrift)
+		}
+		if act.countsFlowDrift != tc.flowDrift {
+			t.Errorf("%s countsFlowDrift = %v, want %v", tc.action, act.countsFlowDrift, tc.flowDrift)
 		}
 	}
 }
