@@ -33,9 +33,9 @@ const (
 	// at (gwnode-config.yaml). staticd's `no ip route` form needs it.
 	driftFRRNexthop = "169.254.0.1"
 
-	// watchRecoveryBudget is the recovery budget of the drift actions one of
-	// the agent's watches repairs: the two route drops and ovs-flow-drop.
-	// driftActions says why it is this value.
+	// watchRecoveryBudget is the recovery budget of the actions one of the
+	// agent's watches repairs: the two route drops, ovs-flow-drop and
+	// frr-restart (flaps.go). driftActions says why it is this value.
 	watchRecoveryBudget = 10 * time.Second
 
 	// The OVS flow cookies and the nftables table the agent owns, duplicated
@@ -51,9 +51,10 @@ const (
 //
 // The two route drops are repaired by the route watch and ovs-flow-drop by
 // the OVS flow watch, whatever the reconcile cadence is. They carry
-// watchRecoveryBudget, 10 s. That is above confirmationTime, the time a probe
-// confirmation takes, and below slowCadence, the 15 s a cadence flip sets, so
-// a repair that waited for the tick fails it.
+// watchRecoveryBudget, 10 s, and so does the routing flap frr-restart
+// (flaps.go), which the FRR watch repairs. That is above confirmationTime,
+// the time a probe confirmation takes, and below slowCadence, the 15 s a
+// cadence flip sets, so a repair that waited for the tick fails it.
 //
 // nft-flush heals on the next periodic reconcile, so its budget is the
 // worst-case cadence, 15 s after a cadence flip, plus probe slack.

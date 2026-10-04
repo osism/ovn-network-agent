@@ -63,8 +63,12 @@ func flapActions() []*action {
 			weight: 2,
 			scope:  scopeGateway,
 			// No hold: the restart is the fault, and the restore waits out
-			// the recycle and re-asserts the session.
-			recoveryBudget: 120 * time.Second,
+			// the recycle and re-asserts the session. The agent's FRR watch
+			// repairs what the restart dropped once the daemons have
+			// settled, whatever the reconcile cadence, so the action
+			// carries the watches' budget (driftActions says why it is
+			// this value).
+			recoveryBudget: watchRecoveryBudget,
 			inject: func(ctx context.Context, l *lab, gw string, _ int) error {
 				// The recycle runs backgrounded inside the container. Run
 				// synchronously, a slow stop+start rides the exec into
@@ -110,9 +114,10 @@ func flapActions() []*action {
 // answers vtysh happily — then waits for the restarted vtysh and
 // re-asserts the BGP session — idempotent and self-cleaning, ending with
 // `write memory`. The marker wait runs on frrRecycleTimeout, not the
-// daemon budget: it spans the full stop+clear+start. The agent re-adds
-// its static routes on the next reconcile, and the converge gate's green
-// probes are the assertion that the announcements returned.
+// daemon budget: it spans the full stop+clear+start. The agent's FRR
+// watch re-applies its static routes and prefix-list entries once the
+// restarted daemons have settled, and the converge gate's green probes are
+// the assertion that the announcements returned.
 func restoreGatewayFRR(ctx context.Context, l *lab, gw string) error {
 	if err := l.waitReadyFor(ctx, gw, "test -f "+frrRestartDoneMarker, frrRecycleTimeout); err != nil {
 		return fmt.Errorf("wait for the FRR recycle on %s: %w", gw, err)
