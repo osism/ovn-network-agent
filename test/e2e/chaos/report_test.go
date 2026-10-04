@@ -769,3 +769,94 @@ func TestRenderReportLeavesOutRouteDriftItNeverMeasured(t *testing.T) {
 		}
 	}
 }
+
+// The OVS flow drift table lists what the agent's flow watch counted across
+// each ovs-flow-drop, in tick order, right after the route drift table. A
+// recovery that measured nothing gets no row.
+func TestRenderReportListsTheFlowDriftDeltas(t *testing.T) {
+	t.Parallel()
+	rec := reportRecord(t)
+	rec.Recoveries = append(rec.Recoveries,
+		recoveryRecord{Tick: 7, Action: "ovs-flow-drop", Target: "gateway-2", BudgetMS: 10_000, ConvergedMS: 40,
+			FlowDrift: &flowDrift{MACTweak: 2, Hairpin: 1}},
+		recoveryRecord{Tick: 3, Action: "kernel-route-drop", Target: "gateway-1", BudgetMS: 10_000, ConvergedMS: 60,
+			RouteDrift: &routeDrift{Kernel: 1}},
+		// The tick repaired this one: the watch counted nothing.
+		recoveryRecord{Tick: 6, Action: "ovs-flow-drop", Target: "gateway-3", BudgetMS: 10_000, ConvergedMS: 5_040,
+			FlowDrift: &flowDrift{}},
+	)
+
+	out := renderToString(t, rec, nil)
+
+	last := -1
+	for _, want := range []string{
+		"### Route drift seen by the agent",
+		"| 3 | kernel-route-drop | gateway-1 | 1 | 0 |",
+		"### OVS flow drift seen by the agent",
+		"| tick | action | target | mactweak | hairpin |",
+		"| 6 | ovs-flow-drop | gateway-3 | 0 | 0 |",
+		"| 7 | ovs-flow-drop | gateway-2 | 2 | 1 |",
+		"### Probes",
+	} {
+		at := strings.Index(out, want)
+		if at < 0 {
+			t.Fatalf("the report lacks %q:\n%s", want, out)
+		}
+		if at < last {
+			t.Fatalf("%q is out of order:\n%s", want, out)
+		}
+		last = at
+	}
+	section := out[strings.Index(out, "### OVS flow drift seen by the agent"):strings.Index(out, "### Probes")]
+	for _, action := range []string{"kernel-route-drop", "mgmt-delay", "frr-restart"} {
+		if strings.Contains(section, action) {
+			t.Errorf("the OVS flow drift table lists %s, which measured no flow drift:\n%s", action, section)
+		}
+	}
+}
+
+// Without a recovery that measured flow drift there is nothing to list, and
+// the section stays out of the report. That holds for a run without
+// ovs-flow-drop and for a record written before flow_drift existed, which
+// unmarshals without the field.
+func TestRenderReportLeavesOutFlowDriftItNeverMeasured(t *testing.T) {
+	t.Parallel()
+	const oldRecord = `{
+  "schema": "chaos-run-record/v1",
+  "result": "pass",
+  "inputs": {"seed": 7, "profile": "flat-minimal", "duration_ms": 180000},
+  "recoveries": [{
+    "tick": 1, "action": "ovs-flow-drop", "target": "gateway-1",
+    "budget_ms": 60000, "converged_ms": 11300,
+    "down_ms": {"cross-fip": 11300}, "down_windows": {"cross-fip": 1},
+    "from_inject_ms": {"cross-fip": 11300}, "from_restore_ms": {"cross-fip": 11300},
+    "cr_owner_after": "gateway-1"
+  }]
+}`
+	var old runRecord
+	if err := json.Unmarshal([]byte(oldRecord), &old); err != nil {
+		t.Fatalf("unmarshal the old record: %v", err)
+	}
+	if len(old.Recoveries) != 1 || old.Recoveries[0].FlowDrift != nil {
+		t.Fatalf("the old record unmarshalled as %+v, want one recovery without flow_drift", old.Recoveries)
+	}
+
+	withRouteDriftOnly := reportRecord(t)
+	withRouteDriftOnly.Recoveries = append(withRouteDriftOnly.Recoveries,
+		recoveryRecord{Tick: 3, Action: "kernel-route-drop", Target: "gateway-1", BudgetMS: 10_000, ConvergedMS: 60,
+			RouteDrift: &routeDrift{Kernel: 1}})
+
+	for name, rec := range map[string]*runRecord{
+		"no ovs-flow-drop":                reportRecord(t),
+		"route drift only":                withRouteDriftOnly,
+		"record written before the field": &old,
+	} {
+		out := renderToString(t, rec, nil)
+		if strings.Contains(out, "OVS flow drift seen by the agent") {
+			t.Errorf("%s: the report rendered an OVS flow drift section:\n%s", name, out)
+		}
+		if !strings.Contains(out, "### Recoveries") {
+			t.Errorf("%s: the report lost its recoveries section:\n%s", name, out)
+		}
+	}
+}
