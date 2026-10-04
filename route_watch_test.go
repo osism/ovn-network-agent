@@ -204,45 +204,10 @@ func (l *triggerLog) times() []time.Time {
 
 func (l *triggerLog) count() int { return len(l.times()) }
 
-// subscribeResult is what one call of a scripted subscribe returns.
-type subscribeResult struct {
-	events chan routeEvent
-	err    error
-}
-
-// subscribeScript stands in for the netlink subscription. Each call returns
-// the next scripted result. Once the script is used up a call returns a
-// channel that never delivers, so the watcher idles on it.
-type subscribeScript struct {
-	mu      sync.Mutex
-	results []subscribeResult
-	at      []time.Time // when each call came in
-}
-
-func (s *subscribeScript) subscribe(<-chan struct{}) (<-chan routeEvent, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.at = append(s.at, time.Now())
-	if len(s.results) == 0 {
-		return make(chan routeEvent), nil
-	}
-	r := s.results[0]
-	s.results = s.results[1:]
-	return r.events, r.err
-}
-
-func (s *subscribeScript) callTimes() []time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]time.Time(nil), s.at...)
-}
-
-func (s *subscribeScript) callCount() int { return len(s.callTimes()) }
-
 // newTestRouteWatcher builds a watcher that owns the test FIP, subscribes
 // through the script and runs on short timings. The test adjusts the timings
 // it is about before it starts the watcher.
-func newTestRouteWatcher(t *testing.T, script *subscribeScript, triggers *triggerLog) *routeWatcher {
+func newTestRouteWatcher(t *testing.T, script *subscribeScript[routeEvent], triggers *triggerLog) *routeWatcher {
 	t.Helper()
 	w := newRouteWatcher(Config{VethNexthop: testWatchNexthop}, triggers.trigger)
 	w.subscribe = script.subscribe
@@ -252,33 +217,6 @@ func newTestRouteWatcher(t *testing.T, script *subscribeScript, triggers *trigge
 	w.backoffMax = 40 * time.Millisecond
 	w.setOwned(testRouteOwnership(t))
 	return w
-}
-
-// startRouteWatcher starts w and returns the function that stops it and waits
-// for its goroutine. The function also runs at the end of the test. Call
-// withTestMetrics and captureSlog before this, so their cleanups run after the
-// goroutine is gone.
-func startRouteWatcher(t *testing.T, w *routeWatcher) (stop func()) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	w.start(ctx)
-	stop = func() {
-		cancel()
-		w.wait()
-	}
-	t.Cleanup(stop)
-	return stop
-}
-
-// sendRouteEvent hands ev to the watcher. The channel is unbuffered, so the
-// watcher has taken the event when this returns.
-func sendRouteEvent(t *testing.T, events chan<- routeEvent, ev routeEvent) {
-	t.Helper()
-	select {
-	case events <- ev:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("the watcher did not take the event %+v", ev)
-	}
 }
 
 // waitForCondition polls cond until it holds and fails the test after 2 s.
@@ -311,15 +249,15 @@ func returnsWithin(d time.Duration, fn func()) bool {
 func TestRouteWatcherDebouncesDriftIntoOneTrigger(t *testing.T) {
 	m := withTestMetrics(t)
 	events := make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: events}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: events}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
 	w.debounce = 100 * time.Millisecond
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
 	first := time.Now()
 	for range 3 {
-		sendRouteEvent(t, events, ownedKernelDelete)
+		sendEvent(t, events, ownedKernelDelete)
 	}
 
 	waitForCondition(t, "the debounced trigger", func() bool { return triggers.count() > 0 })
@@ -340,12 +278,12 @@ func TestRouteWatcherDebouncesDriftIntoOneTrigger(t *testing.T) {
 func TestRouteWatcherIgnoresUnownedPrefix(t *testing.T) {
 	m := withTestMetrics(t)
 	events := make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: events}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: events}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
-	sendRouteEvent(t, events, unownedKernelDelete)
+	sendEvent(t, events, unownedKernelDelete)
 
 	time.Sleep(2 * w.debounce)
 	if got := triggers.count(); got != 0 {
@@ -363,35 +301,35 @@ func TestRouteWatcherIgnoresUnownedPrefix(t *testing.T) {
 func TestRouteWatcherFollowsPublishedOwnership(t *testing.T) {
 	withTestMetrics(t)
 	events := make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: events}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: events}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
 	w.setOwned(newRouteOwnership(nil, nil, nil))
-	sendRouteEvent(t, events, ownedKernelDelete)
+	sendEvent(t, events, ownedKernelDelete)
 	time.Sleep(2 * w.debounce)
 	if got := triggers.count(); got != 0 {
 		t.Fatalf("triggers = %d, want 0 after the ownership was emptied", got)
 	}
 
 	w.setOwned(testRouteOwnership(t))
-	sendRouteEvent(t, events, ownedKernelDelete)
+	sendEvent(t, events, ownedKernelDelete)
 	waitForCondition(t, "the trigger for the re-owned prefix", func() bool { return triggers.count() == 1 })
 }
 
 func TestRouteWatcherKeepsMinIntervalBetweenTriggers(t *testing.T) {
 	withTestMetrics(t)
 	events := make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: events}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: events}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
 	w.minInterval = 300 * time.Millisecond
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
-	sendRouteEvent(t, events, ownedKernelDelete)
+	sendEvent(t, events, ownedKernelDelete)
 	waitForCondition(t, "the first trigger", func() bool { return triggers.count() == 1 })
-	sendRouteEvent(t, events, ownedKernelDelete)
+	sendEvent(t, events, ownedKernelDelete)
 	waitForCondition(t, "the second trigger", func() bool { return triggers.count() == 2 })
 
 	at := triggers.times()
@@ -406,18 +344,18 @@ func TestRouteWatcherKeepsMinIntervalAcrossSubscriptions(t *testing.T) {
 	withTestMetrics(t)
 	captureSlog(t)
 	first, second := make(chan routeEvent), make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: first}, {events: second}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: first}, {events: second}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
 	w.minInterval = 300 * time.Millisecond
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
 	waitForCondition(t, "the first subscribe", func() bool { return script.callCount() == 1 })
 	closedAt := time.Now()
 	close(first)
 	waitForCondition(t, "the trigger on recovery", func() bool { return triggers.count() == 1 })
 
-	sendRouteEvent(t, second, ownedKernelDelete)
+	sendEvent(t, second, ownedKernelDelete)
 	waitForCondition(t, "the trigger for drift on the new subscription", func() bool { return triggers.count() == 2 })
 
 	// The recovery trigger came no earlier than backoffMin after the close,
@@ -431,14 +369,14 @@ func TestRouteWatcherKeepsMinIntervalAcrossSubscriptions(t *testing.T) {
 func TestRouteWatcherLogsOneOutageAndTriggersOnRecovery(t *testing.T) {
 	withTestMetrics(t)
 	logs := captureSlog(t)
-	script := &subscribeScript{results: []subscribeResult{
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{
 		{err: errors.New("netlink: permission denied")},
 		{err: errors.New("netlink: permission denied")},
 		{events: make(chan routeEvent)},
 	}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
-	stop := startRouteWatcher(t, w)
+	stop := startWatcher(t, w)
 
 	waitForCondition(t, "the trigger on recovery", func() bool { return triggers.count() > 0 })
 	time.Sleep(2 * w.backoffMax)
@@ -465,10 +403,10 @@ func TestRouteWatcherResubscribesAfterClosedChannel(t *testing.T) {
 	m := withTestMetrics(t)
 	logs := captureSlog(t)
 	first, second := make(chan routeEvent), make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: first}, {events: second}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: first}, {events: second}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
-	stop := startRouteWatcher(t, w)
+	stop := startWatcher(t, w)
 
 	waitForCondition(t, "the first subscribe", func() bool { return script.callCount() == 1 })
 	closedAt := time.Now()
@@ -484,7 +422,7 @@ func TestRouteWatcherResubscribesAfterClosedChannel(t *testing.T) {
 		t.Fatalf("subscribe calls = %d, want 2", got)
 	}
 
-	sendRouteEvent(t, second, ownedKernelDelete)
+	sendEvent(t, second, ownedKernelDelete)
 	waitForCondition(t, "the trigger for drift on the new subscription", func() bool { return triggers.count() == 2 })
 	stop()
 
@@ -502,11 +440,11 @@ func TestRouteWatcherResubscribesAfterClosedChannel(t *testing.T) {
 func TestRouteWatcherDoublesTheWaitBetweenFailedSubscribes(t *testing.T) {
 	captureSlog(t)
 	failed := errors.New("netlink: permission denied")
-	script := &subscribeScript{results: []subscribeResult{
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{
 		{err: failed}, {err: failed}, {err: failed}, {err: failed}, {err: failed},
 	}}
 	w := newTestRouteWatcher(t, script, &triggerLog{})
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
 	waitForCondition(t, "the fifth subscribe", func() bool { return script.callCount() >= 5 })
 
@@ -526,9 +464,9 @@ func TestRouteWatcherKeepsBackingOffAfterShortLivedSubscription(t *testing.T) {
 	failed := errors.New("netlink: permission denied")
 	shortLived := make(chan routeEvent)
 	close(shortLived)
-	script := &subscribeScript{results: []subscribeResult{{err: failed}, {err: failed}, {events: shortLived}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{err: failed}, {err: failed}, {events: shortLived}}}
 	w := newTestRouteWatcher(t, script, &triggerLog{})
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
 	waitForCondition(t, "the subscribe after the short-lived subscription", func() bool { return script.callCount() >= 4 })
 
@@ -539,34 +477,10 @@ func TestRouteWatcherKeepsBackingOffAfterShortLivedSubscription(t *testing.T) {
 	}
 }
 
-func TestNextBackoff(t *testing.T) {
-	const lo, hi = time.Second, 30 * time.Second
-	cases := []struct {
-		name        string
-		prev, lived time.Duration
-		want        time.Duration
-	}{
-		{name: "the first wait is the minimum", want: lo},
-		{name: "a failed subscribe doubles the wait", prev: lo, want: 2 * lo},
-		{name: "the doubling stops at the maximum", prev: 16 * time.Second, want: hi},
-		{name: "the maximum stays the maximum", prev: hi, want: hi},
-		{name: "a short-lived subscription keeps doubling", prev: 2 * time.Second, lived: hi - time.Nanosecond, want: 4 * time.Second},
-		{name: "a subscription that held for the maximum starts over", prev: hi, lived: hi, want: lo},
-		{name: "a first subscription that held for the maximum starts at the minimum", lived: time.Hour, want: lo},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := nextBackoff(tc.prev, tc.lived, lo, hi); got != tc.want {
-				t.Errorf("nextBackoff(%v, %v, %v, %v) = %v, want %v", tc.prev, tc.lived, lo, hi, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestRouteWatcherFiresPendingTriggerWhenChannelCloses(t *testing.T) {
 	withTestMetrics(t)
 	events := make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: events}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: events}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
 	// Neither the debounce nor the resubscribe can produce a trigger inside
@@ -574,19 +488,19 @@ func TestRouteWatcherFiresPendingTriggerWhenChannelCloses(t *testing.T) {
 	w.debounce = time.Minute
 	w.backoffMin = time.Minute
 	w.backoffMax = time.Minute
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
-	sendRouteEvent(t, events, ownedKernelDelete)
+	sendEvent(t, events, ownedKernelDelete)
 	close(events)
 
 	waitForCondition(t, "the pending trigger", func() bool { return triggers.count() == 1 })
 }
 
 func TestRouteWatcherStopsForGoodWhenUnsupported(t *testing.T) {
-	script := &subscribeScript{results: []subscribeResult{{err: errRouteWatchUnsupported}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{err: errRouteWatchUnsupported}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
-	startRouteWatcher(t, w)
+	startWatcher(t, w)
 
 	// The context is still alive: the goroutine has to return by itself.
 	if !returnsWithin(2*time.Second, w.wait) {
@@ -603,13 +517,13 @@ func TestRouteWatcherStopsForGoodWhenUnsupported(t *testing.T) {
 func TestRouteWatcherShutdownDropsPendingTrigger(t *testing.T) {
 	withTestMetrics(t)
 	events := make(chan routeEvent)
-	script := &subscribeScript{results: []subscribeResult{{events: events}}}
+	script := &subscribeScript[routeEvent]{results: []subscribeResult[routeEvent]{{events: events}}}
 	triggers := &triggerLog{}
 	w := newTestRouteWatcher(t, script, triggers)
 	w.debounce = 50 * time.Millisecond
-	stop := startRouteWatcher(t, w)
+	stop := startWatcher(t, w)
 
-	sendRouteEvent(t, events, ownedKernelDelete)
+	sendEvent(t, events, ownedKernelDelete)
 	if !returnsWithin(2*time.Second, stop) {
 		t.Fatal("wait() did not return after the context was cancelled")
 	}
@@ -645,13 +559,13 @@ func TestRouteWatcherWaitReturnsWhenNeverStarted(t *testing.T) {
 func TestNewRouteWatcherUsesProductionTimings(t *testing.T) {
 	w := newRouteWatcher(Config{VethNexthop: testWatchNexthop}, func() {})
 
-	if w.debounce != routeDriftDebounce || w.minInterval != routeDriftMinInterval {
+	if w.debounce != driftDebounce || w.minInterval != driftMinInterval {
 		t.Errorf("debounce = %v, minInterval = %v, want %v and %v",
-			w.debounce, w.minInterval, routeDriftDebounce, routeDriftMinInterval)
+			w.debounce, w.minInterval, driftDebounce, driftMinInterval)
 	}
-	if w.backoffMin != routeWatchBackoffMin || w.backoffMax != routeWatchBackoffMax {
+	if w.backoffMin != driftMinBackoff || w.backoffMax != driftMaxBackoff {
 		t.Errorf("backoff = %v to %v, want %v to %v",
-			w.backoffMin, w.backoffMax, routeWatchBackoffMin, routeWatchBackoffMax)
+			w.backoffMin, w.backoffMax, driftMinBackoff, driftMaxBackoff)
 	}
 	if w.vethNexthop != testWatchNexthop {
 		t.Errorf("vethNexthop = %q, want %q", w.vethNexthop, testWatchNexthop)

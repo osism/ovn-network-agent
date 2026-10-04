@@ -20,6 +20,26 @@ type driftEvent interface {
 // watch cannot work. The watcher stops for good on it.
 var errDriftWatchUnsupported = errors.New("watch is not supported on this platform")
 
+const (
+	// driftDebounce is how long a watcher collects drift events before it
+	// triggers the reconcile, so a flush of many routes or flows is one
+	// cycle.
+	driftDebounce = 100 * time.Millisecond
+
+	// driftMinInterval is the shortest time between two triggers. It keeps a
+	// persistent fault from spinning the agent: a competing writer, or
+	// AddKernelRoute rolling its own route back when the ip rule fails,
+	// produces a drift event per reconcile.
+	driftMinInterval = time.Second
+
+	// driftMinBackoff and driftMaxBackoff bound the wait before a watcher
+	// subscribes again after a failed subscribe or a subscription that
+	// ended. driftMaxBackoff is also how long a subscription has to hold
+	// before the wait starts over at the minimum.
+	driftMinBackoff = time.Second
+	driftMaxBackoff = 30 * time.Second
+)
+
 // driftWatcher is the loop both watches run: it subscribes to a source of
 // events, turns the events that are drift into a debounced, rate-limited
 // reconcile trigger, and subscribes again with a backoff when the
