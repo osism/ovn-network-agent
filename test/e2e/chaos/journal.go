@@ -42,6 +42,7 @@ const (
 	evSettleResult    = "settle-result"
 	evViolation       = "violation"
 	evCheckError      = "check-error"
+	evCheckSkipped    = "check-skipped"
 	evRunAborted      = "run-aborted"
 	evRunEnd          = "run-end"
 )
@@ -271,11 +272,15 @@ type decisionCounts struct {
 // evidence that the invariants were evaluated at all, and not just that
 // nothing was found. A run that could never reach SB and a run where the
 // split-brain never happened are both "zero violations"; only these
-// counts tell them apart.
+// counts tell them apart. `errors` counts the checks the runner could not
+// answer for a reason the run did not cause. `skipped_under_fault` counts
+// the checks that failed while a fault stalling what they read was held,
+// and neither counts as an evaluation.
 type checkCounts struct {
-	Sweeps    int `json:"sweeps"`
-	DualClaim int `json:"dual_claim_evaluated"`
-	Errors    int `json:"errors"`
+	Sweeps            int `json:"sweeps"`
+	DualClaim         int `json:"dual_claim_evaluated"`
+	Errors            int `json:"errors"`
+	SkippedUnderFault int `json:"skipped_under_fault"`
 }
 
 // runRecord is <out>/summary.json.

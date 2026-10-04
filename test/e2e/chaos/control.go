@@ -56,8 +56,9 @@ func controlPlaneActions(p *profile) []*action {
 			object: "ovnsb_db",
 			// A paused SB forces every ovn-controller and agent to reconnect
 			// and resync. While it is paused the baseline sweep's
-			// sbctl --timeout=5 calls fail and are journaled as check-errors,
-			// not violations.
+			// sbctl --timeout=5 calls fail, and the sweep journals them as
+			// check-skipped and counts them under checks.skipped_under_fault,
+			// not as check errors or violations.
 			holdMin:        5 * time.Second,
 			holdMax:        90 * time.Second,
 			recoveryBudget: 120 * time.Second,
