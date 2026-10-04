@@ -127,6 +127,61 @@ func TestRenderRecoveriesDashesAnOldRecordsLoss(t *testing.T) {
 	}
 }
 
+// The header keeps the sweeps the run could not answer apart from the
+// ones a held fault made unanswerable, so a non-zero error count needs no
+// trip to the journal to mean something.
+func TestRenderReportSeparatesSweepErrorsFromSkips(t *testing.T) {
+	t.Parallel()
+	rec := reportRecord(t)
+	rec.Checks = checkCounts{Sweeps: 12, DualClaim: 9, Errors: 1, SkippedUnderFault: 2}
+
+	out := renderToString(t, rec, nil)
+
+	if want := "12 baseline sweeps (9 dual-claim, 1 errors, 2 skipped under fault)"; !strings.Contains(out, want) {
+		t.Fatalf("report is missing %q:\n%s", want, out)
+	}
+}
+
+// A record written before skipped_under_fault existed has no such key. It
+// still loads, and renders the count as zero.
+func TestReportReadsARecordWrittenBeforeSkippedSweepsWereCounted(t *testing.T) {
+	t.Parallel()
+	encoded, err := json.Marshal(reportRecord(t))
+	if err != nil {
+		t.Fatalf("marshal the record: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		t.Fatalf("unmarshal the record: %v", err)
+	}
+	checks, ok := raw["checks"].(map[string]any)
+	if !ok {
+		t.Fatalf("the record has no checks object: %s", encoded)
+	}
+	delete(checks, "skipped_under_fault")
+	old, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal the old record: %v", err)
+	}
+	if strings.Contains(string(old), "skipped_under_fault") {
+		t.Fatalf("the old record still carries skipped_under_fault: %s", old)
+	}
+	path := filepath.Join(t.TempDir(), summaryFile)
+	if err := os.WriteFile(path, old, 0o644); err != nil {
+		t.Fatalf("write the old record: %v", err)
+	}
+
+	rec, events, err := loadRecord(path)
+	if err != nil {
+		t.Fatalf("loadRecord: %v", err)
+	}
+
+	out := renderToString(t, rec, events)
+	if want := "(12 dual-claim, 0 errors, 0 skipped under fault)"; !strings.Contains(out, want) {
+		t.Fatalf("report is missing %q:\n%s", want, out)
+	}
+}
+
 // A run that failed on its own tooling renders its verdict verbatim, so
 // the headline alone tells a harness defect from an agent regression.
 func TestRenderReportNamesTheHarnessFault(t *testing.T) {
