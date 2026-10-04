@@ -42,6 +42,11 @@ type RouteManager struct {
 	// that does not set external_ids:ovn-localnet-port on patch ports.
 	segments map[string]*segmentBinding
 
+	// flowWatch is told which flows each plane wants installed, so a
+	// deletion the agent did not make is drift. It is nil when the OVS flow
+	// watch is off; its methods are no-ops on a nil receiver.
+	flowWatch *flowWatcher
+
 	// execOVSHook, when non-nil, replaces the real exec.Cmd runner used by
 	// OVS helpers. Tests set this to capture commands without executing them.
 	execOVSHook ovsExecFunc
