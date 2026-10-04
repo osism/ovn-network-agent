@@ -90,6 +90,7 @@ func TestRecordingHelpersAreNilSafe(t *testing.T) {
 	setMissingChassis(1)
 	setHairpinFlowPlane(3, 2)
 	recordOVSFlowApplyError("hairpin")
+	recordOVSFlowDrift("hairpin")
 	setLastReconcileStatus(true)
 	recordConfigReload("success")
 }
@@ -123,6 +124,7 @@ func TestNewMetricsRegistryRegistersAllCollectors(t *testing.T) {
 		"ovn_network_agent_hairpin_flows_desired",
 		"ovn_network_agent_hairpin_flows_installed",
 		"ovn_network_agent_ovs_flow_apply_errors_total",
+		"ovn_network_agent_ovs_flow_drift_total",
 		"ovn_network_agent_config_reload_total",
 	}
 	gotNames := make(map[string]bool, len(got))
@@ -787,5 +789,29 @@ func TestRouteDriftCounter(t *testing.T) {
 	}
 	if got := counterValue(t, m, name, "kind", "frr"); got != 2 {
 		t.Errorf("%s{kind=\"frr\"} = %v, want 2", name, got)
+	}
+}
+
+// TestOVSFlowDriftCounter pins both plane series of ovs_flow_drift_total: they
+// exist at 0 from the first scrape and count one deletion each.
+func TestOVSFlowDriftCounter(t *testing.T) {
+	const name = "ovn_network_agent_ovs_flow_drift_total"
+	m := withTestMetrics(t)
+
+	for _, plane := range []string{"hairpin", "mactweak"} {
+		if got := counterValue(t, m, name, "plane", plane); got != 0 {
+			t.Errorf("%s{plane=%q} = %v on a fresh registry, want 0", name, plane, got)
+		}
+	}
+
+	recordOVSFlowDrift("hairpin")
+	recordOVSFlowDrift("mactweak")
+	recordOVSFlowDrift("mactweak")
+
+	if got := counterValue(t, m, name, "plane", "hairpin"); got != 1 {
+		t.Errorf("%s{plane=\"hairpin\"} = %v, want 1", name, got)
+	}
+	if got := counterValue(t, m, name, "plane", "mactweak"); got != 2 {
+		t.Errorf("%s{plane=\"mactweak\"} = %v, want 2", name, got)
 	}
 }
