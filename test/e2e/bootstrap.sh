@@ -880,4 +880,7 @@ main() {
     log "bootstrap complete"
 }
 
-main "$@"
+# test/e2e/chaos/bootstrap_test.go sources this script to test its functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
