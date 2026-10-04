@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -13,9 +14,9 @@ import (
 // The route watch subscribes to the kernel's route notifications and makes
 // the agent reconcile as soon as a route it owns is deleted or replaced from
 // outside, instead of leaving the gap open until the next periodic reconcile.
-// This file holds the platform-independent part: what counts as drift, and the
-// goroutine that turns drift into a reconcile. The netlink subscription is in
-// routing_linux.go.
+// This file holds the platform-independent part: what counts as drift. The
+// goroutine that turns drift into a reconcile is the driftWatcher of
+// drift_watch.go, and the netlink subscription is in routing_linux.go.
 
 // routeEvent is one kernel route notification, reduced to what the drift
 // decision needs. KernelTable and VRFTable are both true when route_table_id
@@ -30,6 +31,9 @@ type routeEvent struct {
 	Gw          string // gateway of a single-path route, else ""
 }
 
+// watchSubject names the route watch in its log lines.
+func (routeEvent) watchSubject() string { return "route" }
+
 // routeOwnership is the set of routes the last reconcile wanted in place. An
 // event for any other prefix is not drift, which is how the routes a reconcile
 // removes on purpose stay out of the count: they leave the ownership before
@@ -42,7 +46,7 @@ type routeOwnership struct {
 
 // errRouteWatchUnsupported is what subscribeRouteEvents returns on a platform
 // without kernel route notifications.
-var errRouteWatchUnsupported = errors.New("route watch is only supported on Linux")
+var errRouteWatchUnsupported = fmt.Errorf("route watch is only supported on Linux: %w", errDriftWatchUnsupported)
 
 // errRouteSubscriptionClosed is the error the outage warning carries when a
 // subscription ended because its event channel was closed.
@@ -144,9 +148,9 @@ func classifyRouteEvent(ev routeEvent, owned routeOwnership, vethNexthop string)
 	return "", false
 }
 
-// routeWatcher turns kernel route events into reconcile triggers. One
-// goroutine, started by start, owns the subscription. The reconcile publishes
-// what it owns through setOwned.
+// routeWatcher turns kernel route events into reconcile triggers. The embedded
+// driftWatcher owns the subscription on one goroutine, started by start. The
+// reconcile publishes what it owns through setOwned.
 //
 // setOwned, start and wait are no-ops on a nil receiver, so an agent without a
 // watcher (route_watch off, dry-run, port-forward-only mode) calls them
@@ -157,18 +161,8 @@ type routeWatcher struct {
 	owned routeOwnership
 
 	vethNexthop string
-	trigger     func()
-	// subscribe opens one subscription. The watcher closes done when it is
-	// finished with that subscription.
-	subscribe func(done <-chan struct{}) (<-chan routeEvent, error)
 
-	debounce    time.Duration
-	minInterval time.Duration
-	backoffMin  time.Duration
-	backoffMax  time.Duration
-
-	// stopped is closed when the goroutine has returned. Nil until start.
-	stopped chan struct{}
+	driftWatcher[routeEvent]
 }
 
 // newRouteWatcher builds a watcher that calls trigger when an owned route
@@ -177,17 +171,27 @@ type routeWatcher struct {
 // which a reload replaces from Run's goroutine.
 func newRouteWatcher(cfg Config, trigger func()) *routeWatcher {
 	routeTableID, vrfName := cfg.RouteTableID, cfg.VRFName
-	return &routeWatcher{
-		vethNexthop: cfg.VethNexthop,
-		trigger:     trigger,
+	w := &routeWatcher{vethNexthop: cfg.VethNexthop}
+	w.driftWatcher = driftWatcher[routeEvent]{
+		kinds:     []string{routeDriftKindKernel, routeDriftKindFRR},
+		closedErr: errRouteSubscriptionClosed,
 		subscribe: func(done <-chan struct{}) (<-chan routeEvent, error) {
 			return subscribeRouteEvents(done, routeTableID, vrfName)
 		},
+		classify: func(ev routeEvent) (string, bool) {
+			return classifyRouteEvent(ev, w.currentOwned(), w.vethNexthop)
+		},
+		onDrift: func(ev routeEvent, kind string) {
+			recordRouteDrift(kind)
+			slog.Debug("route drift event", "kind", kind, "dst", ev.Dst, "deleted", ev.Deleted, "replaced", ev.Replaced)
+		},
+		trigger:     trigger,
 		debounce:    routeDriftDebounce,
 		minInterval: routeDriftMinInterval,
 		backoffMin:  routeWatchBackoffMin,
 		backoffMax:  routeWatchBackoffMax,
 	}
+	return w
 }
 
 // setOwned publishes the routes the current reconcile wants in place. The
@@ -214,160 +218,14 @@ func (w *routeWatcher) start(ctx context.Context) {
 	if w == nil {
 		return
 	}
-	w.stopped = make(chan struct{})
-	go func() {
-		defer close(w.stopped)
-		w.run(ctx)
-	}()
+	w.driftWatcher.start(ctx)
 }
 
 // wait blocks until the goroutine has returned. It returns at once when start
 // was never called.
 func (w *routeWatcher) wait() {
-	if w == nil || w.stopped == nil {
+	if w == nil {
 		return
 	}
-	<-w.stopped
-}
-
-// run subscribes, handles the events of that subscription, and subscribes
-// again with a backoff when the subscription fails. A watcher that cannot
-// subscribe leaves the agent where it is without one: on the periodic
-// reconcile.
-func (w *routeWatcher) run(ctx context.Context) {
-	var (
-		// backoff is the wait before the previous subscribe, 0 before the
-		// first.
-		backoff time.Duration
-		// outage is true from the warning about a lost subscription until
-		// the next subscribe that succeeds, so one outage logs one warning
-		// however many retries it takes.
-		outage      bool
-		lastTrigger time.Time
-	)
-	for ctx.Err() == nil {
-		// done belongs to this subscription alone. It is closed on every way
-		// out, which is what releases the socket of a subscription whose
-		// channel was closed.
-		done := make(chan struct{})
-		events, err := w.subscribe(done)
-		if errors.Is(err, errRouteWatchUnsupported) {
-			close(done)
-			slog.Debug("route watch is not supported on this platform")
-			return
-		}
-		// lived is how long this subscription held, 0 when the subscribe
-		// failed.
-		var lived time.Duration
-		if err == nil {
-			if outage {
-				// Route changes during the outage were not seen.
-				outage = false
-				slog.Info("route watch is back")
-				lastTrigger = time.Now()
-				w.trigger()
-			}
-			subscribedAt := time.Now()
-			lastTrigger = w.consume(ctx, events, lastTrigger)
-			lived = time.Since(subscribedAt)
-			err = errRouteSubscriptionClosed
-		}
-		close(done)
-		if ctx.Err() != nil {
-			return
-		}
-
-		if !outage {
-			outage = true
-			slog.Warn("route watch unavailable, drift is repaired by the periodic reconcile until it is back", "error", err)
-		}
-		backoff = nextBackoff(backoff, lived, w.backoffMin, w.backoffMax)
-		retry := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			retry.Stop()
-			return
-		case <-retry.C:
-		}
-	}
-}
-
-// nextBackoff returns the wait before the next subscribe. prev is the wait
-// before the subscribe that just ended, 0 for the first one. lived is how long
-// its subscription held, 0 when the subscribe failed.
-//
-// The wait doubles up to hi. It starts over at lo only after a subscription
-// that held for hi, which is what counts as healthy. One that opens and fails
-// right away keeps backing off: every resubscribe after an outage triggers a
-// reconcile, so a flapping socket would otherwise reconcile the agent every
-// lo.
-func nextBackoff(prev, lived, lo, hi time.Duration) time.Duration {
-	if prev == 0 || lived >= hi {
-		return lo
-	}
-	return min(2*prev, hi)
-}
-
-// consume handles the events of one subscription until its channel is closed
-// or ctx is done. It takes the time of the previous trigger and returns the
-// time of the last one, so the rate limit holds across subscriptions.
-//
-// Drift events arm one timer. It fires after the debounce, or later when that
-// is needed to keep minInterval since the previous trigger. Events that arrive
-// while it is pending ride along.
-func (w *routeWatcher) consume(ctx context.Context, events <-chan routeEvent, lastTrigger time.Time) time.Time {
-	var (
-		timer       *time.Timer
-		fire        <-chan time.Time
-		kernel, frr int
-	)
-	fireTrigger := func() {
-		timer, fire = nil, nil
-		if ctx.Err() != nil {
-			return
-		}
-		slog.Info("route drift detected, reconciling", "kernel", kernel, "frr", frr)
-		kernel, frr = 0, 0
-		lastTrigger = time.Now()
-		w.trigger()
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
-			return lastTrigger
-
-		case ev, ok := <-events:
-			if !ok {
-				// The socket failed, so later changes go unseen. A pending
-				// trigger does not wait for its timer.
-				if timer != nil {
-					timer.Stop()
-					fireTrigger()
-				}
-				return lastTrigger
-			}
-			kind, drift := classifyRouteEvent(ev, w.currentOwned(), w.vethNexthop)
-			if !drift {
-				continue
-			}
-			recordRouteDrift(kind)
-			slog.Debug("route drift event", "kind", kind, "dst", ev.Dst, "deleted", ev.Deleted, "replaced", ev.Replaced)
-			if kind == routeDriftKindFRR {
-				frr++
-			} else {
-				kernel++
-			}
-			if timer == nil {
-				timer = time.NewTimer(max(w.debounce, w.minInterval-time.Since(lastTrigger)))
-				fire = timer.C
-			}
-
-		case <-fire:
-			fireTrigger()
-		}
-	}
+	w.driftWatcher.wait()
 }
