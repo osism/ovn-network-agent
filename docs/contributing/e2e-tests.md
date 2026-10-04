@@ -157,13 +157,29 @@ containers, which is what containerlab requires.
 waits for OVN NB to become reachable from the host, then provisions
 the lab in three layers, described below.
 
-Bring-up gates on three readiness waits: OVN NB reachability, SB
+Bring-up gates on four readiness waits: OVN NB reachability, SB
 chassis registration for every gateway and for `compute-1`, and the
-upstream `bgpd`. The `bgpd` start — the one daemon bootstrap starts
-itself — is retried up to `BGPD_START_ATTEMPTS` (default `3`) times, each
-attempt waiting `BGPD_WAIT_SECS` (default `30` s) for the daemon to
-register, so a one-off startup hiccup heals itself instead of failing the
-job.
+upstream `zebra` and `bgpd`. `bgpd` ships disabled, so bootstrap always
+starts it itself. The start is retried up to `BGPD_START_ATTEMPTS`
+(default `3`) times, each attempt waiting `BGPD_WAIT_SECS` (default
+`30` s) for the daemon to register, so a one-off startup hiccup heals
+itself instead of failing the job.
+
+watchfrr starts `zebra` at container start, but the pinned FRR 8.4 can
+crash it there (`zebra crashed in startup, signal 11`), and watchfrr's
+own retry comes only after its 55 s startup timeout, after the baseline
+gate has failed. So bootstrap checks `zebra` before the `bgpd` start,
+starts it in place when it is missing, and retries up to
+`ZEBRA_START_ATTEMPTS` (default `3`) times with a readiness wait of
+`ZEBRA_WAIT_SECS` (default `30` s) per attempt. Right before
+`bootstrap complete` it looks at `zebra` once more; this end check only
+reports and never restarts it. A `zebra` that cannot be started, or that
+is gone at the end, aborts the bring-up with one of these lines:
+
+```text
+zebra did not come up on clab-ovn-e2e-upstream after 3 attempts; without zebra the upstream installs no BGP route and no client reaches a floating IP
+zebra on clab-ovn-e2e-upstream died after it came up; without zebra the upstream installs no BGP route and no client reaches a floating IP
+```
 
 The upstream next-hop `Static_MAC_Binding` is written the same way, for
 a different reason: the gateway agents maintain that same row and have
