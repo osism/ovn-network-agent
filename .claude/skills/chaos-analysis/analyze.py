@@ -263,6 +263,8 @@ def analyze(roots):
             "ticks": rec["ticks"],
             "executed": rec["decisions"]["executed"],
             "check_errors": rec.get("checks", {}).get("errors", 0),
+            # None: the record predates #239 and counts these in check_errors.
+            "check_skipped": rec.get("checks", {}).get("skipped_under_fault"),
             "violations": len(rec.get("violations", [])),
             "sent": sum(p["sent"] for p in rec["probes"].values()),
             "lost": sum(p["lost"] for p in rec["probes"].values()),
@@ -425,12 +427,13 @@ def render_md(a, top):
                    f"predates `down_ms` and is a restore→last-recovery span.\n")
 
     out.append("## Runs\n")
-    out.append("| record | profile | seed | result | loss | check errors | violations |")
-    out.append("| --- | --- | --- | --- | --- | --- | --- |")
+    out.append("| record | profile | seed | result | loss | check errors | skipped under fault | violations |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for r in sorted(runs, key=lambda r: (r["started_at"], r["profile"])):
+        skipped = "n/a" if r["check_skipped"] is None else r["check_skipped"]
         out.append(f"| {r['label']} | {r['profile']} | {r['seed']} | {r['result']} "
                    f"| {r['lost']}/{r['sent']} ({100 * r['lost'] / max(r['sent'], 1):.1f}%) "
-                   f"| {r['check_errors']} | {r['violations']} |")
+                   f"| {r['check_errors']} | {skipped} | {r['violations']} |")
     out.append("")
 
     out.append("## Open loss by action and phase — the optimisation candidates\n")

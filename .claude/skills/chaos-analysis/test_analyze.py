@@ -231,6 +231,17 @@ class Analyze(unittest.TestCase):
         self.assertEqual(result["actions"]["gateway-kill"]["residual_events"], 0)
         self.assertIn("| 1.3 s | n/a |", analyze.render_md(result, 15))
 
+    def test_runs_show_the_sweeps_skipped_under_a_held_fault_apart_from_the_errors(self):
+        # Before #239 a record counted those sweeps in checks.errors and had
+        # no skipped_under_fault, so its count is not available rather than 0.
+        old = {**NEW, "checks": {"sweeps": 60, "dual_claim_evaluated": 55, "errors": 5}}
+        new = {**NEW, "checks": {"sweeps": 60, "dual_claim_evaluated": 55, "errors": 0, "skipped_under_fault": 5}}
+        report = analyze.render_md(analyze_records({"old": old, "new": new}), 15)
+
+        self.assertIn("| check errors | skipped under fault | violations |", report)
+        self.assertIn("| old | everything-on | 7 | pass | 2/70 (2.9%) | 5 | n/a | 0 |", report)
+        self.assertIn("| new | everything-on | 7 | pass | 2/70 (2.9%) | 0 | 5 | 0 |", report)
+
 
 class PhaseRows(unittest.TestCase):
     def test_spreads_the_downtime_over_every_fault_of_the_action(self):
