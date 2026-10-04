@@ -482,7 +482,9 @@ func (rm *RouteManager) ReconcileOVSHairpinFlows(targets map[string]HairpinTarge
 	}
 	if len(rm.segments) == 0 {
 		// Segments not yet discovered; EnsureSegments must run first. The
-		// existing flows stay installed until it does.
+		// existing flows stay installed until it does. Without bindings no
+		// hairpin flow can be repaired, so none is owned.
+		rm.flowWatch.setOwned(flowPlaneHairpin, nil)
 		slog.Warn("skipping OVS hairpin flow reconcile: segment bindings not yet discovered")
 		return nil
 	}
@@ -788,6 +790,10 @@ func parseFlowMatch(match string) (key flowKey, havePriority, ok bool) {
 // from here rather than paying for a second exec. A failed dump calls it not
 // at all: there is nothing to report, and no apply happens either.
 func (rm *RouteManager) reconcileFlowPlane(plane, cookie string, desired []desiredFlow, observe func(installed int)) error {
+	// Published before the dump, so every stale delete below hits a flow
+	// the flow watch no longer counts as owned.
+	rm.flowWatch.setOwned(plane, desired)
+
 	out, err := rm.runOVS("ovs-ofctl", "--no-stats", "dump-flows", rm.cfg.BridgeDev,
 		fmt.Sprintf("cookie=%s/-1", cookie))
 	if err != nil {

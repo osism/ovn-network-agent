@@ -1091,6 +1091,75 @@ func TestReconcileOVSHairpinFlowsDeletesStaleAfterAdds(t *testing.T) {
 	}
 }
 
+// The flow watch counts a deletion as drift when its key is owned, so the
+// ownership has to be in place before the plane is read: a desired flow is
+// owned by the time its dump runs, and a stale flow is no longer owned by the
+// time the agent deletes it.
+func TestReconcileFlowPlanePublishesOwnershipBeforeTheDump(t *testing.T) {
+	const bridge = "br-ex"
+	var (
+		desiredHairpin = flowKey{priority: hairpinFlowPriority, inPort: "42", dst: "5.182.234.199"}
+		staleHairpin   = flowKey{priority: hairpinFlowPriority, inPort: "42", dst: "203.0.113.50"}
+		desiredTweak   = flowKey{priority: macTweakFlowPriority, inPort: "42"}
+	)
+
+	// ownershipAt runs the reconcile and returns what owns reported for
+	// key on plane when the first command containing marker ran.
+	ownershipAt := func(t *testing.T, rec *ovsRecorder, marker, plane string, key flowKey, reconcile func(rm *RouteManager) error) bool {
+		t.Helper()
+		w := newFlowWatcher(Config{}, func() {})
+		// An earlier cycle owned the stale flow.
+		w.setOwned(flowPlaneHairpin, ownedFlows(staleHairpin))
+		record := rec.hook()
+		var owned, found bool
+		rm := &RouteManager{
+			cfg:       Config{BridgeDev: bridge},
+			segments:  fallbackSegments("patch-provnet-0", "42", "aa:bb:cc:dd:ee:ff"),
+			flowWatch: w,
+			execOVSHook: func(cmd *exec.Cmd) ([]byte, error) {
+				if !found && strings.Contains(strings.Join(cmd.Args, " "), marker) {
+					owned, found = w.owns(plane, key), true
+				}
+				return record(cmd)
+			},
+		}
+		if err := reconcile(rm); err != nil {
+			t.Fatalf("reconcile error: %v", err)
+		}
+		if !found {
+			t.Fatalf("no OVS command contained %q: %v", marker, rec.calls)
+		}
+		return owned
+	}
+	hairpin := func(rm *RouteManager) error {
+		return rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"5.182.234.199": {RouterMAC: "fa:16:3e:6f:a1:64"}})
+	}
+	newRec := func() *ovsRecorder {
+		rec := newOVSRecorder()
+		rec.on([]string{"ovs-vsctl", "get", "Interface", "patch-provnet-0", "ofport"}, "42\n", nil)
+		rec.onDump(bridge, ovsCookieHairpin,
+			" cookie=0x998, table=0, priority=910,ip,in_port=42,nw_dst=203.0.113.50 actions=mod_dl_src:aa:bb:cc:dd:ee:ff,mod_dl_dst:fa:16:3e:00:01:02,IN_PORT\n")
+		return rec
+	}
+
+	t.Run("hairpin key owned at the dump", func(t *testing.T) {
+		if !ownershipAt(t, newRec(), "dump-flows", flowPlaneHairpin, desiredHairpin, hairpin) {
+			t.Error("the desired hairpin key was not owned when the plane was dumped")
+		}
+	})
+	t.Run("stale hairpin key not owned at its delete", func(t *testing.T) {
+		if ownershipAt(t, newRec(), "--strict del-flows", flowPlaneHairpin, staleHairpin, hairpin) {
+			t.Error("the stale hairpin key was still owned when the agent deleted it")
+		}
+	})
+	t.Run("MAC-tweak key owned at the dump", func(t *testing.T) {
+		ensure := func(rm *RouteManager) error { return rm.EnsureSegments([]DesiredSegment{{LocalnetPort: ""}}) }
+		if !ownershipAt(t, newRec(), "dump-flows", flowPlaneMACTweak, desiredTweak, ensure) {
+			t.Error("the desired MAC-tweak key was not owned when the plane was dumped")
+		}
+	})
+}
+
 // TestReconcileOVSHairpinFlowsIgnoresUnparseableDumpLine proves a dump line
 // the agent cannot key is dropped rather than guessed at: it produces no
 // delete, and the desired flow it partly resembles is simply (re-)added.
@@ -1235,6 +1304,33 @@ func TestReconcileOVSHairpinFlowsNoBindingsIsNoOp(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("expected no OVS commands when bindings empty, got: %v", rec.calls)
+	}
+}
+
+// Without bindings the agent cannot put a hairpin flow back, so a deletion
+// must not trigger a reconcile for one: the hairpin plane is no longer owned.
+// The MAC-tweak plane belongs to EnsureSegments and keeps its keys.
+func TestReconcileOVSHairpinFlowsNoBindingsClearsOwnership(t *testing.T) {
+	rec := newOVSRecorder()
+	hairpinKey := flowKey{priority: hairpinFlowPriority, inPort: "42", dst: "10.0.0.1"}
+	tweakKey := flowKey{priority: macTweakFlowPriority, inPort: "42"}
+	w := newFlowWatcher(Config{}, func() {})
+	w.setOwned(flowPlaneHairpin, ownedFlows(hairpinKey))
+	w.setOwned(flowPlaneMACTweak, ownedFlows(tweakKey))
+	rm := &RouteManager{cfg: Config{BridgeDev: "br-ex"}, flowWatch: w, execOVSHook: rec.hook()}
+
+	if err := rm.ReconcileOVSHairpinFlows(map[string]HairpinTarget{"10.0.0.1": {RouterMAC: "aa:aa:aa:aa:aa:aa"}}); err != nil {
+		t.Fatalf("ReconcileOVSHairpinFlows() error: %v", err)
+	}
+
+	if w.owns(flowPlaneHairpin, hairpinKey) {
+		t.Error("the hairpin key is still owned without segment bindings")
+	}
+	if !w.owns(flowPlaneMACTweak, tweakKey) {
+		t.Error("the MAC-tweak key lost its ownership")
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("OVS commands = %v, want none without bindings", rec.calls)
 	}
 }
 
