@@ -191,6 +191,9 @@ func TestScenario_FailureInjection_OvsOfctlFailsOnce(t *testing.T) {
 	// window above a single healthy cycle either way.
 	shim := testenv.WithFailingTool(t, "ovs-ofctl", 10)
 	cfg := testenv.FastDefaults()
+	// The flow monitor runs ovs-ofctl as well: its starts would use up the
+	// forced failures meant for the reconcile.
+	cfg.OVSFlowWatch = &ovsFlowWatchOff
 	cfg.ExtraEnv = append(cfg.ExtraEnv, shim.Env())
 	shim.Arm()
 

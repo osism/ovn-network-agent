@@ -183,9 +183,11 @@ func TestScenario_HairpinFlowSelfHeal(t *testing.T) {
 	})
 
 	// A 2s reconcile interval, so the repair and the two quiet cycles after
-	// it fit into a test without a long wait.
+	// it fit into a test without a long wait. The OVS flow watch is off, so
+	// the repair below is the tick's.
 	const reconcileInterval = 2 * time.Second
 	cfg := testenv.FastDefaults()
+	cfg.OVSFlowWatch = &ovsFlowWatchOff
 	a := readyAgent(t, cfg)
 	defer a.Stop(15 * time.Second)
 
@@ -229,6 +231,17 @@ func TestScenario_HairpinFlowSelfHeal(t *testing.T) {
 	if duration < 2*reconcileInterval {
 		t.Errorf("hairpin flow duration = %s after %s (installed at %s), want more than two reconcile intervals: the flow was rewritten instead of left alone",
 			duration, quiet, repaired.Format(time.TimeOnly))
+	}
+
+	// With ovs_flow_watch off the agent says so at startup and runs no
+	// monitor process.
+	if !strings.Contains(a.LogTail(100000), "OVS flow watch disabled") {
+		t.Errorf("expected 'OVS flow watch disabled' in the agent log; last logs:\n%s", a.LogTail(40))
+	}
+	if _, err := exec.LookPath("pgrep"); err == nil {
+		if pids := flowMonitorPids(t); len(pids) != 0 {
+			t.Errorf("OVS flow monitor processes %v run with ovs_flow_watch off, want none", pids)
+		}
 	}
 }
 

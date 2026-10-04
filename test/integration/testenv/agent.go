@@ -50,6 +50,7 @@ type AgentConfig struct {
 	DrainOnShutdown   *bool `yaml:"drain_on_shutdown,omitempty"`
 	VethLeakEnabled   *bool `yaml:"veth_leak_enabled,omitempty"`
 	RouteWatch        *bool `yaml:"route_watch,omitempty"`
+	OVSFlowWatch      *bool `yaml:"ovs_flow_watch,omitempty"`
 
 	ReconcileInterval       string `yaml:"reconcile_interval,omitempty"`
 	StaleChassisGracePeriod string `yaml:"stale_chassis_grace_period,omitempty"`
@@ -428,6 +429,7 @@ func writeConfigFile(t *testing.T, path string, cfg AgentConfig) {
 	putBool("drain_on_shutdown", cfg.DrainOnShutdown)
 	putBool("veth_leak_enabled", cfg.VethLeakEnabled)
 	putBool("route_watch", cfg.RouteWatch)
+	putBool("ovs_flow_watch", cfg.OVSFlowWatch)
 
 	put("port_forward_dev", cfg.PortForwardDev)
 	putBool("port_forward_l3mdev_accept", cfg.PortForwardL3mdevAccept)
