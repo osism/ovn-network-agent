@@ -77,15 +77,21 @@ func MACTweakFlow(cookie, ofport, mac string, ipv6 bool) string {
 		cookie, macTweakFlowPriority, proto, ofport, mac)
 }
 
+// ovsArgv returns the argv of an OVS command: the wrapper (e.g. "docker exec
+// openvswitch_vswitchd"), if any, then binary and args. It always builds a new
+// slice and never appends to wrapper, so goroutines may share one wrapper.
+func ovsArgv(wrapper []string, binary string, args ...string) []string {
+	argv := make([]string, 0, len(wrapper)+1+len(args))
+	argv = append(argv, wrapper...)
+	argv = append(argv, binary)
+	return append(argv, args...)
+}
+
 // ovsCmd builds an exec.Cmd for an OVS command, prepending the configured
 // wrapper (e.g. "docker exec openvswitch_vswitchd") if set.
 func (rm *RouteManager) ovsCmd(binary string, args ...string) *exec.Cmd {
-	if len(rm.ovsWrapper) > 0 {
-		fullArgs := append(rm.ovsWrapper[1:], binary)
-		fullArgs = append(fullArgs, args...)
-		return exec.Command(rm.ovsWrapper[0], fullArgs...)
-	}
-	return exec.Command(binary, args...)
+	argv := ovsArgv(rm.ovsWrapper, binary, args...)
+	return exec.Command(argv[0], argv[1:]...)
 }
 
 // runOVS builds and runs an OVS command. When execOVSHook is set (tests) the
@@ -684,46 +690,8 @@ func parseFlowDump(out []byte) []parsedFlow {
 			continue
 		}
 
-		var (
-			key           flowKey
-			havePriority  bool
-			haveProto     bool
-			haveInPort    bool
-			malformedPort bool
-			malformedDst  bool
-		)
-		fields := strings.FieldsFunc(match, func(r rune) bool {
-			return r == ',' || unicode.IsSpace(r)
-		})
-		for _, f := range fields {
-			switch {
-			case f == "ip":
-				haveProto = true
-			case f == "ipv6":
-				haveProto, key.ipv6 = true, true
-			case strings.HasPrefix(f, "priority="):
-				p, err := strconv.Atoi(strings.TrimPrefix(f, "priority="))
-				if err != nil {
-					continue
-				}
-				key.priority, havePriority = p, true
-			case strings.HasPrefix(f, "in_port="):
-				port := strings.TrimPrefix(f, "in_port=")
-				if _, err := strconv.Atoi(port); err != nil {
-					malformedPort = true
-					continue
-				}
-				key.inPort, haveInPort = port, true
-			case strings.HasPrefix(f, "nw_dst="), strings.HasPrefix(f, "ip_dst="), strings.HasPrefix(f, "ipv6_dst="):
-				_, value, _ := strings.Cut(f, "=")
-				addr, _, _ := strings.Cut(value, "/") // the host mask is elided in some dumps, present in others
-				key.dst = canonicalIP(addr)
-				if key.dst == "" {
-					malformedDst = true
-				}
-			}
-		}
-		if !havePriority || !haveProto || !haveInPort || malformedPort || malformedDst {
+		key, havePriority, ok := parseFlowMatch(match)
+		if !ok || !havePriority {
 			slog.Warn("ignoring unparseable OVS flow dump line", "line", strings.TrimSpace(line))
 			continue
 		}
@@ -731,6 +699,53 @@ func parseFlowDump(out []byte) []parsedFlow {
 		flows = append(flows, parsedFlow{key: key, actions: normalizeActions(actions)})
 	}
 	return flows
+}
+
+// parseFlowMatch keys the match part of a flow as ovs-ofctl prints it, in a
+// dump line before its actions or in a flow monitor event. Fields it does not
+// know (cookie, table, statistics) are skipped. ok is false without a protocol
+// keyword, without a numeric in_port, or with a destination that does not
+// parse. havePriority reports whether the match carried a priority, which a
+// monitor event does not.
+func parseFlowMatch(match string) (key flowKey, havePriority, ok bool) {
+	var (
+		haveProto     bool
+		haveInPort    bool
+		malformedPort bool
+		malformedDst  bool
+	)
+	fields := strings.FieldsFunc(match, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+	for _, f := range fields {
+		switch {
+		case f == "ip":
+			haveProto = true
+		case f == "ipv6":
+			haveProto, key.ipv6 = true, true
+		case strings.HasPrefix(f, "priority="):
+			p, err := strconv.Atoi(strings.TrimPrefix(f, "priority="))
+			if err != nil {
+				continue
+			}
+			key.priority, havePriority = p, true
+		case strings.HasPrefix(f, "in_port="):
+			port := strings.TrimPrefix(f, "in_port=")
+			if _, err := strconv.Atoi(port); err != nil {
+				malformedPort = true
+				continue
+			}
+			key.inPort, haveInPort = port, true
+		case strings.HasPrefix(f, "nw_dst="), strings.HasPrefix(f, "ip_dst="), strings.HasPrefix(f, "ipv6_dst="):
+			_, value, _ := strings.Cut(f, "=")
+			addr, _, _ := strings.Cut(value, "/") // the host mask is elided in some dumps, present in others
+			key.dst = canonicalIP(addr)
+			if key.dst == "" {
+				malformedDst = true
+			}
+		}
+	}
+	return key, havePriority, haveProto && haveInPort && !malformedPort && !malformedDst
 }
 
 // reconcileFlowPlane brings one agent-managed flow plane — the flows carrying

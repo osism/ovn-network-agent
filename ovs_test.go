@@ -351,6 +351,55 @@ func TestParseFlowDumpMatchesDesiredKeys(t *testing.T) {
 	}
 }
 
+func TestParseFlowMatch(t *testing.T) {
+	tests := []struct {
+		name         string
+		match        string
+		wantKey      flowKey
+		wantPriority bool
+		wantOK       bool
+	}{
+		{
+			name:         "dump match with priority and destination",
+			match:        " cookie=0x998, table=0, priority=910,ip,in_port=42,nw_dst=192.0.2.10",
+			wantKey:      flowKey{priority: 910, inPort: "42", dst: "192.0.2.10"},
+			wantPriority: true,
+			wantOK:       true,
+		},
+		{
+			name:    "monitor match carries no priority",
+			match:   "ipv6,in_port=1,ipv6_dst=2001:0db8::10/128",
+			wantKey: flowKey{ipv6: true, inPort: "1", dst: "2001:db8::10"},
+			wantOK:  true,
+		},
+		{
+			name:    "MAC-tweak match has no destination",
+			match:   "ip,in_port=1",
+			wantKey: flowKey{inPort: "1"},
+			wantOK:  true,
+		},
+		{name: "empty match", match: ""},
+		{name: "no protocol keyword", match: "priority=900,in_port=42"},
+		{name: "no in_port", match: "priority=900,ip"},
+		{name: "named in_port", match: "ip,in_port=patch-provnet-0"},
+		{name: "unparseable destination", match: "ip,in_port=1,nw_dst=bogus"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, havePriority, ok := parseFlowMatch(tt.match)
+			if ok != tt.wantOK {
+				t.Fatalf("parseFlowMatch(%q) ok = %v, want %v", tt.match, ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if havePriority != tt.wantPriority || key != tt.wantKey {
+				t.Errorf("parseFlowMatch(%q) = (%+v, %v), want (%+v, %v)", tt.match, key, havePriority, tt.wantKey, tt.wantPriority)
+			}
+		})
+	}
+}
+
 func TestNormalizeActions(t *testing.T) {
 	tests := []struct {
 		name string
@@ -437,6 +486,31 @@ func TestOVSCmdNoWrapper(t *testing.T) {
 	want := []string{"ovs-ofctl", "add-flow", "br-ex", "flow"}
 	if !reflect.DeepEqual(cmd.Args, want) {
 		t.Errorf("ovsCmd args = %v, want %v", cmd.Args, want)
+	}
+}
+
+// The flow watch builds its commands on its own goroutine from the same
+// wrapper slice the reconcile uses. Appending to a wrapper with spare capacity
+// would let one command's arguments overwrite the other's.
+func TestOVSArgvNeverWritesToTheWrapper(t *testing.T) {
+	backing := make([]string, 3, 8)
+	copy(backing, []string{"docker", "exec", "openvswitch_vswitchd"})
+	wrapper := backing[:3]
+
+	first := ovsArgv(wrapper, "ovs-ofctl", "dump-flows", "br-ex")
+	second := ovsArgv(wrapper, "ovs-appctl", "-t", "ctl", "exit")
+
+	if want := []string{"docker", "exec", "openvswitch_vswitchd", "ovs-ofctl", "dump-flows", "br-ex"}; !reflect.DeepEqual(first, want) {
+		t.Errorf("first argv = %v, want %v", first, want)
+	}
+	if want := []string{"docker", "exec", "openvswitch_vswitchd", "ovs-appctl", "-t", "ctl", "exit"}; !reflect.DeepEqual(second, want) {
+		t.Errorf("second argv = %v, want %v", second, want)
+	}
+	if spare := backing[:cap(backing)][3:]; !reflect.DeepEqual(spare, make([]string, len(spare))) {
+		t.Errorf("the wrapper's spare capacity was written: %q", spare)
+	}
+	if got := ovsArgv(nil, "ovs-ofctl"); !reflect.DeepEqual(got, []string{"ovs-ofctl"}) {
+		t.Errorf("argv without a wrapper = %v, want [ovs-ofctl]", got)
 	}
 }
 
