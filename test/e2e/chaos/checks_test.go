@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,33 @@ func newTestChecks(t *testing.T, cmd commander, nodes map[string]string) (*basel
 		e.nodes = nodes
 	}
 	return &baselineChecks{lab: e.lab, engine: e}, rec, buf
+}
+
+// holdFault opens the span of a fault on central at tick 4, as execute
+// does right before the inject, and leaves it held.
+func holdFault(c *baselineChecks, name string) int {
+	return c.engine.beginHold(decision{tick: 4, action: &action{name: name}, target: centralNode})
+}
+
+// lookupFails answers the dual-claim lookup with errBoom and everything
+// else the way a healthy lab does.
+func lookupFails(argv []string) (string, error) {
+	if strings.Contains(strings.Join(argv, " "), "type=chassisredirect") {
+		return "", errBoom
+	}
+	return healthyLabResponses(argv)
+}
+
+// eventsNamed is the journal's events of one name, in order.
+func eventsNamed(t *testing.T, journal, name string) []event {
+	t.Helper()
+	var out []event
+	for _, ev := range eventsIn(t, journal) {
+		if ev.Event == name {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 // The agent staying alive is one of the run's invariants: a node the run
@@ -240,7 +268,195 @@ func TestCheckNoDualClaimJournalsALookupFailure(t *testing.T) {
 		}
 	}
 	if !journaled {
-		t.Fatalf("the skipped check was swallowed instead of journaled: %q", buf.String())
+		t.Fatalf("the failed lookup was swallowed instead of journaled as a check error: %q", buf.String())
+	}
+	// No fault was held, so nothing explains the failure: it is an error.
+	if checks.counts.Errors != 1 || checks.counts.SkippedUnderFault != 0 {
+		t.Fatalf("counts = %+v, want one error and nothing skipped under fault", checks.counts)
+	}
+	if skipped := eventsNamed(t, buf.String(), evCheckSkipped); len(skipped) != 0 {
+		t.Fatalf("a lookup that failed under no fault was journaled as skipped: %+v", skipped)
+	}
+}
+
+// The run paused the SB itself, so a dual-claim lookup that failed while
+// sb-pause held it could not have been answered. It is no sweep breakage:
+// it is counted apart from the errors and journaled with the fault that
+// explains it. Counted as an error, every sb-pause put one into
+// checks.errors per sweep of its hold, 35 across the 2026-10-04 nightly
+// (issue #239).
+func TestCheckNoDualClaimSkipsALookupThatFailedUnderSBPause(t *testing.T) {
+	checks, rec, buf := newTestChecks(t, &fakeCommander{respond: lookupFails}, nil)
+	holdFault(checks, "sb-pause")
+
+	checks.checkNoDualClaim(context.Background())
+
+	if got := checks.counts; got.Errors != 0 || got.DualClaim != 0 || got.SkippedUnderFault != 1 {
+		t.Fatalf("counts = %+v, want one lookup skipped under fault, no error and no evaluation", got)
+	}
+	if len(rec.Violations) != 0 {
+		t.Fatalf("a lookup the paused SB could not answer was recorded as a violation: %+v", rec.Violations)
+	}
+	skipped := eventsNamed(t, buf.String(), evCheckSkipped)
+	if len(skipped) != 1 {
+		t.Fatalf("journaled %d check-skipped events, want one: %q", len(skipped), buf.String())
+	}
+	ev := skipped[0]
+	if ev.Kind != violationDualClaim || ev.Action != "sb-pause" || ev.Target != centralNode ||
+		ev.Tick != 4 || ev.Detail != "list chassisredirect port bindings: boom" {
+		t.Fatalf("check-skipped = %+v, want the dual-claim lookup's error under tick 4's sb-pause on %s",
+			ev, centralNode)
+	}
+	if errs := eventsNamed(t, buf.String(), evCheckError); len(errs) != 0 {
+		t.Fatalf("the skipped lookup was also journaled as a check error: %+v", errs)
+	}
+}
+
+// unanswerableUnder names its faults by action name, and the tests here
+// hold them by the same literal. A name no action carries never matches a
+// held span: a renamed sb-pause would turn every lookup under it back into
+// a check error while every other test still passed.
+func TestUnanswerableUnderNamesActionsTheRunCanDraw(t *testing.T) {
+	known := actionNames(fullRegistry(t))
+	for kind, faults := range unanswerableUnder {
+		for _, name := range faults {
+			if !slices.Contains(known, name) {
+				t.Errorf("unanswerableUnder[%s] names %q, which is no action (known: %v)", kind, name, known)
+			}
+		}
+	}
+}
+
+// sbctl --timeout=5 can hang on the paused SB until after the restore. The
+// lookup started inside the hold, so it is still skipped.
+func TestCheckNoDualClaimSkipsALookupThatOutlastedTheRestore(t *testing.T) {
+	cmd := &fakeCommander{}
+	checks, _, _ := newTestChecks(t, cmd, nil)
+	i := holdFault(checks, "sb-pause")
+	cmd.respond = func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "type=chassisredirect") {
+			checks.lab.sleep(time.Second)
+			checks.engine.endHold(i) // SIGCONT returns mid-lookup
+			checks.lab.sleep(4 * time.Second)
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}
+
+	checks.checkNoDualClaim(context.Background())
+
+	if got := checks.counts; got.SkippedUnderFault != 1 || got.Errors != 0 {
+		t.Fatalf("counts = %+v, want the lookup that started under sb-pause skipped, not an error", got)
+	}
+}
+
+// Once the restore returned the SB answers again. A lookup that started
+// after it and failed anyway is a sweep breakage the run did not cause.
+func TestCheckNoDualClaimCountsALookupThatFailedAfterTheRestore(t *testing.T) {
+	checks, _, buf := newTestChecks(t, &fakeCommander{respond: lookupFails}, nil)
+	i := holdFault(checks, "sb-pause")
+	checks.lab.sleep(5 * time.Second)
+	checks.engine.endHold(i)
+	checks.lab.sleep(time.Second)
+
+	checks.checkNoDualClaim(context.Background())
+
+	if got := checks.counts; got.Errors != 1 || got.SkippedUnderFault != 0 {
+		t.Fatalf("counts = %+v, want one error and nothing skipped under fault", got)
+	}
+	if errs := eventsNamed(t, buf.String(), evCheckError); len(errs) != 1 {
+		t.Fatalf("journaled %d check errors, want one: %q", len(errs), buf.String())
+	}
+	if skipped := eventsNamed(t, buf.String(), evCheckSkipped); len(skipped) != 0 {
+		t.Fatalf("a lookup after the restore was journaled as skipped: %+v", skipped)
+	}
+}
+
+// The other faults on central leave the SB answering, so a dual-claim
+// lookup that fails under them is exactly the signal checks.errors exists
+// for.
+func TestCheckNoDualClaimCountsALookupThatFailedUnderAnotherFault(t *testing.T) {
+	for _, name := range []string{"nb-pause", "northd-pause", "fip-churn"} {
+		t.Run(name, func(t *testing.T) {
+			checks, _, _ := newTestChecks(t, &fakeCommander{respond: lookupFails}, nil)
+			holdFault(checks, name)
+
+			checks.checkNoDualClaim(context.Background())
+
+			if got := checks.counts; got.Errors != 1 || got.SkippedUnderFault != 0 {
+				t.Fatalf("counts = %+v, want one error and nothing skipped under %s", got, name)
+			}
+		})
+	}
+}
+
+// pgrep runs on the gateways and never reads the SB, so sb-pause does not
+// explain a probe that failed: it stays an error.
+func TestCheckAgentsAliveCountsAFailedProbeUnderSBPause(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "pgrep") {
+			return "", errBoom
+		}
+		return healthyLabResponses(argv)
+	}}
+	checks, _, _ := newTestChecks(t, cmd, nil)
+	holdFault(checks, "sb-pause")
+
+	checks.checkAgentsAlive(context.Background())
+
+	if got := checks.counts; got.Errors != len(gatewayNames()) || got.SkippedUnderFault != 0 {
+		t.Fatalf("counts = %+v, want %d errors and nothing skipped under fault", got, len(gatewayNames()))
+	}
+}
+
+// A cancelled run is not a failed check, held fault or not.
+func TestACancelledLookupUnderSBPauseIsNeitherCountedNorJournaled(t *testing.T) {
+	cmd := &fakeCommander{respond: func(argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "type=chassisredirect") {
+			return "", context.Canceled
+		}
+		return healthyLabResponses(argv)
+	}}
+	checks, _, buf := newTestChecks(t, cmd, nil)
+	holdFault(checks, "sb-pause")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	checks.checkNoDualClaim(ctx)
+
+	if got := checks.counts; got.Errors != 0 || got.SkippedUnderFault != 0 {
+		t.Fatalf("counts = %+v, want nothing counted for a cancelled run", got)
+	}
+	for _, name := range []string{evCheckError, evCheckSkipped} {
+		if evs := eventsNamed(t, buf.String(), name); len(evs) != 0 {
+			t.Fatalf("a cancelled lookup was journaled as %s: %+v", name, evs)
+		}
+	}
+}
+
+// A skipped lookup evaluated nothing. A run whose every lookup was skipped
+// under sb-pause asserted nothing, and fails like any other run that never
+// got to evaluate the dual-claim invariant.
+func TestARunWhoseEveryLookupWasSkippedUnderFaultDoesNotPass(t *testing.T) {
+	checks, rec, _ := newTestChecks(t, &fakeCommander{respond: lookupFails}, nil)
+	holdFault(checks, "sb-pause")
+
+	checks.sweep(context.Background())
+	checks.sweep(context.Background())
+	checks.finalize()
+	rec.finalize(time.Now())
+
+	if rec.Result != resultFail {
+		t.Fatalf("result = %q, want %q — the invariant was never evaluated", rec.Result, resultFail)
+	}
+	if len(rec.Violations) != 1 || rec.Violations[0].Kind != violationChecksNeverRan {
+		t.Fatalf("violations = %+v, want one %s", rec.Violations, violationChecksNeverRan)
+	}
+	if want := "0 check errors, 2 skipped under a held fault"; !strings.Contains(rec.Violations[0].Detail, want) {
+		t.Fatalf("violation detail %q does not say %q", rec.Violations[0].Detail, want)
+	}
+	if want := (checkCounts{Sweeps: 2, DualClaim: 0, Errors: 0, SkippedUnderFault: 2}); rec.Checks != want {
+		t.Fatalf("checks = %+v, want %+v", rec.Checks, want)
 	}
 }
 

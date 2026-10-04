@@ -12,6 +12,13 @@ import (
 // is doing, so an invariant broken during a fault hold is caught.
 const checkInterval = 10 * time.Second
 
+// unanswerableUnder names, per baseline check, the faults that stall what
+// the check reads. A check that fails while one of them is held could not
+// have been answered: the run paused that database itself.
+var unanswerableUnder = map[string][]string{
+	violationDualClaim: {"sb-pause"},
+}
+
 // baselineChecks are the invariants that must hold across the whole run,
 // no matter which faults the engine picked:
 //
@@ -71,8 +78,8 @@ func (c *baselineChecks) finalize() {
 	}
 	c.engine.violate(violationRecord{
 		Kind: violationChecksNeverRan,
-		Detail: fmt.Sprintf("the dual-claim invariant was never evaluated: %d sweeps, %d check errors",
-			c.counts.Sweeps, c.counts.Errors),
+		Detail: fmt.Sprintf("the dual-claim invariant was never evaluated: %d sweeps, %d check errors, %d skipped under a held fault",
+			c.counts.Sweeps, c.counts.Errors, c.counts.SkippedUnderFault),
 	})
 }
 
@@ -81,8 +88,22 @@ func (c *baselineChecks) finalize() {
 // went unevaluated, so it is counted (finalize holds the run to the
 // count) and journaled rather than swallowed. A cancelled run is not a
 // failed check: every in-flight command fails on ctx.Done() by design.
-func (c *baselineChecks) checkError(ctx context.Context, kind string, err error) {
+//
+// A failure whose query, from `from` until now, overlapped a held fault
+// that stalls what the check reads (unanswerableUnder) is no error: the
+// run caused it. It is counted in SkippedUnderFault and journaled as
+// check-skipped with that fault's tick, action and target. A failure under
+// any other fault, or under none, stays a check-error.
+func (c *baselineChecks) checkError(ctx context.Context, kind string, from time.Time, err error) {
 	if ctx.Err() != nil {
+		return
+	}
+	if span, held := c.engine.heldDuring(unanswerableUnder[kind], from, c.engine.now()); held {
+		c.counts.SkippedUnderFault++
+		c.engine.jrnl.emit(event{
+			Event: evCheckSkipped, Kind: kind, Tick: span.tick,
+			Action: span.action, Target: span.target, Detail: err.Error(),
+		})
 		return
 	}
 	c.counts.Errors++
@@ -94,12 +115,13 @@ func (c *baselineChecks) checkAgentsAlive(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		from := c.engine.now()
 		alive, err := c.lab.agentAlive(ctx, gw)
 		if err != nil {
 			// The question could not be asked — a docker daemon under load,
 			// an expired command timeout. Reading that as "no agent" would
 			// fail the run over a node that is perfectly healthy.
-			c.checkError(ctx, violationAgentDown, err)
+			c.checkError(ctx, violationAgentDown, from, err)
 			continue
 		}
 		if alive {
@@ -119,9 +141,10 @@ func (c *baselineChecks) checkAgentsAlive(ctx context.Context) {
 }
 
 func (c *baselineChecks) checkNoDualClaim(ctx context.Context) {
+	from := c.engine.now()
 	claims, err := c.lab.crPortClaims(ctx)
 	if err != nil {
-		c.checkError(ctx, violationDualClaim, err)
+		c.checkError(ctx, violationDualClaim, from, err)
 		return
 	}
 	c.counts.DualClaim++

@@ -178,6 +178,33 @@ func TestViolationRecordSerializesTheJournalOffset(t *testing.T) {
 	}
 }
 
+// skipped_under_fault is a counter like its siblings: a run that skipped
+// nothing writes a zero rather than dropping the key, and errors stays
+// apart from it.
+func TestCheckCountsSerializeTheSkippedSweeps(t *testing.T) {
+	rec := &runRecord{Checks: checkCounts{Sweeps: 3, DualClaim: 1, Errors: 0, SkippedUnderFault: 2}}
+	rec.finalize(newFakeClock().now())
+	var buf bytes.Buffer
+	if err := rec.write(&buf); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatalf("the record is not valid JSON: %v", err)
+	}
+	checks, ok := raw["checks"].(map[string]any)
+	if !ok {
+		t.Fatalf("the record has no checks object: %s", buf.String())
+	}
+	if got, ok := checks["skipped_under_fault"]; !ok || got != float64(2) {
+		t.Fatalf("checks.skipped_under_fault = %v (present %v), want 2", got, ok)
+	}
+	if got, ok := checks["errors"]; !ok || got != float64(0) {
+		t.Fatalf("checks.errors = %v (present %v), want 0", got, ok)
+	}
+}
+
 // The settle-window schedule is part of the reproducibility contract, so
 // both keys must reach the run inputs verbatim — and, unlike the omitempty
 // event fields, even at zero, or a replay cannot tell "not set" from "set
