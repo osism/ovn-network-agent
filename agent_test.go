@@ -2790,9 +2790,9 @@ func TestAgentRunStartsAndJoinsRouteWatch(t *testing.T) {
 	cancel()
 
 	select {
-	case <-done:
+	case err := <-done:
 		close(release)
-		t.Fatal("Run() returned while the route watch goroutine was still running")
+		t.Fatalf("Run() returned (%v) while the route watch goroutine was still running", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(release)
@@ -3027,9 +3027,9 @@ func TestAgentRunJoinsFlowWatchBeforeCleanup(t *testing.T) {
 	cancel()
 
 	select {
-	case <-done:
+	case err := <-done:
 		close(release)
-		t.Fatal("Run() returned while the OVS flow watch goroutine was still running")
+		t.Fatalf("Run() returned (%v) while the OVS flow watch goroutine was still running", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(release)
@@ -3217,9 +3217,9 @@ func TestAgentRunPrimesStartsAndJoinsFRRWatch(t *testing.T) {
 	cancel()
 
 	select {
-	case <-done:
+	case err := <-done:
 		close(release)
-		t.Fatal("Run() returned while an FRR watch poll was still in flight")
+		t.Fatalf("Run() returned (%v) while an FRR watch poll was still in flight", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(release)
