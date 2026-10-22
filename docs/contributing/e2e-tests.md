@@ -2058,7 +2058,10 @@ a short smoke (3 minutes, seed 42, `everything-on`) by carrying the
 smoke stays on `ubuntu-latest`, because it is the one trigger that
 builds and runs a fork's own code. Each profile's journal and summary
 upload on every outcome, together with the lab-state dump the runner
-writes after every run — and each job renders its own `-report` into the Actions job summary,
+writes after every run. The artifact is kept 7 days, or 30 when the
+job did not succeed, because a red nightly is often triaged more than
+a week after it ran. Each job also renders its own `-report` into the
+Actions job summary,
 so the verdict, the recovery durations and the loss windows are
 readable on the run page without downloading the artifact. It
 is deliberately not part of `e2e.yml`'s PR path: the scenarios there
