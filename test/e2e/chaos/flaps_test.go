@@ -133,7 +133,10 @@ func TestUpstreamBGPRestartNeverRecyclesTheContainer(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	for _, want := range []string{
-		"bgpd -d -A 127.0.0.1 -u frr -g frr",
+		// The log directory is made and handed to frr ahead of the start,
+		// as two commands: sh -e ignores a failure on the left of `&&`.
+		"mkdir -p /var/log/frr; chown frr:frr /var/log/frr; pgrep -f '" + bgpdMatchPattern + "'",
+		"bgpd -d -A 127.0.0.1 -u frr -g frr --log file:/var/log/frr/bgpd.log",
 		"grep -qw bgpd",
 		// The reload must stay guarded: the upstream image has no
 		// integrated /etc/frr/frr.conf (write memory persists per-daemon

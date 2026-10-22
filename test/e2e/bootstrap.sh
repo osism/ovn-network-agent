@@ -516,19 +516,32 @@ dump_upstream_frr_state() {
 # ensure_workload_netns pattern) so the script body stays single-quoted;
 # the start output is captured and surfaced to the job log instead of
 # discarded, so a failed start names its cause.
+#
+# bgpd logs to /var/log/frr/bgpd.log, the directory collect-artifacts.sh
+# tails: -d detaches it from this exec and the upstream config has no
+# `log` statement, so without --log its log went nowhere. FRR opens the
+# file as root, before bgpd drops to frr, and appends to it, so every
+# restart adds to the same file. The image has no /var/log/frr, and a
+# bgpd that cannot open its log file starts anyway and logs nothing, so
+# the directory is made first and handed to frr, as FRR's packages ship
+# it. A failure there ends the attempt at once, and configure_upstream_frr
+# retries it.
 start_upstream_bgpd() {
     docker exec -i --env "BGPD_WAIT_SECS=${BGPD_WAIT_SECS}" \
         "${UPSTREAM_NODE}" sh -eu <<'EOSH'
 if grep -q "^bgpd=no" /etc/frr/daemons 2>/dev/null; then
     sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
 fi
+# Two commands, not `&&`: sh -e ignores a failure on the left of `&&`.
+mkdir -p /var/log/frr
+chown frr:frr /var/log/frr
 # The upstream image's pgrep/pkill are BusyBox applets that match against
 # argv[0] — the full path — never the comm name, so `-x bgpd` finds
 # nothing even while bgpd runs. Anchor the full path under -f (same
 # reading on BusyBox and procps).
 start_out=""
 if ! pgrep -f '^/usr/lib/frr/bgpd' >/dev/null; then
-    if start_out=$(/usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr 2>&1); then
+    if start_out=$(/usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr --log file:/var/log/frr/bgpd.log 2>&1); then
         :
     else
         rc=$?
