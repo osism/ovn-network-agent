@@ -160,10 +160,16 @@ func killUpstreamBGPD(ctx context.Context, l *lab) error {
 // the image's own init applies ("/etc/frr/frr.conf does not exist;
 // skipping config apply"). Unconditional, it exited 11 on the missing file
 // in run 30261099950 and parked the node over a bgpd that was already
-// back up, configured and re-established.
+// back up, configured and re-established. bgpd starts with
+// start_upstream_bgpd's command line, `--log file:/var/log/frr/bgpd.log`
+// included, so every incarnation appends to the log collect-artifacts.sh
+// tails; the directory is made first, as two commands because sh -e
+// ignores a failure on the left of `&&`.
 func restoreUpstreamBGPD(ctx context.Context, l *lab) error {
 	script := strings.Join([]string{
-		"pgrep -f '" + bgpdMatchPattern + "' >/dev/null 2>&1 || /usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr",
+		"mkdir -p /var/log/frr",
+		"chown frr:frr /var/log/frr",
+		"pgrep -f '" + bgpdMatchPattern + "' >/dev/null 2>&1 || /usr/lib/frr/bgpd -d -A 127.0.0.1 -u frr -g frr --log file:/var/log/frr/bgpd.log",
 		bgpdReadyProbe,
 		"[ ! -r /etc/frr/frr.conf ] || vtysh -b",
 	}, "; ")

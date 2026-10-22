@@ -19,7 +19,9 @@ import (
 // list exit 1), and START_STDERR is what a failing attempt prints.
 // PKILL_EXIT is the exit code of the zebra kill between attempts: BusyBox
 // pkill exits 1 when nothing matched, which is the crash case. PGREP_EXIT
-// is the exit code of the end check's look. Every other call exits 0.
+// is the exit code of the end check's look. The upstream bgpd start and
+// the upstream vtysh push record their script too and pass. Every other
+// call exits 0.
 const bootstrapDockerStub = `#!/bin/sh
 # docker: record argv; script the start attempts, the kill between them
 # and the end check
@@ -34,6 +36,9 @@ case "$*" in
     exit "${code}" ;;
 *"pkill -KILL -f ^/usr/lib/frr/zebra") exit "${PKILL_EXIT:-0}" ;;
 *"pgrep -f ^/usr/lib/frr/zebra") exit "${PGREP_EXIT:-0}" ;;
+*"--env BGPD_WAIT_SECS="*"sh -eu"|*"-upstream vtysh")
+    cat >"${DOCKER_STDIN}"
+    exit 0 ;;
 esac
 exit 0
 `
@@ -46,7 +51,8 @@ exit 0
 
 // bootstrapRun is what one run of bootstrap.sh against the stubs left
 // behind: its exit code, its stderr, the docker calls it made and the
-// script the last upstream zebra start attempt fed to the container.
+// script the last upstream start attempt or upstream vtysh push fed to
+// the container.
 type bootstrapRun struct {
 	code   int
 	stderr string
@@ -537,6 +543,135 @@ func TestBootstrapZebraStartScriptDecidesOnTheProcess(t *testing.T) {
 			}
 			if got := strings.Contains(string(calls), "-f ^/usr/lib/frr/bgpd"); got != tc.wantBgpdKill {
 				t.Fatalf("killed bgpd = %t, want %t: %q", got, tc.wantBgpdKill, calls)
+			}
+		})
+	}
+}
+
+// bootstrapBGPDScriptStubs stand in for the upstream container's tools
+// while the bgpd start script runs in a real sh. mkdir, chown and bgpd
+// record their argv in CALLS, in order; MKDIR_EXIT and CHOWN_EXIT are the
+// exit codes of the log directory's two commands. pgrep finds no bgpd,
+// and vtysh lists bgpd once the bgpd stub has run.
+var bootstrapBGPDScriptStubs = map[string]string{
+	"mkdir": `#!/bin/sh
+printf 'mkdir %s\n' "$*" >>"${CALLS}"
+exit "${MKDIR_EXIT}"
+`,
+	"chown": `#!/bin/sh
+printf 'chown %s\n' "$*" >>"${CALLS}"
+exit "${CHOWN_EXIT}"
+`,
+	"bgpd": `#!/bin/sh
+printf 'bgpd %s\n' "$*" >>"${CALLS}"
+`,
+	"pgrep": `#!/bin/sh
+# pgrep -f ^/usr/lib/frr/bgpd: no bgpd runs yet
+exit 1
+`,
+	"vtysh": `#!/bin/sh
+# vtysh -c "show daemons": bgpd registers once it has been started
+if grep -q '^bgpd ' "${CALLS}" 2>/dev/null; then echo " zebra staticd bgpd"; else echo " zebra staticd"; fi
+`,
+	"sleep":    bootstrapSleepStub,
+	"hostname": "#!/bin/sh\necho upstream\n",
+}
+
+// The script start_upstream_bgpd feeds to the upstream runs here in a real
+// sh against stubs for the container's tools. It makes /var/log/frr and
+// hands it to frr before it starts bgpd with its log file there, and a
+// failure of either command ends the attempt before bgpd starts. sh -e
+// ignores a failure on the left of `&&`, so joined that way a failed
+// mkdir would start a bgpd with nowhere to log.
+func TestBootstrapUpstreamBGPDStartLogsToFile(t *testing.T) {
+	t.Parallel()
+	const startCmd = "/usr/lib/frr/bgpd -d"
+	run := runBootstrapFunc(t, "start_upstream_bgpd")
+	if run.code != 0 {
+		t.Fatalf("start_upstream_bgpd against the stubs exited %d: %s", run.code, run.stderr)
+	}
+	if got := run.count("exec -i --env BGPD_WAIT_SECS=30 clab-ovn-e2e-upstream sh -eu"); got != 1 {
+		t.Fatalf("the bgpd start was sent %d times, want once: %q", got, run.calls)
+	}
+	script := run.stdin
+	if !strings.Contains(script, startCmd) {
+		t.Fatalf("the start script does not run %q:\n%s", startCmd, script)
+	}
+	stubs := t.TempDir()
+	// The daemons file is pointed at a path that does not exist, so an FRR
+	// installed on the host cannot change the outcome.
+	script = strings.ReplaceAll(script, startCmd, "bgpd -d")
+	script = strings.ReplaceAll(script, "/etc/frr/daemons", filepath.Join(stubs, "daemons"))
+	for name, body := range bootstrapBGPDScriptStubs {
+		if err := os.WriteFile(filepath.Join(stubs, name), []byte(body), 0o755); err != nil {
+			t.Fatalf("write the %s stub: %v", name, err)
+		}
+	}
+
+	const (
+		mkdirCall = "mkdir -p /var/log/frr"
+		chownCall = "chown frr:frr /var/log/frr"
+		bgpdCall  = "bgpd -d -A 127.0.0.1 -u frr -g frr --log file:/var/log/frr/bgpd.log"
+	)
+	for _, tc := range []struct {
+		name      string
+		mkdirExit int
+		chownExit int
+		wantExit  int
+		wantCalls []string
+	}{
+		{
+			name:      "the log directory is made before bgpd starts with its log file",
+			wantCalls: []string{mkdirCall, chownCall, bgpdCall},
+		},
+		{
+			name:      "a failed mkdir ends the attempt before bgpd starts",
+			mkdirExit: 1, wantExit: 1,
+			wantCalls: []string{mkdirCall},
+		},
+		{
+			name:      "a failed chown ends the attempt before bgpd starts",
+			chownExit: 1, wantExit: 1,
+			wantCalls: []string{mkdirCall, chownCall},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			calls := filepath.Join(t.TempDir(), "calls")
+			sh := exec.Command("sh", "-eu")
+			sh.Stdin = strings.NewReader(script)
+			sh.Env = []string{
+				"PATH=" + stubs + string(os.PathListSeparator) + os.Getenv("PATH"),
+				"BGPD_WAIT_SECS=30",
+				"CALLS=" + calls,
+				"MKDIR_EXIT=" + strconv.Itoa(tc.mkdirExit),
+				"CHOWN_EXIT=" + strconv.Itoa(tc.chownExit),
+			}
+			var stderr bytes.Buffer
+			sh.Stderr = &stderr
+
+			code := 0
+			if err := sh.Run(); err != nil {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					t.Fatalf("run the start script: %v", err)
+				}
+				code = exitErr.ExitCode()
+			}
+
+			if code != tc.wantExit {
+				t.Fatalf("exit %d, want %d: %s", code, tc.wantExit, stderr.String())
+			}
+			raw, err := os.ReadFile(calls)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("read the recorded calls: %v", err)
+			}
+			var got []string
+			if lines := strings.TrimSuffix(string(raw), "\n"); lines != "" {
+				got = strings.Split(lines, "\n")
+			}
+			if !slices.Equal(got, tc.wantCalls) {
+				t.Fatalf("calls = %q, want %q", got, tc.wantCalls)
 			}
 		})
 	}

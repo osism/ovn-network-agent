@@ -133,7 +133,10 @@ collect_frr() {
     # zebra in place (see bootstrap.sh:ensure_upstream_zebra and
     # configure_upstream_frr); capture the same state their failure path
     # dumps into the job log so a zebra or bgpd bring-up failure can be
-    # root-caused from the artifact bundle alone.
+    # root-caused from the artifact bundle alone. bgpd logs to
+    # /var/log/frr/bgpd.log at bring-up and at every chaos restart, and a
+    # run appends one block per restart, so the tail keeps 1000 lines to
+    # hold the first start too.
     capture "${OUT_DIR}/frr/upstream-show-daemons.txt" \
         exec_in "${UPSTREAM}" vtysh -c "show daemons"
     capture "${OUT_DIR}/frr/upstream-bgp-summary.txt" \
@@ -143,7 +146,7 @@ collect_frr() {
     capture "${OUT_DIR}/frr/upstream-processes.txt" \
         exec_in "${UPSTREAM}" ps
     capture "${OUT_DIR}/frr/upstream-frr-log.txt" \
-        exec_in "${UPSTREAM}" sh -c 'tail -n 200 /var/log/frr/* 2>/dev/null'
+        exec_in "${UPSTREAM}" sh -c 'tail -n 1000 /var/log/frr/* 2>/dev/null'
 }
 
 collect_kernel() {
