@@ -251,7 +251,7 @@ silently change what the gate checks. Run it locally the way CI does —
 keep the version in sync with the pin in `lint.yml`:
 
 ```bash
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 golangci-lint config verify
 golangci-lint run
 ```
