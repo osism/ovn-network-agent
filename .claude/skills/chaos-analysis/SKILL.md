@@ -21,8 +21,9 @@ gh run list --workflow "E2E Chaos" --limit 40 \
 
 Pool only runs of one build: group by `headSha`, and take the nightly
 (7 records, one per profile) plus the dispatch runs (one record each) of
-the commit under test. Artifact retention is 7 days. Download into
-`chaos-artifacts/` (ignored by git), one directory per run:
+the commit under test. Artifact retention is 7 days, 30 for a job that
+did not succeed. Download into `chaos-artifacts/` (ignored by git), one
+directory per run:
 
 ```sh
 printf '%s\n' <id...> | xargs -P 6 -I{} \
