@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -457,5 +459,146 @@ func TestWriteRecordReportsAnUnwritablePath(t *testing.T) {
 	err := writeRecord(rec, filepath.Join(t.TempDir(), "no-such-dir", summaryFile))
 	if err == nil {
 		t.Fatal("a run record that could not be written was reported as written")
+	}
+}
+
+// The job log outlives the artifact, so the violation lines are what is left
+// of a red run once summary.json has expired: every field the record carries
+// has to be on the line.
+func TestPrintViolationsWritesOneLinePerViolation(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+
+	printViolations(&buf, []violationRecord{{
+		Kind: violationActionFailed, Tick: 11, Action: "upstream-bgp-restart", Target: "upstream",
+		JournalOffset: 412, Detail: "restore: exit status 1",
+	}}, "/out/summary.json")
+
+	want := "[chaos] violation 1/1: action-failed tick 11 upstream-bgp-restart upstream (journal line 412): restore: exit status 1\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("printViolations wrote\n%q\nwant\n%q", got, want)
+	}
+}
+
+// Most kinds leave fields unset — a sweep finding has no tick, a
+// checks-never-ran has no target. An unset field leaves no label behind, and a
+// detail that is only whitespace leaves no dangling colon.
+func TestPrintViolationsLeavesOutEmptyFields(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+
+	printViolations(&buf, []violationRecord{
+		{Kind: violationChecksNeverRan, Detail: "the dual-claim invariant was never evaluated"},
+		{Kind: violationAgentDown, Target: "gateway-1", Detail: "  \n"},
+	}, "/out/summary.json")
+
+	want := "[chaos] violation 1/2: checks-never-ran: the dual-claim invariant was never evaluated\n" +
+		"[chaos] violation 2/2: agent-down gateway-1\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("printViolations wrote\n%q\nwant\n%q", got, want)
+	}
+}
+
+// A detail folds a command's whole stderr into one string, so it can span
+// lines. Each violation still has to be one line, and no line of the detail
+// may start a log line: the Actions runner reads a line that starts with `::`
+// as a workflow command.
+func TestPrintViolationsKeepsAMultiLineDetailOnOneLine(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+
+	printViolations(&buf, []violationRecord{{
+		Kind: violationActionFailed, Tick: 3, Action: "frr-restart", Target: "gateway-2",
+		Detail: "inject: exit status 1: first\n::error::second\r\nthird\n",
+	}}, "/out/summary.json")
+
+	want := `[chaos] violation 1/1: action-failed tick 3 frr-restart gateway-2: inject: exit status 1: first\n::error::second\r\nthird` + "\n"
+	got := buf.String()
+	if got != want {
+		t.Fatalf("printViolations wrote\n%q\nwant\n%q", got, want)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		if !strings.HasPrefix(line, "[chaos] ") {
+			t.Fatalf("line %q does not start with [chaos]", line)
+		}
+	}
+}
+
+// The baseline sweep raises a violation per sweep and nothing stops it, so the
+// list is capped. The record still holds every one of them, and the closing
+// line says where.
+func TestPrintViolationsCapsTheList(t *testing.T) {
+	t.Parallel()
+	violations := func(n int) []violationRecord {
+		vs := make([]violationRecord, n)
+		for i := range vs {
+			vs[i] = violationRecord{Kind: violationAgentDown, Target: "gateway-1", Detail: "no ovn-network-agent process"}
+		}
+		return vs
+	}
+	lines := func(n int) []string {
+		var buf bytes.Buffer
+		printViolations(&buf, violations(n), "/out/summary.json")
+		return strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	}
+
+	atCap := lines(maxPrintedViolations)
+	if len(atCap) != 25 {
+		t.Fatalf("25 violations printed %d lines, want 25:\n%s", len(atCap), strings.Join(atCap, "\n"))
+	}
+	if want := "[chaos] violation 25/25: agent-down gateway-1: no ovn-network-agent process"; atCap[24] != want {
+		t.Fatalf("the last of 25 lines is %q, want %q", atCap[24], want)
+	}
+
+	overCap := lines(30)
+	if len(overCap) != 26 {
+		t.Fatalf("30 violations printed %d lines, want 25 and a closing line:\n%s", len(overCap), strings.Join(overCap, "\n"))
+	}
+	for i, line := range overCap[:25] {
+		if want := fmt.Sprintf("[chaos] violation %d/30: agent-down gateway-1: no ovn-network-agent process", i+1); line != want {
+			t.Fatalf("line %d is %q, want %q", i+1, line, want)
+		}
+	}
+	if want := "[chaos] … and 5 more violations in /out/summary.json"; overCap[25] != want {
+		t.Fatalf("the closing line is %q, want %q", overCap[25], want)
+	}
+}
+
+// A passing run says so in the summary line; it must not add an empty list.
+func TestPrintViolationsIsSilentWithoutViolations(t *testing.T) {
+	t.Parallel()
+	for name, vs := range map[string][]violationRecord{"nil": nil, "empty": {}} {
+		var buf bytes.Buffer
+		printViolations(&buf, vs, "/out/summary.json")
+		if buf.Len() != 0 {
+			t.Fatalf("%s violations wrote %q, want nothing", name, buf.String())
+		}
+	}
+}
+
+// countingWriter fails every write, like a stderr whose reader went away,
+// and counts how often it was asked to write.
+type countingWriter struct{ writes int }
+
+func (c *countingWriter) Write([]byte) (int, error) {
+	c.writes++
+	return 0, io.ErrClosedPipe
+}
+
+// The list is written in one piece, so it stays one block in the job log, and
+// a stderr that cannot be written to does not stop the run: summary.json
+// already holds the record.
+func TestPrintViolationsWritesOnce(t *testing.T) {
+	t.Parallel()
+	w := &countingWriter{}
+	vs := make([]violationRecord, 3)
+	for i := range vs {
+		vs[i] = violationRecord{Kind: violationDualClaim, Target: "cr-lr0-public", Detail: "claimed by 2 chassis"}
+	}
+
+	printViolations(w, vs, "/out/summary.json")
+
+	if w.writes != 1 {
+		t.Fatalf("printViolations wrote %d times, want once", w.writes)
 	}
 }

@@ -47,10 +47,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -192,6 +194,7 @@ func run(cfg config) (int, error) {
 		return exitFatal, fmt.Errorf("create %s: %w", cfg.outDir, err)
 	}
 	journalPath := filepath.Join(cfg.outDir, journalFile)
+	summaryPath := filepath.Join(cfg.outDir, summaryFile)
 	jf, err := os.Create(journalPath)
 	if err != nil {
 		return exitFatal, fmt.Errorf("create %s: %w", journalPath, err)
@@ -248,7 +251,7 @@ func run(cfg config) (int, error) {
 	if err := jrnl.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "[chaos] journal: %v\n", err)
 	}
-	if err := writeRecord(rec, filepath.Join(cfg.outDir, summaryFile)); err != nil {
+	if err := writeRecord(rec, summaryPath); err != nil {
 		return exitFatal, err
 	}
 	if rec.Result != resultPass && code == exitPass {
@@ -256,7 +259,8 @@ func run(cfg config) (int, error) {
 	}
 	fmt.Fprintf(os.Stderr, "[chaos] %s: %d ticks, %d executed, %d skipped, %d violations (%s, %s)\n",
 		rec.Result, rec.Ticks, rec.Decisions.Executed, rec.Decisions.Skipped,
-		len(rec.Violations), journalPath, filepath.Join(cfg.outDir, summaryFile))
+		len(rec.Violations), journalPath, summaryPath)
+	printViolations(os.Stderr, rec.Violations, summaryPath)
 	collectLabState(cfg.collect, cfg.labName, cfg.outDir)
 	return code, nil
 }
@@ -356,6 +360,58 @@ func writeRecord(rec *runRecord, path string) error {
 	}
 	defer func() { _ = f.Close() }()
 	return rec.write(f)
+}
+
+// maxPrintedViolations bounds the lines printViolations writes. A park stops
+// the tick loop after the first recovery-timeout or action-failed, but the
+// baseline sweep raises a violation per sweep and a settle window one per
+// oracle finding, and nothing stops those.
+const maxPrintedViolations = 25
+
+// oneLine escapes the line breaks of a violation line.
+var oneLine = strings.NewReplacer("\r", `\r`, "\n", `\n`)
+
+// printViolations lists the run's violations below the summary line, one
+// line each, in record order. The job log is kept far longer than the
+// uploaded artifact, so once the artifact of a red run has expired these
+// lines are all that is left of its cause.
+//
+// A detail folds a command's whole stderr into one string, and a target can
+// be read from OVSDB, so every line break in a violation is written as `\n`
+// or `\r`: a violation is always one line, and since every line starts with
+// "[chaos] ", no command or container output can start one — the Actions
+// runner reads a line that starts with `::` as a workflow command.
+func printViolations(w io.Writer, vs []violationRecord, summaryPath string) {
+	if len(vs) == 0 {
+		return
+	}
+	var b strings.Builder
+	for i, v := range vs {
+		if i == maxPrintedViolations {
+			fmt.Fprintf(&b, "[chaos] … and %d more violations in %s\n", len(vs)-i, summaryPath)
+			break
+		}
+		line := v.Kind
+		if v.Tick != 0 {
+			line += fmt.Sprintf(" tick %d", v.Tick)
+		}
+		if v.Action != "" {
+			line += " " + v.Action
+		}
+		if v.Target != "" {
+			line += " " + v.Target
+		}
+		if v.JournalOffset != 0 {
+			line += fmt.Sprintf(" (journal line %d)", v.JournalOffset)
+		}
+		if detail := strings.TrimSpace(v.Detail); detail != "" {
+			line += ": " + detail
+		}
+		fmt.Fprintf(&b, "[chaos] violation %d/%d: %s\n", i+1, len(vs), oneLine.Replace(line))
+	}
+	// One write keeps the list one block in the log. Its error has nowhere
+	// left to go — this is stderr — and summary.json already holds the record.
+	_, _ = io.WriteString(w, b.String())
 }
 
 // collectLabState reuses the lab's existing artifact collector so every
