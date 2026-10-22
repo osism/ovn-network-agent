@@ -298,7 +298,9 @@ jobs:
       # green run's recovery durations are what a later regression is
       # compared against. The runner dumps `lab-state/` into the same
       # directory itself after every run, so a green run's agent logs are
-      # in the artifact too.
+      # in the artifact too. A job that failed or was cancelled keeps its
+      # artifact 30 days instead of 7, because a red nightly is often
+      # triaged more than a week after it ran.
       - name: Upload the chaos artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -306,7 +308,7 @@ jobs:
           name: e2e-artifacts-chaos-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chaos
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: ${{ job.status == 'success' && 7 || 30 }}
 
       # Always tear the lab down so a partial-failure run does not leak
       # docker networks/containers on the self-hosted machine. `if:
