@@ -13,8 +13,10 @@ name: E2E Chaos
 #     sweeps the curated profiles as a matrix, one job per profile at the
 #     runner-default 10 minutes, with the seed set to the run id so
 #     successive nights explore different action sequences. The seed is
-#     echoed to the run log and recorded in the uploaded run record, so a
-#     failing night is replayable from its own artifacts.
+#     echoed to the run log and recorded in the uploaded run record, and
+#     the chaos step's log prints it with the profile and the duration, so
+#     a failing night stays replayable from its job log once its artifacts
+#     have expired.
 #   - Dispatch (`workflow_dispatch`): the exact replay path. Dispatching
 #     with the seed, profile and duration recorded in a failing nightly
 #     job reruns that job exactly. Also the ad-hoc path: dispatch it from
@@ -51,9 +53,10 @@ on:
     # The defaults (`-seed 42 -duration 10m -profile everything-on`)
     # match a nightly everything-on job's duration and profile, not its
     # seed — nightly jobs seed from the run id. To replay a specific
-    # nightly job, dispatch with the seed, profile and duration read back
-    # from that job's artifacts; the fixed seed then reproduces its
-    # action sequence exactly.
+    # nightly job, dispatch with the seed, profile and duration its "Run
+    # the chaos session" step prints (CHAOS_SEED, CHAOS_DURATION,
+    # CHAOS_PROFILE); the fixed seed then reproduces its action sequence
+    # exactly.
     inputs:
       seed:
         description: RNG seed for the fault sequence (same seed, same sequence)

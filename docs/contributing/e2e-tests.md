@@ -2043,9 +2043,15 @@ seed set to the run id so each night is a different — and, because the
 runner records it, replayable — fault sequence. `workflow_dispatch`
 takes `seed`/`duration`/`profile` inputs (defaulting to 42 / 10m /
 `everything-on`), so replaying a failing nightly combination is just
-dispatching it with the seed, profile and duration read back from that
-job's artifacts. Both of those paths run on the org's self-hosted
-runners; the requirements a runner has to meet to join that pool are in
+dispatching it with that job's seed, profile and duration. The job log
+carries all three, so a replay does not need the artifact: the "Run the
+chaos session" step prints them as its `CHAOS_SEED`, `CHAOS_DURATION`
+and `CHAOS_PROFILE` env lines, and again in its expanded command line
+`go run ./test/e2e/chaos -duration … -seed … -profile …`. A nightly
+seed is also the run id, and the profile is also in the job name
+`Seeded chaos session (<profile>)`. Both of those paths run on the
+org's self-hosted runners; the requirements a runner has to meet to
+join that pool are in
 [CI pipeline](./ci.md#scheduled-and-push-runs). A pull request opts into
 a short smoke (3 minutes, seed 42, `everything-on`) by carrying the
 `chaos-smoke` label, rather than chaos running on every PR — and that
@@ -2254,6 +2260,17 @@ roughly twice the baseline job's. The cap is a backstop — a
 `if: failure()` artifact steps and leaves nothing to triage.
 
 ### Triaging a failed run
+
+A chaos job's triage starts in its job log, not in the artifact. Near
+the end of the "Run the chaos session" step, above the lab-state
+collector's `[artifacts]` lines, the runner prints its
+`[chaos] <result>: …` summary line, and directly below it every
+violation of the run, one `[chaos] violation <i>/<n>: …` line each: its
+kind, tick, action, target, journal line and detail, with every line
+break written as `\n` or `\r`. It prints at most 25 and then names how
+many more `summary.json` holds. The job log is kept 90 days and the
+artifact expires sooner, so once the artifact of a red nightly has
+expired, these lines are the only record of its cause.
 
 The uploaded artifact bundle mirrors the directories the collector
 writes:
