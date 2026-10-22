@@ -63,7 +63,7 @@ jobs:
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3
           GOARCH=${{ matrix.goarch }} VERSION="${VERSION}" nfpm package --packager deb --target .
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: build-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -82,7 +82,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -116,7 +116,7 @@ jobs:
           done
 
       - name: Generate changelog
-        uses: orhun/git-cliff-action@3d96a18cc4ec17e9dc69ddcc424ccafaf1f78ce2 # v4
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
         id: changelog
         with:
           config: cliff.toml
