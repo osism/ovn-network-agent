@@ -244,7 +244,10 @@ diagnostics and retries.
   (`eth1 = 100.64.1.1/30`, `eth2 = 100.64.2.1/30`,
   `eth3 = 100.64.3.1/30`), `10.0.0.1/24` on `eth4` (towards
   `client-1`), IPv4 forwarding enabled, FRR with `bgpd` enabled and
-  one eBGP neighbor per gateway.
+  one eBGP neighbor per gateway. `bgpd` logs to
+  `/var/log/frr/bgpd.log` (FRR's `--log file:` option, at bring-up and
+  at every chaos restart) with `bgp log-neighbor-changes` set, so the
+  log records its starts, stops and session changes.
 - the gateways all share AS 65000, so on its own the upstream's
   re-advertisement of one gateway's prefixes to another would be
   dropped by AS-path loop prevention. The upstream therefore sets
@@ -2296,7 +2299,7 @@ writes:
   frr/upstream-bgp-summary.txt     — upstream `vtysh -c "show bgp summary"`
   frr/upstream-daemons-file.txt    — upstream `/etc/frr/daemons`
   frr/upstream-processes.txt       — upstream process list (`ps`)
-  frr/upstream-frr-log.txt         — upstream `/var/log/frr/*` tail
+  frr/upstream-frr-log.txt         — last 1000 lines of upstream `/var/log/frr/*` (`bgpd.log`: starts, stops, session changes)
   kernel/<gateway>-ip-route.txt    — `ip route show table all`
   agent/<gateway>.log              — copy of the gateway container's stdout
   ovn-controller/<chassis>.log     — `ovn-controller` log per gateway and compute-1 (chassis-registration daemon)
