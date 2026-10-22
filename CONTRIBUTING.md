@@ -17,7 +17,7 @@ Run the same lint gate CI enforces (keep the version in sync with
 [`.github/workflows/lint.yml`](./.github/workflows/lint.yml)):
 
 ```bash
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 golangci-lint run   # config and exclusions live in .golangci.yml
 ```
 
