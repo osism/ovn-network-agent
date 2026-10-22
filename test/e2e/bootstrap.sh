@@ -733,7 +733,10 @@ configure_upstream_frr() {
     #     /32s only.
     #
     # `redistribute connected` below only exports the upstream's own
-    # networks.
+    # networks. `bgp log-neighbor-changes` writes each session's Up and
+    # Down into bgpd's log (/var/log/frr/bgpd.log, see
+    # start_upstream_bgpd); FRR 8.4 leaves it off under the traditional
+    # defaults the upstream runs.
     local neighbors_remote_as=""
     local neighbors_activate=""
     local neighbors_as_override=""
@@ -751,6 +754,7 @@ configure_upstream_frr() {
 configure terminal
 router bgp ${BGP_ASN_UPSTREAM}
  bgp router-id ${BGP_ROUTER_ID_UPSTREAM}
+ bgp log-neighbor-changes
  no bgp default ipv4-unicast
  no bgp ebgp-requires-policy
 ${neighbors_remote_as} address-family ipv4 unicast

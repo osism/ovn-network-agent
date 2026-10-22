@@ -677,6 +677,29 @@ func TestBootstrapUpstreamBGPDStartLogsToFile(t *testing.T) {
 	}
 }
 
+// The upstream BGP config turns on bgp log-neighbor-changes, which FRR 8.4
+// leaves off under the traditional defaults, so bgpd's log records every
+// session going up and down. It sits in the router context, ahead of the
+// address family, and `write memory` persists it for a restarted bgpd.
+func TestBootstrapUpstreamBGPConfigLogsNeighborChanges(t *testing.T) {
+	t.Parallel()
+	run := runBootstrapFunc(t, "configure_upstream_frr")
+	if run.code != 0 {
+		t.Fatalf("configure_upstream_frr against the stubs exited %d: %s", run.code, run.stderr)
+	}
+
+	push := run.stdin
+	router := strings.Index(push, "router bgp 65001\n")
+	setting := strings.Index(push, "\n bgp log-neighbor-changes\n")
+	family := strings.Index(push, " address-family ipv4 unicast")
+	if router < 0 || setting < router || family < setting {
+		t.Fatalf("the push does not set bgp log-neighbor-changes between router bgp 65001 and its address family:\n%s", push)
+	}
+	if !strings.HasSuffix(push, "write memory\n") {
+		t.Fatalf("the push does not end in write memory:\n%s", push)
+	}
+}
+
 // The end check passes a lab whose zebra still runs after one look, and
 // never starts anything.
 func TestBootstrapEndCheckPassesWhileZebraRuns(t *testing.T) {
