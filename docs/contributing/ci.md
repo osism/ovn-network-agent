@@ -151,8 +151,11 @@ The seed is the run id, so successive nights explore different fault
 sequences rather than replaying one; it is echoed to the run log and
 recorded by the runner in the uploaded `summary.json` and
 `journal.jsonl`, so a failing night is fully replayable — dispatch
-`e2e-chaos.yml` with the seed, profile and duration read back from that
-job's artifacts and the run reproduces exactly.
+`e2e-chaos.yml` with that job's seed, profile and duration and the run
+reproduces exactly. The job log carries all three, so a replay still
+works once the artifact has expired: the "Run the chaos session" step
+prints them as its `CHAOS_SEED`, `CHAOS_DURATION` and `CHAOS_PROFILE`
+env lines.
 
 Both the nightly and the dispatch path run on the org's **self-hosted
 runners** (`runs-on: self-hosted`), which is where a 40-minute session
